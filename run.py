@@ -1,0 +1,361 @@
+"""
+Точка входа FCF — Единая Вычислительная Архитектура (ЕВА).
+
+Режимы:
+- --init: Создать PrimordialLayer и протестировать прямой проход
+- --train-tokenizer: Обучить BPE-токенизатор на Wikipedia
+- --train-language: Запустить самообучение языку (Пункт 2)
+- --train-instruction: Запустить инструктивное дообучение (Пункт 3)
+- --interactive: Интерактивный диалог с системой
+"""
+
+import os
+import sys
+import argparse
+import torch
+from loguru import logger
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from fcf.config import load_config, FCFConfig
+from fcf.primordial_layer import PrimordialLayer
+from fcf.utils import save_primordial_layer, load_primordial_layer
+from fcf.tokenizer_utils import (
+    load_tokenizer,
+    train_tokenizer_on_wikipedia,
+    create_fallback_tokenizer,
+)
+from fcf.language_trainer import LanguageTrainer
+from fcf.instruction_trainer import InstructionTrainer
+from fcf.domain_trainer import DomainTrainer
+from fcf.domain_registry import DomainRegistry
+
+
+def cmd_init(config_path: str = None):
+    logger.info("=" * 60)
+    logger.info("FCF — Пункт 1. Первооснова")
+    logger.info("=" * 60)
+
+    config = load_config(config_path)
+    logger.info(f"[Init] Конфигурация: d_model={config.d_model}, num_heads={config.num_heads}")
+
+    layer = PrimordialLayer(config)
+
+    total_params = sum(p.numel() for p in layer.parameters())
+    logger.info(f"[Init] PrimordialLayer создан: {total_params:,} параметров")
+    logger.info(f"[Init] StateStorage: FAISS IndexFlatIP ({config.d_model}d)")
+    logger.info(f"[Init] SRG: w_sim={config.srg.w_sim}, w_ent={config.srg.w_ent}, w_eth={config.srg.w_eth}")
+    logger.info(f"[Init] EthicsFilter: 5 аксиом, threshold={config.srg.ethics_threshold}")
+    logger.info(f"[Init] GrowthController: width_thr={config.growth.width_threshold}, depth_thr={config.growth.depth_threshold}")
+    logger.info(f"[Init] CuriosityLoop: threshold={config.curiosity.threshold}")
+
+    test_input = torch.randint(0, min(config.vocab_size, 1000), (1, 16))
+    with torch.no_grad():
+        x = layer.embed(test_input)
+        hidden = layer.forward_transformer(x)
+        logits = layer.forward_logits(hidden)
+    logger.info(f"[Init] Тестовый прямой проход: OK (input={test_input.shape}, embedding={x.shape}, hidden={hidden.shape}, logits={logits.shape})")
+
+    test_text = "Привет! Как дела?"
+    ethics_score, axiom_scores = layer.srg.ethics_filter.evaluate(test_text)
+    logger.info(f"[Init] Тест EthicsFilter: score={ethics_score:.2f}, axioms={axiom_scores}")
+
+    return layer
+
+
+def cmd_interactive(config_path: str = None, checkpoint_path: str = None):
+    logger.info("=" * 60)
+    logger.info("FCF — Интерактивный режим")
+    logger.info("=" * 60)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
+        logger.info(f"[Load] Загружен из {checkpoint_path}")
+    else:
+        layer = cmd_init(config_path)
+
+    tokenizer = _load_or_create_tokenizer()
+
+    print()
+    print("EVA (FCF) — интерактивный режим")
+    print("Введите 'exit' для выхода, 'save' для сохранения, 'stats' для статистики")
+    print()
+
+    while True:
+        try:
+            user_input = input(">>> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nЗавершение...")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() == "exit":
+            break
+
+        if user_input.lower() == "save":
+            save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "manual")
+            save_primordial_layer(layer, save_path)
+            continue
+
+        if user_input.lower() == "stats":
+            print(f"Слой: {layer.summary()}")
+            print(f"Слепков: {len(layer.state_storage)}")
+            print(f"Уверенность (avg): {layer.meta.average_confidence():.3f}")
+            print(f"Счётчик любопытства: {layer.curiosity.counter}/{layer.curiosity.threshold}")
+            continue
+
+        result = layer.process_query(
+            query=user_input,
+            tokenizer=tokenizer,
+            max_new_tokens=256,
+            temperature=0.8,
+        )
+
+        print(f"\nEVA: {result['response']}\n")
+        print(f"    [confidence={result['confidence']:.3f}, "
+              f"ethics={result['ethics_score']:.3f}, "
+              f"growth={result['growth_signal']}]")
+
+        if result.get("clarification_question"):
+            print(f"    [Уточняющий вопрос: {result['clarification_question']}]")
+
+    logger.info("Завершение работы.")
+
+
+def cmd_train_tokenizer(config_path: str = None):
+    logger.info("=" * 60)
+    logger.info("FCF — Обучение BPE-токенизатора")
+    logger.info("=" * 60)
+
+    output_path = os.path.join(os.path.dirname(__file__), "tokenizer.json")
+
+    tokenizer = train_tokenizer_on_wikipedia(
+        output_path=output_path,
+        vocab_size=50257,
+        num_texts=100000,
+    )
+
+    if tokenizer:
+        logger.info(f"[Tokenizer] Готов: vocab_size={tokenizer.get_vocab_size()}")
+        _test_tokenizer(tokenizer)
+    else:
+        logger.error("[Tokenizer] Не удалось обучить токенизатор")
+
+
+def cmd_train_language(
+    config_path: str = None,
+    checkpoint_path: str = None,
+    text_file: str = None,
+    max_steps: int = None,
+    device: str = "cpu",
+):
+    logger.info("=" * 60)
+    logger.info("FCF — Пункт 2. Самообучение языку")
+    logger.info("=" * 60)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
+        logger.info(f"[Load] Загружен из {checkpoint_path}")
+    else:
+        layer = cmd_init(config_path)
+
+    tokenizer = _load_or_create_tokenizer()
+    _test_tokenizer(tokenizer)
+
+    trainer = LanguageTrainer(
+        layer=layer,
+        tokenizer=tokenizer,
+        checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "language"),
+    )
+
+    stats = trainer.train(
+        text_file=text_file,
+        max_steps=max_steps,
+        device=device,
+    )
+
+    logger.info(f"[Train] Статистика: {stats}")
+    return stats
+
+
+def cmd_train_domain(
+    config_path: str = None,
+    checkpoint_path: str = None,
+    conceptnet_db: str = None,
+    data_file: str = None,
+    domain_id: str = None,
+    max_steps: int = 200,
+    device: str = "cpu",
+):
+    logger.info("=" * 60)
+    logger.info("FCF — Пункт 4. Доменные правила")
+    logger.info("=" * 60)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
+        logger.info(f"[Load] Загружен из {checkpoint_path}")
+    else:
+        layer = cmd_init(config_path)
+
+    tokenizer = _load_or_create_tokenizer()
+    _test_tokenizer(tokenizer)
+
+    registry = DomainRegistry()
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        reg_path = os.path.join(checkpoint_path, "domain_registry.pkl")
+        if os.path.exists(reg_path):
+            registry = DomainRegistry.load(reg_path)
+
+    trainer = DomainTrainer(
+        layer=layer,
+        tokenizer=tokenizer,
+        registry=registry,
+        checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "domain"),
+    )
+
+    if conceptnet_db and os.path.exists(conceptnet_db):
+        results = trainer.train_from_conceptnet(
+            db_path=conceptnet_db,
+            max_steps_per_domain=max_steps,
+            device=device,
+        )
+        logger.info(f"[Domain] Результаты ConceptNet: {len(results)} доменов")
+    elif data_file and domain_id:
+        ok = trainer.train_single_domain(
+            domain_id=domain_id,
+            data_file=data_file,
+            max_steps=max_steps,
+            device=device,
+        )
+        logger.info(f"[Domain] Домен {domain_id}: {'OK' if ok else 'FAIL'}")
+    else:
+        logger.error("Укажите --conceptnet-db или --data-file + --domain-id")
+
+    logger.info(f"[Domain] Реестр: {registry.summary()}")
+    return registry
+
+
+def cmd_train_instruction(
+    config_path: str = None,
+    checkpoint_path: str = None,
+    instructions_file: str = None,
+    max_steps: int = None,
+    device: str = "cpu",
+):
+    logger.info("=" * 60)
+    logger.info("FCF — Пункт 3. Инструктивное дообучение")
+    logger.info("=" * 60)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
+        logger.info(f"[Load] Загружен из {checkpoint_path}")
+    else:
+        layer = cmd_init(config_path)
+
+    tokenizer = _load_or_create_tokenizer()
+    _test_tokenizer(tokenizer)
+
+    trainer = InstructionTrainer(
+        layer=layer,
+        tokenizer=tokenizer,
+        checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "instruction"),
+    )
+
+    stats = trainer.train(
+        instructions_file=instructions_file,
+        max_steps=max_steps,
+        device=device,
+    )
+
+    logger.info(f"[Train] Статистика: {stats}")
+    return stats
+
+
+def _load_or_create_tokenizer():
+    tokenizer_path = os.path.join(os.path.dirname(__file__), "tokenizer.json")
+    if os.path.exists(tokenizer_path):
+        try:
+            return load_tokenizer(tokenizer_path)
+        except Exception as e:
+            logger.warning(f"[Token] Ошибка загрузки: {e}")
+    logger.warning("[Token] tokenizer.json не найден. Используется fallback.")
+    return create_fallback_tokenizer()
+
+
+def _test_tokenizer(tokenizer):
+    test_text = "Привет! Как дела? Это тест токенизатора."
+    try:
+        encoding = tokenizer.encode(test_text)
+        ids = encoding.ids if hasattr(encoding, "ids") else encoding
+        decoded = tokenizer.decode(ids)
+        logger.info(f"[Token] Тест: '{test_text}' -> {len(ids)} токенов -> '{decoded}'")
+    except Exception as e:
+        logger.warning(f"[Token] Тест не пройден: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FCF — Единая Вычислительная Архитектура")
+    parser.add_argument("--init", action="store_true", help="Инициализировать PrimordialLayer")
+    parser.add_argument("--interactive", action="store_true", help="Интерактивный режим")
+    parser.add_argument("--train-tokenizer", action="store_true", help="Обучить BPE-токенизатор")
+    parser.add_argument("--train-language", action="store_true", help="Самообучение языку (Пункт 2)")
+    parser.add_argument("--train-instruction", action="store_true", help="Инструктивное дообучение (Пункт 3)")
+    parser.add_argument("--train-domain", action="store_true", help="Обучение доменных правил (Пункт 4)")
+    parser.add_argument("--config", type=str, default=None, help="Путь к config.json")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Путь к чекпоинту для загрузки")
+    parser.add_argument("--max-steps", type=int, default=None, help="Максимальное число шагов обучения")
+    parser.add_argument("--device", type=str, default="cpu", help="Устройство (cpu/cuda)")
+    parser.add_argument("--text-file", type=str, default=None, help="Путь к текстовому файлу для обучения")
+    parser.add_argument("--instructions-file", type=str, default=None, help="Путь к JSON с инструкциями")
+    parser.add_argument("--conceptnet-db", type=str, default=None, help="Путь к ConceptNet SQLite базе")
+    parser.add_argument("--data-file", type=str, default=None, help="Путь к JSON с фактами для домена")
+    parser.add_argument("--domain-id", type=str, default=None, help="Идентификатор домена")
+
+    args = parser.parse_args()
+
+    logger.remove()
+    logger.add(sys.stderr, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>")
+
+    if args.interactive:
+        cmd_interactive(config_path=args.config, checkpoint_path=args.checkpoint)
+    elif args.train_tokenizer:
+        cmd_train_tokenizer(config_path=args.config)
+    elif args.train_language:
+        cmd_train_language(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
+            text_file=args.text_file,
+            max_steps=args.max_steps,
+            device=args.device,
+        )
+    elif args.train_instruction:
+        cmd_train_instruction(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
+            instructions_file=args.instructions_file,
+            max_steps=args.max_steps,
+            device=args.device,
+        )
+    elif args.train_domain:
+        cmd_train_domain(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
+            conceptnet_db=args.conceptnet_db,
+            data_file=args.data_file,
+            domain_id=args.domain_id,
+            max_steps=args.max_steps,
+            device=args.device,
+        )
+    elif args.init:
+        layer = cmd_init(config_path=args.config)
+        save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "init")
+        save_primordial_layer(layer, save_path)
+        logger.info(f"[Init] Сохранено в {save_path}")
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

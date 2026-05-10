@@ -122,6 +122,7 @@ class LanguageTrainer:
         max_steps: Optional[int] = None,
         block_size: int = 512,
         device: str = "cpu",
+        use_wikipedia: bool = False,
     ) -> Dict[str, Any]:
         import sys
         from loguru import logger as loguru_logger
@@ -152,15 +153,21 @@ class LanguageTrainer:
         self.layer.train()
 
         blocks = []
-        if text_file and os.path.exists(text_file):
+        if use_wikipedia:
+            logger.info("[Train] Используется Wikipedia (потоковая загрузка)")
+        elif text_file and os.path.exists(text_file):
             blocks = self._pre_tokenize_corpus(text_file, block_size)
 
-        if not blocks:
+        if not blocks and not use_wikipedia:
             logger.error("Нет данных для обучения.")
             return {"error": "no_data"}
 
-        max_steps = max_steps or self.config.training.max_steps or len(blocks) * 10
-        logger.info(f"[Train] Блоков: {len(blocks)}, макс. шагов: {max_steps}")
+        if use_wikipedia:
+            max_steps = max_steps or self.config.training.max_steps or 10000
+            logger.info(f"[Train] Wikipedia streaming, макс. шагов: {max_steps}")
+        else:
+            max_steps = max_steps or self.config.training.max_steps or len(blocks) * 10
+            logger.info(f"[Train] Блоков: {len(blocks)}, макс. шагов: {max_steps}")
         print(f"\n{'='*60}")
         print(f"  Обучение запущено")
         print(f"  Блоков: {len(blocks)} | Цель шагов: {max_steps}")
@@ -173,16 +180,31 @@ class LanguageTrainer:
         start_time = time.time()
         tokens_processed = 0
         block_idx = 0
+        wiki_iter = None
+
+        if use_wikipedia:
+            wiki = DataManager.load_wikipedia(streaming=True)
+            if wiki:
+                wiki_iter = iter(wiki)
+            else:
+                logger.error("Wikipedia не загружена")
+                return {"error": "no_wikipedia"}
 
         for step_idx in range(max_steps):
             if self.stopped:
                 break
 
-            block = blocks[block_idx % len(blocks)]
-            block_idx += 1
-
-            input_ids = block["input_ids"].to(device)
-            labels = block["labels"].to(device)
+            if use_wikipedia and wiki_iter:
+                input_ids, labels = self._tokenize_wiki_block(
+                    wiki_iter, block_size, device
+                )
+                if input_ids is None:
+                    continue
+            else:
+                block = blocks[block_idx % len(blocks)]
+                block_idx += 1
+                input_ids = block["input_ids"].to(device)
+                labels = block["labels"].to(device)
 
             loss = self._training_step(input_ids, labels)
             self.total_loss += loss
@@ -372,3 +394,33 @@ class LanguageTrainer:
             "usage_count": self.layer.meta.usage_count,
             "stop_reason": self.stop_reason,
         }
+
+    def _tokenize_wiki_block(self, wiki_iter, block_size, device):
+        try:
+            article = next(wiki_iter)
+            text = article.get('text', '')
+            if len(text) < 100:
+                return None, None
+
+            words = text.split()
+            start = 0
+            if len(words) > block_size:
+                start = hash(text) % max(1, len(words) - block_size)
+
+            chunk = " ".join(words[start:start + block_size])
+            if len(chunk) < 50:
+                return None, None
+
+            encoding = self.tokenizer.encode(chunk)
+            ids = encoding.ids if hasattr(encoding, "ids") else encoding
+            ids = ids[:block_size]
+            while len(ids) < block_size:
+                ids.append(0)
+
+            input_ids = torch.tensor([ids[:-1]], dtype=torch.long).to(device)
+            labels = torch.tensor([ids[1:]], dtype=torch.long).to(device)
+            return input_ids, labels
+        except StopIteration:
+            return None, None
+        except Exception:
+            return None, None

@@ -164,6 +164,7 @@ def cmd_train_language(
     text_file: str = None,
     max_steps: int = None,
     device: str = "cpu",
+    use_wikipedia: bool = False,
 ):
     logger.info("=" * 60)
     logger.info("FCF — Пункт 2. Самообучение языку")
@@ -188,6 +189,7 @@ def cmd_train_language(
         text_file=text_file,
         max_steps=max_steps,
         device=device,
+        use_wikipedia=use_wikipedia,
     )
 
     logger.info(f"[Train] Статистика: {stats}")
@@ -547,6 +549,7 @@ def main():
     parser.add_argument("--max-steps", type=int, default=None, help="Максимальное число шагов обучения")
     parser.add_argument("--device", type=str, default="cpu", help="Устройство (cpu/cuda)")
     parser.add_argument("--text-file", type=str, default=None, help="Путь к текстовому файлу для обучения")
+    parser.add_argument("--wikipedia", action="store_true", help="Использовать Wikipedia для обучения")
     parser.add_argument("--instructions-file", type=str, default=None, help="Путь к JSON с инструкциями")
     parser.add_argument("--conceptnet-db", type=str, default=None, help="Путь к ConceptNet SQLite базе")
     parser.add_argument("--data-file", type=str, default=None, help="Путь к JSON с фактами для домена")
@@ -569,6 +572,7 @@ def main():
             text_file=args.text_file,
             max_steps=args.max_steps,
             device=args.device,
+            use_wikipedia=args.wikipedia,
         )
     elif args.train_instruction:
         cmd_train_instruction(

@@ -25,36 +25,17 @@ class DataManager:
         try:
             from datasets import load_dataset
 
-            dataset = None
-            errors = []
-
-            for dataset_id in [
-                f"wikipedia",  # старый формат
-                f"wikimedia/wikipedia",  # новый формат
-            ]:
-                for year in ["20220301", "20231101"]:
-                    try:
-                        dataset = load_dataset(
-                            dataset_id,
-                            f"{year}.{language}",
-                            split=split,
-                            streaming=streaming,
-                            trust_remote_code=True,
-                        )
-                        logger.info(
-                            f"[DataManager] Wikipedia загружена: {dataset_id} "
-                            f"({year}.{language})"
-                        )
-                        return dataset
-                    except Exception as e:
-                        errors.append(f"{dataset_id}/{year}.{language}: {e}")
-                        continue
-
-            logger.warning(
-                f"[DataManager] Wikipedia не загружена ни через один источник. "
-                f"Ошибки: {'; '.join(errors[-3:])}"
+            dataset = load_dataset(
+                "wikimedia/wikipedia",
+                f"20231101.{language}",
+                split=split,
+                streaming=streaming,
             )
-            return None
+            logger.info(
+                f"[DataManager] Wikipedia загружена: "
+                f"wikimedia/wikipedia 20231101.{language}"
+            )
+            return dataset
 
         except ImportError:
             logger.error("[DataManager] `datasets` не установлен. pip install datasets")

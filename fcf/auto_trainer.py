@@ -160,10 +160,13 @@ class AutoTrainer:
         return had_work
 
     def _check_layer_degradation(self) -> bool:
+        if len(self.layer.meta.confidence_history) < 10:
+            return False
+
         avg_conf = self.layer.meta.average_confidence(
             window=self.layer_degradation_window
         )
-        if avg_conf < self.layer_degradation_threshold:
+        if avg_conf < self.layer_degradation_threshold and avg_conf > 0.0:
             logger.info(
                 f"[AutoTrainer] Деградация слоя: "
                 f"avg_conf={avg_conf:.3f}"

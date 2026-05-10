@@ -1,0 +1,18 @@
+18:11:41 | INFO     | ============================================================
+18:11:41 | INFO     | Пункт 2 — Самообучение языку
+18:11:41 | INFO     | Устройство: cpu
+18:11:41 | INFO     | Learning rate: 0.0001
+18:11:41 | INFO     | ============================================================
+18:11:41 | INFO     | [CPU] Потоков: 12
+18:11:41 | INFO     | [PreTokenize] Токенизация: training_corpus.txt
+18:11:41 | INFO     | [PreTokenize] Токенов всего: 3880, размер блока: 512
+18:11:41 | INFO     | [PreTokenize] Готово: 14 блоков (block_size=512)
+18:11:41 | INFO     | [Train] Блоков: 14, макс. шагов: 2000
+18:16:00 | INFO     | [SRG] step=100 confidence=0.765 avg=0.765
+18:21:02 | INFO     | [SRG] step=200 confidence=0.681 avg=0.723
+18:25:59 | INFO     | [SRG] step=300 confidence=0.858 avg=0.768
+18:31:45 | INFO     | [SRG] step=400 confidence=0.675 avg=0.745
+18:36:58 | INFO     | [SRG] step=500 confidence=0.723 avg=0.740
+18:42:01 | INFO     | [SRG] step=600 confidence=0.722 avg=0.737
+18:47:06 | INFO     | [SRG] step=700 confidence=0.610 avg=0.719
+18:52:09 | INFO     | [SRG] step=800 confidence=0.904 avg=0.742

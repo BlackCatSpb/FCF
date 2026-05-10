@@ -252,6 +252,8 @@ class PrimordialLayer(nn.Module):
                     self._adapter_backup = adapter.apply_to_layer(
                         self.transformer.attention
                     )
+                    ffn_backup = adapter.apply_to_layer(self.transformer.ffn)
+                    self._adapter_backup.update(ffn_backup)
                     self._active_adapter = adapter
                     logger.debug(f"[Domain] Адаптер {matched_domain} применён")
                 except Exception as e:
@@ -269,6 +271,9 @@ class PrimordialLayer(nn.Module):
         if self._active_adapter is not None:
             self._active_adapter.remove_from_layer(
                 self.transformer.attention, self._adapter_backup
+            )
+            self._active_adapter.remove_from_layer(
+                self.transformer.ffn, self._adapter_backup
             )
             self._active_adapter = None
             self._adapter_backup = {}

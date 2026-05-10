@@ -30,38 +30,44 @@ class LoRAAdapter(nn.Module):
         rank: int = 8,
         alpha: float = 1.0,
         target_modules: Optional[List[str]] = None,
+        ff_mult: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
         self.alpha = alpha
+        self.ff_mult = ff_mult
         self.target_modules = target_modules or TARGET_MODULES
 
         self.A: Dict[str, nn.Parameter] = {}
         self.B: Dict[str, nn.Parameter] = {}
 
-        self._original_weights: Dict[str, torch.Tensor] = {}
-
         for module_name in self.target_modules:
+            in_dim, out_dim = self._get_module_dims(module_name)
             self.A[module_name] = nn.Parameter(
-                torch.randn(d_model, rank) * 0.02
+                torch.randn(rank, in_dim) * 0.02
             )
             self.B[module_name] = nn.Parameter(
-                torch.zeros(rank, d_model)
+                torch.zeros(out_dim, rank)
             )
+
+    def _get_module_dims(self, module_name: str) -> tuple:
+        if module_name in ("gate_proj", "up_proj"):
+            return (self.d_model, self.d_model * self.ff_mult)
+        elif module_name == "down_proj":
+            return (self.d_model * self.ff_mult, self.d_model)
+        else:
+            return (self.d_model, self.d_model)
 
     def forward(
         self, x: torch.Tensor, W: torch.Tensor, module_name: str
     ) -> torch.Tensor:
-        A = self.A[module_name]
-        B = self.B[module_name]
+        A, B = self.A[module_name], self.B[module_name]
         delta = (B @ A) * (self.alpha / self.rank)
-        effective_W = W + delta
-        return nn.functional.linear(x, effective_W)
+        return nn.functional.linear(x, W + delta.to(W.device))
 
     def get_delta(self, module_name: str) -> torch.Tensor:
-        A = self.A[module_name]
-        B = self.B[module_name]
+        A, B = self.A[module_name], self.B[module_name]
         return (B @ A) * (self.alpha / self.rank)
 
     def apply_to_layer(self, layer: nn.Module) -> Dict[str, torch.Tensor]:
@@ -70,12 +76,10 @@ class LoRAAdapter(nn.Module):
             if hasattr(layer, module_name):
                 original = getattr(layer, module_name)
                 saved[module_name] = original.weight.data.clone()
-
                 delta = self.get_delta(module_name)
                 original.weight.data = original.weight.data + delta.to(
                     original.weight.device
                 )
-
         return saved
 
     def remove_from_layer(
@@ -109,16 +113,19 @@ class LoRAAdapter(nn.Module):
         cls,
         data: Dict[str, Dict[str, np.ndarray]],
         alpha: float = 1.0,
+        ff_mult: int = 4,
     ) -> "LoRAAdapter":
-        d_model = data[list(data.keys())[0]]["A"].shape[0]
-        rank = data[list(data.keys())[0]]["A"].shape[1]
+        first_name = list(data.keys())[0]
+        in_dim = data[first_name]["A"].shape[0]
+        rank = data[first_name]["A"].shape[1]
         target_modules = list(data.keys())
 
         adapter = cls(
-            d_model=d_model,
+            d_model=in_dim if in_dim <= 2560 else 2560,
             rank=rank,
             alpha=alpha,
             target_modules=target_modules,
+            ff_mult=ff_mult,
         )
 
         for name in target_modules:
@@ -140,6 +147,7 @@ class LoRAAdapter(nn.Module):
             "d_model": self.d_model,
             "rank": self.rank,
             "alpha": self.alpha,
+            "ff_mult": self.ff_mult,
             "target_modules": self.target_modules,
             "weights": self.to_numpy(),
         }
@@ -157,6 +165,7 @@ class LoRAAdapter(nn.Module):
         adapter = cls.from_numpy(
             data["weights"],
             alpha=data.get("alpha", 1.0),
+            ff_mult=data.get("ff_mult", 4),
         )
         adapter.d_model = data["d_model"]
         adapter.rank = data["rank"]

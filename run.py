@@ -17,6 +17,10 @@ from loguru import logger
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from fcf.config import load_config, FCFConfig
 from fcf.primordial_layer import PrimordialLayer
 from fcf.utils import save_primordial_layer, load_primordial_layer
@@ -316,7 +320,8 @@ def main():
     args = parser.parse_args()
 
     logger.remove()
-    logger.add(sys.stderr, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>")
+    logger.add(sys.stderr, level="INFO",
+               format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>")
 
     if args.interactive:
         cmd_interactive(config_path=args.config, checkpoint_path=args.checkpoint)

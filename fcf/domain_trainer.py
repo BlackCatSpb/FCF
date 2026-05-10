@@ -229,12 +229,9 @@ class DomainTrainer:
         device: str = "cpu",
     ):
         adapter.to(device)
-        self.layer.eval()
+        self.layer.train()
 
-        for param in self.layer.parameters():
-            param.requires_grad = False
-
-        trainable_params = adapter.get_trainable_parameters()
+        trainable_params = list(adapter.get_trainable_parameters())
         optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
 
         blocks = []
@@ -276,9 +273,27 @@ class DomainTrainer:
 
                 x = self.layer.embed(input_ids)
 
-                hidden = self._forward_with_adapter(adapter, x)
+                saved_attn = {}
+                saved_ffn = {}
+                for name in adapter.target_modules:
+                    if hasattr(self.layer.transformer.attention, name):
+                        w = getattr(self.layer.transformer.attention, name)
+                        saved_attn[name] = w.weight.data.clone()
+                        delta = adapter.get_delta(name).to(w.weight.device)
+                        w.weight.data = w.weight.data + delta
+                    elif hasattr(self.layer.transformer.ffn, name):
+                        w = getattr(self.layer.transformer.ffn, name)
+                        saved_ffn[name] = w.weight.data.clone()
+                        delta = adapter.get_delta(name).to(w.weight.device)
+                        w.weight.data = w.weight.data + delta
 
+                hidden = self.layer.transformer(x)
                 logits = self.layer.forward_logits(hidden)
+
+                for name, orig in saved_attn.items():
+                    getattr(self.layer.transformer.attention, name).weight.data = orig
+                for name, orig in saved_ffn.items():
+                    getattr(self.layer.transformer.ffn, name).weight.data = orig
 
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
@@ -291,22 +306,24 @@ class DomainTrainer:
             optimizer.step()
 
             if step % 20 == 0:
-                logger.debug(f"[Domain] step={step}, loss={total_loss.item():.4f}")
+                logger.info(f"[Domain] step={step}, loss={total_loss.item():.4f}")
 
-        for param in self.layer.parameters():
-            param.requires_grad = True
-
+        self.layer.eval()
         logger.info(f"[Domain] Обучение завершено: loss={total_loss.item():.4f}")
 
     def _forward_with_adapter(
         self, adapter: LoRAAdapter, x: torch.Tensor
     ) -> torch.Tensor:
         saved = {}
-        attn = self.layer.transformer.attention
 
         for name in adapter.target_modules:
-            if hasattr(attn, name):
-                w = getattr(attn, name)
+            if hasattr(self.layer.transformer.attention, name):
+                w = getattr(self.layer.transformer.attention, name)
+                saved[name] = w.weight.data.clone()
+                delta = adapter.get_delta(name).to(w.weight.device)
+                w.weight.data = w.weight.data + delta
+            elif hasattr(self.layer.transformer.ffn, name):
+                w = getattr(self.layer.transformer.ffn, name)
                 saved[name] = w.weight.data.clone()
                 delta = adapter.get_delta(name).to(w.weight.device)
                 w.weight.data = w.weight.data + delta
@@ -314,7 +331,9 @@ class DomainTrainer:
         hidden = self.layer.transformer(x)
 
         for name, original in saved.items():
-            if hasattr(attn, name):
-                getattr(attn, name).weight.data = original
+            if hasattr(self.layer.transformer.attention, name):
+                getattr(self.layer.transformer.attention, name).weight.data = original
+            elif hasattr(self.layer.transformer.ffn, name):
+                getattr(self.layer.transformer.ffn, name).weight.data = original
 
         return hidden

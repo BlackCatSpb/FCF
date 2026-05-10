@@ -11,6 +11,7 @@
 
 import os
 import sys
+import time
 import argparse
 import torch
 import numpy as np
@@ -40,6 +41,8 @@ from fcf.sleep_mode import SleepMode
 from fcf.kca_engine import KCAEngine
 from fcf.state_algebra import StateAlgebra
 from fcf.hnsw_index import HNSWIndex
+from fcf.environment_tuner import EnvironmentAutoTuner
+from fcf.auto_trainer import AutoTrainer
 
 
 def cmd_init(config_path: str = None):
@@ -341,6 +344,85 @@ def cmd_sleep(
     return stats
 
 
+def cmd_auto_tune(config_path: str = None):
+    logger.info("=" * 60)
+    logger.info("FCF — Автонастройка среды исполнения")
+    logger.info("=" * 60)
+
+    tuner = EnvironmentAutoTuner()
+    profile = tuner.discover()
+    tuner.apply()
+
+    print()
+    print(tuner.summary())
+    print()
+
+    config = tuner.get_training_config()
+    logger.info(f"[AutoTune] Конфиг обучения: {config}")
+
+    return tuner
+
+
+def cmd_auto_train(
+    config_path: str = None,
+    checkpoint_path: str = None,
+):
+    logger.info("=" * 60)
+    logger.info("FCF — Фоновое автодообучение")
+    logger.info("=" * 60)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
+    else:
+        layer = cmd_init(config_path)
+
+    tokenizer = _load_or_create_tokenizer()
+
+    tuner = EnvironmentAutoTuner()
+    tuner.discover()
+    tuner.apply()
+
+    registry = DomainRegistry()
+    reg_path = os.path.join(os.path.dirname(__file__), "domain_rules", "registry.pkl")
+    if os.path.exists(reg_path):
+        registry = DomainRegistry.load(reg_path)
+
+    trainer = AutoTrainer(
+        layer=layer,
+        tokenizer=tokenizer,
+        domain_registry=registry,
+        tuner=tuner,
+    )
+
+    trainer.start(check_interval=30.0)
+
+    print()
+    print("Автодообучение запущено в фоне.")
+    print("Триггеры: деградация доменов, деградация слоёв, failed_queries.")
+    print(f"Интервал проверки: 30с")
+    print(f"Доменов в реестре: {len(registry)}")
+    print()
+
+    try:
+        while True:
+            time.sleep(30)
+            stats = tuner.get_runtime_stats()
+            print(
+                f"\r  CPU: {stats.cpu_percent:.0f}% | "
+                f"RAM free: {stats.ram_free_gb:.1f}GB | "
+                f"Training events: {len(trainer.get_history())} | "
+                f"Failed queries: {len(trainer.failed_queries)}",
+                end="",
+                flush=True,
+            )
+    except KeyboardInterrupt:
+        print()
+        trainer.stop()
+        logger.info("Автодообучение остановлено.")
+
+    return trainer
+
+
 def cmd_full_test(
     config_path: str = None,
     checkpoint_path: str = None,
@@ -458,6 +540,8 @@ def main():
     parser.add_argument("--train-depth", action="store_true", help="Рост в глубину (Пункт 5)")
     parser.add_argument("--sleep", action="store_true", help="Запустить консолидацию (Пункт 6)")
     parser.add_argument("--full-test", action="store_true", help="Полный тест всех компонентов (Пункт 7)")
+    parser.add_argument("--auto-tune", action="store_true", help="Автонастройка среды исполнения")
+    parser.add_argument("--auto-train", action="store_true", help="Запустить фоновое автодообучение")
     parser.add_argument("--config", type=str, default=None, help="Путь к config.json")
     parser.add_argument("--checkpoint", type=str, default=None, help="Путь к чекпоинту для загрузки")
     parser.add_argument("--max-steps", type=int, default=None, help="Максимальное число шагов обучения")
@@ -519,6 +603,13 @@ def main():
         )
     elif args.full_test:
         cmd_full_test(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
+        )
+    elif args.auto_tune:
+        cmd_auto_tune(config_path=args.config)
+    elif args.auto_train:
+        cmd_auto_train(
             config_path=args.config,
             checkpoint_path=args.checkpoint,
         )

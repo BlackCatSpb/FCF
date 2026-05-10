@@ -1,4 +1,5 @@
 checkpoints/
+domain_rules/
 *.pt
 *.faiss
 *.pkl
@@ -11,12 +12,8 @@ venv/
 *.egg-info/
 dist/
 build/
-train_log.txt
-train_instruction_log.txt
-train_status.json
-train_instruction_status.json
-test_corpus.txt
-test_instructions.json
-domain_rules/
+logs/
+tests/
 .idea/
 .vscode/
+*.lnk

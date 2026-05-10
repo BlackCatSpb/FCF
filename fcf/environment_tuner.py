@@ -87,7 +87,9 @@ class EnvironmentAutoTuner:
             cpu_phys = os.cpu_count() or 4
             cpu_log = cpu_phys
 
-        recommended_threads = min(cpu_phys, 16)
+        recommended_threads = min(cpu_phys - 2, 16)  # Оставляем 2 ядра системе
+        if recommended_threads < 2:
+            recommended_threads = 2
 
         recommended_batch_size = 1
         if cuda_available:
@@ -125,6 +127,12 @@ class EnvironmentAutoTuner:
             f"threads={self.profile.recommended_threads}"
         )
 
+        if cuda_available and vram_gb < 4.0:
+            logger.info(
+                f"[AutoTune] GPU {device_name}: VRAM={vram_gb:.1f}GB < 4GB. "
+                f"Обучение только на CPU. GPU будет использован для инференса."
+            )
+
         return self.profile
 
     def apply(self) -> HardwareProfile:
@@ -153,6 +161,29 @@ class EnvironmentAutoTuner:
         if self.profile:
             return self.profile.device
         return "cpu"
+
+    def get_training_device(self) -> str:
+        """Возвращает устройство для обучения. GPU только если VRAM >= 4GB."""
+        if self.profile is None:
+            self.discover()
+        if self.profile and self.profile.vram_gb >= 4.0:
+            return "cuda"
+        return "cpu"
+
+    def get_inference_device(self) -> str:
+        """Возвращает устройство для инференса. GPU можно даже с 2GB."""
+        if self.profile is None:
+            self.discover()
+        if self.profile and self.profile.cuda_available:
+            return "cuda"
+        return "cpu"
+
+    def can_use_gpu_for_training(self) -> bool:
+        if self.profile is None:
+            self.discover()
+        if self.profile:
+            return self.profile.vram_gb >= 4.0
+        return False
 
     def get_optimal_batch_size(self, model_params: int) -> int:
         if self.profile is None:
@@ -221,6 +252,7 @@ class EnvironmentAutoTuner:
             while self._running:
                 try:
                     self.stats = self.get_runtime_stats()
+                    self._balance_threads()
                     time.sleep(interval)
                 except Exception:
                     time.sleep(interval)
@@ -228,6 +260,23 @@ class EnvironmentAutoTuner:
         self._monitor_thread = threading.Thread(target=_monitor, daemon=True)
         self._monitor_thread.start()
         logger.info(f"[AutoTune] Мониторинг запущен (интервал={interval}с)")
+
+    def _balance_threads(self):
+        """Периодически меняет affinity потоков для равномерной нагрузки на ядра."""
+        try:
+            if self.profile is None:
+                return
+            n_phys = self.profile.cpu_cores_physical
+            n_threads = torch.get_num_threads()
+            if n_phys <= 2 or n_threads <= 2:
+                return
+            import random
+            new_threads = n_threads + random.choice([-1, 0, 1])
+            new_threads = max(2, min(n_phys, new_threads))
+            if new_threads != n_threads:
+                torch.set_num_threads(new_threads)
+        except Exception:
+            pass
 
     def stop_monitoring(self):
         self._running = False
@@ -239,8 +288,10 @@ class EnvironmentAutoTuner:
         if self.profile is None:
             self.discover()
 
+        training_device = self.get_training_device()
+
         config = {
-            "device": "cpu",
+            "device": training_device,
             "threads": 4,
             "batch_size": 1,
             "mixed_precision": False,
@@ -248,10 +299,11 @@ class EnvironmentAutoTuner:
         }
 
         if self.profile:
-            config["device"] = self.profile.device
             config["threads"] = self.profile.recommended_threads
             config["batch_size"] = self.profile.recommended_batch_size
-            config["mixed_precision"] = self.profile.mixed_precision
+            config["mixed_precision"] = (
+                self.profile.mixed_precision and training_device == "cuda"
+            )
 
             if config["batch_size"] == 1:
                 config["gradient_accumulation_steps"] = 4
@@ -292,10 +344,19 @@ class EnvironmentAutoTuner:
             f"  VRAM: {self.profile.vram_gb:.1f} GB",
             f"  RAM: {self.profile.ram_gb:.1f} GB",
             f"  CPU cores: {self.profile.cpu_cores_physical} phys / {self.profile.cpu_cores_logical} log",
-            f"  Threads: {self.profile.recommended_threads}",
+            f"  Threads: {self.profile.recommended_threads} (оставлено 2 ядра системе)",
             f"  Batch: {self.profile.recommended_batch_size}",
             f"  Mixed precision: {self.profile.mixed_precision}",
         ]
+
+        if self.profile.cuda_available:
+            if self.profile.vram_gb >= 4.0:
+                lines.append(f"  GPU training: ДА (VRAM={self.profile.vram_gb:.1f}GB >= 4GB)")
+            else:
+                lines.append(f"  GPU training: НЕТ (VRAM={self.profile.vram_gb:.1f}GB < 4GB нужно)")
+            lines.append(f"  GPU inference: ДА")
+        else:
+            lines.append(f"  GPU: отсутствует")
 
         stats = self.get_runtime_stats()
         lines.append(

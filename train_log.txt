@@ -17,3 +17,10 @@
 18:47:06 | INFO     | [SRG] step=700 confidence=0.610 avg=0.719
 18:52:09 | INFO     | [SRG] step=800 confidence=0.904 avg=0.742
 18:57:27 | INFO     | [SRG] step=900 confidence=0.887 avg=0.758
+19:02:40 | INFO     | [SRG] step=1000 confidence=0.842 avg=0.767
+19:02:42 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000/weights.pt
+19:02:42 | INFO     | [Save] Слепки сохранены: 4 шт.
+19:02:42 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000\index.faiss
+19:02:42 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000\meta.pkl
+19:02:42 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000\config.json
+19:02:42 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000

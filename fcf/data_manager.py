@@ -158,55 +158,66 @@ class DataManager:
     def load_conceptnet(
         db_path: str,
         language: str = "ru",
+        max_facts: int = 100000,
     ) -> Optional[List[Dict[str, str]]]:
-        """Загружает факты из локальной ConceptNet SQLite базы."""
-        import sqlite3
-
-        if not os.path.exists(db_path):
-            logger.error(f"[DataManager] ConceptNet база не найдена: {db_path}")
-            return None
-
         try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
+            from conceptnet_lite import connect
+            connect(db_path)
+            from conceptnet_lite.db import Edge
+            logger.info(f"[DataManager] ConceptNet подключена: {db_path}")
 
-            cursor.execute(
-                """
-                SELECT relation, start, end, weight
-                FROM edges
-                WHERE (
-                    start LIKE ? || '/c/%'
-                    OR end LIKE ? || '/c/%'
-                )
-                AND weight > 1.0
-                LIMIT 100000
-                """,
-                (language, language),
-            )
+            facts = []
+            seen = set()
+            lang_prefix = f"/c/{language}/"
+            count = 0
 
-            rows = cursor.fetchall()
-            conn.close()
+            edges = Edge.select().iterator()
 
-            data = []
-            for relation, start, end, weight in rows:
-                start_label = start.split("/")[-1].replace("_", " ")
-                end_label = end.split("/")[-1].replace("_", " ")
-                rel_label = relation.split("/")[-1].replace("_", " ")
+            for edge in edges:
+                count += 1
+                try:
+                    start_uri = edge.start.uri
+                    end_uri = edge.end.uri
 
-                data.append({
-                    "concept": start_label,
-                    "relation": rel_label,
-                    "target": end_label,
-                    "weight": weight,
-                })
+                    if lang_prefix not in start_uri and lang_prefix not in end_uri:
+                        continue
 
-            logger.info(
-                f"[DataManager] ConceptNet загружен: {len(data)} фактов (ru)"
-            )
-            return data
+                    rel = edge.relation.name
+                    weight = edge.etc.get('weight', 1.0) if edge.etc else 1.0
 
+                    if weight < 0.5:
+                        continue
+
+                    rel_name = rel.replace("/r/", "")
+                    start_name = start_uri.split("/")[-1].replace("_", " ")
+                    end_name = end_uri.split("/")[-1].replace("_", " ")
+
+                    key = f"{start_name}|{rel_name}|{end_name}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    facts.append({
+                        "concept": start_name,
+                        "relation": rel_name,
+                        "target": end_name,
+                        "weight": weight,
+                    })
+
+                    if len(facts) >= max_facts:
+                        break
+
+                except Exception:
+                    continue
+
+            logger.info(f"[DataManager] ConceptNet: {len(facts)} фактов из {count} рёбер ({language})")
+            return facts
+
+        except ImportError:
+            logger.warning("[DataManager] conceptnet-lite не установлен")
+            return None
         except Exception as e:
-            logger.error(f"[DataManager] Ошибка загрузки ConceptNet: {e}")
+            logger.error(f"[DataManager] Ошибка ConceptNet: {e}")
             return None
 
     @staticmethod

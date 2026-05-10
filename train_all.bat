@@ -8,7 +8,7 @@ echo FCF Training Pipeline
 echo ============================================================
 echo.
 echo [1/4] Training tokenizer on training_corpus.txt ...
-python -c "from fcf.tokenizer_utils import train_bpe_tokenizer; from fcf.data_manager import DataManager; it = DataManager.load_texts_from_file('training_corpus.txt'); t = train_bpe_tokenizer('tokenizer.json', it(), vocab_size=10000, min_frequency=1); print('Tokenizer ready:', t.get_vocab_size(), 'tokens')"
+python -c "import sys; sys.path.insert(0,'.'); from fcf.tokenizer_utils import train_bpe_tokenizer; it = open('training_corpus.txt',encoding='utf-8'); t = train_bpe_tokenizer('tokenizer.json', (l.strip() for l in it if l.strip()), vocab_size=10000, min_frequency=1); print('Tokenizer ready:', t.get_vocab_size(), 'tokens')"
 if %ERRORLEVEL% NEQ 0 goto :error
 
 echo.

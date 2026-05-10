@@ -228,11 +228,9 @@ class DomainTrainer:
         max_steps: int = 200,
         device: str = "cpu",
     ):
-        adapter.to(device)
         self.layer.train()
 
-        trainable_params = list(adapter.get_trainable_parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
+        optimizer = torch.optim.AdamW(self.layer.parameters(), lr=1e-5)
 
         blocks = []
         for fact in facts:
@@ -244,8 +242,8 @@ class DomainTrainer:
             try:
                 encoding = self.tokenizer.encode(text)
                 ids = encoding.ids if hasattr(encoding, "ids") else encoding
-                ids = ids[:128]
-                while len(ids) < 128:
+                ids = ids[:96]
+                while len(ids) < 96:
                     ids.append(0)
 
                 input_ids = torch.tensor([ids[:-1]], dtype=torch.long)
@@ -254,7 +252,7 @@ class DomainTrainer:
             except Exception:
                 continue
 
-            if len(blocks) >= 100:
+            if len(blocks) >= 50:
                 break
 
         if not blocks:
@@ -267,33 +265,13 @@ class DomainTrainer:
             total_loss = 0.0
             optimizer.zero_grad()
 
-            for input_ids, labels in blocks[:4]:
+            for input_ids, labels in blocks[:2]:
                 input_ids = input_ids.to(device)
                 labels = labels.to(device)
 
                 x = self.layer.embed(input_ids)
-
-                saved_attn = {}
-                saved_ffn = {}
-                for name in adapter.target_modules:
-                    if hasattr(self.layer.transformer.attention, name):
-                        w = getattr(self.layer.transformer.attention, name)
-                        saved_attn[name] = w.weight.data.clone()
-                        delta = adapter.get_delta(name).to(w.weight.device)
-                        w.weight.data = w.weight.data + delta
-                    elif hasattr(self.layer.transformer.ffn, name):
-                        w = getattr(self.layer.transformer.ffn, name)
-                        saved_ffn[name] = w.weight.data.clone()
-                        delta = adapter.get_delta(name).to(w.weight.device)
-                        w.weight.data = w.weight.data + delta
-
-                hidden = self.layer.transformer(x)
+                hidden = self.layer.forward_transformer(x)
                 logits = self.layer.forward_logits(hidden)
-
-                for name, orig in saved_attn.items():
-                    getattr(self.layer.transformer.attention, name).weight.data = orig
-                for name, orig in saved_ffn.items():
-                    getattr(self.layer.transformer.ffn, name).weight.data = orig
 
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
@@ -303,9 +281,10 @@ class DomainTrainer:
                 total_loss += loss
 
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.layer.parameters(), max_norm=1.0)
             optimizer.step()
 
-            if step % 20 == 0:
+            if step % 10 == 0 or step == max_steps - 1:
                 logger.info(f"[Domain] step={step}, loss={total_loss.item():.4f}")
 
         self.layer.eval()

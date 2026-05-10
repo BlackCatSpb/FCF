@@ -13,6 +13,7 @@ import os
 import sys
 import argparse
 import torch
+import numpy as np
 from loguru import logger
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -33,6 +34,12 @@ from fcf.language_trainer import LanguageTrainer
 from fcf.instruction_trainer import InstructionTrainer
 from fcf.domain_trainer import DomainTrainer
 from fcf.domain_registry import DomainRegistry
+from fcf.recursive_processor import RecursiveProcessor
+from fcf.layer_crystallizer import LayerCrystallizer
+from fcf.sleep_mode import SleepMode
+from fcf.kca_engine import KCAEngine
+from fcf.state_algebra import StateAlgebra
+from fcf.hnsw_index import HNSWIndex
 
 
 def cmd_init(config_path: str = None):
@@ -241,6 +248,147 @@ def cmd_train_domain(
     return registry
 
 
+def cmd_train_depth(
+    config_path: str = None,
+    checkpoint_path: str = None,
+    text_file: str = None,
+    max_steps: int = 50,
+    device: str = "cpu",
+):
+    logger.info("=" * 60)
+    logger.info("FCF — Пункт 5. Рост в глубину")
+    logger.info("=" * 60)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
+        logger.info(f"[Load] Загружен из {checkpoint_path}")
+    else:
+        layer = cmd_init(config_path)
+
+    tokenizer = _load_or_create_tokenizer()
+
+    crystallizer = LayerCrystallizer(device=device)
+    crystallizer.set_layers([layer])
+
+    recursive = RecursiveProcessor()
+
+    test_queries = [
+        "Объясни сложную взаимосвязь между квантовой физикой и сознанием",
+        "Расскажи про устройство вселенной",
+        "Что такое жизнь с точки зрения философии?",
+    ]
+
+    for query in test_queries:
+        logger.info(f"[Depth] Тест: {query[:60]}...")
+        result = layer.process_query(query=query, tokenizer=tokenizer)
+
+        if result["confidence"] < 0.5:
+            encoding = tokenizer.encode(query)
+            ids = encoding.ids if hasattr(encoding, "ids") else encoding
+            input_ids = torch.tensor([ids], dtype=torch.long)
+
+            rec_result = recursive.process(
+                layer=layer,
+                input_ids=input_ids,
+                tokenizer=tokenizer,
+            )
+
+            if rec_result["recursion_exhausted"]:
+                recursive.add_failed_query(query, result["response"], result["confidence"])
+
+    if recursive.should_crystallize():
+        logger.info("[Depth] Кристаллизация нового слоя...")
+        new_layer = crystallizer.crystallize(
+            tokenizer=tokenizer,
+            failed_queries=recursive.get_failed_queries(),
+            checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "depth"),
+        )
+        if new_layer:
+            logger.info(f"[Depth] Новый слой создан: всего слоёв={crystallizer.num_layers}")
+    else:
+        logger.info("[Depth] Кристаллизация не требуется")
+
+    return crystallizer
+
+
+def cmd_sleep(
+    config_path: str = None,
+    checkpoint_path: str = None,
+):
+    logger.info("=" * 60)
+    logger.info("FCF — Пункт 6. Sleep Mode (Консолидация)")
+    logger.info("=" * 60)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
+        logger.info(f"[Load] Загружен из {checkpoint_path}")
+    else:
+        layer = cmd_init(config_path)
+
+    registry = DomainRegistry()
+    reg_path = os.path.join(os.path.dirname(__file__), "domain_rules", "registry.pkl")
+    if os.path.exists(reg_path):
+        registry = DomainRegistry.load(reg_path)
+
+    sleep = SleepMode()
+
+    stats = sleep.execute(
+        layers=[layer],
+        domain_registry=registry,
+    )
+
+    logger.info(f"[Sleep] Статистика: {stats}")
+    return stats
+
+
+def cmd_full_test(
+    config_path: str = None,
+    checkpoint_path: str = None,
+):
+    logger.info("=" * 60)
+    logger.info("FCF — Пункт 7. Полноценный FCF (тест всех компонентов)")
+    logger.info("=" * 60)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
+    else:
+        layer = cmd_init(config_path)
+
+    tokenizer = _load_or_create_tokenizer()
+
+    logger.info("--- KCA Engine ---")
+    kca = KCAEngine(hidden_dim=layer.config.d_model)
+    z = np.random.randn(layer.config.d_model).astype(np.float32)
+    c_q = np.random.randn(layer.config.d_model).astype(np.float32)
+    z_opt, conf = kca.refine(z, c_q)
+    logger.info(f"KCA: z.shape={z_opt.shape}, confidence={conf:.3f}")
+
+    logger.info("--- State Algebra ---")
+    algebra = StateAlgebra(dim=layer.config.d_model)
+    za = np.random.randn(layer.config.d_model).astype(np.float32)
+    zb = np.random.randn(layer.config.d_model).astype(np.float32)
+    z_sum = algebra.sum(za, zb)
+    logger.info(f"StateAlgebra: sum.shape={z_sum.shape}")
+
+    logger.info("--- HNSW Index ---")
+    hnsw = HNSWIndex(dim=layer.config.d_model)
+    hnsw.add_domain("test", c_q)
+    found = hnsw.search_domain(c_q)
+    logger.info(f"HNSW: domain={found}")
+
+    logger.info("--- Sleep Mode ---")
+    sleep = SleepMode()
+    sleep.on_query()
+
+    logger.info("--- Layer Crystallizer ---")
+    crystallizer = LayerCrystallizer(device="cpu")
+    crystallizer.set_layers([layer])
+    logger.info(f"Crystallizer: {crystallizer.summary()}")
+
+    logger.info("=== Все компоненты FCF работоспособны ===")
+    return True
+
+
 def cmd_train_instruction(
     config_path: str = None,
     checkpoint_path: str = None,
@@ -307,6 +455,9 @@ def main():
     parser.add_argument("--train-language", action="store_true", help="Самообучение языку (Пункт 2)")
     parser.add_argument("--train-instruction", action="store_true", help="Инструктивное дообучение (Пункт 3)")
     parser.add_argument("--train-domain", action="store_true", help="Обучение доменных правил (Пункт 4)")
+    parser.add_argument("--train-depth", action="store_true", help="Рост в глубину (Пункт 5)")
+    parser.add_argument("--sleep", action="store_true", help="Запустить консолидацию (Пункт 6)")
+    parser.add_argument("--full-test", action="store_true", help="Полный тест всех компонентов (Пункт 7)")
     parser.add_argument("--config", type=str, default=None, help="Путь к config.json")
     parser.add_argument("--checkpoint", type=str, default=None, help="Путь к чекпоинту для загрузки")
     parser.add_argument("--max-steps", type=int, default=None, help="Максимальное число шагов обучения")
@@ -352,6 +503,24 @@ def main():
             domain_id=args.domain_id,
             max_steps=args.max_steps,
             device=args.device,
+        )
+    elif args.train_depth:
+        cmd_train_depth(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
+            text_file=args.text_file,
+            max_steps=args.max_steps or 50,
+            device=args.device,
+        )
+    elif args.sleep:
+        cmd_sleep(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
+        )
+    elif args.full_test:
+        cmd_full_test(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
         )
     elif args.init:
         layer = cmd_init(config_path=args.config)

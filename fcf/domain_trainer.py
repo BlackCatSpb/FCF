@@ -43,7 +43,7 @@ class DomainTrainer:
     ):
         self.layer = layer
         self.tokenizer = tokenizer
-        self.registry = registry or DomainRegistry()
+        self.registry = registry if registry is not None else DomainRegistry()
         self.config = config or layer.config
         self.checkpoint_dir = checkpoint_dir or os.path.join(
             os.path.dirname(__file__), "..", "checkpoints", "domain"

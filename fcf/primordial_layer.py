@@ -105,6 +105,20 @@ class PrimordialLayer(nn.Module):
         return self.lm_head(hidden)
 
     @torch.no_grad()
+    def _encode(self, tokenizer, text: str, device=None) -> torch.Tensor:
+        encoding = tokenizer.encode(text)
+        ids = encoding.ids if hasattr(encoding, 'ids') else encoding
+        if isinstance(ids, list):
+            ids = torch.tensor([ids], dtype=torch.long)
+        elif isinstance(ids, torch.Tensor):
+            ids = ids.unsqueeze(0) if ids.dim() == 1 else ids
+        else:
+            ids = torch.tensor([list(ids)], dtype=torch.long)
+        if device is not None:
+            ids = ids.to(device)
+        return ids
+
+    @torch.no_grad()
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -231,10 +245,7 @@ class PrimordialLayer(nn.Module):
         domain: str = "general",
     ) -> Dict[str, Any]:
         device = next(self.parameters()).device
-        query_ids = tokenizer.encode(query, return_tensors="pt")
-        if query_ids.dim() == 1:
-            query_ids = query_ids.unsqueeze(0)
-        query_ids = query_ids.to(device)
+        query_ids = self._encode(tokenizer, query, device)
 
         c_query = self.get_context_vector(query_ids)
 
@@ -265,7 +276,7 @@ class PrimordialLayer(nn.Module):
             temperature=temperature,
         )
         response_text = tokenizer.decode(
-            response_ids[0], skip_special_tokens=True
+            response_ids[0].tolist(), skip_special_tokens=True
         )
 
         if self._active_adapter is not None:

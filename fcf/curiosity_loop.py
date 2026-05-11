@@ -50,9 +50,12 @@ class CuriosityLoop:
         )
 
         device = next(layer.parameters()).device
-        input_ids = tokenizer.encode(prompt, return_tensors="pt")
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
+        encoding = tokenizer.encode(prompt)
+        ids = encoding.ids if hasattr(encoding, 'ids') else encoding
+        if isinstance(ids, list):
+            input_ids = torch.tensor([ids], dtype=torch.long)
+        else:
+            input_ids = torch.tensor(ids, dtype=torch.long).unsqueeze(0)
         input_ids = input_ids.to(device)
 
         with torch.no_grad():
@@ -64,7 +67,7 @@ class CuriosityLoop:
                 top_p=0.9,
             )
 
-        full_output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        full_output = tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)
 
         assistant_marker = "<|im_start|>assistant\n"
         if assistant_marker in prompt:

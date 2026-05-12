@@ -1,0 +1,30 @@
+19:57:04 | INFO     | ============================================================
+19:57:04 | INFO     | Пункт 2 — Самообучение языку
+19:57:04 | INFO     | Устройство: cpu
+19:57:04 | INFO     | Learning rate: 0.0001
+19:57:04 | INFO     | ============================================================
+19:57:04 | INFO     | [CPU] Потоков: 12
+19:57:04 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+19:57:04 | INFO     | [Train] Wikipedia streaming, макс. шагов: 50000
+19:57:08 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+20:02:17 | INFO     | [SRG] step=100 confidence=0.763 avg=0.763
+20:08:23 | INFO     | [SRG] step=200 confidence=0.694 avg=0.729
+20:14:35 | INFO     | [SRG] step=300 confidence=0.720 avg=0.726
+20:20:11 | INFO     | [SRG] step=400 confidence=0.658 avg=0.709
+20:25:58 | INFO     | [SRG] step=500 confidence=0.797 avg=0.727
+20:31:55 | INFO     | [SRG] step=600 confidence=0.606 avg=0.707
+20:37:53 | INFO     | [SRG] step=700 confidence=0.668 avg=0.701
+20:43:53 | INFO     | [SRG] step=800 confidence=0.638 avg=0.693
+20:48:50 | INFO     | [SRG] step=900 confidence=0.766 avg=0.701
+20:53:57 | INFO     | [SRG] step=1000 confidence=0.756 avg=0.707
+20:53:58 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000/weights.pt
+20:53:58 | INFO     | [Save] Слепки сохранены: 0 шт.
+20:53:58 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000\index.faiss
+20:53:58 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000\meta.pkl
+20:53:58 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000\config.json
+20:53:58 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\language\step_001000
+20:54:07 | INFO     | [GenTest] step=1000: История это наука которая изучает,., также — также.,,,, млн.,.....
+20:59:41 | INFO     | [SRG] step=1100 confidence=0.663 avg=0.703
+21:05:15 | INFO     | [SRG] step=1200 confidence=0.619 avg=0.696
+21:11:09 | INFO     | [SRG] step=1300 confidence=0.652 avg=0.692
+21:17:04 | INFO     | [SRG] step=1400 confidence=0.637 avg=0.688

@@ -24,6 +24,9 @@ class DataManager:
     ) -> Optional[Iterator[Dict[str, Any]]]:
         try:
             from datasets import load_dataset
+            import os
+            os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+            os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
 
             dataset = load_dataset(
                 "wikimedia/wikipedia",

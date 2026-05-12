@@ -55,6 +55,7 @@ class LanguageTrainer:
 
         self.srg_eval_interval: int = 100
         self.checkpoint_interval: int = 1000
+        self.gen_test_interval: int = 1000
         self.log_interval: int = 10
         self.status_interval: int = 5
         self.stop_window: int = 500
@@ -69,6 +70,14 @@ class LanguageTrainer:
             "Она изучает события, процессы и закономерности развития. "
             "Историки исследуют"
         )
+
+        self._gen_test_prompts = [
+            "История это наука которая изучает",
+            "Математика помогает человечеству",
+            "Природа Земли удивительна потому что",
+            "Компьютеры обрабатывают данные с помощью",
+            "Человек отличается от животных тем что",
+        ]
 
     def _pre_tokenize_corpus(
         self, text_file: str, block_size: int = 512
@@ -259,6 +268,7 @@ class LanguageTrainer:
 
             if self.step % self.checkpoint_interval == 0:
                 self._save_checkpoint()
+                self._generation_test()
 
             if (
                 self.step >= self.stop_window
@@ -311,7 +321,32 @@ class LanguageTrainer:
         return loss.item()
 
     @torch.no_grad()
-    def _srg_evaluation(self):
+    def _generation_test(self):
+        self.layer.eval()
+        device = next(self.layer.parameters()).device
+        results = []
+
+        for prompt in self._gen_test_prompts:
+            try:
+                encoding = self.tokenizer.encode(prompt)
+                ids = encoding.ids if hasattr(encoding, 'ids') else encoding
+                input_ids = torch.tensor([ids], dtype=torch.long).to(device)
+                output = self.layer.generate(input_ids, max_new_tokens=40, temperature=0.8)
+                response = self.tokenizer.decode(output[0].tolist())
+                results.append({"Q": prompt, "A": response})
+            except Exception as e:
+                results.append({"Q": prompt, "A": f"ERROR: {e}"})
+
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "logs", f"gen_step_{self.step:06d}.json"
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"step": self.step, "avg_confidence": self.layer.meta.average_confidence(), "results": results}, f, ensure_ascii=False, indent=2)
+
+        sample = results[0]["A"][:80] if results else ""
+        logger.info(f"[GenTest] step={self.step}: {sample}...")
+        self.layer.train()
         self.layer.eval()
 
         try:

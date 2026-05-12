@@ -347,6 +347,9 @@ class LanguageTrainer:
         sample = results[0]["A"][:80] if results else ""
         logger.info(f"[GenTest] step={self.step}: {sample}...")
         self.layer.train()
+
+    @torch.no_grad()
+    def _srg_evaluation(self):
         self.layer.eval()
 
         try:

@@ -509,7 +509,113 @@ def cmd_train_instruction(
     return stats
 
 
-def _load_or_create_tokenizer():
+def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
+    logger.info("=" * 60)
+    logger.info("FCF — Ленивое обучение + Интерактивный режим")
+    logger.info("=" * 60)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
+        logger.info(f"[Load] Загружен из {checkpoint_path}")
+    else:
+        layer = cmd_init(config_path)
+
+    tokenizer = _load_or_create_tokenizer()
+
+    tuner = EnvironmentAutoTuner()
+    tuner.discover()
+    tuner.apply()
+
+    registry = DomainRegistry()
+    reg_path = os.path.join(os.path.dirname(__file__), "domain_rules", "registry.pkl")
+    if os.path.exists(reg_path):
+        registry = DomainRegistry.load(reg_path)
+
+    trainer = AutoTrainer(
+        layer=layer,
+        tokenizer=tokenizer,
+        domain_registry=registry,
+        tuner=tuner,
+    )
+    trainer.start(check_interval=120.0)
+
+    print()
+    print("=" * 60)
+    print("  FCF — Ленивое обучение активно")
+    print("=" * 60)
+    print(f"  Слой: {layer.summary()}")
+    print(f"  Доменов: {len(registry)}")
+    print(f"  Фоновое дообучение: каждые 120с")
+    print(f"  Триггеры: деградация доменов, слоёв, failed_queries")
+    print()
+    print("  Введите вопрос или команду:")
+    print("    stats  — статистика обучения")
+    print("    train  — запустить обучение на Wikipedia")
+    print("    save   — сохранить чекпоинт")
+    print("    exit   — выход")
+    print("=" * 60)
+    print()
+
+    while True:
+        try:
+            user_input = input(">>> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nЗавершение...")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() == "exit":
+            break
+
+        if user_input.lower() == "save":
+            save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
+            save_primordial_layer(layer, save_path)
+            print(f"Сохранено в {save_path}")
+            continue
+
+        if user_input.lower() == "stats":
+            print(f"  Слой: {layer.summary()}")
+            print(f"  Слепков: {len(layer.state_storage)}")
+            print(f"  SRG avg: {layer.meta.average_confidence():.3f}")
+            print(f"  Доменов: {len(registry)}")
+            print(f"  Training events: {len(trainer.get_history())}")
+            print(f"  Failed queries: {len(trainer.failed_queries)}")
+            print(f"  CPU: {tuner.get_runtime_stats().cpu_percent:.0f}%")
+            continue
+
+        if user_input.lower() == "train":
+            print("Запуск обучения на Wikipedia (5000 шагов)...")
+            from fcf.language_trainer import LanguageTrainer
+            lt = LanguageTrainer(layer=layer, tokenizer=tokenizer)
+            lt.train(max_steps=5000, device="cpu", use_wikipedia=True)
+            save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
+            save_primordial_layer(layer, save_path)
+            print(f"Обучение завершено. Сохранено в {save_path}")
+            continue
+
+        trainer.resource.set_generating()
+        result = layer.process_query(
+            query=user_input,
+            tokenizer=tokenizer,
+            max_new_tokens=128,
+            temperature=0.7,
+        )
+        trainer.resource.set_idle()
+
+        confidence = result["confidence"]
+        if confidence < 0.6:
+            trainer.add_failed_query(user_input, result["response"], confidence)
+
+        print(f"\nEVA: {result['response']}\n")
+        print(f"    [conf={confidence:.3f}, ethics={result['ethics_score']:.2f}]")
+
+        if result.get("clarification_question"):
+            print(f"    [?: {result['clarification_question']}]")
+
+    trainer.stop()
+    logger.info("Завершение.")
     tokenizer_path = os.path.join(os.path.dirname(__file__), "tokenizer.json")
     if os.path.exists(tokenizer_path):
         try:
@@ -544,6 +650,7 @@ def main():
     parser.add_argument("--full-test", action="store_true", help="Полный тест всех компонентов (Пункт 7)")
     parser.add_argument("--auto-tune", action="store_true", help="Автонастройка среды исполнения")
     parser.add_argument("--auto-train", action="store_true", help="Запустить фоновое автодообучение")
+    parser.add_argument("--lazy-learn", action="store_true", help="Интерактивный режим + фоновое дообучение")
     parser.add_argument("--config", type=str, default=None, help="Путь к config.json")
     parser.add_argument("--checkpoint", type=str, default=None, help="Путь к чекпоинту для загрузки")
     parser.add_argument("--max-steps", type=int, default=None, help="Максимальное число шагов обучения")
@@ -614,6 +721,11 @@ def main():
         cmd_auto_tune(config_path=args.config)
     elif args.auto_train:
         cmd_auto_train(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
+        )
+    elif args.lazy_learn:
+        cmd_lazy_learn(
             config_path=args.config,
             checkpoint_path=args.checkpoint,
         )

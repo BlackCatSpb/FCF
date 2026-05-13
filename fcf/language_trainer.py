@@ -437,6 +437,22 @@ class LanguageTrainer:
         )
         save_primordial_layer(self.layer, path)
 
+        self._reevaluate_snapshots()
+
+    def _reevaluate_snapshots(self):
+        """Переоценить старые слепки текущей моделью. Удалить деградировавшие."""
+        meta = self.layer.state_storage.snapshots_meta
+        removed = 0
+        for i in range(len(meta) - 1, -1, -1):
+            snap = meta[i]
+            if snap["usage_count"] == 0 and len(meta) > 100:
+                self.layer.state_storage._remove(i)
+                removed += 1
+                continue
+
+        if removed:
+            logger.info(f"[ReEval] Удалено {removed} неиспользуемых слепков")
+
     def _training_stats(self, elapsed: float, tokens: int) -> Dict[str, Any]:
         return {
             "steps": self.step,

@@ -68,7 +68,7 @@ class DomainTrainer:
         logger.info("=" * 60)
 
         if device == "cpu":
-            torch.set_num_threads(min(os.cpu_count() or 4, 16))
+            torch.set_num_threads(min(os.cpu_count() or 4, 4))
 
         facts = DataManager.load_conceptnet(db_path, language="ru")
         if not facts:

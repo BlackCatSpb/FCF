@@ -163,9 +163,9 @@ class LanguageTrainer:
         logger.info("=" * 60)
 
         if device == "cpu":
-            num_threads = min(os.cpu_count() or 4, 16)
+            num_threads = min(os.cpu_count() or 4, 4)
             torch.set_num_threads(num_threads)
-            logger.info(f"[CPU] Потоков: {num_threads}")
+            logger.info(f"[CPU] Потоков: {num_threads} (из {os.cpu_count()} доступных)")
 
         self.layer.to(device)
         self.layer.train()

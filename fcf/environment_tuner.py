@@ -87,7 +87,7 @@ class EnvironmentAutoTuner:
             cpu_phys = os.cpu_count() or 4
             cpu_log = cpu_phys
 
-        recommended_threads = min(cpu_phys - 2, 16)  # Оставляем 2 ядра системе
+        recommended_threads = min(max(cpu_phys // 2, 2), 4)  # Оставляем 2 ядра системе
         if recommended_threads < 2:
             recommended_threads = 2
 

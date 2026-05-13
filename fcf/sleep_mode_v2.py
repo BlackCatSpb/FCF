@@ -224,6 +224,14 @@ class SleepModeV2:
         if hnsw_index:
             hnsw_index.defragment()
 
+        if self._forget_gate is not None and hasattr(self, '_forget_history'):
+            from .extensions import ForgetfulnessGateTrainer
+            trainer = ForgetfulnessGateTrainer(self._forget_gate)
+            for record in self._forget_history:
+                trainer.record_deletion(**record)
+            trainer.train(epochs=5, lr=1e-4)
+            self._forget_history.clear()
+
         self.last_sleep_time = time.time()
         self.sleep_count += 1
         logger.info(f"[Sleep] v2 завершён: {stats}")

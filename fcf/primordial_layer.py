@@ -169,12 +169,22 @@ class PrimordialLayer(nn.Module):
         return input_ids
 
     def get_context_vector(self, input_ids: torch.Tensor) -> np.ndarray:
+        """
+        Контекстный вектор c_query из Key-векторов первого слоя (по спецификации §6.1).
+
+        Вычисляется как усреднённый по головам и токенам Key-вектор
+        после первого прохода, а не как последнее скрытое состояние.
+        """
         self.eval()
         with torch.no_grad():
             x = self.embed(input_ids)
-            hidden = self.transformer(x)
-            last_hidden = hidden[:, -1, :]
-        return last_hidden.squeeze(0).cpu().numpy()
+            x_norm = self.transformer.norm1(x)
+            B, T, C = x_norm.shape
+            K = self.transformer.attention.W_K(x_norm).view(
+                B, T, self.config.num_heads, self.config.head_dim
+            )
+            K_mean = K.mean(dim=2).mean(dim=1)
+        return K_mean.squeeze(0).cpu().numpy()
 
     def evaluate_response(
         self,

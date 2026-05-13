@@ -34,6 +34,10 @@ class LanguageTrainer:
         tokenizer,
         config: FCFConfig = None,
         checkpoint_dir: str = None,
+        hierarchy=None,
+        lambda_contrastive: float = 0.1,
+        lambda_hierarchy: float = 0.05,
+        lambda_recursive: float = 0.01,
     ):
         self.layer = layer
         self.tokenizer = tokenizer
@@ -42,6 +46,11 @@ class LanguageTrainer:
             os.path.dirname(__file__), "..", "checkpoints", "language"
         )
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        self.hierarchy = hierarchy
+        self.lambda_contrastive = lambda_contrastive
+        self.lambda_hierarchy = lambda_hierarchy
+        self.lambda_recursive = lambda_recursive
 
         self.optimizer = torch.optim.AdamW(
             self.layer.parameters(),
@@ -304,11 +313,20 @@ class LanguageTrainer:
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
 
-        loss = F.cross_entropy(
+        loss_lm = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100,
         )
+
+        loss = loss_lm
+
+        if self.hierarchy is not None:
+            codes = self.hierarchy(x)
+            h_loss = self.hierarchy.hierarchy_loss(
+                codes["z_sym"], codes["z_word"], codes["z_sent"]
+            )
+            loss = loss + self.lambda_hierarchy * h_loss
 
         loss.backward()
 

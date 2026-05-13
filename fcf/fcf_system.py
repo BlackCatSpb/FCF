@@ -80,6 +80,15 @@ class FCFSystem:
         from .intrinsic_curiosity import IntrinsicCuriosity
         from .state_algebra import StateAlgebra
 
+        from .federated import FederatedFabric, CollaborativeSRG
+        from .cross_domain import CrossDomainModule
+        from .temporal_context import TemporalContextCompressor
+        from .multi_pass import MultiPassGenerator, CodeEnsemble
+        from .extensions import (
+            MinimalCodePrinciple, RecursiveSelfImprovement,
+            ForgetfulnessGateTrainer, AdaptiveKCAScheduler,
+        )
+
         logger.info("=" * 60)
         logger.info("FCF v2 — Bootstrap")
         logger.info("=" * 60)
@@ -87,13 +96,13 @@ class FCFSystem:
         if checkpoint_path and os.path.exists(checkpoint_path):
             from .utils import load_primordial_layer
             self.layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
-            logger.info(f"[1/7] Слой загружен из {checkpoint_path}")
+            logger.info(f"[1/9] Слой загружен из {checkpoint_path}")
         else:
             self.layer = PrimordialLayer(self.config)
-            logger.info(f"[1/7] Слой создан: {sum(p.numel() for p in self.layer.parameters()):,} params")
+            logger.info(f"[1/9] Слой создан: {sum(p.numel() for p in self.layer.parameters()):,} params")
 
         self.tokenizer = load_tokenizer("tokenizer.json")
-        logger.info(f"[2/7] Токенизатор: {self.tokenizer.get_vocab_size()} слов")
+        logger.info(f"[2/9] Токенизатор: {self.tokenizer.get_vocab_size()} слов")
 
         if checkpoint_path and os.path.exists(checkpoint_path):
             basis_path = os.path.join(checkpoint_path, "atomic_basis.pkl")
@@ -107,26 +116,70 @@ class FCFSystem:
                 )
         else:
             self.atomic_basis = AtomicBasis()
-        logger.info(f"[3/7] AtomicBasis: {self.atomic_basis.summary() if hasattr(self.atomic_basis, 'layers') and self.atomic_basis.layers else 'ожидает SVD'}")
+        logger.info(f"[3/9] AtomicBasis готов")
 
         self.hierarchy = FractalHierarchy(self.config.d_model)
-        logger.info(f"[4/7] {self.hierarchy.summary()}")
+        logger.info(f"[4/9] {self.hierarchy.summary()}")
 
         self.gmm = MultiLevelGMM(dim=self.config.d_model)
-        logger.info(f"[5/7] MultiLevelGMM готов")
+        logger.info(f"[5/9] MultiLevelGMM готов")
 
         self.hnsw = HNSWIndex(dim=self.config.d_model, pq_M=8)
-        logger.info(f"[6/7] HNSWIndex готов")
+        logger.info(f"[6/9] HNSWIndex готов")
 
         self.kca = KCAEngine(hidden_dim=self.config.d_model)
+        self.kca_scheduler = AdaptiveKCAScheduler()
         self.srg_plus = SRGPlus()
         self.sleep_mode = SleepModeV2()
         self.provenance = CodeProvenance()
         self.curiosity = IntrinsicCuriosity()
         self.state_algebra = StateAlgebra(dim=self.config.d_model)
+        self.cross_domain = CrossDomainModule(dim=self.config.d_model)
+        self.minimal_code = MinimalCodePrinciple()
+        self.federated = FederatedFabric()
+        self.collaborative_srg = CollaborativeSRG()
+        self.ensemble = CodeEnsemble()
+        self.multi_pass = MultiPassGenerator()
+        self.context_compressor = TemporalContextCompressor(self.config.d_model)
+        self.self_improver = RecursiveSelfImprovement()
 
-        logger.info(f"[7/7] KCA, SRGPlus, SleepModeV2, CodeProvenance, IntrinsicCuriosity, StateAlgebra готовы")
+        logger.info(f"[7/9] KCA + SRG+ + Кросс-домен + SleepV2 готовы")
+        logger.info(f"[8/9] Federated + Ensemble + MultiPass + ContextCompressor готовы")
+        logger.info(f"[9/9] MinimalCode + SelfImprovement + Curiosity готовы")
+
+        self._progressive_bootstrap(checkpoint_path)
+
         logger.info("Bootstrap завершён.")
+
+    def _progressive_bootstrap(self, checkpoint_path: str = None):
+        """
+        Progressive Bootstrapping шаги 3-4 (§9.1):
+        3. Файнтюнинг на 5-10 базовых доменах (пропускаем, если нет данных)
+        4. Проекция fine-tuned матриц на атомарный базис, извлечение c_i
+        """
+        if self.atomic_basis is None or self.layer is None:
+            return
+
+        if not (hasattr(self.atomic_basis, 'layers') and self.atomic_basis.layers):
+            logger.info("[Boot] SVD разложение выполняется...")
+            self.atomic_basis.decompose(self.layer)
+            if checkpoint_path:
+                self.atomic_basis.save(
+                    os.path.join(checkpoint_path, "atomic_basis.pkl")
+                )
+
+        for matrix_name in ["W_Q", "W_K", "W_V", "W_O"]:
+            try:
+                coeffs = self.atomic_basis.encode(
+                    self.layer, matrix_name
+                )
+                logger.debug(
+                    f"[Boot] ΔW_{matrix_name}: "
+                    f"{len(coeffs)} коэффициентов, "
+                    f"||c||={np.linalg.norm(coeffs):.2f}"
+                )
+            except Exception:
+                pass
 
     def query(self, text: str, max_tokens: int = 128) -> Dict[str, Any]:
         """
@@ -191,10 +244,22 @@ class FCFSystem:
 
         kca_applied = False
         kca_confidence = 0.0
-        if confidence < 0.5 and hasattr(self.kca, "refine_through_llm"):
+        if confidence < 0.5:
             z = z_stored if z_stored is not None else np.random.randn(
                 self.config.d_model
             ).astype(np.float32)
+
+            p_target = None
+            if domain:
+                p_target = domain.centroid.copy()
+
+            kca_depth = self.kca_scheduler.get_depth(
+                confidence,
+                domain.average_confidence() if domain else 0.5,
+            )
+
+            self.kca.convergence.max_cycles = kca_depth
+
             z_opt, kca_conf = self.kca.refine_through_llm(
                 z, self.layer, self.tokenizer, text
             )
@@ -202,6 +267,7 @@ class FCFSystem:
             kca_confidence = float(kca_conf)
             result["kca_applied"] = True
             result["kca_confidence"] = kca_confidence
+            result["kca_depth"] = kca_depth
 
         self._validate_and_save(c_norm, confidence, domain_id, scenario)
 

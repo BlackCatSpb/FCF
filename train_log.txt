@@ -404,3 +404,148 @@
 16:07:14 | INFO     | [SRG] step=23400 confidence=0.875 avg=0.783
 17:03:57 | INFO     | [SRG] step=23500 confidence=0.803 avg=0.782
 18:52:49 | INFO     | [SRG] step=23600 confidence=0.787 avg=0.783
+21:49:24 | INFO     | ============================================================
+21:49:24 | INFO     | Пункт 2 — Самообучение языку
+21:49:24 | INFO     | Устройство: cpu
+21:49:24 | INFO     | Learning rate: 0.0001
+21:49:24 | INFO     | ============================================================
+21:49:24 | INFO     | [CPU] Потоков: 12
+21:49:24 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+21:49:24 | INFO     | [Train] Wikipedia streaming, макс. шагов: 100
+21:49:35 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+21:53:58 | WARNING  | [SRG] Ошибка: 
+21:54:00 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final/weights.pt
+21:54:00 | INFO     | [Save] Слепки сохранены: 86 шт.
+21:54:00 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\index.faiss
+21:54:00 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\meta.pkl
+21:54:00 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\config.json
+21:54:00 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final
+21:54:00 | INFO     | [Train] Завершено: max_steps
+21:54:00 | INFO     | [Train] Шагов: 100, токенов: 51,100, время: 274с
+21:54:01 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy/weights.pt
+21:54:01 | INFO     | [Save] Слепки сохранены: 86 шт.
+21:54:01 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\index.faiss
+21:54:01 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\meta.pkl
+21:54:01 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\config.json
+21:54:01 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy
+21:54:01 | INFO     | ============================================================
+21:54:01 | INFO     | ============================================================
+21:54:01 | INFO     | Пункт 2 — Самообучение языку
+21:54:01 | INFO     | Пункт 2 — Самообучение языку
+21:54:01 | INFO     | Устройство: cpu
+21:54:01 | INFO     | Устройство: cpu
+21:54:01 | INFO     | Learning rate: 0.0001
+21:54:01 | INFO     | Learning rate: 0.0001
+21:54:01 | INFO     | ============================================================
+21:54:01 | INFO     | ============================================================
+21:54:01 | INFO     | [CPU] Потоков: 12
+21:54:01 | INFO     | [CPU] Потоков: 12
+21:54:01 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+21:54:01 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+21:54:01 | INFO     | [Train] Wikipedia streaming, макс. шагов: 100
+21:54:01 | INFO     | [Train] Wikipedia streaming, макс. шагов: 100
+21:54:04 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+21:54:04 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+21:59:05 | WARNING  | [SRG] Ошибка: 
+21:59:05 | WARNING  | [SRG] Ошибка: 
+21:59:06 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final/weights.pt
+21:59:06 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final/weights.pt
+21:59:06 | INFO     | [Save] Слепки сохранены: 86 шт.
+21:59:06 | INFO     | [Save] Слепки сохранены: 86 шт.
+21:59:06 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\index.faiss
+21:59:06 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\index.faiss
+21:59:06 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\meta.pkl
+21:59:06 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\meta.pkl
+21:59:06 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\config.json
+21:59:06 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\config.json
+21:59:06 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final
+21:59:06 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final
+21:59:06 | INFO     | [Train] Завершено: max_steps
+21:59:06 | INFO     | [Train] Завершено: max_steps
+21:59:06 | INFO     | [Train] Шагов: 200, токенов: 51,100, время: 304с
+21:59:06 | INFO     | [Train] Шагов: 200, токенов: 51,100, время: 304с
+21:59:07 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy/weights.pt
+21:59:07 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy/weights.pt
+21:59:07 | INFO     | [Save] Слепки сохранены: 86 шт.
+21:59:07 | INFO     | [Save] Слепки сохранены: 86 шт.
+21:59:07 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\index.faiss
+21:59:07 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\index.faiss
+21:59:07 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\meta.pkl
+21:59:07 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\meta.pkl
+21:59:07 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\config.json
+21:59:07 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\config.json
+21:59:07 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy
+21:59:07 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy
+21:59:07 | INFO     | ============================================================
+21:59:07 | INFO     | ============================================================
+21:59:07 | INFO     | ============================================================
+21:59:07 | INFO     | Пункт 2 — Самообучение языку
+21:59:07 | INFO     | Пункт 2 — Самообучение языку
+21:59:07 | INFO     | Пункт 2 — Самообучение языку
+21:59:07 | INFO     | Устройство: cpu
+21:59:07 | INFO     | Устройство: cpu
+21:59:07 | INFO     | Устройство: cpu
+21:59:07 | INFO     | Learning rate: 0.0001
+21:59:07 | INFO     | Learning rate: 0.0001
+21:59:07 | INFO     | Learning rate: 0.0001
+21:59:07 | INFO     | ============================================================
+21:59:07 | INFO     | ============================================================
+21:59:07 | INFO     | ============================================================
+21:59:07 | INFO     | [CPU] Потоков: 12
+21:59:07 | INFO     | [CPU] Потоков: 12
+21:59:07 | INFO     | [CPU] Потоков: 12
+21:59:07 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+21:59:07 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+21:59:07 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+21:59:07 | INFO     | [Train] Wikipedia streaming, макс. шагов: 100
+21:59:07 | INFO     | [Train] Wikipedia streaming, макс. шагов: 100
+21:59:07 | INFO     | [Train] Wikipedia streaming, макс. шагов: 100
+21:59:10 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+21:59:10 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+21:59:10 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+22:03:17 | INFO     | ============================================================
+22:03:17 | INFO     | Пункт 2 — Самообучение языку
+22:03:17 | INFO     | Устройство: cpu
+22:03:17 | INFO     | Learning rate: 0.0001
+22:03:17 | INFO     | ============================================================
+22:03:17 | INFO     | [CPU] Потоков: 12
+22:03:17 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+22:03:17 | INFO     | [Train] Wikipedia streaming, макс. шагов: 100
+22:03:23 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+22:07:50 | WARNING  | [SRG] Ошибка: AssertionError: 
+22:07:52 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final/weights.pt
+22:07:52 | INFO     | [Save] Слепки сохранены: 86 шт.
+22:07:52 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\index.faiss
+22:07:52 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\meta.pkl
+22:07:52 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final\config.json
+22:07:52 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\final
+22:07:52 | INFO     | [Train] Завершено: max_steps
+22:07:52 | INFO     | [Train] Шагов: 100, токенов: 51,100, время: 273с
+22:07:53 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy/weights.pt
+22:07:53 | INFO     | [Save] Слепки сохранены: 86 шт.
+22:07:53 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\index.faiss
+22:07:53 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\meta.pkl
+22:07:53 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy\config.json
+22:07:53 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\lazy
+22:07:53 | INFO     | ============================================================
+22:07:53 | INFO     | ============================================================
+22:07:53 | INFO     | Пункт 2 — Самообучение языку
+22:07:53 | INFO     | Пункт 2 — Самообучение языку
+22:07:53 | INFO     | Устройство: cpu
+22:07:53 | INFO     | Устройство: cpu
+22:07:53 | INFO     | Learning rate: 0.0001
+22:07:53 | INFO     | Learning rate: 0.0001
+22:07:53 | INFO     | ============================================================
+22:07:53 | INFO     | ============================================================
+22:07:53 | INFO     | [CPU] Потоков: 12
+22:07:53 | INFO     | [CPU] Потоков: 12
+22:07:53 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+22:07:53 | INFO     | [Train] Используется Wikipedia (потоковая загрузка)
+22:07:53 | INFO     | [Train] Wikipedia streaming, макс. шагов: 100
+22:07:53 | INFO     | [Train] Wikipedia streaming, макс. шагов: 100
+22:07:56 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+22:07:56 | INFO     | [DataManager] Wikipedia загружена: wikimedia/wikipedia 20231101.ru
+22:09:51 | INFO     | [AutoTrainer] Фоновое обучение остановлено
+22:09:51 | INFO     | [AutoTrainer] Фоновое обучение остановлено
+22:09:51 | INFO     | Завершение.
+22:09:51 | INFO     | Завершение.

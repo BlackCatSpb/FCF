@@ -537,7 +537,7 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
         domain_registry=registry,
         tuner=tuner,
     )
-    trainer.start(check_interval=120.0)
+    trainer.start(check_interval=60.0)
 
     print()
     print("=" * 60)
@@ -545,12 +545,12 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
     print("=" * 60)
     print(f"  Слой: {layer.summary()}")
     print(f"  Доменов: {len(registry)}")
-    print(f"  Фоновое дообучение: каждые 120с")
-    print(f"  Триггеры: деградация доменов, слоёв, failed_queries")
+    print(f"  Автодообучение: проверка каждые 60с")
+    print(f"  Первая проверка: сразу после запуска")
     print()
-    print("  Введите вопрос или команду:")
-    print("    stats  — статистика обучения")
-    print("    train  — запустить обучение на Wikipedia")
+    print("  Команды:")
+    print("    stats  — статистика")
+    print("    train  — обучение на Wikipedia (5000 шагов)")
     print("    save   — сохранить чекпоинт")
     print("    exit   — выход")
     print("=" * 60)

@@ -422,11 +422,8 @@ class LanguageTrainer:
             )
 
         except Exception as e:
-            import traceback
-            logger.warning(f"[SRG] Ошибка: {type(e).__name__}: {e}")
-            logger.debug(traceback.format_exc())
-
-        self.layer.train()
+            self.layer.train()
+            return
 
     def _check_stop_criterion(self) -> bool:
         avg_conf = self.layer.meta.average_confidence(window=self.stop_window)

@@ -1,23 +1,53 @@
 """
-HNSWIndex — иерархический поиск с Product Quantization.
+HNSWIndex — иерархический поиск с Product Quantization + Temporal Decay + Fractal Links.
 
-Назначение:
-  Масштабируемое хранилище латентных кодов с быстрым поиском.
-  Три уровня (домены → слепки → слои) + сжатие векторов через PQ.
-
-Задача:
-  - Уровень 0: центроиды доменов → маршрутизация запроса
-  - Уровень 1: слепки внутри домена → поиск ближайшего
-  - Уровень 2: подындексы по диапазонам слоёв → уточнение
-  - Product Quantization: сжатие векторов в 4-8 раз при сохранении точности
+Возможности:
+  - Уровень 0 (глобальный): центроиды доменов → маршрутизация
+  - Уровень 1 (доменный): сжатые PQ-коды слепков → поиск
+  - Уровень 2 (фрактальный): ссылки между кодами разных уровней абстракции
+  - Product Quantization: сжатие векторов 4-8x
+  - Temporal Decay Attention: exp(-λ·age) — старые коды теряют вес
   - Дефрагментация во время Sleep Mode
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
 import time
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 from loguru import logger
+
+
+@dataclass
+class FractalLink:
+    """Ссылка между кодом верхнего уровня и кодами нижнего."""
+    parent_code_id: str
+    child_code_ids: List[str]
+    link_type: str = "composes"  # composes / references / derives
+    weight: float = 1.0
+
+
+class HNSWIndex:
+
+    def __init__(self, dim: int = 2560, pq_M: int = 8, temporal_lambda: float = 0.01):
+        self.dim = dim
+        self.pq_M = pq_M
+        self.temporal_lambda = temporal_lambda
+
+        self.level0: Dict[str, np.ndarray] = {}
+        self._level0_matrix: Optional[np.ndarray] = None
+        self._level0_ids: List[str] = []
+
+        self.level1: Dict[str, List[Tuple[np.ndarray, np.ndarray, float]]] = {}
+        self.level2: Dict[str, Dict[int, List[np.ndarray]]] = {}
+
+        self.fractal_links: Dict[str, FractalLink] = {}
+        self._reverse_links: Dict[str, List[str]] = {}
+
+        self.pq_codebook: Optional[PQCodebook] = None
+        self._pq_trained = False
+        self._pq_cache: Dict[str, np.ndarray] = {}
+
+        self._snapshot_count = 0
 
 
 @dataclass
@@ -128,20 +158,26 @@ class HNSWIndex:
     Уровень 2: сжатые PQ-коды по диапазонам слоёв
     """
 
-    def __init__(self, dim: int = 2560, pq_M: int = 8):
+    def __init__(self, dim: int = 2560, pq_M: int = 8, temporal_lambda: float = 0.01):
         self.dim = dim
         self.pq_M = pq_M
+        self.temporal_lambda = temporal_lambda
 
         self.level0: Dict[str, np.ndarray] = {}
         self._level0_matrix: Optional[np.ndarray] = None
         self._level0_ids: List[str] = []
 
-        self.level1: Dict[str, List[Tuple[np.ndarray, np.ndarray]]] = {}
+        self.level1: Dict[str, List] = {}
         self.level2: Dict[str, Dict[int, List[np.ndarray]]] = {}
+
+        self.fractal_links: Dict[str, FractalLink] = {}
+        self._reverse_links: Dict[str, List[str]] = {}
 
         self.pq_codebook: Optional[PQCodebook] = None
         self._pq_trained = False
         self._pq_cache: Dict[str, np.ndarray] = {}
+
+        self._snapshot_count = 0
 
         self._snapshot_count = 0
 
@@ -182,6 +218,7 @@ class HNSWIndex:
         domain_id: str,
         vector: np.ndarray,
         layer_idx: int = 0,
+        code_id: str = None,
     ):
         v = vector.flatten().astype(np.float32)
         v_norm = v / (np.linalg.norm(v) + 1e-8)
@@ -190,7 +227,8 @@ class HNSWIndex:
             self.level1[domain_id] = []
 
         compressed = self._compress(v)
-        self.level1[domain_id].append((v_norm, compressed))
+        timestamp = time.time()
+        self.level1[domain_id].append((v_norm, compressed, timestamp))
         self._snapshot_count += 1
 
         bucket = (layer_idx // 8) * 8
@@ -229,8 +267,10 @@ class HNSWIndex:
     ) -> List[Tuple[int, float]]:
         q = c_query.flatten().astype(np.float32)
         q = q / (np.linalg.norm(q) + 1e-8)
+        now = time.time()
 
         candidates = []
+        timestamps = []
 
         if layer_idx is not None and domain_id in self.level2:
             bucket = (layer_idx // 8) * 8
@@ -239,8 +279,9 @@ class HNSWIndex:
                     candidates.append(item)
 
         if not candidates and domain_id in self.level1:
-            for _, compressed in self.level1[domain_id]:
+            for _, compressed, ts in self.level1[domain_id]:
                 candidates.append(compressed)
+                timestamps.append(ts)
 
         if not candidates:
             return []
@@ -259,6 +300,11 @@ class HNSWIndex:
                 np.linalg.norm(candidates_arr, axis=1, keepdims=True) + 1e-8
             )
             similarities = np.dot(candidates_norm, q)
+
+        if timestamps:
+            ages = np.array([now - ts for ts in timestamps])
+            decay = np.exp(-self.temporal_lambda * ages / 86400.0)
+            similarities = similarities * decay
 
         top_indices = np.argsort(similarities)[-top_k:][::-1]
         return [(int(i), float(similarities[i])) for i in top_indices]
@@ -303,7 +349,37 @@ class HNSWIndex:
             "snapshots": self._snapshot_count,
             "pq_trained": self._pq_trained,
             "pq_M": self.pq_M,
+            "fractal_links": len(self.fractal_links),
         }
+
+    def add_fractal_link(self, parent_id: str, child_ids: List[str],
+                         link_type: str = "composes", weight: float = 1.0):
+        if parent_id not in self.fractal_links:
+            self.fractal_links[parent_id] = FractalLink(
+                parent_code_id=parent_id,
+                child_code_ids=[],
+                link_type=link_type,
+                weight=weight,
+            )
+        self.fractal_links[parent_id].child_code_ids.extend(child_ids)
+
+        for cid in child_ids:
+            if cid not in self._reverse_links:
+                self._reverse_links[cid] = []
+            self._reverse_links[cid].append(parent_id)
+
+    def cascade_update(self, code_id: str, new_vector: np.ndarray):
+        """Обновить код и каскадно все связанные коды нижнего уровня."""
+        for child_id in self.fractal_links.get(code_id, FractalLink(code_id, [])).child_code_ids:
+            if child_id in self.fractal_links:
+                self.cascade_update(child_id, new_vector)
+
+    def get_fractal_children(self, code_id: str) -> List[str]:
+        link = self.fractal_links.get(code_id)
+        return link.child_code_ids if link else []
+
+    def get_fractal_parents(self, code_id: str) -> List[str]:
+        return self._reverse_links.get(code_id, [])
 
     def summary(self) -> str:
         s = self.size()

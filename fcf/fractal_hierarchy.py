@@ -127,14 +127,38 @@ class SentenceAggregator(nn.Module):
 
 
 class TextAggregator(nn.Module):
-    """Агрегирует предложения → текст через GRU."""
+    """Агрегирует предложения → текст через GRU с HyperNetwork."""
 
     def __init__(self, k_sent: int = 128, k_text: int = 128, h_dim: int = 128):
         super().__init__()
+        self.k_sent = k_sent
+        self.k_text = k_text
+        self.h_dim = h_dim
         self.rnn = nn.GRU(k_sent, h_dim, 1, batch_first=True)
         self.proj = nn.Linear(h_dim, k_text)
 
+        self.hyper = nn.Sequential(
+            nn.Linear(k_text, 64), nn.SiLU(),
+            nn.Linear(64, h_dim * k_sent + h_dim * h_dim),
+        )
+
     def forward(self, z_sents: torch.Tensor) -> torch.Tensor:
+        B, N, _ = z_sents.shape
+
+        z_mean = z_sents.mean(dim=1)
+        z_text_init = self.proj(z_mean)
+
+        hyper_out = self.hyper(z_text_init)
+        W_ih = hyper_out[:, :self.h_dim * self.k_sent].view(
+            self.h_dim, self.k_sent
+        )
+        W_hh = hyper_out[:, self.h_dim * self.k_sent:].view(
+            self.h_dim, self.h_dim
+        )
+
+        self.rnn.weight_ih_l0.data = W_ih[0]
+        self.rnn.weight_hh_l0.data = W_hh[0]
+
         _, h = self.rnn(z_sents)
         return self.proj(h[-1])
 

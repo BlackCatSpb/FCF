@@ -142,11 +142,39 @@ class FCFSystem:
             self.layer._encode(self.tokenizer, text)
         )
 
-        domain_id = self.hnsw.search_domain(c_query)
+        c_norm = c_query / (np.linalg.norm(c_query) + 1e-8)
+
+        domain_id = None
+        scenario = "cold_start"
+        z_stored = None
+
+        domain_id = self.hnsw.search_domain(c_norm)
+
+        if domain_id:
+            results = self.hnsw.search_snapshot(domain_id, c_norm, top_k=1)
+            if results:
+                idx, similarity = results[0]
+                if similarity > 0.95:
+                    scenario = "exact_match"
+                    if self.layer.state_storage and idx < len(
+                        self.layer.state_storage.snapshots_meta
+                    ):
+                        z_stored = self.layer.state_storage.snapshots_meta[idx].get("c")
+                elif similarity > 0.7:
+                    scenario = "partial_match"
+                    if self.layer.state_storage and idx < len(
+                        self.layer.state_storage.snapshots_meta
+                    ):
+                        stored = self.layer.state_storage.snapshots_meta[idx].get("c")
+                        if stored is not None:
+                            noise = np.random.randn(*stored.shape) * 0.05
+                            z_stored = stored + noise
+                            z_stored = z_stored / (np.linalg.norm(z_stored) + 1e-8)
+
         if domain_id is None:
-            domain_id = self.gmm.classify(c_query, level="word")
+            domain_id = self.gmm.classify(c_norm, level="word")
         if domain_id is None:
-            domain_id = self.gmm.add_or_update(c_query, level="word")
+            domain_id = self.gmm.add_or_update(c_norm, level="word")
 
         domain = self.gmm.gmms["word"].domains.get(domain_id)
 
@@ -159,33 +187,65 @@ class FCFSystem:
 
         if domain:
             domain.record_confidence(confidence)
-            domain.update(c_query)
+            domain.update(c_norm)
 
-        if confidence < 0.5 and hasattr(self, '_suppress_kca') and not self._suppress_kca:
-            z = np.random.randn(self.config.d_model).astype(np.float32)
-            z_opt, kca_conf = self.kca.refine(z, c_query)
+        kca_applied = False
+        kca_confidence = 0.0
+        if confidence < 0.5 and hasattr(self.kca, "refine_through_llm"):
+            z = z_stored if z_stored is not None else np.random.randn(
+                self.config.d_model
+            ).astype(np.float32)
+            z_opt, kca_conf = self.kca.refine_through_llm(
+                z, self.layer, self.tokenizer, text
+            )
+            kca_applied = True
+            kca_confidence = float(kca_conf)
             result["kca_applied"] = True
-            result["kca_confidence"] = float(kca_conf)
+            result["kca_confidence"] = kca_confidence
 
-        snapshot_idx = self.hnsw.search_snapshot(domain_id, c_query)
-        if not snapshot_idx:
-            self.hnsw.add_snapshot(domain_id, c_query)
+        self._validate_and_save(c_norm, confidence, domain_id, scenario)
 
         self.provenance.record(
             code_id=f"q_{self._query_count}",
             domain_id=domain_id,
             level="word",
             created_via="query",
-            kca_iterations=0,
-            final_srg=confidence,
+            kca_iterations=len(self.kca.correction_history) if kca_applied else 0,
+            final_srg=kca_confidence if kca_applied else confidence,
         )
 
         if self.curiosity and domain:
             self.curiosity.probe(domain, self.layer, self.tokenizer, self.srg_plus)
 
+        result["domain_id"] = domain_id
+        result["scenario"] = scenario
+
         self._query_count += 1
 
         return result
+
+    def _validate_and_save(self, c_vec, confidence, domain_id, scenario):
+        """Три критерия валидации перед сохранением кода."""
+        if self.layer is None or self.layer.state_storage is None:
+            return
+
+        usage_count = 1
+        meta = self.layer.meta
+
+        if confidence < 0.8:
+            return
+
+        if scenario == "exact_match":
+            return
+
+        snapshot_idx = self.hnsw.search_snapshot(domain_id, c_vec)
+        if snapshot_idx:
+            return
+
+        self.hnsw.add_snapshot(domain_id, c_vec)
+
+        self.layer._eval_context_vector = c_vec
+        self.layer.save_snapshot_if_confident(domain=domain_id)
 
     def start_background(self, interval: float = 300.0):
         """Запустить фоновый цикл: Sleep Mode + Intrinsic Curiosity."""

@@ -104,10 +104,14 @@ class KCAEngine:
         eta0: float = 0.01,
         lambda_gap: float = 0.3,
         lambda_contra: float = 0.2,
+        lambda_kl: float = 0.1,
+        lambda_mono: float = 0.01,
     ):
         self.hidden_dim = hidden_dim
         self.lambda_gap = lambda_gap
         self.lambda_contra = lambda_contra
+        self.lambda_kl = lambda_kl
+        self.lambda_mono = lambda_mono
         self.rho = rho
         self.eta0 = eta0
 
@@ -117,24 +121,34 @@ class KCAEngine:
         )
         self.correction_history: List[Dict] = []
 
+        self._prev_srg: Optional[float] = None
+        self._layer = None
+
+    def set_layer(self, layer):
+        self._layer = layer
+
     def refine(
         self,
         z_init: np.ndarray,
         c_query: np.ndarray,
+        tokenizer=None,
+        prompt: str = "",
         c_target: Optional[np.ndarray] = None,
         graph_embeddings: Optional[np.ndarray] = None,
+        p_target: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, float]:
-        z = z_init.copy()
+        z = z_init.copy().astype(np.float32)
         z_prev = z.copy()
+        self._prev_srg = None
 
         for iteration in range(self.convergence.max_cycles):
             eta = self.eta0 * (self.rho ** iteration)
 
             loss, grad = self._compute_loss_and_grad(
-                z, c_query, c_target, graph_embeddings
+                z, c_query, c_target, graph_embeddings, p_target
             )
 
-            z_new = z - eta * grad
+            z_new = z - eta * grad.astype(np.float32)
 
             gamma = self._compute_gate(z_new, z, graph_embeddings)
 
@@ -156,7 +170,88 @@ class KCAEngine:
             z = z_new
 
         confidence = self._compute_confidence(z, c_query, c_target)
-        return z, confidence
+        return z.astype(np.float32), confidence
+
+    def refine_through_llm(
+        self,
+        z_init: np.ndarray,
+        layer,
+        tokenizer,
+        prompt: str,
+        max_tokens: int = 64,
+    ) -> Tuple[np.ndarray, float]:
+        """
+        KCA с градиентами через реальный forward pass LLM.
+
+        В отличие от аналитического refine(), здесь loss вычисляется
+        через фактический проход модели с модифицированными весами.
+        """
+        import torch
+
+        z = z_init.copy().astype(np.float32)
+        z_t = torch.from_numpy(z).float().requires_grad_(True)
+        optimizer = torch.optim.Adam([z_t], lr=self.eta0)
+
+        for iteration in range(self.convergence.max_cycles):
+            optimizer.zero_grad()
+
+            encoding = tokenizer.encode(prompt)
+            ids = encoding.ids if hasattr(encoding, "ids") else encoding
+            input_ids = torch.tensor([ids], dtype=torch.long)
+
+            device = next(layer.parameters()).device
+            input_ids = input_ids.to(device)
+
+            x = layer.embed(input_ids)
+            hidden = layer.forward_transformer(x)
+            logits = layer.forward_logits(hidden)
+
+            probs = torch.softmax(logits[:, -1, :], dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-10)).sum()
+            max_ent = np.log(logits.shape[-1])
+            confidence = 1.0 - entropy / max_ent
+
+            z_np = z_t.detach().cpu().numpy()
+            sim = np.dot(z_np.flatten(), z_np.flatten()) / (
+                np.linalg.norm(z_np) ** 2 + 1e-8
+            )
+            target_sim = torch.tensor(0.9, device=device)
+
+            loss = (
+                -self.lambda_gap * confidence
+                + 0.5 * (torch.tensor(float(sim), device=device) - target_sim) ** 2
+            )
+
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                gamma = float(torch.exp(-torch.norm(z_t.grad or torch.zeros_like(z_t))))
+
+            z_new = z_t.detach().cpu().numpy().astype(np.float32)
+
+            status, z_out = self.convergence.check(
+                z_new, z.astype(np.float32), gamma, iteration
+            )
+
+            self.correction_history.append({
+                "iteration": iteration,
+                "loss": float(loss.item()),
+                "gamma": float(gamma),
+                "status": status,
+                "via_llm": True,
+            })
+
+            if status != "CONTINUE":
+                conf = float(confidence.item())
+                return z_out, conf
+
+            z = z_new
+            z_t = torch.from_numpy(z).float().requires_grad_(True)
+            for g in optimizer.param_groups:
+                g["lr"] = self.eta0 * (self.rho ** iteration)
+
+        return z.astype(np.float32), float(confidence.item())
 
     def _compute_loss_and_grad(
         self,
@@ -164,32 +259,49 @@ class KCAEngine:
         c_query: np.ndarray,
         c_target: Optional[np.ndarray],
         graph_embeddings: Optional[np.ndarray],
+        p_target: Optional[np.ndarray] = None,
     ) -> Tuple[float, np.ndarray]:
-        z = z.flatten()
-        c_q = c_query.flatten()
+        z = z.flatten().astype(np.float64)
+        c_q = c_query.flatten().astype(np.float64)
 
         sim = np.dot(z, c_q) / (np.linalg.norm(z) * np.linalg.norm(c_q) + 1e-8)
-        loss = 1.0 - sim
+        srg_conf = float((sim + 1.0) / 2.0)
+
+        loss = -self.lambda_gap * srg_conf
 
         norm_z = np.linalg.norm(z) + 1e-8
         norm_c = np.linalg.norm(c_q) + 1e-8
-        grad = -(c_q / (norm_z * norm_c) - z * sim / (norm_z ** 2))
-        grad = grad / (np.linalg.norm(grad) + 1e-8)
+        grad = -self.lambda_gap * (
+            c_q / (norm_z * norm_c) - z * sim / (norm_z ** 2)
+        )
 
         if c_target is not None:
-            c_t = c_target.flatten()
+            c_t = c_target.flatten().astype(np.float64)
             diff = z - c_t
             loss += 0.5 * np.mean(diff ** 2)
-            grad += 0.5 * diff
+            grad += diff / len(diff)
+
+        if p_target is not None:
+            p_t = p_target.flatten().astype(np.float64)
+            p_t = np.clip(p_t, 1e-10, 1.0)
+            p_t = p_t / np.sum(p_t)
+            kl = np.sum(p_t * (np.log(p_t + 1e-10) - np.log(p_t + 1e-10)))
+            loss += self.lambda_kl * kl
 
         if graph_embeddings is not None and len(graph_embeddings) > 0:
-            g_emb = graph_embeddings.mean(axis=0).flatten()
-            if len(g_emb) == len(z):
-                gap_loss = self.lambda_gap * np.mean((z - g_emb) ** 2)
-                loss += gap_loss
-                grad += self.lambda_gap * (z - g_emb)
+            g_emb = graph_embeddings.mean(axis=0).flatten().astype(np.float64)
+            gap_loss = self.lambda_contra * np.mean((z - g_emb) ** 2)
+            loss += gap_loss
+            grad += self.lambda_contra * (z - g_emb) / len(z)
 
-        return loss, grad
+        if self._prev_srg is not None:
+            mono_penalty = max(0, self._prev_srg - srg_conf)
+            loss += self.lambda_mono * mono_penalty
+
+        self._prev_srg = srg_conf
+
+        grad = grad / (np.linalg.norm(grad) + 1e-8)
+        return float(loss), grad.astype(np.float32)
 
     def _compute_gate(
         self,

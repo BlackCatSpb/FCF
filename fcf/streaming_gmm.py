@@ -126,29 +126,49 @@ class StreamingGMM:
 
         return best_id
 
-    def add_or_update(self, vector: np.ndarray) -> str:
-        """Добавить вектор: обновить существующий домен или создать новый."""
+    def add_or_update(self, vector: np.ndarray, inherit_from: str = None) -> str:
+        """Добавить вектор: обновить существующий домен или создать новый с наследованием."""
         domain_id = self.classify(vector)
 
         if domain_id is not None:
             self.domains[domain_id].update(vector, self.alpha)
             return domain_id
 
-        return self._create_domain(vector)
+        return self._create_domain(vector, inherit_from=inherit_from)
 
-    def _create_domain(self, vector: np.ndarray) -> str:
+    def _create_domain(self, vector: np.ndarray, inherit_from: str = None) -> str:
         domain_id = f"{self.level}_{self._next_id}"
         self._next_id += 1
 
         v = vector.flatten()
+
+        if inherit_from and inherit_from in self.domains:
+            parent = self.domains[inherit_from]
+            centroid = 0.7 * v + 0.3 * parent.centroid
+            covariance = parent.covariance.copy()
+            count = parent.count // 2
+        else:
+            centroid = v.copy()
+            covariance = np.eye(self.dim) * 0.1
+            count = 1
+
         domain = StreamingDomain(
             domain_id=domain_id,
             level=self.level,
-            centroid=v.copy(),
-            covariance=np.eye(self.dim) * 0.1,
+            centroid=centroid,
+            covariance=covariance,
+            count=count,
         )
         self.domains[domain_id] = domain
-        logger.info(f"[GMM] Новый домен: {domain_id} (level={self.level})")
+
+        if inherit_from:
+            logger.info(
+                f"[GMM] Новый домен: {domain_id} "
+                f"(унаследован от {inherit_from}, level={self.level})"
+            )
+        else:
+            logger.info(f"[GMM] Новый домен: {domain_id} (level={self.level})")
+
         return domain_id
 
     def merge_similar(self) -> int:

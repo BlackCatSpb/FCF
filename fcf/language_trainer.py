@@ -417,7 +417,7 @@ class LanguageTrainer:
             )
 
         except Exception as e:
-            logger.warning(f"[SRG] Ошибка: {e}")
+            logger.warning(f"[SRG] Ошибка: {type(e).__name__}: {e}")
 
         self.layer.train()
 

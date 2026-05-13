@@ -117,8 +117,7 @@ class SentenceAggregator(nn.Module):
         return self.up_proj(z_word_weighted)
 
     def refine(self, z_words: torch.Tensor, n_iter: int = 5, rho: float = 0.85) -> torch.Tensor:
-        mean_val = z_words.mean(1)
-        z = self.up_proj(mean_val)
+        z = self.up_proj(z_words.mean(dim=1))
         for _ in range(n_iter):
             z_new = self.aggregate(z, z_words)
             z = rho * z + (1 - rho) * z_new

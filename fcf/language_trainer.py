@@ -204,9 +204,14 @@ class LanguageTrainer:
             wiki = DataManager.load_wikipedia(streaming=True)
             if wiki:
                 wiki_iter = iter(wiki)
+                logger.info("[Train] Wikipedia streaming активен")
             else:
-                logger.error("Wikipedia не загружена")
-                return {"error": "no_wikipedia"}
+                logger.warning("[Train] Wikipedia недоступна, fallback на локальный корпус")
+                use_wikipedia = False
+                if text_file and os.path.exists(text_file):
+                    blocks = self._pre_tokenize_corpus(text_file, block_size)
+                else:
+                    blocks = self._pre_tokenize_corpus("training_corpus.txt", block_size)
 
         for step_idx in range(max_steps):
             if self.stopped:
@@ -218,7 +223,7 @@ class LanguageTrainer:
                 )
                 if input_ids is None:
                     continue
-            else:
+            elif not use_wikipedia and blocks:
                 block = blocks[block_idx % len(blocks)]
                 block_idx += 1
                 input_ids = block["input_ids"].to(device)

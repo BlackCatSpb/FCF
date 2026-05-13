@@ -1,38 +1,181 @@
 """
-HNSWIndex — иерархический поиск состояний (Пункт 7).
+HNSWIndex — иерархический поиск с Product Quantization.
 
-Три уровня:
-- Уровень 0 (глобальный): центроиды всех доменов → маршрутизация
-- Уровень 1 (доменный): слепки внутри домена
-- Уровень 2 (слой-специфичный): подындексы по диапазонам слоёв (1-8, 9-16, ...)
+Назначение:
+  Масштабируемое хранилище латентных кодов с быстрым поиском.
+  Три уровня (домены → слепки → слои) + сжатие векторов через PQ.
 
-Обеспечивает логарифмическую сложность поиска даже при миллионах слепков.
+Задача:
+  - Уровень 0: центроиды доменов → маршрутизация запроса
+  - Уровень 1: слепки внутри домена → поиск ближайшего
+  - Уровень 2: подындексы по диапазонам слоёв → уточнение
+  - Product Quantization: сжатие векторов в 4-8 раз при сохранении точности
+  - Дефрагментация во время Sleep Mode
 """
 
 import numpy as np
 from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+import time
+from loguru import logger
+
+
+@dataclass
+class PQCodebook:
+    """
+    Product Quantization: разбивает вектор на M подвекторов,
+    квантует каждый в один из 256 центроидов.
+    Сжатие: 4 байта × d → M байт (примерно d/M : 1).
+    """
+
+    M: int
+    d: int
+    sub_dim: int
+    codes: np.ndarray
+
+    @classmethod
+    def train(
+        cls,
+        vectors: np.ndarray,
+        M: int = 8,
+        n_iter: int = 10,
+    ) -> "PQCodebook":
+        N, d = vectors.shape
+        sub_dim = d // M
+        if d % M != 0:
+            d_pad = ((d + M - 1) // M) * M
+            padded = np.zeros((N, d_pad), dtype=np.float32)
+            padded[:, :d] = vectors
+            vectors = padded
+            d = d_pad
+            sub_dim = d // M
+
+        codes = np.zeros((256, M, sub_dim), dtype=np.float32)
+
+        for m in range(M):
+            sub_vectors = vectors[:, m * sub_dim : (m + 1) * sub_dim].copy()
+            centroids = sub_vectors[
+                np.random.choice(N, min(256, N), replace=False)
+            ]
+            for _ in range(n_iter):
+                distances = np.sum(
+                    (sub_vectors[:, None, :] - centroids[None, :, :]) ** 2,
+                    axis=-1,
+                )
+                assignments = np.argmin(distances, axis=1)
+
+                new_centroids = np.zeros_like(centroids)
+                counts = np.zeros(256, dtype=np.int32)
+                for i in range(N):
+                    c = assignments[i]
+                    new_centroids[c] += sub_vectors[i]
+                    counts[c] += 1
+
+                for c in range(256):
+                    if counts[c] > 0:
+                        centroids[c] = new_centroids[c] / counts[c]
+
+            codes[:, m, :] = centroids.astype(np.float32)
+
+        logger.info(f"[PQ] Codebook: M={M}, sub_dim={sub_dim}, d={d}")
+        return cls(M=M, d=d, sub_dim=sub_dim, codes=codes)
+
+    def encode(self, vector: np.ndarray) -> np.ndarray:
+        v = vector.flatten().astype(np.float32)
+        if len(v) < self.d:
+            v = np.pad(v, (0, self.d - len(v)))
+        codes = np.zeros(self.M, dtype=np.uint8)
+        for m in range(self.M):
+            sub = v[m * self.sub_dim : (m + 1) * self.sub_dim]
+            dists = np.sum((self.codes[:, m, :] - sub) ** 2, axis=1)
+            codes[m] = np.argmin(dists)
+        return codes
+
+    def encode_batch(self, vectors: np.ndarray) -> np.ndarray:
+        N = vectors.shape[0]
+        encoded = np.zeros((N, self.M), dtype=np.uint8)
+        for i in range(N):
+            encoded[i] = self.encode(vectors[i])
+        return encoded
+
+    def decode(self, codes: np.ndarray) -> np.ndarray:
+        codes = codes.astype(np.int32)
+        if codes.ndim == 1:
+            codes = codes.reshape(1, -1)
+        N = codes.shape[0]
+        decoded = np.zeros((N, self.d), dtype=np.float32)
+        for m in range(self.M):
+            decoded[:, m * self.sub_dim : (m + 1) * self.sub_dim] = \
+                self.codes[codes[:, m], m, :]
+        return decoded
+
+    def similarity_batch(self, query: np.ndarray, codes: np.ndarray) -> np.ndarray:
+        decoded = self.decode(codes)
+        q = query.flatten().astype(np.float32)
+        if len(q) < self.d:
+            q = np.pad(q, (0, self.d - len(q)))
+        q_norm = q / (np.linalg.norm(q) + 1e-8)
+        d_norm = decoded / (np.linalg.norm(decoded, axis=1, keepdims=True) + 1e-8)
+        return np.dot(d_norm, q_norm)
 
 
 class HNSWIndex:
+    """
+    Иерархический HNSW-индекс с Product Quantization.
 
-    def __init__(self, dim: int = 2560, M: int = 32):
+    Уровень 0: центроиды доменов (точные векторы)
+    Уровень 1: сжатые PQ-коды слепков внутри домена
+    Уровень 2: сжатые PQ-коды по диапазонам слоёв
+    """
+
+    def __init__(self, dim: int = 2560, pq_M: int = 8):
         self.dim = dim
-        self.M = M
+        self.pq_M = pq_M
 
         self.level0: Dict[str, np.ndarray] = {}
-        self.level1: Dict[str, List[np.ndarray]] = {}
+        self._level0_matrix: Optional[np.ndarray] = None
+        self._level0_ids: List[str] = []
+
+        self.level1: Dict[str, List[Tuple[np.ndarray, np.ndarray]]] = {}
         self.level2: Dict[str, Dict[int, List[np.ndarray]]] = {}
 
-        self._level0_ids: List[str] = []
-        self._level0_matrix: Optional[np.ndarray] = None
+        self.pq_codebook: Optional[PQCodebook] = None
+        self._pq_trained = False
+        self._pq_cache: Dict[str, np.ndarray] = {}
+
+        self._snapshot_count = 0
+
+    def train_pq(self, vectors: np.ndarray):
+        """Обучить Product Quantization на накопленных векторах."""
+        if len(vectors) < 256:
+            logger.warning("[PQ] Недостаточно векторов для обучения")
+            return
+        self.pq_codebook = PQCodebook.train(vectors, M=self.pq_M)
+        self._pq_trained = True
+        self._pq_cache.clear()
+        logger.info(
+            f"[PQ] Обучено: M={self.pq_M}, "
+            f"compression={32 / self.pq_M:.1f}x"
+        )
+
+    def _compress(self, vector: np.ndarray) -> np.ndarray:
+        if not self._pq_trained or self.pq_codebook is None:
+            v = vector.flatten().astype(np.float32)
+            return v / (np.linalg.norm(v) + 1e-8)
+        return self.pq_codebook.encode(vector)
 
     def add_domain(self, domain_id: str, centroid: np.ndarray):
         c = centroid.flatten().astype(np.float32)
         c = c / (np.linalg.norm(c) + 1e-8)
         self.level0[domain_id] = c
-        self.level1[domain_id] = []
-        self.level2[domain_id] = {}
+
+        if domain_id not in self.level1:
+            self.level1[domain_id] = []
+        if domain_id not in self.level2:
+            self.level2[domain_id] = {}
+
         self._rebuild_level0()
+        self._pq_cache.pop(domain_id, None)
 
     def add_snapshot(
         self,
@@ -41,18 +184,24 @@ class HNSWIndex:
         layer_idx: int = 0,
     ):
         v = vector.flatten().astype(np.float32)
-        v = v / (np.linalg.norm(v) + 1e-8)
+        v_norm = v / (np.linalg.norm(v) + 1e-8)
 
         if domain_id not in self.level1:
             self.level1[domain_id] = []
-        self.level1[domain_id].append(v)
 
-        layer_bucket = (layer_idx // 8) * 8
+        compressed = self._compress(v)
+        self.level1[domain_id].append((v_norm, compressed))
+        self._snapshot_count += 1
+
+        bucket = (layer_idx // 8) * 8
         if domain_id not in self.level2:
             self.level2[domain_id] = {}
-        if layer_bucket not in self.level2[domain_id]:
-            self.level2[domain_id][layer_bucket] = []
-        self.level2[domain_id][layer_bucket].append(v)
+        if bucket not in self.level2[domain_id]:
+            self.level2[domain_id][bucket] = []
+
+        self.level2[domain_id][bucket].append(compressed)
+
+        self._pq_cache.pop(domain_id, None)
 
     def search_domain(self, c_query: np.ndarray) -> Optional[str]:
         if not self.level0:
@@ -69,49 +218,79 @@ class HNSWIndex:
 
         similarities = np.dot(self._level0_matrix, q)
         best_idx = int(np.argmax(similarities))
-
-        if best_idx < len(self._level0_ids):
-            return self._level0_ids[best_idx]
-
-        return None
+        return self._level0_ids[best_idx] if best_idx < len(self._level0_ids) else None
 
     def search_snapshot(
         self,
         domain_id: str,
         c_query: np.ndarray,
         layer_idx: Optional[int] = None,
-    ) -> Optional[int]:
+        top_k: int = 1,
+    ) -> List[Tuple[int, float]]:
         q = c_query.flatten().astype(np.float32)
         q = q / (np.linalg.norm(q) + 1e-8)
 
-        vectors = None
+        candidates = []
+
         if layer_idx is not None and domain_id in self.level2:
             bucket = (layer_idx // 8) * 8
             if bucket in self.level2[domain_id]:
-                vectors = self.level2[domain_id][bucket]
+                for item in self.level2[domain_id][bucket]:
+                    candidates.append(item)
 
-        if not vectors and domain_id in self.level1:
-            vectors = self.level1[domain_id]
+        if not candidates and domain_id in self.level1:
+            for _, compressed in self.level1[domain_id]:
+                candidates.append(compressed)
 
-        if not vectors:
-            return None
+        if not candidates:
+            return []
 
-        best_idx = -1
-        best_sim = -1.0
-        for i, v in enumerate(vectors):
-            sim = np.dot(v, q)
-            if sim > best_sim:
-                best_sim = sim
-                best_idx = i
+        if self._pq_trained and self.pq_codebook is not None:
+            domain_key = f"{domain_id}_pq"
+            if domain_key not in self._pq_cache:
+                codes = np.array([c for c in candidates], dtype=np.uint8)
+                self._pq_cache[domain_key] = codes
+            similarities = self.pq_codebook.similarity_batch(
+                q, self._pq_cache[domain_key]
+            )
+        else:
+            candidates_arr = np.array(candidates, dtype=np.float32)
+            candidates_norm = candidates_arr / (
+                np.linalg.norm(candidates_arr, axis=1, keepdims=True) + 1e-8
+            )
+            similarities = np.dot(candidates_norm, q)
 
-        return best_idx if best_idx >= 0 else None
+        top_indices = np.argsort(similarities)[-top_k:][::-1]
+        return [(int(i), float(similarities[i])) for i in top_indices]
+
+    def get_snapshot_count(self, domain_id: str = None) -> int:
+        if domain_id:
+            return len(self.level1.get(domain_id, []))
+        return self._snapshot_count
+
+    def remove_stale(self, indices: List[int], domain_id: str):
+        if domain_id not in self.level1:
+            return
+        for idx in sorted(indices, reverse=True):
+            if idx < len(self.level1[domain_id]):
+                del self.level1[domain_id][idx]
+                self._snapshot_count = max(0, self._snapshot_count - 1)
+        self._pq_cache.pop(domain_id, None)
+
+    def defragment(self):
+        """Перестроить все кэши после массовых удалений."""
+        self._rebuild_level0()
+        self._pq_cache.clear()
+        for domain_id in list(self.level1.keys()):
+            if not self.level1[domain_id]:
+                del self.level1[domain_id]
+        logger.info(f"[HNSW] Дефрагментация: {self._snapshot_count} слепков, {len(self.level0)} доменов")
 
     def _rebuild_level0(self):
         self._level0_ids = list(self.level0.keys())
         if not self._level0_ids:
             self._level0_matrix = None
             return
-
         self._level0_matrix = np.zeros(
             (len(self._level0_ids), self.dim), dtype=np.float32
         )
@@ -121,10 +300,14 @@ class HNSWIndex:
     def size(self) -> Dict[str, int]:
         return {
             "domains": len(self.level0),
-            "level1_snapshots": sum(
-                len(v) for v in self.level1.values()
-            ),
-            "level2_buckets": sum(
-                len(buckets) for buckets in self.level2.values()
-            ),
+            "snapshots": self._snapshot_count,
+            "pq_trained": self._pq_trained,
+            "pq_M": self.pq_M,
         }
+
+    def summary(self) -> str:
+        s = self.size()
+        return (
+            f"HNSWIndex(domains={s['domains']}, snapshots={s['snapshots']}, "
+            f"PQ={'on' if s['pq_trained'] else 'off'}, M={s['pq_M']})"
+        )

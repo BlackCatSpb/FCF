@@ -54,31 +54,53 @@ class MinimalCodePrinciple:
 
 
 class OperatorTrainer:
-    """Обучает операторы State Algebra на синтетических парах."""
+    """Обучает ВСЕ операторы State Algebra на синтетических парах."""
 
     def __init__(self, state_algebra):
         self.algebra = state_algebra
 
-    def train_sum(self, pairs: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
+    def train_all(self, pairs: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
                   epochs: int = 50, lr: float = 1e-3):
-        """Обучить оператор суммирования на тройках (z_A, z_B, z_target)."""
-        optimizer = torch.optim.Adam(
-            list(self.algebra.projector.parameters()), lr=lr
-        )
+        """Обучить sum, scale, subtract, cross_attend на тройках."""
+        params = list(self.algebra.projector.parameters())
+        params += list(self.algebra.cross_attn_block.parameters())
+        params += [self.algebra.translator.weight]
+        optimizer = torch.optim.Adam(params, lr=lr)
+
         for epoch in range(epochs):
             total_loss = 0.0
             for z_a, z_b, z_target in pairs:
                 optimizer.zero_grad()
+
                 a = torch.from_numpy(z_a).float().unsqueeze(0)
                 b = torch.from_numpy(z_b).float().unsqueeze(0)
                 target = torch.from_numpy(z_target).float().unsqueeze(0)
-                predicted = self.algebra.projector(a + b)
-                loss = F.mse_loss(predicted, target)
+
+                loss_sum = F.mse_loss(self.algebra.projector(a + b), target)
+
+                alpha = torch.rand(1).item() * 1.5 + 0.5
+                loss_scale = F.mse_loss(
+                    self.algebra.projector(alpha * a), target
+                )
+
+                diff = torch.clamp(a - b, -1.0, 1.0)
+                loss_sub = F.mse_loss(self.algebra.projector(diff), target)
+
+                combined = torch.cat([
+                    a.unsqueeze(1), b.unsqueeze(1)
+                ], dim=1)
+                attn_out = self.algebra.cross_attn_block(combined)
+                loss_cross = F.mse_loss(
+                    self.algebra.projector(attn_out), target
+                )
+
+                loss = loss_sum + loss_scale + loss_sub + loss_cross
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
+
             if epoch % 10 == 0:
-                logger.debug(f"[OpTrain] sum epoch={epoch}, loss={total_loss:.4f}")
+                logger.debug(f"[OpTrain] epoch={epoch}, loss={total_loss:.4f}")
 
 
 class RecursiveSelfImprovement:

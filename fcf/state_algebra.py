@@ -44,11 +44,47 @@ class Projector(nn.Module):
             return self.forward(z)
 
 
+class CrossAttendBlock(nn.Module):
+    """TransformerBlock для кросс-аттеншн композиции латентных кодов (§8.2)."""
+
+    def __init__(self, dim: int = 2560, num_heads: int = 4):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.W_Q = nn.Linear(dim, dim, bias=False)
+        self.W_K = nn.Linear(dim, dim, bias=False)
+        self.W_V = nn.Linear(dim, dim, bias=False)
+        self.W_O = nn.Linear(dim, dim, bias=False)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 2), nn.SiLU(), nn.Linear(dim * 2, dim)
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, D = x.shape
+        q = self.W_Q(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.W_K(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.W_V(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        attn = torch.softmax(
+            torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.head_dim), dim=-1
+        )
+        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, N, D)
+        out = self.W_O(out)
+        x = self.norm1(x + out)
+        x = self.norm2(x + self.ffn(x))
+        return x.mean(dim=1)
+
+
 class StateAlgebra:
 
     def __init__(self, dim: int = 2560, bottleneck: int = 256):
         self.dim = dim
         self.projector = Projector(dim, bottleneck)
+        self.cross_attn_block = CrossAttendBlock(dim)
+        self.translator = nn.Linear(dim * 2, dim, bias=False)
+        nn.init.xavier_uniform_(self.translator.weight)
 
     def sum(self, z_A: np.ndarray, z_B: np.ndarray) -> np.ndarray:
         z_a = torch.from_numpy(z_A).float().unsqueeze(0)
@@ -75,20 +111,28 @@ class StateAlgebra:
         return result.squeeze(0).numpy()
 
     def cross_attend(self, z_A: np.ndarray, z_B: np.ndarray) -> np.ndarray:
-        z_a = torch.from_numpy(z_A).float().unsqueeze(0)
-        z_b = torch.from_numpy(z_B).float().unsqueeze(0)
-        combined = torch.cat([z_a, z_b], dim=-1)
+        """
+        Cross-attention через полноценный TransformerBlock (§8.2).
 
-        attn_out = self._simple_cross_attention(z_a, z_b)
+        z_comp = Proj_M(TransformerBlock([z_A; z_B]))
+        """
+        z_a = torch.from_numpy(z_A).float().unsqueeze(0).unsqueeze(1)
+        z_b = torch.from_numpy(z_B).float().unsqueeze(0).unsqueeze(1)
+        combined = torch.cat([z_a, z_b], dim=1)
+        attn_out = self.cross_attn_block(combined)
         result = self.projector.project(attn_out)
         return result.squeeze(0).numpy()
 
-    def _simple_cross_attention(
-        self, A: torch.Tensor, B: torch.Tensor
-    ) -> torch.Tensor:
-        sim = torch.mm(A, B.T)
-        attn = torch.softmax(sim, dim=-1)
-        return torch.mm(attn, B)
+    def translate(self, z_A: np.ndarray, c_domain_B: np.ndarray) -> np.ndarray:
+        """
+        Cross-Domain Translation: z_{A→B} = Proj(Translator(z_A, c_domain_B)) (§8.2).
+        """
+        za = torch.from_numpy(z_A).float().unsqueeze(0)
+        cb = torch.from_numpy(c_domain_B).float().unsqueeze(0)
+        x = torch.cat([za, cb], dim=-1)
+        translated = self.translator(x)
+        result = self.projector.project(translated)
+        return result.squeeze(0).numpy()
 
     def compose(
         self,

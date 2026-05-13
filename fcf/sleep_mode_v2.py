@@ -248,16 +248,45 @@ class SleepModeV2:
             age = now - meta.get("timestamp", now)
             usage = meta.get("usage_count", 0)
             score = usage * np.exp(-0.1 * age / 86400)
+            was_deleted = False
+
             if usage == 0 and age > ttl:
+                self._record_deletion(meta, was_needed=False)
                 storage._remove(i)
                 removed += 1
+                was_deleted = True
             elif score < 0.01:
+                self._record_deletion(meta, was_needed=False)
                 storage._remove(i)
                 removed += 1
+                was_deleted = True
 
         if removed:
             logger.info(f"[Sleep] Удалено слепков: {removed}")
         return removed
+
+    def _record_deletion(self, meta: dict, was_needed: bool):
+        if self._forget_history is None:
+            self._forget_history = []
+        self._forget_history.append({
+            "context": meta.get("c", np.zeros(2560, dtype=np.float32)),
+            "usage": int(meta.get("usage_count", 0)),
+            "confidence": float(meta.get("confidence", 0.0)),
+            "age": float(time.time() - meta.get("timestamp", time.time())),
+            "was_needed": was_needed,
+        })
+
+    def mark_code_needed(self, code_vector: np.ndarray):
+        """Отметить что удалённый код позже потребовался (y=1 для ForgetfulnessGate)."""
+        if self._forget_history is None:
+            self._forget_history = []
+        self._forget_history.append({
+            "context": code_vector.flatten(),
+            "usage": 1,
+            "confidence": 0.8,
+            "age": 0.0,
+            "was_needed": True,
+        })
 
     def _cluster(self, layer) -> int:
         if len(layer.state_storage) < 5:

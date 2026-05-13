@@ -417,7 +417,9 @@ class LanguageTrainer:
             )
 
         except Exception as e:
+            import traceback
             logger.warning(f"[SRG] Ошибка: {type(e).__name__}: {e}")
+            logger.debug(traceback.format_exc())
 
         self.layer.train()
 

@@ -539,6 +539,29 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
     )
     trainer.start(check_interval=60.0)
 
+    import threading
+    training_active = [True]
+    training_thread = None
+
+    def _background_training():
+        from fcf.language_trainer import LanguageTrainer
+        lt = LanguageTrainer(layer=layer, tokenizer=tokenizer,
+                            checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "lazy"))
+        while training_active[0]:
+            try:
+                trainer.resource.set_generating()
+                lt.train(max_steps=100, device="cpu", use_wikipedia=True)
+                trainer.resource.set_idle()
+                save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
+                save_primordial_layer(layer, save_path)
+            except Exception as e:
+                logger.warning(f"[Lazy] Ошибка обучения: {e}")
+                time.sleep(10)
+
+    training_thread = threading.Thread(target=_background_training, daemon=True)
+    training_thread.start()
+    logger.info("[Lazy] Фоновое Wikipedia-обучение запущено")
+
     print()
     print("=" * 60)
     print("  FCF — Ленивое обучение активно")
@@ -546,7 +569,7 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
     print(f"  Слой: {layer.summary()}")
     print(f"  Доменов: {len(registry)}")
     print(f"  Автодообучение: проверка каждые 60с")
-    print(f"  Первая проверка: сразу после запуска")
+    print(f"  Wikipedia-обучение: ФОНОВОЕ (100 шагов/цикл)")
     print()
     print("  Команды:")
     print("    stats  — статистика")
@@ -614,6 +637,9 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
         if result.get("clarification_question"):
             print(f"    [?: {result['clarification_question']}]")
 
+    training_active[0] = False
+    if training_thread:
+        training_thread.join(timeout=5.0)
     trainer.stop()
     logger.info("Завершение.")
 def _load_or_create_tokenizer():

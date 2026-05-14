@@ -163,6 +163,8 @@ class SleepModeV2:
         self.adversarial = AdversarialValidator()
         self.dreamer = DreamGenerator()
 
+        self._forget_history: List[Dict] = []
+
         self.sleep_count = 0
         self.last_query_time = time.time()
         self.last_sleep_time = time.time()
@@ -223,7 +225,7 @@ class SleepModeV2:
         if hnsw_index:
             hnsw_index.defragment()
 
-        if self_improver is not None and hnsw_index is not None and self_improver._kca_engine is not None:
+        if self_improver is not None and hnsw_index is not None:
             old_codes = {}
             for layer in layers:
                 for i, meta in enumerate(layer.state_storage.snapshots_meta):

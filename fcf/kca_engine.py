@@ -248,8 +248,7 @@ class KCAEngine:
 
             z = z_new
             z_t = torch.from_numpy(z).float().requires_grad_(True)
-            for g in optimizer.param_groups:
-                g["lr"] = self.eta0 * (self.rho ** iteration)
+            optimizer = torch.optim.Adam([z_t], lr=self.eta0 * (self.rho ** (iteration + 1)))
 
         return z.astype(np.float32), float(confidence.item())
 
@@ -285,7 +284,12 @@ class KCAEngine:
             p_t = p_target.flatten().astype(np.float64)
             p_t = np.clip(p_t, 1e-10, 1.0)
             p_t = p_t / np.sum(p_t)
-            kl = np.sum(p_t * (np.log(p_t + 1e-10) - np.log(p_t + 1e-10)))
+            z_np = z.astype(np.float64)
+            log_softmax_z = z_np - np.max(z_np)
+            softmax_z = np.exp(log_softmax_z)
+            softmax_z = np.clip(softmax_z, 1e-10, 1.0)
+            softmax_z = softmax_z / np.sum(softmax_z)
+            kl = np.sum(p_t * (np.log(p_t + 1e-10) - np.log(softmax_z + 1e-10)))
             loss += self.lambda_kl * kl
 
         if graph_embeddings is not None and len(graph_embeddings) > 0:

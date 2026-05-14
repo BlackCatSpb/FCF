@@ -166,6 +166,8 @@ class InstructionTrainer:
             enqueue=True,
         )
 
+        try:
+
         logger.info("=" * 60)
         logger.info("Пункт 3 — Инструктивное дообучение")
         logger.info(f"Устройство: {device}")
@@ -293,6 +295,8 @@ class InstructionTrainer:
         )
 
         return stats
+        finally:
+            loguru_logger.remove(log_id)
 
     def _training_step(
         self, input_ids: torch.Tensor, labels: torch.Tensor

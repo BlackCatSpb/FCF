@@ -114,14 +114,14 @@ class LoRAAdapter(nn.Module):
         data: Dict[str, Dict[str, np.ndarray]],
         alpha: float = 1.0,
         ff_mult: int = 4,
+        d_model: int = 2560,
     ) -> "LoRAAdapter":
         first_name = list(data.keys())[0]
-        in_dim = data[first_name]["A"].shape[0]
-        rank = data[first_name]["A"].shape[1]
+        rank = data[first_name]["A"].shape[0]
         target_modules = list(data.keys())
 
         adapter = cls(
-            d_model=in_dim if in_dim <= 2560 else 2560,
+            d_model=d_model,
             rank=rank,
             alpha=alpha,
             target_modules=target_modules,

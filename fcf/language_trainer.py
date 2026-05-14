@@ -156,6 +156,8 @@ class LanguageTrainer:
             enqueue=True,
         )
 
+        try:
+
         logger.info("=" * 60)
         logger.info("Пункт 2 — Самообучение языку")
         logger.info(f"Устройство: {device}")
@@ -305,6 +307,8 @@ class LanguageTrainer:
         )
 
         return stats
+        finally:
+            loguru_logger.remove(log_id)
 
     def _training_step(
         self, input_ids: torch.Tensor, labels: torch.Tensor

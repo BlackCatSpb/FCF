@@ -641,7 +641,51 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
         training_thread.join(timeout=5.0)
     trainer.stop()
     logger.info("Завершение.")
-def _load_or_create_tokenizer():
+def cmd_fcf_system(config_path: str = None, checkpoint_path: str = None):
+    logger.info("=" * 60)
+    logger.info("FCFSystem — Полный когнитивный цикл")
+    logger.info("=" * 60)
+
+    from fcf.fcf_system import FCFSystem
+    fcf = FCFSystem()
+    fcf.bootstrap(checkpoint_path)
+    fcf.start_background(interval=300.0)
+
+    print()
+    print("=" * 60)
+    print(f"  FCFSystem active — {fcf.summary()}")
+    print("  Фоновый цикл: Sleep Mode каждые 300с")
+    print("  Команды: stats, exit")
+    print("=" * 60)
+    print()
+
+    while True:
+        try:
+            user_input = input(">>> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nShutting down...")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() == "exit":
+            break
+        if user_input.lower() == "stats":
+            s = fcf.stats()
+            for k, v in s.items():
+                print(f"  {k}: {v}")
+            continue
+
+        result = fcf.query(user_input)
+        print(f"\nEVA: {result.get('response', '?')}\n")
+        print(f"    [conf={result.get('confidence', 0):.3f}, "
+              f"domain={result.get('domain_id', '?')}, "
+              f"scenario={result.get('scenario', '?')}]")
+        if result.get('code_description'):
+            print(f"    [desc: {result['code_description'][:100]}]")
+
+    fcf.stop_background()
+    logger.info("FCFSystem stopped.")
     tokenizer_path = os.path.join(os.path.dirname(__file__), "tokenizer.json")
     if os.path.exists(tokenizer_path):
         try:
@@ -677,6 +721,7 @@ def main():
     parser.add_argument("--auto-tune", action="store_true", help="Автонастройка среды исполнения")
     parser.add_argument("--auto-train", action="store_true", help="Запустить фоновое автодообучение")
     parser.add_argument("--lazy-learn", action="store_true", help="Интерактивный режим + фоновое дообучение")
+    parser.add_argument("--fcf", action="store_true", help="FCFSystem — полный когнитивный цикл")
     parser.add_argument("--config", type=str, default=None, help="Путь к config.json")
     parser.add_argument("--checkpoint", type=str, default=None, help="Путь к чекпоинту для загрузки")
     parser.add_argument("--max-steps", type=int, default=None, help="Максимальное число шагов обучения")
@@ -752,6 +797,11 @@ def main():
         )
     elif args.lazy_learn:
         cmd_lazy_learn(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
+        )
+    elif args.fcf:
+        cmd_fcf_system(
             config_path=args.config,
             checkpoint_path=args.checkpoint,
         )

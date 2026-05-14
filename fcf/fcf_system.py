@@ -23,20 +23,19 @@ from loguru import logger
 
 
 class FCFSystem:
-    """
-    Единая система FCF v2.
-
-    Использование:
-        fcf = FCFSystem()
-        fcf.bootstrap(checkpoint_path)   # загрузить или инициализировать
-        result = fcf.query("Вопрос?")     # обработать запрос
-        fcf.start_background()            # запустить фоновые процессы
-    """
+    """Единая система FCF v2."""
 
     def __init__(self, config=None):
         from .config import load_config
+        from .environment_tuner import EnvironmentAutoTuner
+
         self.config = config or load_config()
-        self.device = "cpu"
+
+        tuner = EnvironmentAutoTuner()
+        tuner.discover()
+        self.device = tuner.get_training_device()
+        self._inference_device = tuner.get_inference_device()
+        tuner.apply()
 
         self.layer = None
         self.tokenizer = None
@@ -45,15 +44,29 @@ class FCFSystem:
         self.gmm = None
         self.hnsw = None
         self.kca = None
+        self.kca_scheduler = None
         self.srg_plus = None
         self.sleep_mode = None
         self.provenance = None
         self.curiosity = None
         self.state_algebra = None
+        self.cross_domain = None
+        self.minimal_code = None
+        self.federated = None
+        self.collaborative_srg = None
+        self.ensemble = None
+        self.multi_pass = None
+        self.context_compressor = None
+        self.self_improver = None
+        self.code_mutation_module = None
+        self.self_descriptive = None
 
-        self._background_thread: Optional[threading.Thread] = None
+        self._background_thread = None
         self._running = False
         self._query_count = 0
+        self._dialog_history = []
+
+        logger.info(f"[FCF] Device: train={self.device}, inference={self._inference_device}")
 
     def bootstrap(self, checkpoint_path: str = None):
         """
@@ -84,6 +97,8 @@ class FCFSystem:
         from .cross_domain import CrossDomainModule
         from .temporal_context import TemporalContextCompressor
         from .multi_pass import MultiPassGenerator, CodeEnsemble
+        from .code_mutation import CodeMutation, CodeDistillation
+        from .self_descriptive import SelfDescriptiveCodes
         from .extensions import (
             MinimalCodePrinciple, RecursiveSelfImprovement,
             ForgetfulnessGateTrainer, AdaptiveKCAScheduler,
@@ -142,6 +157,8 @@ class FCFSystem:
         self.multi_pass = MultiPassGenerator()
         self.context_compressor = TemporalContextCompressor(self.config.d_model)
         self.self_improver = RecursiveSelfImprovement()
+        self.code_mutation_module = CodeMutation()
+        self.self_descriptive = SelfDescriptiveCodes()
 
         logger.info(f"[7/9] KCA + SRG+ + Кросс-домен + SleepV2 готовы")
         logger.info(f"[8/9] Federated + Ensemble + MultiPass + ContextCompressor готовы")
@@ -286,17 +303,54 @@ class FCFSystem:
         result["domain_id"] = domain_id
         result["scenario"] = scenario
 
+        self._dialog_history.append({"role": "user", "text": text})
+        self._dialog_history.append({"role": "assistant", "text": result.get("response", "")[:200]})
+        if len(self._dialog_history) > 50:
+            self._dialog_history = self._dialog_history[-50:]
+
+        if self.hierarchy is not None:
+            try:
+                emb = self.layer.embed(self.layer._encode(self.tokenizer, text))
+                codes = self.hierarchy(emb)
+                result["z_sym_norm"] = float(np.linalg.norm(codes["z_sym"].cpu().numpy()))
+            except Exception:
+                pass
+
+        if self.state_algebra is not None and domain and len(self.gmm.gmms["word"]) > 1:
+            try:
+                centroids = [d.centroid for d in self.gmm.gmms["word"].domains.values()]
+                if len(centroids) >= 2:
+                    z_combined = self.state_algebra.cross_attend(
+                        centroids[0], centroids[1]
+                    )
+                    result["cross_domain_applied"] = True
+            except Exception:
+                pass
+
+        if self.self_descriptive is not None and domain_id:
+            try:
+                desc = self.self_descriptive.describe(
+                    code_id=f"q_{self._query_count}",
+                    layer=self.layer,
+                    tokenizer=self.tokenizer,
+                    domain_name=domain_id,
+                )
+                if desc:
+                    result["code_description"] = desc
+            except Exception:
+                pass
+
+        if domain:
+            self.curiosity.probe(domain, self.layer, self.tokenizer, self.srg_plus) if self.curiosity else None
+
         self._query_count += 1
 
         return result
 
     def _validate_and_save(self, c_vec, confidence, domain_id, scenario):
-        """Три критерия валидации перед сохранением кода."""
+        """Три критерия валидации перед сохранением кода (§6.3)."""
         if self.layer is None or self.layer.state_storage is None:
             return
-
-        usage_count = 1
-        meta = self.layer.meta
 
         if confidence < 0.8:
             return
@@ -304,14 +358,29 @@ class FCFSystem:
         if scenario == "exact_match":
             return
 
-        snapshot_idx = self.hnsw.search_snapshot(domain_id, c_vec)
-        if snapshot_idx:
+        snapshot_idx = self.hnsw.search_snapshot(domain_id, c_vec, top_k=1)
+        if snapshot_idx and snapshot_idx[0][1] > 0.95:
             return
 
         self.hnsw.add_snapshot(domain_id, c_vec)
 
         self.layer._eval_context_vector = c_vec
         self.layer.save_snapshot_if_confident(domain=domain_id)
+
+        if hasattr(self, 'code_mutation_module'):
+            code_mutator = self.code_mutation_module
+            if code_mutator.should_mutate():
+                z = c_vec.copy()
+                mutated, score, improved = code_mutator.mutate(z, lambda z, c: confidence)
+                if improved:
+                    self.hnsw.add_snapshot(domain_id, mutated)
+                    self.provenance.record(
+                        code_id=f"m_{self._query_count}",
+                        domain_id=domain_id, level="word",
+                        created_via="mutation",
+                        parent_codes=[f"q_{self._query_count - 1}"],
+                        final_srg=float(score),
+                    )
 
     def start_background(self, interval: float = 300.0):
         """Запустить фоновый цикл: Sleep Mode + Intrinsic Curiosity."""

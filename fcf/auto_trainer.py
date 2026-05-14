@@ -254,8 +254,29 @@ class AutoTrainer:
 
             for input_ids, labels in blocks[:2]:
                 x = self.layer.embed(input_ids)
-                hidden = self.layer.forward_transformer(x)
+
+                saved = {}
+                for name in adapter.target_modules:
+                    if hasattr(self.layer.transformer.attention, name):
+                        w = getattr(self.layer.transformer.attention, name)
+                        saved[name] = w.weight.data.clone()
+                        delta = adapter.get_delta(name).to(w.weight.device)
+                        w.weight.data = w.weight.data + delta
+                    elif hasattr(self.layer.transformer.ffn, name):
+                        w = getattr(self.layer.transformer.ffn, name)
+                        saved[name] = w.weight.data.clone()
+                        delta = adapter.get_delta(name).to(w.weight.device)
+                        w.weight.data = w.weight.data + delta
+
+                hidden = self.layer.transformer(x)
                 logits = self.layer.forward_logits(hidden)
+
+                for name, orig in saved.items():
+                    if hasattr(self.layer.transformer.attention, name):
+                        getattr(self.layer.transformer.attention, name).weight.data = orig
+                    elif hasattr(self.layer.transformer.ffn, name):
+                        getattr(self.layer.transformer.ffn, name).weight.data = orig
+
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),

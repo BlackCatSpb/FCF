@@ -26,30 +26,6 @@ class FractalLink:
     weight: float = 1.0
 
 
-class HNSWIndex:
-
-    def __init__(self, dim: int = 2560, pq_M: int = 8, temporal_lambda: float = 0.01):
-        self.dim = dim
-        self.pq_M = pq_M
-        self.temporal_lambda = temporal_lambda
-
-        self.level0: Dict[str, np.ndarray] = {}
-        self._level0_matrix: Optional[np.ndarray] = None
-        self._level0_ids: List[str] = []
-
-        self.level1: Dict[str, List[Tuple[np.ndarray, np.ndarray, float]]] = {}
-        self.level2: Dict[str, Dict[int, List[np.ndarray]]] = {}
-
-        self.fractal_links: Dict[str, FractalLink] = {}
-        self._reverse_links: Dict[str, List[str]] = {}
-
-        self.pq_codebook: Optional[PQCodebook] = None
-        self._pq_trained = False
-        self._pq_cache: Dict[str, np.ndarray] = {}
-
-        self._snapshot_count = 0
-
-
 @dataclass
 class PQCodebook:
     """
@@ -237,7 +213,7 @@ class HNSWIndex:
         if bucket not in self.level2[domain_id]:
             self.level2[domain_id][bucket] = []
 
-        self.level2[domain_id][bucket].append(compressed)
+        self.level2[domain_id][bucket].append((compressed, timestamp))
 
         self._pq_cache.pop(domain_id, None)
 
@@ -276,7 +252,11 @@ class HNSWIndex:
             bucket = (layer_idx // 8) * 8
             if bucket in self.level2[domain_id]:
                 for item in self.level2[domain_id][bucket]:
-                    candidates.append(item)
+                    if isinstance(item, tuple):
+                        candidates.append(item[0])
+                        timestamps.append(item[1])
+                    else:
+                        candidates.append(item)
 
         if not candidates and domain_id in self.level1:
             for _, compressed, ts in self.level1[domain_id]:

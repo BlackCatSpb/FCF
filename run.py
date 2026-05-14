@@ -733,6 +733,7 @@ def cmd_fcf_system(config_path: str = None, checkpoint_path: str = None):
 
     fcf.stop_background()
     logger.info("FCFSystem stopped.")
+def _load_or_create_tokenizer():
     tokenizer_path = os.path.join(os.path.dirname(__file__), "tokenizer.json")
     if os.path.exists(tokenizer_path):
         try:

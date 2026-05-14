@@ -184,6 +184,7 @@ class FractalHierarchy(nn.Module):
         if z_sent.dim() == 1:
             z_sent = z_sent.unsqueeze(0)
         z_text = self.text_agg(z_sent.unsqueeze(1))
+
         return {"z_sym": z_sym, "z_word": z_word, "z_sent": z_sent, "z_text": z_text}
 
     def hierarchy_loss(self, z_sym, z_word, z_sent) -> torch.Tensor:

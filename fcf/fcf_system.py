@@ -158,6 +158,7 @@ class FCFSystem:
         self.context_compressor = TemporalContextCompressor(self.config.d_model)
         self.self_improver = RecursiveSelfImprovement()
         self.code_mutation_module = CodeMutation()
+        self.code_distillation = CodeDistillation()
         self.self_descriptive = SelfDescriptiveCodes()
 
         logger.info(f"[7/9] KCA + SRG+ + Кросс-домен + SleepV2 готовы")
@@ -348,19 +349,30 @@ class FCFSystem:
         return result
 
     def _validate_and_save(self, c_vec, confidence, domain_id, scenario):
-        """Три критерия валидации перед сохранением кода (§6.3)."""
         if self.layer is None or self.layer.state_storage is None:
             return
-
         if confidence < 0.8:
             return
-
         if scenario == "exact_match":
             return
 
         snapshot_idx = self.hnsw.search_snapshot(domain_id, c_vec, top_k=1)
         if snapshot_idx and snapshot_idx[0][1] > 0.95:
             return
+
+        if hasattr(self, 'code_distillation'):
+            existing = [m["c"] for m in self.layer.state_storage.snapshots_meta[-50:]]
+            if existing:
+                distilled = self.code_distillation.try_distill(c_vec, existing)
+                if distilled:
+                    self.provenance.record(
+                        code_id=f"d_{self._query_count}",
+                        domain_id=domain_id, level="word",
+                        created_via="distillation",
+                        parent_codes=[f"q_{self._query_count}"],
+                        final_srg=float(confidence),
+                    )
+                    return
 
         self.hnsw.add_snapshot(domain_id, c_vec)
 
@@ -374,13 +386,6 @@ class FCFSystem:
                 mutated, score, improved = code_mutator.mutate(z, lambda z, c: confidence)
                 if improved:
                     self.hnsw.add_snapshot(domain_id, mutated)
-                    self.provenance.record(
-                        code_id=f"m_{self._query_count}",
-                        domain_id=domain_id, level="word",
-                        created_via="mutation",
-                        parent_codes=[f"q_{self._query_count - 1}"],
-                        final_srg=float(score),
-                    )
 
     def start_background(self, interval: float = 300.0):
         """Запустить фоновый цикл: Sleep Mode + Intrinsic Curiosity."""

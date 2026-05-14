@@ -185,6 +185,7 @@ class SleepModeV2:
         hierarchy=None,
         state_algebra=None,
         hnsw_index=None,
+        self_improver=None,
     ) -> Dict[str, Any]:
         logger.info(f"Sleep Mode #{self.sleep_count + 1} — v2")
 
@@ -223,6 +224,14 @@ class SleepModeV2:
 
         if hnsw_index:
             hnsw_index.defragment()
+
+        if self_improver is not None and hnsw_index is not None:
+            old_codes = {}
+            for layer in layers:
+                for i, meta in enumerate(layer.state_storage.snapshots_meta):
+                    old_codes[f"snap_{i}"] = (meta["c"], meta.get("confidence", 0.5))
+            improved = self_improver.improve(old_codes, None, None, None)
+            stats["codes_reevaluated"] = improved
 
         if self._forget_gate is not None and hasattr(self, '_forget_history'):
             from .extensions import ForgetfulnessGateTrainer

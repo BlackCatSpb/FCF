@@ -331,11 +331,22 @@ class LanguageTrainer:
         loss = loss_lm
 
         if self.hierarchy is not None:
-            codes = self.hierarchy(x)
-            h_loss = self.hierarchy.hierarchy_loss(
-                codes["z_sym"], codes["z_word"], codes["z_sent"]
-            )
-            loss = loss + self.lambda_hierarchy * h_loss
+            try:
+                codes = self.hierarchy(x)
+                h_loss = self.hierarchy.hierarchy_loss(
+                    codes["z_sym"], codes["z_word"], codes["z_sent"]
+                )
+                loss = loss + self.lambda_hierarchy * h_loss
+
+                if z_sym.shape[0] >= 2:
+                    is_sim = torch.tensor(1.0, device=x.device)
+                    c_loss = self.hierarchy.contrastive_loss(
+                        codes["z_sym"][0], codes["z_sym"][1],
+                        is_sim.unsqueeze(0)
+                    )
+                    loss = loss + self.lambda_contrastive * c_loss
+            except Exception:
+                pass
 
         loss.backward()
 

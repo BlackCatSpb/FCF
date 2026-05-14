@@ -238,8 +238,8 @@ class UnifiedStateGrammar:
 
         for i in range(min(len(valid_pairs), 50)):
             a, b, _ = valid_pairs[i % len(valid_pairs)]
-            noise_a = np.random.randn(*a.shape).astype(np.float32) * 100
-            noise_b = np.random.randn(*b.shape).astype(np.float32) * 100
+            noise_a = np.random.randn(*a.shape).astype(np.float32) * 0.05
+            noise_b = np.random.randn(*b.shape).astype(np.float32) * 0.05
             invalid_pairs.append((noise_a, noise_b, np.zeros_like(a)))
 
         optimizer = torch.optim.Adam(params, lr=lr)
@@ -263,9 +263,9 @@ class UnifiedStateGrammar:
                 zbi = torch.from_numpy(b_i).float().unsqueeze(0)
                 zci = torch.from_numpy(c_v).float().unsqueeze(0)
 
-                _, inv_score = self.validator.validate(zai, zbi, zci)
+                val_score, _ = self.validator.validate(zai, zbi, zci)
                 loss_val = F.binary_cross_entropy(
-                    torch.tensor([[inv_score]], device=za.device),
+                    torch.tensor([[val_score]], device=za.device),
                     torch.tensor([[0.0]], device=za.device))
 
                 loss = loss_mse + 0.1 * loss_val

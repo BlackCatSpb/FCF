@@ -222,6 +222,12 @@ class KCAEngine:
                 + 0.5 * (torch.tensor(float(sim), device=device) - target_sim) ** 2
             )
 
+            if hasattr(self, 'lambda_contra') and graph_embeddings is not None:
+                pass
+
+            entropy_loss = 0.1 * entropy / max_ent
+            loss = loss + self.lambda_mono * entropy_loss
+
             loss.backward()
             optimizer.step()
 

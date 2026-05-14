@@ -393,13 +393,13 @@ class FCFSystem:
             while self._running:
                 try:
                     if self.sleep_mode.should_sleep():
-                    self.sleep_mode.execute(
-                        layers=[self.layer],
-                        gmm=self.gmm,
-                        hnsw_index=self.hnsw,
-                        state_algebra=self.state_algebra,
-                        self_improver=self.self_improver,
-                    )
+                        self.sleep_mode.execute(
+                            layers=[self.layer],
+                            gmm=self.gmm,
+                            hnsw_index=self.hnsw,
+                            state_algebra=self.state_algebra,
+                            self_improver=self.self_improver,
+                        )
                     time.sleep(interval)
                 except Exception as e:
                     logger.warning(f"[FCF] Ошибка фона: {e}")

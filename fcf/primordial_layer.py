@@ -218,7 +218,7 @@ class PrimordialLayer(nn.Module):
         self._eval_text = response_text
 
         if hasattr(self.transformer, 'get_kv_state'):
-            self._eval_K, self._eval_V = self.transformer.get_kv_state(response_ids)
+            self._eval_K, self._eval_V = self.transformer.get_kv_state(x)
         else:
             self._eval_K = np.zeros((self.config.num_heads, self.config.head_dim), dtype=np.float32)
             self._eval_V = np.zeros((self.config.num_heads, self.config.head_dim), dtype=np.float32)

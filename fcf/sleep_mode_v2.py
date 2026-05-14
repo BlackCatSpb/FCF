@@ -158,9 +158,7 @@ class SleepModeV2:
         self.ttl_idle_days = ttl_idle_days
         self.tic = time.time()
 
-        self._forget_gate: Optional[ForgetfulnessGate] = None
-        self._forget_optimizer: Optional[torch.optim.AdamW] = None
-        self._forget_history: List[Dict] = []
+        self._forget_gate: ForgetfulnessGate = ForgetfulnessGate()
 
         self.adversarial = AdversarialValidator()
         self.dreamer = DreamGenerator()
@@ -225,15 +223,18 @@ class SleepModeV2:
         if hnsw_index:
             hnsw_index.defragment()
 
-        if self_improver is not None and hnsw_index is not None:
+        if self_improver is not None and hnsw_index is not None and self_improver._kca_engine is not None:
             old_codes = {}
             for layer in layers:
                 for i, meta in enumerate(layer.state_storage.snapshots_meta):
                     old_codes[f"snap_{i}"] = (meta["c"], meta.get("confidence", 0.5))
-            improved = self_improver.improve(old_codes, None, None, None)
-            stats["codes_reevaluated"] = improved
+            try:
+                improved = self_improver.improve(old_codes, None, None, None)
+                stats["codes_reevaluated"] = improved
+            except Exception:
+                pass
 
-        if self._forget_gate is not None and hasattr(self, '_forget_history'):
+        if self._forget_gate is not None and self._forget_history:
             from .extensions import ForgetfulnessGateTrainer
             trainer = ForgetfulnessGateTrainer(self._forget_gate)
             for record in self._forget_history:

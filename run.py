@@ -543,19 +543,18 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
     training_active = [True]
     training_thread = None
 
+    from fcf.language_trainer import LanguageTrainer
+    lt = LanguageTrainer(layer=layer, tokenizer=tokenizer,
+                        checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "lazy"))
+
     def _background_training():
-        from fcf.language_trainer import LanguageTrainer
-        lt = LanguageTrainer(layer=layer, tokenizer=tokenizer,
-                            checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "lazy"))
         while training_active[0]:
             try:
-                trainer.resource.set_generating()
-                lt.train(max_steps=100, device="cpu", use_wikipedia=True)
-                trainer.resource.set_idle()
+                lt.train(max_steps=500, device="cpu", use_wikipedia=True)
                 save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
                 save_primordial_layer(layer, save_path)
             except Exception as e:
-                logger.warning(f"[Lazy] Ошибка обучения: {e}")
+                logger.warning(f"[Lazy] Ошибка: {e}")
                 time.sleep(10)
 
     training_thread = threading.Thread(target=_background_training, daemon=True)

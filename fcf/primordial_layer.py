@@ -179,10 +179,8 @@ class PrimordialLayer(nn.Module):
             try:
                 x_norm = self.transformer.norm1(x)
                 B, T, C = x_norm.shape
-                K = self.transformer.attention.W_K(x_norm).view(
-                    B, T, self.config.num_heads, self.config.head_dim
-                )
-                K_mean = K.mean(dim=2).mean(dim=1)
+                K = self.transformer.attention.W_K(x_norm)
+                K_mean = K.mean(dim=1)
                 return K_mean.squeeze(0).cpu().numpy()
             except Exception:
                 hidden = self.transformer(x)

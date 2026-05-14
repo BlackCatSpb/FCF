@@ -161,7 +161,10 @@ class FCFSystem:
         self.code_distillation = CodeDistillation()
         self.self_descriptive = SelfDescriptiveCodes()
 
-        logger.info(f"[7/9] KCA + SRG+ + Кросс-домен + SleepV2 готовы")
+        from .unified_grammar import UnifiedStateGrammar
+
+        self.state_grammar = UnifiedStateGrammar(self.config.d_model)
+        logger.info(f"[Grammar] UnifiedStateGrammar: 41 механизм")
         logger.info(f"[8/9] Federated + Ensemble + MultiPass + ContextCompressor готовы")
         logger.info(f"[9/9] MinimalCode + SelfImprovement + Curiosity готовы")
 
@@ -301,7 +304,17 @@ class FCFSystem:
         if self.curiosity and domain:
             self.curiosity.probe(domain, self.layer, self.tokenizer, self.srg_plus)
 
-        result["domain_id"] = domain_id
+        if self.state_grammar is not None:
+            try:
+                grammar_result = self.state_grammar.compose(
+                    c_norm, c_query, c_norm,
+                    label_a="query", label_b="context"
+                )
+                result["composition_validity"] = grammar_result.validity
+                result["composition_delta_I"] = grammar_result.delta_I
+                result["composition_creativity"] = grammar_result.creativity
+            except Exception:
+                pass
         result["scenario"] = scenario
 
         self._dialog_history.append({"role": "user", "text": text})
@@ -398,12 +411,13 @@ class FCFSystem:
             while self._running:
                 try:
                     if self.sleep_mode.should_sleep():
-                        self.sleep_mode.execute(
-                            layers=[self.layer],
-                            gmm=self.gmm,
-                            hnsw_index=self.hnsw,
-                            state_algebra=self.state_algebra,
-                        )
+                    self.sleep_mode.execute(
+                        layers=[self.layer],
+                        gmm=self.gmm,
+                        hnsw_index=self.hnsw,
+                        state_algebra=self.state_algebra,
+                        self_improver=self.self_improver,
+                    )
                     time.sleep(interval)
                 except Exception as e:
                     logger.warning(f"[FCF] Ошибка фона: {e}")

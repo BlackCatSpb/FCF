@@ -83,6 +83,10 @@ class StateValenceV2(nn.Module):
             z = z * 0.5 + np.random.randn(*z.shape).astype(np.float32) * 0.01
         return z
 
+    def forward(self, z: torch.Tensor, intensity: float = 0.5) -> Tuple[torch.Tensor, torch.Tensor]:
+        alpha = torch.sigmoid(self.scorer(torch.cat([z, torch.full((z.shape[0], 2), intensity, device=z.device)], dim=-1))[:, 0:1])
+        return z * alpha, alpha
+
 
 # ============================================================
 # 2. TEMPORAL — skip-connections, forget gate, attention over history

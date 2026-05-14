@@ -338,7 +338,7 @@ class LanguageTrainer:
                 )
                 loss = loss + self.lambda_hierarchy * h_loss
 
-                if z_sym.shape[0] >= 2:
+                if codes["z_sym"].shape[0] >= 2:
                     is_sim = torch.tensor(1.0, device=x.device)
                     c_loss = self.hierarchy.contrastive_loss(
                         codes["z_sym"][0], codes["z_sym"][1],

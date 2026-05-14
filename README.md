@@ -343,4 +343,111 @@ python -m fcf.checkpoint_comparator
 
 ---
 
+## Суть ключевых методов
+
+### Ядро: PrimordialLayer
+
+**`get_context_vector(input_ids)`** — §6.1 спецификации. Вычисляет контекстный вектор `c_query` из Key-проекции первого слоя трансформера. В отличие от стандартного подхода (последнее скрытое состояние), здесь `c = mean(W_K(norm1(embed(x))))`. Ключи внимания кодируют «о чём спрашивает» каждый токен — усреднение даёт семантическую сигнатуру всего запроса. Именно этот вектор используется для поиска в HNSW и маршрутизации доменов.
+
+**`generate(input_ids, max_tokens, temperature, top_k, top_p)`** — Авторегрессионная генерация. На каждом шаге: embed → transformer → lm_head → logits → temperature scaling → top-k фильтрация → top-p (nucleus) фильтрация → multinomial sampling. Цикл до max_tokens или EOS.
+
+**`process_query(query, tokenizer)`** — Полный пайплайн обработки запроса. Токенизация → генерация → SRG-оценка → сохранение слепка в FAISS → поиск домена → активация CuriosityLoop при низкой уверенности. Возвращает response, confidence, similarity, ethics_score, growth_signal.
+
+**`evaluate_response(query_ids, response_ids, response_text)`** — Вычисляет SRG-метрики: семантическое сходство (cos между c_query и c_response), энтропийную уверенность (1 - H(p)/log₂(V) из логитов последнего токена), этический скор (EthicsFilter). Сохраняет K,V-тензоры последнего токена для FAISS-слепка.
+
+**`save_snapshot_if_confident(domain)`** — Сохраняет текущее состояние в FAISS если confidence ≥ 0.8. Хранит: L2-нормированный контекстный вектор, K,V-тензоры последнего токена, confidence, domain, timestamp, usage_count.
+
+### Хранилище: StateStorage + HNSW
+
+**`StateStorage.add(c, K, V, confidence, domain)`** — L2-нормирует контекстный вектор, добавляет в FAISS IndexFlatIP, сохраняет метаданные. При переполнении (max_snapshots) удаляет самый старый слепок.
+
+**`StateStorage.search(c_query, threshold)`** — FAISS inner product search (эквивалентно cosine после нормировки). Возвращает индекс ближайшего слепка если distance ≥ threshold, иначе -1. Инкрементирует usage_count найденного слепка.
+
+**`HNSWIndex.add_domain(domain_id, centroid)`** — Добавляет центроид домена на Уровень 0 (глобальный). Перестраивает матрицу центроидов для batch cosine search.
+
+**`HNSWIndex.add_snapshot(domain_id, vector, layer_idx)`** — Добавляет вектор на Уровень 1 (доменный) и Уровень 2 (слоевой). Если PQ обучен — сжимает вектор в M байт (сжатие 4x). Сохраняет timestamp для Temporal Decay.
+
+**`HNSWIndex.search_domain(c_query)`** — Batch cosine similarity между c_query и всеми центроидами доменов. Возвращает ID ближайшего домена. O(D) по числу доменов.
+
+**`HNSWIndex.search_snapshot(domain_id, c_query, layer_idx, top_k)`** — Поиск ближайшего слепка в домене. Сначала Уровень 2 (слой-специфичный), затем Уровень 1 (весь домен). Применяет Temporal Decay: `similarity *= exp(-λ·age/86400)`. С PQ: декодирует сжатые коды и вычисляет cosine similarity. Без PQ: прямой dot product с нормированными векторами.
+
+**`PQCodebook.train(vectors, M, n_iter)`** — Обучает Product Quantization. Разбивает d-мерный вектор на M подвекторов. Для каждого подпространства: K-Means с 256 центроидами. Результат: codebook размера (256, M, d/M). Кодирование: вектор → M байт (индексы центроидов).
+
+### Самооценка: SRG + Ethics
+
+**`SemanticRelevanceGate.evaluate(c_query, c_response, logits, response_text)`** — Вычисляет `confidence = w_sim·similarity + w_ent·entropy_score + w_eth·ethics_score`. Если ethics_score < 0.3 — безусловное отклонение (0.0). Возвращает confidence ∈ [0, 1].
+
+**`SemanticRelevanceGate.evaluate_full(...)`** — Расширенная версия: возвращает confidence, similarity, entropy_score, ethics_score, axiom_scores (по каждой из 5 аксиом).
+
+**`EthicsFilter.evaluate(text)`** — Проверяет текст по 4 категориям паттернов: HARM (насилие, террор, дискриминация), PRIVACY (карты, телефоны, email), DISHONESTY (ложная уверенность), USELESS (пустые ответы). Каждое совпадение: -0.2. Возвращает общий скор и словарь по аксиомам.
+
+**`SRGAnomalyDetector.check(code_id, score)`** — Z-score детектор аномалий. Если |score - global_mean| / global_std > 2.5 — код помечается как подозрительный. Защищает от кодов, которые «обманывают» SRG.
+
+**`MetaSRG.get_trend()`** — Анализирует тренд уверенности: сравнивает среднее первой и второй половины окна из 50 последних оценок. Если падение > 0.05 — сигнал к диагностике.
+
+**`CodeUncertainty.get_kca_depth(code_id)`** — Адаптивное планирование глубины KCA. Если variance > 0.1 → +2 итерации (глубже). Если > 0.05 → стандарт. Иначе → -1 итерация (быстрее).
+
+### Коррекция: KCA Engine
+
+**`KCAEngine.refine(z_init, c_query, c_target, graph_embeddings, p_target)`** — Аналитический KCA. Итеративно обновляет латентный код градиентным спуском: `z_{t+1} = z_t - η_t·∇_z L_KCA(z_t)`. Функция потерь: `L = -λ_gap·SRG_conf + λ_kl·D_KL(p||p_target) + λ_contra·||z - g_emb||² + λ_mono·max(0, prev_srg - current_srg)`. Адаптивное демпфирование: η_t = η₀·ρ^t.
+
+**`KCAEngine.refine_through_llm(z_init, layer, tokenizer, prompt)`** — KCA через реальный forward pass модели. Создаёт оптимизатор Adam над z. На каждой итерации: z → (опционально AtomicBasis.decode) → модификация весов → forward pass → вычисление confidence → loss → backward → обновление z. Пересоздаёт оптимизатор при каждой итерации для корректного шага обучения.
+
+**`ConvergenceController.check(X_current, X_prev, gamma_mean, step_idx)`** — 4-этапный протокол сходимости:
+1. Gate saturation: если γ < 0.05 дважды → SATURATED (модель отвергает коррекцию)
+2. Oscillation: если cos(∇_t, ∇_{t-1}) < -0.5 → усреднение последних 3 состояний
+3. Hard limit: step ≥ max_cycles → MAX_CYCLES
+4. Иначе → CONTINUE
+
+### Рост и домены: GMM + GrowthController
+
+**`StreamingGMM.classify(vector)`** — Вычисляет likelihood(vector | domain) для каждого домена через многомерное нормальное распределение. Если max likelihood < birth_threshold → None (нужен новый домен).
+
+**`StreamingGMM.add_or_update(vector, inherit_from)`** — Классифицирует вектор: если найден домен → обновляет центроид (EMA: μ = μ + α·diff) и ковариацию. Если не найден → создаёт новый домен. При inherit_from: центроид = 0.7·vector + 0.3·parent.centroid.
+
+**`StreamingGMM.merge_similar()`** — Попарно вычисляет симметричную KL-дивергенцию. Если KL < merge_threshold → объединяет домены: усредняет центроиды и ковариации с весами пропорционально числу векторов.
+
+**`GrowthController.evaluate(meta, gradient_norm, recursion_exhausted)`** — Принимает решение о росте. EXPAND_WIDTH: avg_confidence < 0.5 И gradient_norm > 1.0. EXPAND_DEPTH: avg_confidence < 0.3 И patience исчерпана И рекурсия не помогла. TRY_RECURSION: avg_confidence < 0.3 без исчерпания рекурсии.
+
+### Грамматика состояний: UnifiedStateGrammar
+
+**`UnifiedStateGrammar.compose(z_a, z_b, z_context, label_a, label_b, alpha_a, alpha_b)`** — Полная композиция через все 41 механизм. Порядок: Valence модуляция → ContextualComposer → Validator → 20+ метрик (delta_I, tversky, mutual_info, contradictory, excluded_middle, self_ref, russell, causal_necessity, epistemic, temporal_coherence, resonance, frontier, metaphor, ethics, emotion, creativity, narrative_arc, counterfactual). Возвращает CompositionResult с 20+ полями.
+
+**`UnifiedStateGrammar.analyze(state_sequence, context)`** — Анализ последовательности: TemporalChain coherence, entropy_rate, transition_entropy, NarrativeCoherence arc_type, EmotionalValence arc, TopologicalPersistence diagram, FractalSelfConsistency dimension.
+
+**`UnifiedStateGrammar.discover(training_data, epochs, lr)`** — Обнаруживает правила композиции из данных. Обучает ContextualComposer через MSE между предсказанной и реальной композицией. Обучает Validator через BCE на валидных/невалидных парах. Возвращает финальный loss.
+
+**`UnifiedStateGrammar.validate_rules(test_data)`** — Сравнивает MSE грамматической композиции против baseline (простая сумма). Возвращает improvement = (MSE_baseline - MSE_grammar) / MSE_baseline.
+
+### Обучение: LanguageTrainer
+
+**`LanguageTrainer.train(text_file, max_steps, block_size, device, use_wikipedia)`** — Основной цикл обучения. При use_wikipedia: потоковая загрузка статей через HuggingFace datasets, токенизация на лету. При text_file: предварительная токенизация корпуса. Каждые 100 шагов: SRG-оценка. Каждые 1000: сохранение чекпоинта + generation test + grammar discovery. Каждые 500: auto-benchmark в JSON.
+
+**`LanguageTrainer._training_step(input_ids, labels)`** — Один шаг обучения. Forward pass → cross-entropy loss → + λ_hierarchy·L_hierarchy (если hierarchy задан) → + λ_contrastive·L_contrastive (если batch ≥ 2) → backward → gradient clipping → optimizer.step().
+
+**`LanguageTrainer._grammar_discovery_step()`** — Grammar-guided training. Из последних 50 FAISS-слепков формирует обучающие пары (c_i, c_{i+1}, (c_i + c_{i+1})/2). Вызывает grammar.discover() на 10 эпохах. Интегрирует symbolic reasoning в neural training.
+
+**`LanguageTrainer._auto_benchmark()`** — Сохраняет метрики (step, avg_confidence, snapshots, loss) в `logs/benchmark_history.json`. Кумулятивная история прогресса обучения.
+
+### Сон: SleepModeV2
+
+**`SleepModeV2.execute(layers, gmm, hnsw_index, state_algebra, self_improver)`** — Полный цикл консолидации: удаление устаревших слепков (temporal decay) → кластеризация (KMeans) → слияние GMM-доменов (KL-дивергенция) → Dream Mode (генерация синтетических кодов через StateAlgebra) → ForgetfulnessGate обучение → дефрагментация HNSW → RecursiveSelfImprovement (переоценка старых кодов).
+
+**`DreamGenerator.dream(existing_codes, state_algebra, srg_evaluator)`** — Генерирует синтетические коды через случайные операции StateAlgebra (sum, scale, subtract, cross_attend). Каждый проверяется быстрой SRG-аппроксимацией. Принятые (score ≥ 0.7) добавляются в домены.
+
+**`AdversarialValidator.validate(code_vector, srg_fn, context)`** — Генерирует num_attacks возмущённых версий контекста (noise_scale × N(0,1)). Код считается робастным если ≥ 80% атак пройдено.
+
+### Когнитивный цикл: FCFSystem
+
+**`FCFSystem.bootstrap(checkpoint_path)`** — 9-шаговая инициализация. 1: слой (загрузка/создание). 2: токенизатор. 3: AtomicBasis (SVD при наличии чекпоинта). 4: FractalHierarchy. 5: MultiLevelGMM. 6: HNSWIndex. 7: KCA + SRG+ + SleepV2 + Grammar. 8: Federated + Ensemble + MultiPass + ContextCompressor. 9: MinimalCode + SelfImprovement + Curiosity. Плюс Progressive Bootstrapping: SVD-разложение обученной модели, извлечение коэффициентов c_i.
+
+**`FCFSystem.query(text, max_tokens)`** — Полный 3-фазный когнитивный цикл.
+- Фаза 1 (Perception): токенизация → c_query (Key-векторы) → HNSW Level 0 (поиск домена) → 3 сценария (exact_match/partial_match/cold_start) → HNSW Level 1 (поиск слепка).
+- Фаза 2 (Genesis & KCA): генерация ответа → SRG-оценка → если confidence < 0.5: AtomicBasis.decode (модификация весов) → KCA refine_through_llm → если улучшило confidence → перегенерация ответа.
+- Фаза 3 (Execution & Memory): валидация (confidence ≥ 0.8 + similarity > 0.95) → Code Distillation (выразим через существующие?) → Code Mutation (5%) → сохранение в HNSW + GMM → Code Provenance → StateGrammar composition → SelfDescriptiveCodes.
+
+**`FCFSystem._validate_and_save(c_vec, confidence, domain_id, scenario)`** — 3-критериальная валидация: confidence ≥ 0.8, сценарий не exact_match, similarity с существующим < 0.95. При прохождении: CodeDistillation (проверка выразимости), CodeMutation (5% шанс улучшения), сохранение в HNSW и FAISS.
+
+---
+
 *FCF — Fractal Cognitive Fabric. Единая Вычислительная Архитектура. v2.0*

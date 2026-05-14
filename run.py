@@ -544,8 +544,13 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
     training_thread = None
 
     from fcf.language_trainer import LanguageTrainer
+    from fcf.unified_grammar import UnifiedStateGrammar
+
+    grammar = UnifiedStateGrammar(layer.config.d_model)
+
     lt = LanguageTrainer(layer=layer, tokenizer=tokenizer,
-                        checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "lazy"))
+                         checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "lazy"),
+                         state_grammar=grammar, benchmark_interval=500)
 
     def _background_training():
         while training_active[0]:
@@ -571,10 +576,13 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
     print(f"  Wikipedia-обучение: ФОНОВОЕ (100 шагов/цикл)")
     print()
     print("  Команды:")
-    print("    stats  — статистика")
-    print("    train  — обучение на Wikipedia (5000 шагов)")
-    print("    save   — сохранить чекпоинт")
-    print("    exit   — выход")
+    print("    stats    — статистика обучения")
+    print("    train    — Wikipedia (5000 шагов)")
+    print("    grammar  — визуализация грамматики")
+    print("    discover — запуск rule discovery")
+    print("    bench    — бенчмарк истории")
+    print("    save     — сохранить чекпоинт")
+    print("    exit     — выход")
     print("=" * 60)
     print()
 
@@ -586,6 +594,45 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
             break
 
         if not user_input:
+            continue
+
+        if user_input.lower() == "exit":
+            break
+
+        if user_input.lower() == "save":
+            save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
+            save_primordial_layer(layer, save_path)
+            print(f"Сохранено в {save_path}")
+            continue
+
+        if user_input.lower() == "grammar":
+            print(grammar.visualize())
+            continue
+
+        if user_input.lower() == "discover":
+            meta = layer.state_storage.snapshots_meta
+            if len(meta) < 10:
+                print("Нужно минимум 10 слепков для discovery")
+                continue
+            pairs = []
+            for i in range(0, len(meta) - 2, 2):
+                pairs.append((meta[i]["c"], meta[i+1]["c"],
+                             (meta[i]["c"] + meta[i+1]["c"]) * 0.5))
+            result = grammar.discover(pairs, epochs=20)
+            print(f"Discovery: loss={result.get('discovery_loss', 0):.4f}")
+            v = grammar.validate_rules(pairs)
+            print(f"Validation: improvement={v.get('improvement', 0):.2%}")
+            continue
+
+        if user_input.lower() == "bench":
+            history = lt.benchmark_history
+            if not history:
+                print("История бенчмарков пуста")
+                continue
+            print(f"Benchmark history ({len(history)} записей):")
+            for b in history[-10:]:
+                print(f"  step={b['step']:6d} conf={b['avg_confidence']:.3f} "
+                      f"snap={b['snapshots']} loss={b['loss_recent']:.4f}")
             continue
 
         if user_input.lower() == "exit":

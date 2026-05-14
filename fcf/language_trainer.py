@@ -35,9 +35,11 @@ class LanguageTrainer:
         config: FCFConfig = None,
         checkpoint_dir: str = None,
         hierarchy=None,
+        state_grammar=None,
         lambda_contrastive: float = 0.1,
         lambda_hierarchy: float = 0.05,
         lambda_recursive: float = 0.01,
+        benchmark_interval: int = 0,
     ):
         self.layer = layer
         self.tokenizer = tokenizer
@@ -48,9 +50,12 @@ class LanguageTrainer:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         self.hierarchy = hierarchy
+        self.state_grammar = state_grammar
         self.lambda_contrastive = lambda_contrastive
         self.lambda_hierarchy = lambda_hierarchy
         self.lambda_recursive = lambda_recursive
+        self.benchmark_interval = benchmark_interval
+        self.benchmark_history: List[Dict] = []
 
         self.optimizer = torch.optim.AdamW(
             self.layer.parameters(),
@@ -155,8 +160,6 @@ class LanguageTrainer:
             encoding="utf-8",
             enqueue=True,
         )
-
-        try:
 
         logger.info("=" * 60)
         logger.info("Пункт 2 — Самообучение языку")
@@ -286,6 +289,12 @@ class LanguageTrainer:
                 self._save_checkpoint()
                 self._generation_test()
 
+                if self.state_grammar is not None and self.step > 100:
+                    self._grammar_discovery_step()
+
+                if self.benchmark_interval > 0 and self.step % self.benchmark_interval == 0:
+                    self._auto_benchmark()
+
             if (
                 self.step >= self.stop_window
                 and self.step % (self.srg_eval_interval * 5) == 0
@@ -307,8 +316,6 @@ class LanguageTrainer:
         )
 
         return stats
-        finally:
-            loguru_logger.remove(log_id)
 
     def _training_step(
         self, input_ids: torch.Tensor, labels: torch.Tensor
@@ -485,6 +492,50 @@ class LanguageTrainer:
             "usage_count": self.layer.meta.usage_count,
             "stop_reason": self.stop_reason,
         }
+
+    def _grammar_discovery_step(self):
+        """Grammar-guided training: обнаруживает правила композиции из недавних слепков."""
+        try:
+            meta = self.layer.state_storage.snapshots_meta
+            if len(meta) < 10:
+                return
+            recent = meta[-50:]
+            pairs = []
+            for i in range(0, len(recent) - 2, 2):
+                pairs.append((
+                    recent[i]["c"], recent[i + 1]["c"],
+                    (recent[i]["c"] + recent[i + 1]["c"]) * 0.5
+                ))
+            if pairs:
+                result = self.state_grammar.discover(pairs, epochs=10)
+                logger.info(
+                    f"[Grammar] step={self.step}: "
+                    f"discovery_loss={result.get('discovery_loss', 0):.4f}"
+                )
+        except Exception as e:
+            logger.debug(f"[Grammar] step error: {e}")
+
+    def _auto_benchmark(self):
+        """Авто-бенчмарк: сохраняет метрики качества."""
+        try:
+            meta = self.layer.state_storage.snapshots_meta
+            bench = {
+                "step": self.step,
+                "avg_confidence": self.layer.meta.average_confidence(),
+                "snapshots": len(meta),
+                "loss_recent": self.total_loss,
+                "timestamp": time.time(),
+            }
+            self.benchmark_history.append(bench)
+
+            path = os.path.join(
+                os.path.dirname(__file__), "..", "logs", "benchmark_history.json"
+            )
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(self.benchmark_history[-100:], f, indent=2)
+        except Exception:
+            pass
 
     def _tokenize_wiki_block(self, wiki_iter, block_size, device):
         try:

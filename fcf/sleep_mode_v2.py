@@ -275,8 +275,6 @@ class SleepModeV2:
         return removed
 
     def _record_deletion(self, meta: dict, was_needed: bool):
-        if self._forget_history is None:
-            self._forget_history = []
         self._forget_history.append({
             "context": meta.get("c", np.zeros(2560, dtype=np.float32)),
             "usage": int(meta.get("usage_count", 0)),

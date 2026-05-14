@@ -142,7 +142,16 @@ class FCFSystem:
         self.hnsw = HNSWIndex(dim=self.config.d_model, pq_M=8)
         logger.info(f"[6/9] HNSWIndex готов")
 
-        self.kca = KCAEngine(hidden_dim=self.config.d_model)
+        self.kca = KCAEngine(
+            hidden_dim=self.config.d_model,
+            max_iterations=self.config.kca.max_iterations,
+            rho=self.config.kca.rho,
+            eta0=self.config.kca.eta0,
+            lambda_gap=self.config.kca.lambda_gap,
+            lambda_contra=self.config.kca.lambda_contra,
+            lambda_kl=self.config.kca.lambda_kl,
+            lambda_mono=self.config.kca.lambda_mono,
+        )
         self.kca_scheduler = AdaptiveKCAScheduler()
         self.srg_plus = SRGPlus()
         self.sleep_mode = SleepModeV2()
@@ -160,6 +169,8 @@ class FCFSystem:
         self.code_mutation_module = CodeMutation()
         self.code_distillation = CodeDistillation()
         self.self_descriptive = SelfDescriptiveCodes()
+
+        logger.info(f"[7/9] KCA + SRG+ + SleepV2 + Grammar готовы")
 
         from .unified_grammar import UnifiedStateGrammar
 
@@ -270,15 +281,26 @@ class FCFSystem:
                 self.config.d_model
             ).astype(np.float32)
 
-            p_target = None
-            if domain:
-                p_target = domain.centroid.copy()
+            if self.atomic_basis is not None:
+                try:
+                    coeffs = self.atomic_basis.encode(self.layer, "W_Q")
+                    delta = self.atomic_basis.decode(coeffs, "W_Q")
+                    for name in ["W_Q", "W_K", "W_V", "W_O"]:
+                        try:
+                            c = self.atomic_basis.encode(self.layer, name)
+                            d = self.atomic_basis.decode(c, name)
+                            if hasattr(self.layer.transformer.attention, name):
+                                w = getattr(self.layer.transformer.attention, name)
+                                w.weight.data = w.weight.data + torch.from_numpy(d).float().to(w.weight.device)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             kca_depth = self.kca_scheduler.get_depth(
                 confidence,
                 domain.average_confidence() if domain else 0.5,
             )
-
             self.kca.convergence.max_cycles = kca_depth
 
             z_opt, kca_conf = self.kca.refine_through_llm(
@@ -286,9 +308,22 @@ class FCFSystem:
             )
             kca_applied = True
             kca_confidence = float(kca_conf)
+
+            if kca_conf > confidence:
+                result = self.layer.process_query(
+                    text, self.tokenizer, max_new_tokens=max_tokens
+                )
+                confidence = result["confidence"]
+
             result["kca_applied"] = True
             result["kca_confidence"] = kca_confidence
             result["kca_depth"] = kca_depth
+
+            if self.atomic_basis is not None:
+                try:
+                    self.atomic_basis.restore_original(self.layer) if hasattr(self.atomic_basis, 'restore_original') else None
+                except Exception:
+                    pass
 
         self._validate_and_save(c_norm, confidence, domain_id, scenario)
 
@@ -303,59 +338,6 @@ class FCFSystem:
 
         if self.curiosity and domain:
             self.curiosity.probe(domain, self.layer, self.tokenizer, self.srg_plus)
-
-        if self.state_grammar is not None:
-            try:
-                grammar_result = self.state_grammar.compose(
-                    c_norm, c_query, c_norm,
-                    label_a="query", label_b="context"
-                )
-                result["composition_validity"] = grammar_result.validity
-                result["composition_delta_I"] = grammar_result.delta_I
-                result["composition_creativity"] = grammar_result.creativity
-            except Exception:
-                pass
-        result["scenario"] = scenario
-
-        self._dialog_history.append({"role": "user", "text": text})
-        self._dialog_history.append({"role": "assistant", "text": result.get("response", "")[:200]})
-        if len(self._dialog_history) > 50:
-            self._dialog_history = self._dialog_history[-50:]
-
-        if self.hierarchy is not None:
-            try:
-                emb = self.layer.embed(self.layer._encode(self.tokenizer, text))
-                codes = self.hierarchy(emb)
-                result["z_sym_norm"] = float(np.linalg.norm(codes["z_sym"].cpu().numpy()))
-            except Exception:
-                pass
-
-        if self.state_algebra is not None and domain and len(self.gmm.gmms["word"]) > 1:
-            try:
-                centroids = [d.centroid for d in self.gmm.gmms["word"].domains.values()]
-                if len(centroids) >= 2:
-                    z_combined = self.state_algebra.cross_attend(
-                        centroids[0], centroids[1]
-                    )
-                    result["cross_domain_applied"] = True
-            except Exception:
-                pass
-
-        if self.self_descriptive is not None and domain_id:
-            try:
-                desc = self.self_descriptive.describe(
-                    code_id=f"q_{self._query_count}",
-                    layer=self.layer,
-                    tokenizer=self.tokenizer,
-                    domain_name=domain_id,
-                )
-                if desc:
-                    result["code_description"] = desc
-            except Exception:
-                pass
-
-        if domain:
-            self.curiosity.probe(domain, self.layer, self.tokenizer, self.srg_plus) if self.curiosity else None
 
         self._query_count += 1
 

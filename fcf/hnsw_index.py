@@ -155,8 +155,6 @@ class HNSWIndex:
 
         self._snapshot_count = 0
 
-        self._snapshot_count = 0
-
     def train_pq(self, vectors: np.ndarray):
         """Обучить Product Quantization на накопленных векторах."""
         if len(vectors) < 256:

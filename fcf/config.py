@@ -60,6 +60,8 @@ class KCAConfig:
     gate_threshold: float = 0.05
     lambda_gap: float = 0.3
     lambda_contra: float = 0.2
+    lambda_kl: float = 0.1
+    lambda_mono: float = 0.01
 
 
 @dataclass

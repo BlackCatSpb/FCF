@@ -93,6 +93,8 @@ class PrimordialLayer(nn.Module):
         self._eval_response_vector: Optional[np.ndarray] = None
         self._eval_logits: Optional[np.ndarray] = None
         self._eval_text: str = ""
+        self._eval_K: Optional[np.ndarray] = None
+        self._eval_V: Optional[np.ndarray] = None
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embedding(input_ids)
@@ -215,6 +217,12 @@ class PrimordialLayer(nn.Module):
         self._eval_logits = last_logits
         self._eval_text = response_text
 
+        if hasattr(self.transformer, 'get_kv_state'):
+            self._eval_K, self._eval_V = self.transformer.get_kv_state(response_ids)
+        else:
+            self._eval_K = np.zeros((self.config.num_heads, self.config.head_dim), dtype=np.float32)
+            self._eval_V = np.zeros((self.config.num_heads, self.config.head_dim), dtype=np.float32)
+
         self.meta.record(result["confidence"])
 
         return result
@@ -230,10 +238,10 @@ class PrimordialLayer(nn.Module):
         if confidence < self.config.srg.snapshot_confidence_threshold:
             return False
 
-        K = np.zeros(
+        K = self._eval_K if self._eval_K is not None else np.zeros(
             (self.config.num_heads, self.config.head_dim), dtype=np.float32
         )
-        V = np.zeros(
+        V = self._eval_V if self._eval_V is not None else np.zeros(
             (self.config.num_heads, self.config.head_dim), dtype=np.float32
         )
 

@@ -23,9 +23,6 @@ def run_benchmark(checkpoint_path: str = None,
       - system: состояние системы после теста
     """
     from fcf.fcf_system import FCFSystem
-    from fcf.primordial_layer import PrimordialLayer
-    from fcf.tokenizer_utils import load_tokenizer
-    from fcf.utils import load_primordial_layer
 
     logger.info("=" * 60)
     logger.info("FCF Benchmark")

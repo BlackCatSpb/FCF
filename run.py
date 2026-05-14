@@ -632,16 +632,7 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
             print(f"Benchmark history ({len(history)} записей):")
             for b in history[-10:]:
                 print(f"  step={b['step']:6d} conf={b['avg_confidence']:.3f} "
-                      f"snap={b['snapshots']} loss={b['loss_recent']:.4f}")
-            continue
-
-        if user_input.lower() == "exit":
-            break
-
-        if user_input.lower() == "save":
-            save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
-            save_primordial_layer(layer, save_path)
-            print(f"Сохранено в {save_path}")
+                       f"snap={b['snapshots']} loss={b['loss_recent']:.4f}")
             continue
 
         if user_input.lower() == "stats":

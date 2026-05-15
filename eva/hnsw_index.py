@@ -198,7 +198,7 @@ class HNSWIndex:
 
         compressed = self._compress(v)
         timestamp = time.time()
-        self.level1[domain_id].append((v_norm, compressed, timestamp))
+        self.level1[domain_id].append((v_norm, compressed, timestamp, code_id))
         self._snapshot_count += 1
 
         bucket = (layer_idx // 8) * 8
@@ -253,7 +253,8 @@ class HNSWIndex:
                         candidates.append(item)
 
         if not candidates and domain_id in self.level1:
-            for _, compressed, ts in self.level1[domain_id]:
+            for item in self.level1[domain_id]:
+                _, compressed, ts = item[0], item[1], item[2]
                 candidates.append(compressed)
                 timestamps.append(ts)
 

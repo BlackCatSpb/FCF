@@ -180,18 +180,14 @@ class KCAEngine:
         prompt: str,
         max_tokens: int = 64,
     ) -> Tuple[np.ndarray, float]:
-        """
-        KCA с градиентами через реальный forward pass LLM.
-
-        В отличие от аналитического refine(), здесь loss вычисляется
-        через фактический проход модели с модифицированными весами.
-        """
         import torch
 
         z = z_init.copy().astype(np.float32)
         device = next(layer.parameters()).device
         z_t = torch.from_numpy(z).float().to(device).requires_grad_(True)
         optimizer = torch.optim.Adam([z_t], lr=self.eta0)
+
+        c_query_np = None
 
         for iteration in range(self.convergence.max_cycles):
             optimizer.zero_grad()
@@ -202,28 +198,41 @@ class KCAEngine:
 
             x = layer.embed(input_ids)
             hidden = layer.forward_transformer(x)
-            logits = layer.forward_logits(hidden)
 
-            probs = torch.softmax(logits[:, -1, :], dim=-1)
+            z_expanded = z_t.unsqueeze(0).unsqueeze(0)
+            if z_expanded.shape[-1] == hidden.shape[-1]:
+                hidden = hidden + 0.01 * z_expanded.expand(-1, hidden.shape[1], -1)
+
+            logits = layer.forward_logits(hidden)
+            logits_last = logits[:, -1, :]
+
+            probs = torch.softmax(logits_last, dim=-1)
             entropy = -(probs * torch.log(probs + 1e-10)).sum()
-            max_ent = np.log(logits.shape[-1])
+            max_ent = np.log(float(logits.shape[-1]))
             confidence = 1.0 - entropy / max_ent
 
-            sim_val = float(np.dot(
-                z_t.detach().cpu().numpy().flatten(),
-                z_t.detach().cpu().numpy().flatten()
-            ) / (np.linalg.norm(z_t.detach().cpu().numpy()) ** 2 + 1e-8))
+            if c_query_np is None:
+                with torch.no_grad():
+                    c_query_np = layer.get_context_vector(input_ids)
+
+            z_np = z_t.detach().cpu().numpy().flatten()
+            c_q = c_query_np.flatten()
+            sim_val = float(np.dot(z_np, c_q) / (
+                np.linalg.norm(z_np) * np.linalg.norm(c_q) + 1e-8))
+            sim_val = (sim_val + 1.0) / 2.0
 
             loss = (
                 -self.lambda_gap * confidence
-                + 0.5 * (torch.tensor(sim_val, device=device) - 0.9) ** 2
+                + 0.5 * self.lambda_contra * (torch.tensor(sim_val, device=device) - 0.9) ** 2
             )
 
             loss.backward()
             optimizer.step()
 
             with torch.no_grad():
-                gamma = float(torch.exp(-torch.norm(z_t.grad or torch.zeros_like(z_t))))
+                gamma = float(torch.sigmoid(torch.tensor(
+                    confidence.item() if not torch.isnan(confidence) else 0.5
+                )))
 
             z_new_np = z_t.detach().cpu().numpy().astype(np.float32)
 

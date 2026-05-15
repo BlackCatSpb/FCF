@@ -6,6 +6,7 @@ State Algebra, после скольких итераций KCA он был со
 Позволяет аудит и обратимость эволюции знаний.
 """
 
+import os
 import time
 import hashlib
 from typing import Dict, List, Optional
@@ -94,6 +95,40 @@ class CodeProvenance:
         if rec.created_via == "direct":
             return True
         return all(p in self.records for p in rec.parent_codes)
+
+    def save(self, path: str):
+        import pickle, os
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        data = {
+            "records": {cid: r.to_dict() for cid, r in self.records.items()},
+            "lineage": self._lineage,
+        }
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+        logger.info(f"[Provenance] Сохранено: {path} ({len(self.records)} записей)")
+
+    @classmethod
+    def load(cls, path: str) -> "CodeProvenance":
+        import pickle
+        prov = cls()
+        if not os.path.exists(path):
+            return prov
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        for cid, rdata in data.get("records", {}).items():
+            prov.records[cid] = ProvenanceRecord(
+                code_id=rdata["code_id"],
+                domain_id=rdata["domain_id"],
+                level=rdata["level"],
+                created_via=rdata["created_via"],
+                parent_codes=rdata.get("parent_codes", []),
+                kca_iterations=rdata.get("kca_iterations", 0),
+                final_srg=rdata.get("final_srg", 0.0),
+                metadata=rdata.get("metadata", {}),
+            )
+        prov._lineage = data.get("lineage", {})
+        logger.info(f"[Provenance] Загружено: {path} ({len(prov.records)} записей)")
+        return prov
 
     def summary(self, code_id: str) -> str:
         if code_id not in self.records:

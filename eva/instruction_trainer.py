@@ -59,7 +59,7 @@ class InstructionTrainer:
             self.optimizer,
             start_factor=0.01,
             end_factor=1.0,
-            total_iters=min(500, self.config.training.max_steps // 4),
+            total_iters=min(500, (self.config.training.max_steps or 10000) // 4),
         )
 
         self.step: int = 0
@@ -107,12 +107,17 @@ class InstructionTrainer:
         if len(full_ids) < 4 or prefix_len >= len(full_ids):
             return None, None
 
+        orig_len = len(full_ids)
         full_ids = full_ids[:max_len]
         while len(full_ids) < max_len:
             full_ids.append(3)
 
         labels = full_ids[1:]
-        labels[: prefix_len - 1] = [-100] * max(0, prefix_len - 1)
+        mask_len_before_pad = max(0, prefix_len - 1)
+        labels[:mask_len_before_pad] = [-100] * mask_len_before_pad
+        pad_start = min(orig_len - 1, len(labels))
+        if pad_start < len(labels):
+            labels[pad_start:] = [-100] * (len(labels) - pad_start)
 
         input_ids = torch.tensor([full_ids[:-1]], dtype=torch.long)
         labels = torch.tensor([labels], dtype=torch.long)

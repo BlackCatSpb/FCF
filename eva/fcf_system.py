@@ -238,22 +238,34 @@ class FCFSystem:
         if domain_id:
             results = self.hnsw.search_snapshot(domain_id, c_norm, top_k=1)
             if results:
-                idx, similarity = results[0]
+                best_idx, similarity = results[0]
                 if similarity > 0.95:
                     scenario = "exact_match"
-                    if self.layer.state_storage and idx < len(
-                        self.layer.state_storage.snapshots_meta
-                    ):
-                        z_stored = self.layer.state_storage.snapshots_meta[idx].get("c")
+                    z_stored = None
+                    if self.layer.state_storage:
+                        for meta in self.layer.state_storage.snapshots_meta:
+                            stored_c = meta.get("c")
+                            if stored_c is not None:
+                                s = np.dot(c_norm.flatten(), stored_c.flatten())
+                                if s > 0.95:
+                                    z_stored = stored_c
+                                    break
                 elif similarity > 0.7:
                     scenario = "partial_match"
-                    if self.layer.state_storage and idx < len(
-                        self.layer.state_storage.snapshots_meta
-                    ):
-                        stored = self.layer.state_storage.snapshots_meta[idx].get("c")
-                        if stored is not None:
-                            noise = np.random.randn(*stored.shape) * 0.05
-                            z_stored = stored + noise
+                    z_stored = None
+                    if self.layer.state_storage:
+                        best_stored = None
+                        best_s = -1.0
+                        for meta in self.layer.state_storage.snapshots_meta:
+                            stored_c = meta.get("c")
+                            if stored_c is not None:
+                                s = np.dot(c_norm.flatten(), stored_c.flatten())
+                                if s > best_s:
+                                    best_s = s
+                                    best_stored = stored_c
+                        if best_stored is not None:
+                            noise = np.random.randn(*best_stored.shape) * 0.05
+                            z_stored = best_stored + noise
                             z_stored = z_stored / (np.linalg.norm(z_stored) + 1e-8)
 
         if domain_id is None:
@@ -416,6 +428,8 @@ class FCFSystem:
                             hnsw_index=self.hnsw,
                             state_algebra=self.state_algebra,
                             self_improver=self.self_improver,
+                            kca_engine=self.kca,
+                            tokenizer=self.tokenizer,
                         )
                     time.sleep(interval)
                 except Exception as e:
@@ -447,18 +461,20 @@ class FCFSystem:
         if self.gmm is None or self.layer is None:
             return
         registry = self.layer.domain_registry
+        all_domain_ids = set()
         for level, gmm in self.gmm.gmms.items():
             for domain_id, domain in gmm.domains.items():
+                full_id = f"{level}_{domain_id}"
+                all_domain_ids.add(full_id)
                 if domain_id not in registry:
                     centroid = domain.centroid.copy()
                     registry.add(
-                        domain_id=f"{level}_{domain_id}",
+                        domain_id=full_id,
                         context_centroid=centroid,
                     )
-            for registry_id in list(registry.rules.keys()):
-                base_id = registry_id.split("_", 1)[-1] if "_" in registry_id else registry_id
-                if base_id not in gmm.domains:
-                    registry.remove(registry_id)
+        for registry_id in list(registry.rules.keys()):
+            if registry_id not in all_domain_ids:
+                registry.remove(registry_id)
 
     def save_checkpoint(self, path: str):
         os.makedirs(path, exist_ok=True)

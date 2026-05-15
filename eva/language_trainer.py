@@ -67,7 +67,7 @@ class LanguageTrainer:
             self.optimizer,
             start_factor=0.01,
             end_factor=1.0,
-            total_iters=min(500, self.config.training.max_steps // 4),
+            total_iters=min(500, (self.config.training.max_steps or 10000) // 4),
         )
 
         self.step: int = 0
@@ -470,8 +470,9 @@ class LanguageTrainer:
             )
 
         except Exception as e:
-            self.layer.train()
-            return
+            logger.debug(f"[SRG] eval error: {e}")
+
+        self.layer.train()
 
     def _check_stop_criterion(self) -> bool:
         avg_conf = self.layer.meta.average_confidence(window=self.stop_window)

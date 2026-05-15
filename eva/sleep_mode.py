@@ -188,6 +188,8 @@ class SleepMode:
         state_algebra=None,
         hnsw_index=None,
         self_improver=None,
+        kca_engine=None,
+        tokenizer=None,
     ) -> Dict[str, Any]:
         logger.info(f"Sleep Mode #{self.sleep_count + 1} — v2")
 
@@ -232,11 +234,12 @@ class SleepMode:
             for layer in layers:
                 for i, meta in enumerate(layer.state_storage.snapshots_meta):
                     old_codes[f"snap_{i}"] = (meta["c"], meta.get("confidence", 0.5))
-            try:
-                improved = self_improver.improve(old_codes, None, None, None)
-                stats["codes_reevaluated"] = improved
-            except Exception:
-                pass
+            if old_codes and kca_engine is not None and len(layers) > 0:
+                try:
+                    improved = self_improver.improve(old_codes, layers[0], tokenizer, kca_engine)
+                    stats["codes_reevaluated"] = improved
+                except Exception:
+                    pass
 
         if self._forget_gate is not None and self._forget_history:
             from .extensions import ForgetfulnessGateTrainer

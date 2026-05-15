@@ -336,7 +336,7 @@ class AutoTrainer:
         logger.info(f"[AutoTrainer] Дообучение слоя: {len(blocks)} блоков, {steps} шагов")
 
         for step in range(steps):
-            total_loss = 0.0
+            total_loss = torch.tensor(0.0, device=self.layer.device)
             optimizer.zero_grad()
 
             for input_ids, labels in blocks[:2]:
@@ -348,7 +348,7 @@ class AutoTrainer:
                     labels.view(-1),
                     ignore_index=3,
                 )
-                total_loss += loss
+                total_loss = total_loss + loss
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.layer.parameters(), max_norm=1.0)

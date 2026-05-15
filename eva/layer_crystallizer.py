@@ -81,6 +81,7 @@ class LayerCrystallizer:
         new_layer.load_state_dict(
             copy.deepcopy(last_layer.state_dict())
         )
+        new_layer.lm_head.weight = new_layer.embedding.weight
 
         new_layer.state_storage = type(last_layer.state_storage)(
             dim=last_layer.config.d_model,
@@ -155,7 +156,7 @@ class LayerCrystallizer:
             return
 
         for step in range(self.finetune_steps):
-            total_loss = 0.0
+            total_loss = torch.tensor(0.0, device=self.device)
             optimizer.zero_grad()
 
             for input_ids, labels in blocks[:2]:
@@ -171,7 +172,7 @@ class LayerCrystallizer:
                     labels.view(-1),
                     ignore_index=3,
                 )
-                total_loss += loss
+                total_loss = total_loss + loss
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(layer.parameters(), max_norm=1.0)

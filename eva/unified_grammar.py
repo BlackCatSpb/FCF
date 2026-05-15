@@ -280,9 +280,10 @@ class UnifiedStateGrammar:
                 zci = torch.from_numpy(c_v).float().unsqueeze(0)
 
                 val_score, _ = self.validator.validate(zai, zbi, zci)
-                loss_val = F.binary_cross_entropy(
-                    torch.tensor([[val_score]], device=za.device),
-                    torch.tensor([[0.0]], device=za.device))
+                raw_logits = self.validator.net(torch.cat([zai, zbi, zci], dim=-1))
+                loss_val = F.cross_entropy(
+                    raw_logits,
+                    torch.tensor([0], device=za.device))
 
                 loss = loss_mse + 0.1 * loss_val
                 loss.backward()

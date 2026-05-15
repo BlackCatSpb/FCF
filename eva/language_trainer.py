@@ -243,9 +243,8 @@ class LanguageTrainer:
             tps = tokens_processed / max(elapsed, 0.001)
 
             if self.step % self.status_interval == 0 or self.step == 1:
-                avg_loss = self.total_loss / max(
-                    self.step % self.log_interval or 1, 1
-                )
+                steps_since = self.step % self.log_interval or self.log_interval
+                avg_loss = self.total_loss / max(steps_since, 1)
                 self.total_loss = 0.0
 
                 status = {

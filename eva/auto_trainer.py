@@ -285,6 +285,7 @@ class AutoTrainer:
                 total_loss += loss
 
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(adapter.get_trainable_parameters(), max_norm=1.0)
             optimizer.step()
 
             if step % 20 == 0:
@@ -313,9 +314,11 @@ class AutoTrainer:
     def _finetune_on_queries(self, queries: list, steps: int):
         self.layer.train()
 
-        optimizer = torch.optim.AdamW(
-            self.layer.parameters(), lr=1e-5
-        )
+        if not hasattr(self, '_finetune_optimizer') or self._finetune_optimizer is None:
+            self._finetune_optimizer = torch.optim.AdamW(
+                self.layer.parameters(), lr=1e-5
+            )
+        optimizer = self._finetune_optimizer
 
         blocks = []
         for fq in queries[:50]:

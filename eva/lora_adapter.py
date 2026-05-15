@@ -28,7 +28,7 @@ class LoRAAdapter(nn.Module):
         self,
         d_model: int = 2560,
         rank: int = 8,
-        alpha: float = 1.0,
+        alpha: float = 8.0,
         target_modules: Optional[List[str]] = None,
         ff_mult: int = 4,
     ):
@@ -112,7 +112,7 @@ class LoRAAdapter(nn.Module):
     def from_numpy(
         cls,
         data: Dict[str, Dict[str, np.ndarray]],
-        alpha: float = 1.0,
+        alpha: float = 8.0,
         ff_mult: int = 4,
         d_model: int = 2560,
     ) -> "LoRAAdapter":
@@ -166,9 +166,8 @@ class LoRAAdapter(nn.Module):
             data["weights"],
             alpha=data.get("alpha", 1.0),
             ff_mult=data.get("ff_mult", 4),
+            d_model=data.get("d_model", 2560),
         )
-        adapter.d_model = data["d_model"]
-        adapter.rank = data["rank"]
         adapter.target_modules = data["target_modules"]
         logger.info(f"[LoRA] Адаптер загружен: {path}")
         return adapter

@@ -285,7 +285,8 @@ class DomainTrainer:
                     labels.view(-1),
                     ignore_index=3,
                 )
-                total_loss += loss.item()
+                (loss / len(blocks[:2])).backward()
+            total_loss += loss.item()
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.layer.parameters(), max_norm=1.0)

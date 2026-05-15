@@ -70,9 +70,9 @@ class WordAggregator(nn.Module):
         z = self.up_proj(z_sym.mean(1))
         for _ in range(n_iter):
             z_new = self.aggregate(z, z_sym)
-            z = rho * z + (1 - rho) * z_new
             if torch.norm(z_new - z).item() < 1e-4:
-                break
+                return z_new
+            z = rho * z + (1 - rho) * z_new
         return z
 
 
@@ -120,9 +120,9 @@ class SentenceAggregator(nn.Module):
         z = self.up_proj(z_words.mean(dim=1))
         for _ in range(n_iter):
             z_new = self.aggregate(z, z_words)
-            z = rho * z + (1 - rho) * z_new
             if torch.norm(z_new - z).item() < 1e-4:
-                break
+                return z_new
+            z = rho * z + (1 - rho) * z_new
         return z
 
 
@@ -156,8 +156,8 @@ class TextAggregator(nn.Module):
             self.h_dim, self.h_dim
         )
 
-        self.rnn.weight_ih_l0.data = W_ih[0]
-        self.rnn.weight_hh_l0.data = W_hh[0]
+        self.rnn.weight_ih_l0.data = W_ih.mean(dim=0)
+        self.rnn.weight_hh_l0.data = W_hh.mean(dim=0)
 
         _, h = self.rnn(z_sents)
         return self.proj(h[-1])

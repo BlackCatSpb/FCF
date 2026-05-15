@@ -251,7 +251,8 @@ class KCAEngine:
                 return z_out, conf
 
             z = z_new
-            z_t = torch.from_numpy(z).float().requires_grad_(True)
+            z_t = torch.from_numpy(z).float().to(device)
+            z_t.requires_grad_(True)
             optimizer = torch.optim.Adam([z_t], lr=self.eta0 * (self.rho ** (iteration + 1)))
 
         return z.astype(np.float32), float(confidence.item())

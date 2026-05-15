@@ -101,7 +101,7 @@ class InstructionTrainer:
 
         full_ids = full_ids[:max_len]
         while len(full_ids) < max_len:
-            full_ids.append(0)
+            full_ids.append(3)
 
         labels = full_ids[1:] + [0]
         labels[: prefix_len - 1] = [-100] * max(0, prefix_len - 1)
@@ -306,7 +306,7 @@ class InstructionTrainer:
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             labels.view(-1),
-            ignore_index=-100,
+            ignore_index=3,
         )
 
         loss.backward()

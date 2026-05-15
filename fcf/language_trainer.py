@@ -327,12 +327,12 @@ class LanguageTrainer:
         logits = self.layer.forward_logits(hidden)
 
         shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
+        shift_labels = labels[:, :-1].contiguous()
 
         loss_lm = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
-            ignore_index=-100,
+            ignore_index=3,
         )
 
         loss = loss_lm
@@ -572,7 +572,7 @@ class LanguageTrainer:
             ids = encoding.ids if hasattr(encoding, "ids") else encoding
             ids = ids[:block_size]
             while len(ids) < block_size:
-                ids.append(0)
+                ids.append(3)
 
             input_ids = torch.tensor([ids[:-1]], dtype=torch.long).to(device)
             labels = torch.tensor([ids[1:]], dtype=torch.long).to(device)

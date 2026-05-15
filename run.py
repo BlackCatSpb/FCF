@@ -684,7 +684,7 @@ def cmd_fcf_system(config_path: str = None, checkpoint_path: str = None):
     logger.info("EVASystem — Полный когнитивный цикл")
     logger.info("=" * 60)
 
-    from fcf.fcf_system import EVASystem
+    from fcf.fcf_system import FCFSystem as EVASystem
     fcf = EVASystem()
     fcf.bootstrap(checkpoint_path)
     fcf.start_background(interval=300.0)

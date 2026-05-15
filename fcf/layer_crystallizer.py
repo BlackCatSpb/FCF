@@ -139,7 +139,7 @@ class LayerCrystallizer:
                 ids = encoding.ids if hasattr(encoding, "ids") else encoding
                 ids = ids[:128]
                 while len(ids) < 128:
-                    ids.append(0)
+                    ids.append(3)
 
                 input_ids = torch.tensor([ids[:-1]], dtype=torch.long)
                 labels = torch.tensor([ids[1:]], dtype=torch.long)
@@ -169,7 +169,7 @@ class LayerCrystallizer:
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
-                    ignore_index=0,
+                    ignore_index=3,
                 )
                 total_loss += loss
 

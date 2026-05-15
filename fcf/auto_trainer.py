@@ -232,7 +232,7 @@ class AutoTrainer:
                 ids = encoding.ids if hasattr(encoding, "ids") else encoding
                 ids = ids[:64]
                 while len(ids) < 64:
-                    ids.append(0)
+                    ids.append(3)
                 blocks.append((
                     torch.tensor([ids[:-1]], dtype=torch.long),
                     torch.tensor([ids[1:]], dtype=torch.long),
@@ -280,7 +280,7 @@ class AutoTrainer:
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
-                    ignore_index=0,
+                    ignore_index=3,
                 )
                 total_loss += loss
 
@@ -325,7 +325,7 @@ class AutoTrainer:
                 ids = encoding.ids if hasattr(encoding, "ids") else encoding
                 ids = ids[:64]
                 while len(ids) < 64:
-                    ids.append(0)
+                    ids.append(3)
                 blocks.append((
                     torch.tensor([ids[:-1]], dtype=torch.long),
                     torch.tensor([ids[1:]], dtype=torch.long),
@@ -353,7 +353,7 @@ class AutoTrainer:
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
-                    ignore_index=0,
+                    ignore_index=3,
                 )
                 total_loss += loss
 

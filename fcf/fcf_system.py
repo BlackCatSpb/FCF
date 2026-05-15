@@ -284,14 +284,14 @@ class FCFSystem:
             if self.atomic_basis is not None:
                 try:
                     coeffs = self.atomic_basis.encode(self.layer, "W_Q")
-                    delta = self.atomic_basis.decode(coeffs, "W_Q")
                     for name in ["W_Q", "W_K", "W_V", "W_O"]:
                         try:
                             c = self.atomic_basis.encode(self.layer, name)
                             d = self.atomic_basis.decode(c, name)
                             if hasattr(self.layer.transformer.attention, name):
                                 w = getattr(self.layer.transformer.attention, name)
-                                w.weight.data = w.weight.data + torch.from_numpy(d).float().to(w.weight.device)
+                                orig = self.atomic_basis._original_weights[name]
+                                w.weight.data = (orig + torch.from_numpy(d).float()).to(w.weight.device)
                         except Exception:
                             pass
                 except Exception:

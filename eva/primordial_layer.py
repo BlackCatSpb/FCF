@@ -107,6 +107,11 @@ class PrimordialLayer(nn.Module):
     def forward_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)
 
+    def forward_for_training(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.embed(input_ids)
+        hidden = self.forward_transformer(x)
+        return self.forward_logits(hidden)
+
     @torch.no_grad()
     def _encode(self, tokenizer, text: str, device=None) -> torch.Tensor:
         encoding = tokenizer.encode(text)
@@ -132,14 +137,16 @@ class PrimordialLayer(nn.Module):
         eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         self.eval()
+        self.transformer.attention.reset_cache()
 
         for _ in range(max_new_tokens):
             seq_len = input_ids.shape[1]
             if seq_len > self.config.max_seq_len:
                 break
 
-            x = self.embed(input_ids)
-            hidden = self.transformer(x)
+            has_cache = self.transformer.attention._k_cache is not None
+            x = self.embed(input_ids if not has_cache else input_ids[:, -1:])
+            hidden = self.transformer(x, use_cache=(has_cache or seq_len > 1))
             logits = self.lm_head(hidden)
             logits_last = logits[:, -1, :] / max(temperature, 1e-6)
 
@@ -169,6 +176,7 @@ class PrimordialLayer(nn.Module):
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
 
+        self.transformer.attention.reset_cache()
         return input_ids
 
     def get_context_vector(self, input_ids: torch.Tensor) -> np.ndarray:
@@ -185,7 +193,8 @@ class PrimordialLayer(nn.Module):
                 K = self.transformer.attention.W_K(x_norm)
                 K_mean = K.mean(dim=1)
                 return K_mean.squeeze(0).cpu().numpy()
-            except Exception:
+            except Exception as e:
+                logger.debug(f"[Layer] get_context_vector via K failed: {e}, using hidden state fallback")
                 hidden = self.transformer(x)
                 return hidden[:, -1, :].squeeze(0).cpu().numpy()
 
@@ -203,18 +212,18 @@ class PrimordialLayer(nn.Module):
             x = self.embed(response_ids)
             hidden = self.transformer(x)
             logits = self.lm_head(hidden)
-            last_logits = logits[:, -1, :].squeeze(0).cpu().numpy()
+            full_logits = logits.squeeze(0).cpu().numpy()
 
         result = self.srg.evaluate_full(
             c_query=c_query,
             c_response=c_response,
-            logits=last_logits,
+            logits=full_logits,
             response_text=response_text,
         )
 
         self._eval_context_vector = c_query
         self._eval_response_vector = c_response
-        self._eval_logits = last_logits
+        self._eval_logits = full_logits
         self._eval_text = response_text
 
         if hasattr(self.transformer, 'get_kv_state'):

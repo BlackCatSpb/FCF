@@ -61,7 +61,7 @@ class TemporalContextCompressor:
         z_turn = self.compressor(emb).squeeze(0).cpu().numpy()
 
         self._turn_count += 1
-        alpha = 1.0 / self._turn_count
+        alpha = min(0.5, 1.0 / max(self._turn_count, 1))
         self._dialog_code = (
             (1 - alpha) * self._dialog_code + alpha * z_turn
         )

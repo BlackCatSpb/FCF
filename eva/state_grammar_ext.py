@@ -420,10 +420,11 @@ class CategoryTheory:
 # 21. INFORMATION GEOMETRY — метрика Фишера, геодезические
 # ============================================================
 
-class InformationGeometry:
+class InformationGeometry(nn.Module):
     """Многообразие состояний с метрикой Фишера и геодезическими."""
 
     def __init__(self, dim: int = 2560, manifold_dim: int = 64):
+        super().__init__()
         self.dim = dim; self.manifold_dim = manifold_dim
         self.chart = nn.Sequential(nn.Linear(dim, manifold_dim), nn.SiLU(), nn.Linear(manifold_dim, manifold_dim))
 

@@ -252,13 +252,16 @@ class StreamingGMM:
         mu_b, cov_b = dom_b.centroid, dom_b.covariance + 1e-6 * np.eye(d)
 
         try:
-            inv_cov_b = np.linalg.inv(cov_b)
+            L_b = np.linalg.cholesky(cov_b)
+            diff = mu_b - mu_a
+            z = np.linalg.solve(L_b, diff)
+            mahalanobis = float(z.T @ z)
+
+            z_cov_a = np.linalg.solve(L_b, cov_a)
+            trace_term = float(np.trace(np.linalg.solve(L_b.T, z_cov_a)))
+
             _, logdet_a = np.linalg.slogdet(cov_a)
             _, logdet_b = np.linalg.slogdet(cov_b)
-
-            trace_term = np.trace(inv_cov_b @ cov_a)
-            diff = mu_b - mu_a
-            mahalanobis = diff.T @ inv_cov_b @ diff
 
             kl = 0.5 * (trace_term + mahalanobis - d + logdet_b - logdet_a)
             return float(max(kl, 0.0))

@@ -80,6 +80,8 @@ class AutoTrainer:
 
         self.check_interval: float = 60.0
 
+        self._domain_optimizers: Dict[str, torch.optim.Optimizer] = {}
+
         self.domain_degradation_threshold: float = 0.6
         self.domain_degradation_window: int = 20
         self.layer_degradation_threshold: float = 0.5
@@ -215,10 +217,12 @@ class AutoTrainer:
 
         self.layer.eval()
 
-        optimizer = torch.optim.AdamW(
-            list(adapter.get_trainable_parameters()),
-            lr=1e-5,
-        )
+        if domain_id not in self._domain_optimizers:
+            self._domain_optimizers[domain_id] = torch.optim.AdamW(
+                list(adapter.get_trainable_parameters()),
+                lr=1e-5,
+            )
+        optimizer = self._domain_optimizers[domain_id]
 
         blocks = []
         for fact in facts[:100]:
@@ -255,36 +259,18 @@ class AutoTrainer:
             for input_ids, labels in blocks[:2]:
                 x = self.layer.embed(input_ids)
 
-                saved = {}
-                for name in adapter.target_modules:
-                    if hasattr(self.layer.transformer.attention, name):
-                        w = getattr(self.layer.transformer.attention, name)
-                        saved[name] = w.weight.data.clone()
-                        delta = adapter.get_delta(name).to(w.weight.device)
-                        w.weight.data = w.weight.data + delta
-                    elif hasattr(self.layer.transformer.ffn, name):
-                        w = getattr(self.layer.transformer.ffn, name)
-                        saved[name] = w.weight.data.clone()
-                        delta = adapter.get_delta(name).to(w.weight.device)
-                        w.weight.data = w.weight.data + delta
+                hidden = self._forward_with_adapter(adapter, x)
 
-                hidden = self.layer.transformer(x)
                 logits = self.layer.forward_logits(hidden)
-
-                for name, orig in saved.items():
-                    if hasattr(self.layer.transformer.attention, name):
-                        getattr(self.layer.transformer.attention, name).weight.data = orig
-                    elif hasattr(self.layer.transformer.ffn, name):
-                        getattr(self.layer.transformer.ffn, name).weight.data = orig
 
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
                     ignore_index=3,
                 )
-                total_loss += loss
+                (loss / len(blocks[:2])).backward()
+                total_loss += loss.item()
 
-            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(adapter.get_trainable_parameters(), max_norm=1.0)
             optimizer.step()
 
@@ -389,6 +375,30 @@ class AutoTrainer:
 
     def get_history(self) -> List[Dict]:
         return list(self.training_history)
+
+    def _forward_with_adapter(self, adapter, x: torch.Tensor) -> torch.Tensor:
+        saved = {}
+        for name in adapter.target_modules:
+            if hasattr(self.layer.transformer.attention, name):
+                w = getattr(self.layer.transformer.attention, name)
+                saved[name] = w.weight.data.clone()
+                delta = adapter.get_delta(name).to(w.weight.device)
+                w.weight.data = w.weight.data + delta
+            elif hasattr(self.layer.transformer.ffn, name):
+                w = getattr(self.layer.transformer.ffn, name)
+                saved[name] = w.weight.data.clone()
+                delta = adapter.get_delta(name).to(w.weight.device)
+                w.weight.data = w.weight.data + delta
+
+        hidden = self.layer.transformer(x)
+
+        for name, original in saved.items():
+            if hasattr(self.layer.transformer.attention, name):
+                getattr(self.layer.transformer.attention, name).weight.data = original
+            elif hasattr(self.layer.transformer.ffn, name):
+                getattr(self.layer.transformer.ffn, name).weight.data = original
+
+        return hidden
 
     def summary(self) -> str:
         lines = [

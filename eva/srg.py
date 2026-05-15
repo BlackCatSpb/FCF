@@ -108,6 +108,19 @@ class SemanticRelevanceGate:
         return float(np.clip((sim + 1.0) / 2.0, 0.0, 1.0))
 
     def _compute_entropy_score(self, logits: np.ndarray) -> float:
+        if logits.ndim == 2:
+            scores = []
+            for t in range(logits.shape[0]):
+                logits_t = logits[t].flatten()
+                logits_stable = logits_t - np.max(logits_t)
+                probs = np.exp(logits_stable) / np.sum(np.exp(logits_stable))
+                probs = np.clip(probs, 1e-10, 1.0)
+                entropy = -np.sum(probs * np.log2(probs))
+                max_entropy = np.log2(len(logits_t))
+                max_entropy = max(max_entropy, 1e-10)
+                scores.append(float(1.0 - entropy / max_entropy))
+            return float(np.mean(scores)) if scores else 0.5
+
         logits_flat = logits.flatten()
         logits_stable = logits_flat - np.max(logits_flat)
         probs = np.exp(logits_stable) / np.sum(np.exp(logits_stable))

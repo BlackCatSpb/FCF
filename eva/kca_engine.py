@@ -189,7 +189,8 @@ class KCAEngine:
         import torch
 
         z = z_init.copy().astype(np.float32)
-        z_t = torch.from_numpy(z).float().requires_grad_(True)
+        device = next(layer.parameters()).device
+        z_t = torch.from_numpy(z).float().to(device).requires_grad_(True)
         optimizer = torch.optim.Adam([z_t], lr=self.eta0)
 
         for iteration in range(self.convergence.max_cycles):
@@ -197,10 +198,7 @@ class KCAEngine:
 
             encoding = tokenizer.encode(prompt)
             ids = encoding.ids if hasattr(encoding, "ids") else encoding
-            input_ids = torch.tensor([ids], dtype=torch.long)
-
-            device = next(layer.parameters()).device
-            input_ids = input_ids.to(device)
+            input_ids = torch.tensor([ids], dtype=torch.long).to(device)
 
             x = layer.embed(input_ids)
             hidden = layer.forward_transformer(x)
@@ -211,20 +209,15 @@ class KCAEngine:
             max_ent = np.log(logits.shape[-1])
             confidence = 1.0 - entropy / max_ent
 
-            z_np = z_t.detach().cpu().numpy()
-            sim = np.dot(z_np.flatten(), z_np.flatten()) / (
-                np.linalg.norm(z_np) ** 2 + 1e-8
-            )
-            target_sim = torch.tensor(0.9, device=device)
+            sim_val = float(np.dot(
+                z_t.detach().cpu().numpy().flatten(),
+                z_t.detach().cpu().numpy().flatten()
+            ) / (np.linalg.norm(z_t.detach().cpu().numpy()) ** 2 + 1e-8))
 
             loss = (
                 -self.lambda_gap * confidence
-                + 0.5 * (torch.tensor(float(sim), device=device) - target_sim) ** 2
+                + 0.5 * (torch.tensor(sim_val, device=device) - 0.9) ** 2
             )
-
-            if self.lambda_mono:
-                entropy_loss = 0.1 * entropy / max(max_ent, 1)
-                loss = loss + self.lambda_mono * entropy_loss
 
             loss.backward()
             optimizer.step()
@@ -232,10 +225,10 @@ class KCAEngine:
             with torch.no_grad():
                 gamma = float(torch.exp(-torch.norm(z_t.grad or torch.zeros_like(z_t))))
 
-            z_new = z_t.detach().cpu().numpy().astype(np.float32)
+            z_new_np = z_t.detach().cpu().numpy().astype(np.float32)
 
-            status, z_out = self.convergence.check(
-                z_new, z.astype(np.float32), gamma, iteration
+            status, z_out_np = self.convergence.check(
+                z_new_np, z.astype(np.float32), gamma, iteration
             )
 
             self.correction_history.append({
@@ -248,11 +241,10 @@ class KCAEngine:
 
             if status != "CONTINUE":
                 conf = float(confidence.item())
-                return z_out, conf
+                return z_out_np, conf
 
-            z = z_new
-            z_t = torch.from_numpy(z).float().to(device)
-            z_t.requires_grad_(True)
+            z = z_new_np
+            z_t = torch.from_numpy(z).float().to(device).requires_grad_(True)
             optimizer = torch.optim.Adam([z_t], lr=self.eta0 * (self.rho ** (iteration + 1)))
 
         return z.astype(np.float32), float(confidence.item())

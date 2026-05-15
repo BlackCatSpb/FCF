@@ -55,8 +55,16 @@ class InstructionTrainer:
             weight_decay=self.config.training.weight_decay,
         )
 
+        self.scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=0.01,
+            end_factor=1.0,
+            total_iters=min(500, self.config.training.max_steps // 4),
+        )
+
         self.step: int = 0
         self.total_loss: float = 0.0
+        self._steps_since_loss_reset: int = 0
         self.best_confidence: float = 0.0
 
         self.srg_eval_interval: int = 100
@@ -107,7 +115,7 @@ class InstructionTrainer:
         labels[: prefix_len - 1] = [-100] * max(0, prefix_len - 1)
 
         input_ids = torch.tensor([full_ids[:-1]], dtype=torch.long)
-        labels = torch.tensor([labels[:-1]], dtype=torch.long)
+        labels = torch.tensor([labels], dtype=torch.long)
 
         return input_ids, labels
 
@@ -221,6 +229,7 @@ class InstructionTrainer:
 
             loss = self._training_step(input_ids, labels)
             self.total_loss += loss
+            self._steps_since_loss_reset += 1
             self.step += 1
             tokens_processed += input_ids.numel()
 
@@ -228,10 +237,9 @@ class InstructionTrainer:
             tps = tokens_processed / max(elapsed, 0.001)
 
             if self.step % self.status_interval == 0 or self.step == 1:
-                avg_loss = self.total_loss / max(
-                    self.step % self.log_interval or 1, 1
-                )
+                avg_loss = self.total_loss / max(self._steps_since_loss_reset, 1)
                 self.total_loss = 0.0
+                self._steps_since_loss_reset = 0
 
                 status = {
                     "step": self.step,
@@ -316,6 +324,7 @@ class InstructionTrainer:
         )
 
         self.optimizer.step()
+        self.scheduler.step()
 
         return loss.item()
 
@@ -342,15 +351,19 @@ class InstructionTrainer:
                 torch.cat([input_ids, response_ids], dim=1)
             )
 
-            x = self.layer.embed(generated_ids)
-            hidden = self.layer.forward_transformer(x)
-            logits = self.layer.forward_logits(hidden)
-            last_logits = logits[:, -1, :].squeeze(0).cpu().numpy()
+            new_tokens = generated_ids[:, input_ids.shape[1]:]
+            if new_tokens.shape[1] > 0:
+                x_new = self.layer.embed(new_tokens)
+                hidden_new = self.layer.forward_transformer(x_new)
+                logits_new = self.layer.forward_logits(hidden_new)
+                full_logits = logits_new.squeeze(0).cpu().numpy()
+            else:
+                full_logits = np.zeros((1, self.layer.config.vocab_size), dtype=np.float32)
 
             eval_result = self.layer.srg.evaluate_full(
                 c_query=c_query,
                 c_response=c_response,
-                logits=last_logits,
+                logits=full_logits,
                 response_text=response_text,
             )
 
@@ -409,6 +422,12 @@ class InstructionTrainer:
             f"step_{self.step:06d}" if not final else "final",
         )
         save_primordial_layer(self.layer, path)
+        optimizer_path = os.path.join(path, "optimizer.pth")
+        os.makedirs(path, exist_ok=True)
+        torch.save({
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+        }, optimizer_path)
 
     def _training_stats(self, elapsed: float, tokens: int) -> Dict[str, Any]:
         return {

@@ -245,7 +245,7 @@ class UnifiedStateGrammar:
         return result
 
     def discover(self, training_data: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
-                 epochs: int = 100, lr: float = 1e-4) -> Dict[str, float]:
+                  epochs: int = 100, lr: float = 1e-4) -> Dict[str, float]:
         """Обнаруживает закономерности композиции из данных."""
         params = list(self.ctx_composer.parameters()) + list(self.validator.parameters())
 
@@ -279,11 +279,12 @@ class UnifiedStateGrammar:
                 zbi = torch.from_numpy(b_i).float().unsqueeze(0)
                 zci = torch.from_numpy(c_v).float().unsqueeze(0)
 
-                val_score, _ = self.validator.validate(zai, zbi, zci)
-                raw_logits = self.validator.net(torch.cat([zai, zbi, zci], dim=-1))
-                loss_val = F.cross_entropy(
+                raw_logits = self.validator(
+                    torch.cat([zai, zbi, zci], dim=-1)
+                )
+                loss_val = F.binary_cross_entropy_with_logits(
                     raw_logits,
-                    torch.tensor([0], device=za.device))
+                    torch.zeros_like(raw_logits))
 
                 loss = loss_mse + 0.1 * loss_val
                 loss.backward()

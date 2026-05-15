@@ -19,19 +19,13 @@ class MetaMemory:
 
     def __init__(self, history_size: int = 100):
         self.usage_count: int = 0
-        self.confidence_history: List[float] = []
         self._confidence_deque: deque = deque(maxlen=history_size)
         self.history_size: int = history_size
         self.created_at: float = time.time()
         self.last_clarification: Optional[str] = None
 
     def record(self, confidence: float):
-        self.confidence_history.append(confidence)
         self._confidence_deque.append(confidence)
-
-        if len(self.confidence_history) > self.history_size:
-            self.confidence_history.pop(0)
-
         self.usage_count += 1
 
     def average_confidence(self, window: int = 20) -> float:
@@ -43,6 +37,10 @@ class MetaMemory:
             return 0.0
 
         return sum(recent) / len(recent)
+
+    @property
+    def confidence_history(self) -> List[float]:
+        return list(self._confidence_deque)
 
     def recent_confidence_trend(self, window: int = 10) -> float:
         if len(self._confidence_deque) < window:
@@ -69,7 +67,6 @@ class MetaMemory:
 
     def reset(self):
         self.usage_count = 0
-        self.confidence_history.clear()
         self._confidence_deque.clear()
         self.last_clarification = None
 

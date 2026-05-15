@@ -64,22 +64,18 @@ class PQCodebook:
                 np.random.choice(N, min(256, N), replace=False)
             ]
             for _ in range(n_iter):
-                distances = np.sum(
-                    (sub_vectors[:, None, :] - centroids[None, :, :]) ** 2,
-                    axis=-1,
-                )
-                assignments = np.argmin(distances, axis=1)
+                dists = (
+                    (sub_vectors[:, None, :] - centroids[None, :, :]) ** 2
+                ).sum(axis=-1)
+                assignments = np.argmin(dists, axis=1)
 
                 new_centroids = np.zeros_like(centroids)
-                counts = np.zeros(256, dtype=np.int32)
-                for i in range(N):
-                    c = assignments[i]
-                    new_centroids[c] += sub_vectors[i]
-                    counts[c] += 1
-
                 for c in range(256):
-                    if counts[c] > 0:
-                        centroids[c] = new_centroids[c] / counts[c]
+                    mask = assignments == c
+                    if mask.any():
+                        new_centroids[c] = sub_vectors[mask].mean(axis=0)
+
+                centroids = new_centroids
 
             codes[:, m, :] = centroids.astype(np.float32)
 
@@ -309,6 +305,21 @@ class HNSWIndex:
             if not self.level1[domain_id]:
                 del self.level1[domain_id]
         logger.info(f"[HNSW] Дефрагментация: {self._snapshot_count} слепков, {len(self.level0)} доменов")
+
+    def remove_by_code_id(self, code_id: str):
+        for domain_id in list(self.level1.keys()):
+            self.level1[domain_id] = [
+                item for item in self.level1[domain_id]
+                if (len(item) >= 4 and item[3] != code_id)
+            ]
+        for domain_id in list(self.level2.keys()):
+            for bucket in list(self.level2[domain_id].keys()):
+                self.level2[domain_id][bucket] = [
+                    item for item in self.level2[domain_id][bucket]
+                    if (len(item) >= 3 and item[2] != code_id)
+                ]
+        self._pq_cache.clear()
+        self._snapshot_count = sum(len(v) for v in self.level1.values())
 
     def _rebuild_level0(self):
         self._level0_ids = list(self.level0.keys())

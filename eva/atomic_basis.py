@@ -122,8 +122,9 @@ class AtomicBasis:
         что позволяет найти K за O(d) без перебора.
         """
         frob_sq = np.sum(S ** 2)
+        max_k = min(256, len(S))
         if frob_sq < 1e-10:
-            return min(64, len(S))
+            return min(64, max_k)
 
         target_error_sq = self.error_threshold ** 2
 
@@ -132,9 +133,10 @@ class AtomicBasis:
             squared_tail += S[k] ** 2
             error_sq = squared_tail / frob_sq
             if error_sq > target_error_sq:
-                return min(k + 2, len(S))
+                candidate = min(k + 2, len(S))
+                return min(candidate, max_k)
 
-        return min(128, len(S))
+        return min(128, max_k)
 
     def encode(self, layer, matrix_name: str, layer_name: str = "layer_0") -> np.ndarray:
         """
@@ -217,6 +219,15 @@ class AtomicBasis:
             delta = self.decode(coeffs_dict[name], name, layer_name)
             self._set_weight(layer, name, self._original_weights[name] +
                             torch.from_numpy(delta).float())
+
+    def incremental_update(self, layer, matrix_name: str, delta_c: np.ndarray,
+                           layer_name: str = "layer_0"):
+        current_coeffs = self.encode(layer, matrix_name, layer_name)
+        new_coeffs = current_coeffs + delta_c
+        delta_W = self.decode(new_coeffs, matrix_name, layer_name)
+        orig = self._original_weights[matrix_name]
+        self._set_weight(layer, matrix_name,
+                         orig + torch.from_numpy(delta_W).float())
 
     def restore_original(self, layer):
         """Восстановить оригинальные веса (до всех модификаций)."""

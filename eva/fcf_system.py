@@ -261,6 +261,8 @@ class FCFSystem:
         if domain_id is None:
             domain_id = self.gmm.add_or_update(c_norm, level="word")
 
+        self.sync_gmm_to_registry()
+
         domain = self.gmm.gmms["word"].domains.get(domain_id)
 
         result = self.layer.process_query(
@@ -282,6 +284,7 @@ class FCFSystem:
             ).astype(np.float32)
 
             if self.atomic_basis is not None:
+                basis_applied = False
                 try:
                     coeffs = self.atomic_basis.encode(self.layer, "W_Q")
                     for name in ["W_Q", "W_K", "W_V", "W_O"]:
@@ -293,9 +296,17 @@ class FCFSystem:
                                 orig = self.atomic_basis._original_weights[name]
                                 w.weight.data = (orig + torch.from_numpy(d).float()).to(w.weight.device)
                         except Exception:
-                            pass
+                            if basis_applied:
+                                self.atomic_basis.restore_original(self.layer)
+                            raise
+                    basis_applied = True
                 except Exception:
-                    pass
+                    if hasattr(self.atomic_basis, 'restore_original'):
+                        try:
+                            self.atomic_basis.restore_original(self.layer)
+                        except Exception:
+                            pass
+                    logger.warning("[FCF] AtomicBasis modification failed, weights restored")
 
             kca_depth = self.kca_scheduler.get_depth(
                 confidence,
@@ -431,6 +442,86 @@ class FCFSystem:
             "srp_declining": self.srg_plus.should_diagnose() if self.srg_plus else False,
             "provenance_codes": len(self.provenance.records) if self.provenance else 0,
         }
+
+    def sync_gmm_to_registry(self):
+        if self.gmm is None or self.layer is None:
+            return
+        registry = self.layer.domain_registry
+        for level, gmm in self.gmm.gmms.items():
+            for domain_id, domain in gmm.domains.items():
+                if domain_id not in registry:
+                    centroid = domain.centroid.copy()
+                    registry.add(
+                        domain_id=f"{level}_{domain_id}",
+                        context_centroid=centroid,
+                    )
+            for registry_id in list(registry.rules.keys()):
+                base_id = registry_id.split("_", 1)[-1] if "_" in registry_id else registry_id
+                if base_id not in gmm.domains:
+                    registry.remove(registry_id)
+
+    def save_checkpoint(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        from .utils import save_primordial_layer
+        save_primordial_layer(self.layer, path)
+
+        if self.atomic_basis:
+            self.atomic_basis.save(os.path.join(path, "atomic_basis.pkl"))
+
+        if self.gmm:
+            import pickle
+            gmm_path = os.path.join(path, "gmm.pkl")
+            with open(gmm_path, "wb") as f:
+                pickle.dump({"levels": {lvl: list(gmm.domains.keys())
+                         for lvl, gmm in self.gmm.gmms.items()}}, f)
+
+        if self.provenance:
+            self.provenance.save(os.path.join(path, "provenance.pkl"))
+
+        logger.info(f"[FCF] Checkpoint сохранён: {path}")
+
+    def validate_consistency(self) -> Dict[str, Any]:
+        issues = {}
+
+        if not self.layer:
+            issues["layer"] = "no layer loaded"
+            return issues
+
+        faiss_count = len(self.layer.state_storage) if self.layer.state_storage else 0
+        hnsw_count = self.hnsw.get_snapshot_count() if self.hnsw else 0
+
+        if faiss_count != hnsw_count:
+            issues["faiss_hnsw_mismatch"] = f"FAISS={faiss_count}, HNSW={hnsw_count}"
+
+        gmm_domains = set()
+        if self.gmm:
+            for level, gmm in self.gmm.gmms.items():
+                for did in gmm.domains:
+                    gmm_domains.add(f"{level}_{did}")
+
+        hnsw_domains = set(self.hnsw.level0.keys()) if self.hnsw else set()
+
+        if gmm_domains != hnsw_domains:
+            missing_gmm = gmm_domains - hnsw_domains
+            missing_hnsw = hnsw_domains - gmm_domains
+            if missing_gmm:
+                issues["gmm_missing_from_hnsw"] = list(missing_gmm)
+            if missing_hnsw:
+                issues["hnsw_missing_from_gmm"] = list(missing_hnsw)
+
+        if self.atomic_basis:
+            for name in ["W_Q", "W_K", "W_V", "W_O"]:
+                if name in self.atomic_basis._original_weights:
+                    orig = self.atomic_basis._original_weights[name]
+                    current = self.atomic_basis._get_weight(self.layer, name)
+                    diff = (current - orig.to(current.device)).abs().max().item()
+                    if diff > 1e-3:
+                        issues[f"weight_drift_{name}"] = f"max_diff={diff:.6f}"
+
+        if not issues:
+            return {"status": "consistent", "issues": 0}
+
+        return {"status": "inconsistent", "issues": len(issues), "details": issues}
 
     def summary(self) -> str:
         s = self.stats()

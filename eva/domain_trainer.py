@@ -51,7 +51,7 @@ class DomainTrainer:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         self.rank = 8
-        self.alpha = 0.7
+        self.alpha = 8.0
 
     def train_from_conceptnet(
         self,
@@ -236,6 +236,10 @@ class DomainTrainer:
             param.requires_grad = True
 
         optimizer = torch.optim.AdamW(adapter.get_trainable_parameters(), lr=1e-4)
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0,
+            total_iters=min(50, max_steps // 4),
+        )
 
         blocks = []
         for fact in facts:
@@ -286,11 +290,11 @@ class DomainTrainer:
                     ignore_index=3,
                 )
                 (loss / len(blocks[:2])).backward()
-            total_loss += loss.item()
+                total_loss += loss.item()
 
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.layer.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(adapter.get_trainable_parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
 
             if step % 10 == 0 or step == max_steps - 1:
                 logger.info(f"[Domain] step={step}, loss={total_loss.item():.4f}")

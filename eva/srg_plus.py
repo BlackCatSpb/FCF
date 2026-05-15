@@ -47,33 +47,44 @@ class SRGAnomalyDetector:
         self.code_stats: Dict[str, SRGStats] = {}
         self.anomalies: List[Dict] = []
 
+        self._cached_mean: float = 0.0
+        self._cached_std: float = 1.0
+        self._stats_dirty: bool = True
+
     def record(self, code_id: str, score: float):
         self.global_scores.append(score)
+        self._stats_dirty = True
         if code_id not in self.code_stats:
             self.code_stats[code_id] = SRGStats()
         self.code_stats[code_id].update(score)
+
+    def _refresh_stats(self):
+        if not self._stats_dirty:
+            return
+        if len(self.global_scores) > 0:
+            arr = np.array(list(self.global_scores))
+            self._cached_mean = float(np.mean(arr))
+            self._cached_std = float(np.std(arr)) + 1e-8
+        self._stats_dirty = False
 
     def check(self, code_id: str, score: float) -> bool:
         """True = аномалия обнаружена."""
         if len(self.global_scores) < self.window:
             return False
 
-        global_arr = np.array(list(self.global_scores))
-        global_mean = float(np.mean(global_arr))
-        global_std = float(np.std(global_arr)) + 1e-8
-
-        z_score = abs(score - global_mean) / global_std
+        self._refresh_stats()
+        z_score = abs(score - self._cached_mean) / self._cached_std
 
         if z_score > self.z_threshold:
             self.anomalies.append({
                 "code_id": code_id,
                 "score": score,
                 "z_score": z_score,
-                "global_mean": global_mean,
+                "global_mean": self._cached_mean,
             })
             logger.warning(
                 f"[SRG] Аномалия: code={code_id}, score={score:.3f}, "
-                f"z={z_score:.1f} (mean={global_mean:.3f})"
+                f"z={z_score:.1f} (mean={self._cached_mean:.3f})"
             )
             return True
 

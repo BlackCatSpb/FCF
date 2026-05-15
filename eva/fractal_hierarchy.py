@@ -70,9 +70,9 @@ class WordAggregator(nn.Module):
         z = self.up_proj(z_sym.mean(1))
         for _ in range(n_iter):
             z_new = self.aggregate(z, z_sym)
-            if torch.norm(z_new - z).item() < 1e-4:
-                return z_new
             z = rho * z + (1 - rho) * z_new
+            if torch.norm(z_new - z).item() < 1e-4:
+                return z
         return z
 
 
@@ -120,9 +120,9 @@ class SentenceAggregator(nn.Module):
         z = self.up_proj(z_words.mean(dim=1))
         for _ in range(n_iter):
             z_new = self.aggregate(z, z_words)
-            if torch.norm(z_new - z).item() < 1e-4:
-                return z_new
             z = rho * z + (1 - rho) * z_new
+            if torch.norm(z_new - z).item() < 1e-4:
+                return z
         return z
 
 
@@ -149,18 +149,23 @@ class TextAggregator(nn.Module):
         z_text_init = self.proj(z_mean)
 
         hyper_out = self.hyper(z_text_init)
-        W_ih = hyper_out[:, :self.h_dim * self.k_sent].view(
-            self.h_dim, self.k_sent
-        )
-        W_hh = hyper_out[:, self.h_dim * self.k_sent:].view(
-            self.h_dim, self.h_dim
-        )
 
-        self.rnn.weight_ih_l0.data = W_ih.mean(dim=0)
-        self.rnn.weight_hh_l0.data = W_hh.mean(dim=0)
+        outputs = []
+        for b in range(B):
+            W_ih = hyper_out[b, :self.h_dim * self.k_sent].view(
+                self.h_dim, self.k_sent
+            )
+            W_hh = hyper_out[b, self.h_dim * self.k_sent:].view(
+                self.h_dim, self.h_dim
+            )
 
-        _, h = self.rnn(z_sents)
-        return self.proj(h[-1])
+            self.rnn.weight_ih_l0.data = W_ih
+            self.rnn.weight_hh_l0.data = W_hh
+
+            _, h = self.rnn(z_sents[b:b+1])
+            outputs.append(self.proj(h[-1]))
+
+        return torch.cat(outputs, dim=0)
 
 
 class FractalHierarchy(nn.Module):

@@ -59,7 +59,7 @@ class CrossDomainAttention(nn.Module):
 
 
 class CrossDomainModule:
-    """Обёртка для кросс-доменных операций."""
+    """Обёртка для кросс-доменных операций. Делегирует StateAlgebra для translate."""
 
     def __init__(self, dim: int = 2560):
         self.dim = dim
@@ -72,6 +72,12 @@ class CrossDomainModule:
         with torch.no_grad():
             result = self.translator(z, c)
         return result.squeeze(0).numpy()
+
+    def translate_from_algebra(self, z_A: np.ndarray, c_domain_B: np.ndarray,
+                               state_algebra) -> np.ndarray:
+        if state_algebra is not None:
+            return state_algebra.translate(z_A, c_domain_B)
+        return self.translate(z_A, c_domain_B)
 
     def attend(self, z_query: np.ndarray,
                centroids: List[np.ndarray],

@@ -36,6 +36,10 @@ class StateStorage:
 
         self.snapshots_meta: list = []
         self._vectors: list = []
+        self._next_id: int = 0
+        self._removed_ids: set = set()
+        self._rebuild_pending: int = 0
+        self.REBUILD_THRESHOLD = 50
 
     def add(
         self,
@@ -55,12 +59,16 @@ class StateStorage:
         c_norm = c / (np.linalg.norm(c) + 1e-8)
         c_norm = c_norm.astype(np.float32)
 
+        vector_id = self._next_id
+        self._next_id += 1
+
         if self.index is not None:
             self.index.add(c_norm.reshape(1, -1))
         else:
             self._vectors.append(c_norm)
 
         meta = {
+            "id": vector_id,
             "c": c_norm,
             "K": K.copy(),
             "V": V.copy(),
@@ -82,10 +90,11 @@ class StateStorage:
         if self.index is not None and self.index.ntotal > 0:
             distances, indices = self.index.search(c_norm.reshape(1, -1), 1)
             if distances[0][0] >= threshold:
-                idx = int(indices[0][0])
-                if idx < len(self.snapshots_meta):
-                    self.snapshots_meta[idx]["usage_count"] += 1
-                    return idx
+                faiss_idx = int(indices[0][0])
+                for i, meta in enumerate(self.snapshots_meta):
+                    if meta.get("id", i) == faiss_idx:
+                        self.snapshots_meta[i]["usage_count"] += 1
+                        return i
         else:
             best_idx = -1
             best_sim = -1.0
@@ -110,12 +119,21 @@ class StateStorage:
         if idx < 0 or idx >= len(self.snapshots_meta):
             return
 
+        meta = self.snapshots_meta[idx]
         del self.snapshots_meta[idx]
+
         if self.index is not None:
+            self._rebuild_pending += 1
+            if self._rebuild_pending >= self.REBUILD_THRESHOLD:
+                self._rebuild_index()
+                self._rebuild_pending = 0
+            else:
+                self._removed_ids.add(meta.get("id", idx))
+
+    def _maybe_rebuild(self):
+        if self._rebuild_pending >= self.REBUILD_THRESHOLD:
             self._rebuild_index()
-        else:
-            if idx < len(self._vectors):
-                del self._vectors[idx]
+            self._rebuild_pending = 0
 
     def _rebuild_index(self):
         if self.index is None:
@@ -140,6 +158,22 @@ class StateStorage:
             self._vectors = [m["c"].copy() for m in self.snapshots_meta]
         else:
             self._rebuild_index()
+        self._rebuild_pending = 0
+        self._removed_ids.clear()
+
+    def sync_to_hnsw(self, hnsw_index):
+        if hnsw_index is None:
+            return
+        for meta in self.snapshots_meta:
+            domain = meta.get("domain", "general")
+            hnsw_index.add_snapshot(
+                domain_id=domain,
+                vector=meta["c"],
+                code_id=str(meta.get("id", 0)),
+            )
+
+    def sync_from_hnsw(self, hnsw_index):
+        pass
 
     def __len__(self) -> int:
         return len(self.snapshots_meta)

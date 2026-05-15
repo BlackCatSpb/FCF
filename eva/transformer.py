@@ -54,6 +54,7 @@ class CausalSelfAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.max_seq_len = max_seq_len
 
         self.W_Q = nn.Linear(d_model, d_model, bias=False)
         self.W_K = nn.Linear(d_model, d_model, bias=False)
@@ -66,26 +67,58 @@ class CausalSelfAttention(nn.Module):
             persistent=False,
         )
 
+        self._k_cache = None
+        self._v_cache = None
+
         self._init_weights()
 
     def _init_weights(self):
         for module in [self.W_Q, self.W_K, self.W_V, self.W_O]:
             nn.init.xavier_uniform_(module.weight)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None):
+    def reset_cache(self):
+        self._k_cache = None
+        self._v_cache = None
+
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None,
+                use_cache: bool = False):
         B, T, C = x.shape
 
         q = self.W_Q(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.W_K(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.W_V(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        freqs = self.rope_freqs[:T, :self.head_dim].to(x.device)
-        q, k = apply_rotary_emb(q, k, freqs)
+        total_T = T
+        offset = 0
+
+        if use_cache and self._k_cache is not None:
+            offset = self._k_cache.shape[2]
+            total_T = offset + T
+            k = torch.cat([self._k_cache, k], dim=2)
+            v = torch.cat([self._v_cache, v], dim=2)
+
+        freqs_q = self.rope_freqs[offset:total_T, :self.head_dim].to(x.device)
+        freqs_k = self.rope_freqs[:total_T, :self.head_dim].to(x.device)
+
+        q, _ = apply_rotary_emb(q, torch.zeros_like(q), freqs_q)
+        if use_cache and self._k_cache is not None:
+            k_full = k.clone()
+            k_new = k[:, :, offset:, :]
+            _, k_new_rope = apply_rotary_emb(torch.zeros_like(k_new), k_new, freqs_k[offset:, :])
+            k_full[:, :, offset:, :] = k_new_rope
+            k = k_full
+        else:
+            _, k = apply_rotary_emb(torch.zeros_like(k), k, freqs_k)
+
+        if use_cache:
+            self._k_cache = k.detach()
+            self._v_cache = v.detach()
 
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         causal_mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+            torch.ones(T, total_T, device=x.device, dtype=torch.bool),
+            diagonal=1 + offset,
         )
         attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
 
@@ -140,9 +173,10 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
 
     def forward(
-        self, x: torch.Tensor, attention_mask: torch.Tensor = None
+        self, x: torch.Tensor, attention_mask: torch.Tensor = None,
+        use_cache: bool = False,
     ) -> torch.Tensor:
-        x = x + self.attention(self.norm1(x), attention_mask)
+        x = x + self.attention(self.norm1(x), attention_mask, use_cache=use_cache)
         x = x + self.ffn(self.norm2(x))
         return x
 

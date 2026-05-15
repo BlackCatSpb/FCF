@@ -423,46 +423,54 @@ def cmd_full_test(
     checkpoint_path: str = None,
 ):
     logger.info("=" * 60)
-    logger.info("EVA — Пункт 7. Полноценный FCF (тест всех компонентов)")
+    logger.info("EVA — Пункт 7. Полноценный FCF (тест когнитивного цикла)")
     logger.info("=" * 60)
 
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
-    else:
-        layer = cmd_init(config_path)
+    from eva.fcf_system import FCFSystem
 
-    tokenizer = _load_or_create_tokenizer()
+    system = FCFSystem()
+    system.bootstrap(checkpoint_path)
 
-    logger.info("--- KCA Engine ---")
-    kca = KCAEngine(hidden_dim=layer.config.d_model)
-    z = np.random.randn(layer.config.d_model).astype(np.float32)
-    c_q = np.random.randn(layer.config.d_model).astype(np.float32)
-    z_opt, conf = kca.refine(z, c_q)
-    logger.info(f"KCA: z.shape={z_opt.shape}, confidence={conf:.3f}")
+    test_queries = [
+        "Что такое история?",
+        "Объясни, как работает компьютер.",
+        "Расскажи о природе Земли.",
+    ]
 
-    logger.info("--- State Algebra ---")
-    algebra = StateAlgebra(dim=layer.config.d_model)
-    za = np.random.randn(layer.config.d_model).astype(np.float32)
-    zb = np.random.randn(layer.config.d_model).astype(np.float32)
-    z_sum = algebra.sum(za, zb)
-    logger.info(f"StateAlgebra: sum.shape={z_sum.shape}")
+    results = []
+    for i, query in enumerate(test_queries):
+        logger.info(f"\n--- Когнитивный цикл {i+1}/{len(test_queries)} ---")
+        logger.info(f"Запрос: {query}")
 
-    logger.info("--- HNSW Index ---")
-    hnsw = HNSWIndex(dim=layer.config.d_model)
-    hnsw.add_domain("test", c_q)
-    found = hnsw.search_domain(c_q)
-    logger.info(f"HNSW: domain={found}")
+        result = system.query(query, max_tokens=64)
 
-    logger.info("--- Sleep Mode ---")
-    sleep = SleepMode()
-    sleep.on_query()
+        confidence = result.get("confidence", 0.0)
+        response_preview = result.get("response", "")[:100]
+        kca_applied = result.get("kca_applied", False)
+        domain = result.get("domain", "unknown")
 
-    logger.info("--- Layer Crystallizer ---")
-    crystallizer = LayerCrystallizer(device="cpu")
-    crystallizer.set_layers([layer])
-    logger.info(f"Crystallizer: {crystallizer.summary()}")
+        logger.info(f"  Ответ: {response_preview}...")
+        logger.info(f"  Уверенность: {confidence:.3f}")
+        logger.info(f"  KCA применён: {kca_applied}")
+        logger.info(f"  Домен: {domain}")
 
-    logger.info("=== Все компоненты FCF работоспособны ===")
+        results.append(result)
+
+    logger.info(f"\n--- Итоговая статистика ---")
+    stats = system.stats()
+    logger.info(f"  Запросов: {stats['queries']}")
+    logger.info(f"  Слепков: {stats['layer_snapshots']}")
+    logger.info(f"  HNSW доменов: {stats['hnsw_domains']}")
+    logger.info(f"  HNSW слепков: {stats['hnsw_snapshots']}")
+    logger.info(f"  GMM доменов: {stats['gmm_domains']}")
+
+    avg_conf = np.mean([r.get("confidence", 0.0) for r in results])
+    logger.info(f"  Средняя уверенность: {avg_conf:.3f}")
+
+    consistency = system.validate_consistency()
+    logger.info(f"  Консистентность: {consistency}")
+
+    logger.info("=== Когнитивный цикл FCF протестирован ===")
     return True
 
 

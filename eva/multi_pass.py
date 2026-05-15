@@ -57,8 +57,21 @@ class MultiPassGenerator:
 
     def _synthesize(self, texts: List[str]) -> str:
         """Синтез через мажоритарное голосование слов."""
-        all_sentences = [t.split() for t in texts]
+        if not texts:
+            return ""
+
+        non_empty = [t for t in texts if t.strip()]
+        if not non_empty:
+            return ""
+
+        if len(non_empty) == 1:
+            return non_empty[0]
+
+        all_sentences = [t.split() for t in non_empty]
         max_len = max(len(s) for s in all_sentences)
+        if max_len == 0:
+            return ""
+
         result = []
 
         for i in range(max_len):
@@ -71,7 +84,7 @@ class MultiPassGenerator:
                 best = max(tokens, key=tokens.get)
                 result.append(best)
 
-        return " ".join(result)
+        return " ".join(result) if result else ""
 
 
 class CodeEnsemble:

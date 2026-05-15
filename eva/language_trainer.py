@@ -63,8 +63,16 @@ class LanguageTrainer:
             weight_decay=self.config.training.weight_decay,
         )
 
+        self.scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=0.01,
+            end_factor=1.0,
+            total_iters=min(500, self.config.training.max_steps // 4),
+        )
+
         self.step: int = 0
         self.total_loss: float = 0.0
+        self._steps_since_loss_reset: int = 0
         self.best_confidence: float = 0.0
 
         self.srg_eval_interval: int = 100
@@ -236,6 +244,7 @@ class LanguageTrainer:
 
             loss = self._training_step(input_ids, labels)
             self.total_loss += loss
+            self._steps_since_loss_reset += 1
             self.step += 1
             tokens_processed += input_ids.numel()
 
@@ -243,9 +252,9 @@ class LanguageTrainer:
             tps = tokens_processed / max(elapsed, 0.001)
 
             if self.step % self.status_interval == 0 or self.step == 1:
-                steps_since = self.step % self.log_interval or self.log_interval
-                avg_loss = self.total_loss / max(steps_since, 1)
+                avg_loss = self.total_loss / max(self._steps_since_loss_reset, 1)
                 self.total_loss = 0.0
+                self._steps_since_loss_reset = 0
 
                 status = {
                     "step": self.step,
@@ -361,6 +370,7 @@ class LanguageTrainer:
         )
 
         self.optimizer.step()
+        self.scheduler.step()
 
         return loss.item()
 
@@ -402,6 +412,7 @@ class LanguageTrainer:
             eval_ids_tokens = encoding.ids if hasattr(encoding, "ids") else encoding
             eval_ids = torch.tensor([eval_ids_tokens], dtype=torch.long).to(device)
 
+            self.layer.transformer.attention.reset_cache()
             generated_ids = self.layer.generate(
                 eval_ids, max_new_tokens=32, temperature=0.8
             )
@@ -420,15 +431,19 @@ class LanguageTrainer:
 
             c_response = self.layer.get_context_vector(generated_ids)
 
-            x = self.layer.embed(generated_ids)
-            hidden = self.layer.forward_transformer(x)
-            logits = self.layer.forward_logits(hidden)
-            last_logits = logits[:, -1, :].squeeze(0).cpu().numpy()
+            new_tokens = generated_ids[:, eval_ids.shape[1]:]
+            if new_tokens.shape[1] > 0:
+                x_new = self.layer.embed(new_tokens)
+                hidden_new = self.layer.forward_transformer(x_new)
+                logits_new = self.layer.forward_logits(hidden_new)
+                full_logits = logits_new.squeeze(0).cpu().numpy()
+            else:
+                full_logits = np.zeros((1, self.layer.config.vocab_size), dtype=np.float32)
 
             eval_result = self.layer.srg.evaluate_full(
                 c_query=c_query,
                 c_response=c_response,
-                logits=last_logits,
+                logits=full_logits,
                 response_text=response_text,
             )
 
@@ -476,6 +491,13 @@ class LanguageTrainer:
             f"step_{self.step:06d}" if not final else "final",
         )
         save_primordial_layer(self.layer, path)
+
+        optimizer_path = os.path.join(path, "optimizer.pth")
+        os.makedirs(path, exist_ok=True)
+        torch.save({
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+        }, optimizer_path)
 
         self._reevaluate_snapshots()
 

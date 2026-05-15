@@ -265,18 +265,15 @@ class SleepMode:
             age = now - meta.get("timestamp", now)
             usage = meta.get("usage_count", 0)
             score = usage * np.exp(-0.1 * age / 86400)
-            was_deleted = False
 
             if usage == 0 and age > ttl:
                 self._record_deletion(meta, was_needed=False)
                 storage._remove(i)
                 removed += 1
-                was_deleted = True
             elif score < 0.01:
                 self._record_deletion(meta, was_needed=False)
                 storage._remove(i)
                 removed += 1
-                was_deleted = True
 
         if removed:
             logger.info(f"[Sleep] Удалено слепков: {removed}")

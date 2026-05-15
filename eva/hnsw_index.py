@@ -357,11 +357,16 @@ class HNSWIndex:
                 self._reverse_links[cid] = []
             self._reverse_links[cid].append(parent_id)
 
-    def cascade_update(self, code_id: str, new_vector: np.ndarray):
+    def cascade_update(self, code_id: str, new_vector: np.ndarray, visited: set = None):
         """Обновить код и каскадно все связанные коды нижнего уровня."""
+        if visited is None:
+            visited = set()
+        if code_id in visited:
+            return
+        visited.add(code_id)
         for child_id in self.fractal_links.get(code_id, FractalLink(code_id, [])).child_code_ids:
             if child_id in self.fractal_links:
-                self.cascade_update(child_id, new_vector)
+                self.cascade_update(child_id, new_vector, visited)
 
     def get_fractal_children(self, code_id: str) -> List[str]:
         link = self.fractal_links.get(code_id)

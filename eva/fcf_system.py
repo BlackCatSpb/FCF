@@ -368,6 +368,12 @@ class FCFSystem:
         if self.curiosity and domain:
             self.curiosity.probe(domain, self.layer, self.tokenizer, self.srg_plus)
 
+        self._dialog_history.append(text)
+        if len(self._dialog_history) > 50:
+            self._dialog_history.pop(0)
+        if self.context_compressor:
+            self.context_compressor.update(self.layer, text, self.tokenizer)
+
         self._query_count += 1
 
         return result
@@ -397,6 +403,9 @@ class FCFSystem:
                         final_srg=float(confidence),
                     )
                     return
+
+        if self.minimal_code and self.atomic_basis:
+            c_vec, _ = self.minimal_code.minimize(c_vec, self.atomic_basis)
 
         self.hnsw.add_snapshot(domain_id, c_vec)
 

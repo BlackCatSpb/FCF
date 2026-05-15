@@ -137,6 +137,8 @@ class KCAEngine:
         graph_embeddings: Optional[np.ndarray] = None,
         p_target: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, float]:
+        self.convergence.reset()
+        self.correction_history.clear()
         z = z_init.copy().astype(np.float32)
         z_prev = z.copy()
         self._prev_srg = None
@@ -182,6 +184,8 @@ class KCAEngine:
     ) -> Tuple[np.ndarray, float]:
         import torch
 
+        self.convergence.reset()
+        self.correction_history.clear()
         z = z_init.copy().astype(np.float32)
         device = next(layer.parameters()).device
         z_t = torch.from_numpy(z).float().to(device).requires_grad_(True)

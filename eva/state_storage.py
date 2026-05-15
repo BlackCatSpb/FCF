@@ -92,21 +92,21 @@ class StateStorage:
             if distances[0][0] >= threshold:
                 faiss_idx = int(indices[0][0])
                 for i, meta in enumerate(self.snapshots_meta):
-                    if meta.get("id", i) == faiss_idx:
+                    if meta.get("id", i) == faiss_idx or i == faiss_idx:
                         self.snapshots_meta[i]["usage_count"] += 1
                         return i
-        else:
-            best_idx = -1
-            best_sim = -1.0
-            for i, meta in enumerate(self.snapshots_meta):
-                sim = np.dot(c_norm.flatten(), meta["c"].flatten())
-                if sim > best_sim:
-                    best_sim = sim
-                    best_idx = i
 
-            if best_sim >= threshold and best_idx >= 0:
-                self.snapshots_meta[best_idx]["usage_count"] += 1
-                return best_idx
+        best_idx = -1
+        best_sim = -1.0
+        for i, meta in enumerate(self.snapshots_meta):
+            sim = np.dot(c_norm.flatten(), meta["c"].flatten())
+            if sim > best_sim:
+                best_sim = sim
+                best_idx = i
+
+        if best_sim >= threshold and best_idx >= 0:
+            self.snapshots_meta[best_idx]["usage_count"] += 1
+            return best_idx
 
         return -1
 
@@ -130,18 +130,16 @@ class StateStorage:
             else:
                 self._removed_ids.add(meta.get("id", idx))
 
-    def _maybe_rebuild(self):
-        if self._rebuild_pending >= self.REBUILD_THRESHOLD:
-            self._rebuild_index()
-            self._rebuild_pending = 0
-
     def _rebuild_index(self):
         if self.index is None:
             return
         self.index.reset()
-        for meta in self.snapshots_meta:
+        for i, meta in enumerate(self.snapshots_meta):
             c = meta["c"].astype(np.float32).reshape(1, -1)
             self.index.add(c)
+            meta["id"] = i
+        self._next_id = len(self.snapshots_meta)
+        self._removed_ids.clear()
 
     def get_all_vectors(self) -> np.ndarray:
         if self.index is not None and self.index.ntotal > 0:
@@ -159,7 +157,6 @@ class StateStorage:
         else:
             self._rebuild_index()
         self._rebuild_pending = 0
-        self._removed_ids.clear()
 
     def sync_to_hnsw(self, hnsw_index):
         if hnsw_index is None:

@@ -1,12 +1,5 @@
-"""
-Точка входа FCF — Единая Вычислительная Архитектура (ЕВА).
-
-Режимы:
-- --init: Создать PrimordialLayer и протестировать прямой проход
-- --train-tokenizer: Обучить BPE-токенизатор на Wikipedia
-- --train-language: Запустить самообучение языку (Пункт 2)
-- --train-instruction: Запустить инструктивное дообучение (Пункт 3)
-- --interactive: Интерактивный диалог с системой
+﻿"""
+Точка входа EVA — Единая Вычислительная Архитектура
 """
 
 import os
@@ -47,7 +40,7 @@ from fcf.auto_trainer import AutoTrainer
 
 def cmd_init(config_path: str = None):
     logger.info("=" * 60)
-    logger.info("FCF — Пункт 1. Первооснова")
+    logger.info("EVA — Пункт 1. Первооснова")
     logger.info("=" * 60)
 
     config = load_config(config_path)
@@ -79,7 +72,7 @@ def cmd_init(config_path: str = None):
 
 def cmd_interactive(config_path: str = None, checkpoint_path: str = None):
     logger.info("=" * 60)
-    logger.info("FCF — Интерактивный режим")
+    logger.info("EVA — Интерактивный режим")
     logger.info("=" * 60)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -140,7 +133,7 @@ def cmd_interactive(config_path: str = None, checkpoint_path: str = None):
 
 def cmd_train_tokenizer(config_path: str = None):
     logger.info("=" * 60)
-    logger.info("FCF — Обучение BPE-токенизатора")
+    logger.info("EVA — Обучение BPE-токенизатора")
     logger.info("=" * 60)
 
     output_path = os.path.join(os.path.dirname(__file__), "tokenizer.json")
@@ -167,7 +160,7 @@ def cmd_train_language(
     use_wikipedia: bool = False,
 ):
     logger.info("=" * 60)
-    logger.info("FCF — Пункт 2. Самообучение языку")
+    logger.info("EVA — Пункт 2. Самообучение языку")
     logger.info("=" * 60)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -206,7 +199,7 @@ def cmd_train_domain(
     device: str = "cpu",
 ):
     logger.info("=" * 60)
-    logger.info("FCF — Пункт 4. Доменные правила")
+    logger.info("EVA — Пункт 4. Доменные правила")
     logger.info("=" * 60)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -261,7 +254,7 @@ def cmd_train_depth(
     device: str = "cpu",
 ):
     logger.info("=" * 60)
-    logger.info("FCF — Пункт 5. Рост в глубину")
+    logger.info("EVA — Пункт 5. Рост в глубину")
     logger.info("=" * 60)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -321,7 +314,7 @@ def cmd_sleep(
     checkpoint_path: str = None,
 ):
     logger.info("=" * 60)
-    logger.info("FCF — Пункт 6. Sleep Mode (Консолидация)")
+    logger.info("EVA — Пункт 6. Sleep Mode (Консолидация)")
     logger.info("=" * 60)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -348,7 +341,7 @@ def cmd_sleep(
 
 def cmd_auto_tune(config_path: str = None):
     logger.info("=" * 60)
-    logger.info("FCF — Автонастройка среды исполнения")
+    logger.info("EVA — Автонастройка среды исполнения")
     logger.info("=" * 60)
 
     tuner = EnvironmentAutoTuner()
@@ -370,7 +363,7 @@ def cmd_auto_train(
     checkpoint_path: str = None,
 ):
     logger.info("=" * 60)
-    logger.info("FCF — Фоновое автодообучение")
+    logger.info("EVA — Фоновое автодообучение")
     logger.info("=" * 60)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -430,7 +423,7 @@ def cmd_full_test(
     checkpoint_path: str = None,
 ):
     logger.info("=" * 60)
-    logger.info("FCF — Пункт 7. Полноценный FCF (тест всех компонентов)")
+    logger.info("EVA — Пункт 7. Полноценный FCF (тест всех компонентов)")
     logger.info("=" * 60)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -481,7 +474,7 @@ def cmd_train_instruction(
     device: str = "cpu",
 ):
     logger.info("=" * 60)
-    logger.info("FCF — Пункт 3. Инструктивное дообучение")
+    logger.info("EVA — Пункт 3. Инструктивное дообучение")
     logger.info("=" * 60)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -511,7 +504,7 @@ def cmd_train_instruction(
 
 def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
     logger.info("=" * 60)
-    logger.info("FCF — Ленивое обучение + Интерактивный режим")
+    logger.info("EVA — Ленивое обучение + Интерактивный режим")
     logger.info("=" * 60)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -575,7 +568,7 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
 
     print()
     print("=" * 60)
-    print("  FCF — Ленивое обучение активно")
+    print("  EVA — Ленивое обучение активно")
     print("=" * 60)
     print(f"  Слой: {layer.summary()}")
     print(f"  Доменов: {len(registry)}")
@@ -688,17 +681,17 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
     logger.info("Завершение.")
 def cmd_fcf_system(config_path: str = None, checkpoint_path: str = None):
     logger.info("=" * 60)
-    logger.info("FCFSystem — Полный когнитивный цикл")
+    logger.info("EVASystem — Полный когнитивный цикл")
     logger.info("=" * 60)
 
-    from fcf.fcf_system import FCFSystem
-    fcf = FCFSystem()
+    from fcf.fcf_system import EVASystem
+    fcf = EVASystem()
     fcf.bootstrap(checkpoint_path)
     fcf.start_background(interval=300.0)
 
     print()
     print("=" * 60)
-    print(f"  FCFSystem active — {fcf.summary()}")
+    print(f"  EVASystem active — {fcf.summary()}")
     print("  Фоновый цикл: Sleep Mode каждые 300с")
     print("  Команды: stats, exit")
     print("=" * 60)
@@ -730,7 +723,7 @@ def cmd_fcf_system(config_path: str = None, checkpoint_path: str = None):
             print(f"    [desc: {result['code_description'][:100]}]")
 
     fcf.stop_background()
-    logger.info("FCFSystem stopped.")
+    logger.info("EVASystem stopped.")
 def _load_or_create_tokenizer():
     tokenizer_path = os.path.join(os.path.dirname(__file__), "tokenizer.json")
     if os.path.exists(tokenizer_path):
@@ -754,7 +747,7 @@ def _test_tokenizer(tokenizer):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FCF — Единая Вычислительная Архитектура")
+    parser = argparse.ArgumentParser(description="EVA — Единая Вычислительная Архитектура")
     parser.add_argument("--init", action="store_true", help="Инициализировать PrimordialLayer")
     parser.add_argument("--interactive", action="store_true", help="Интерактивный режим")
     parser.add_argument("--train-tokenizer", action="store_true", help="Обучить BPE-токенизатор")
@@ -767,7 +760,7 @@ def main():
     parser.add_argument("--auto-tune", action="store_true", help="Автонастройка среды исполнения")
     parser.add_argument("--auto-train", action="store_true", help="Запустить фоновое автодообучение")
     parser.add_argument("--lazy-learn", action="store_true", help="Интерактивный режим + фоновое дообучение")
-    parser.add_argument("--fcf", action="store_true", help="FCFSystem — полный когнитивный цикл")
+    parser.add_argument("--fcf", action="store_true", help="EVASystem — полный когнитивный цикл")
     parser.add_argument("--config", type=str, default=None, help="Путь к config.json")
     parser.add_argument("--checkpoint", type=str, default=None, help="Путь к чекпоинту для загрузки")
     parser.add_argument("--max-steps", type=int, default=None, help="Максимальное число шагов обучения")

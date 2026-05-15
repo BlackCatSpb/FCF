@@ -42,6 +42,12 @@ class MetaMemory:
     def confidence_history(self) -> List[float]:
         return list(self._confidence_deque)
 
+    @confidence_history.setter
+    def confidence_history(self, values: List[float]):
+        self._confidence_deque.clear()
+        for v in values[-self.history_size:]:
+            self._confidence_deque.append(v)
+
     def recent_confidence_trend(self, window: int = 10) -> float:
         if len(self._confidence_deque) < window:
             return 0.0

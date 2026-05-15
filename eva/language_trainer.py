@@ -135,7 +135,7 @@ class LanguageTrainer:
             if len(chunk) < 4:
                 continue
             while len(chunk) < block_size + 1:
-                chunk.append(0)
+                chunk.append(3)
 
             input_ids = torch.tensor([chunk[:-1]], dtype=torch.long)
             labels = torch.tensor([chunk[1:]], dtype=torch.long)
@@ -334,12 +334,9 @@ class LanguageTrainer:
         hidden = self.layer.forward_transformer(x)
         logits = self.layer.forward_logits(hidden)
 
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, :-1].contiguous()
-
         loss_lm = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
             ignore_index=3,
         )
 

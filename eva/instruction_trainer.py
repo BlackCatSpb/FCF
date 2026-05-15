@@ -111,7 +111,7 @@ class InstructionTrainer:
         while len(full_ids) < max_len:
             full_ids.append(3)
 
-        labels = full_ids[1:] + [0]
+        labels = full_ids[1:]
         labels[: prefix_len - 1] = [-100] * max(0, prefix_len - 1)
 
         input_ids = torch.tensor([full_ids[:-1]], dtype=torch.long)

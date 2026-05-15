@@ -270,8 +270,10 @@ class DomainTrainer:
 
         logger.info(f"[Domain] Блоков: {len(blocks)}, шагов: {max_steps}")
 
+        last_loss = 0.0
+
         for step in range(max_steps):
-            total_loss = 0.0
+            total_loss = torch.tensor(0.0, device=device)
             optimizer.zero_grad()
 
             for input_ids, labels in blocks[:2]:
@@ -290,17 +292,19 @@ class DomainTrainer:
                     ignore_index=3,
                 )
                 (loss / len(blocks[:2])).backward()
-                total_loss += loss.item()
+                total_loss = total_loss + loss
 
             torch.nn.utils.clip_grad_norm_(adapter.get_trainable_parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
+            last_loss = total_loss
+
             if step % 10 == 0 or step == max_steps - 1:
-                logger.info(f"[Domain] step={step}, loss={total_loss.item():.4f}")
+                logger.info(f"[Domain] step={step}, loss={last_loss:.4f}")
 
         self.layer.eval()
-        logger.info(f"[Domain] Обучение завершено: loss={total_loss.item():.4f}")
+        logger.info(f"[Domain] Обучение завершено: loss={last_loss:.4f}")
 
     def _forward_with_adapter(
         self, adapter: LoRAAdapter, x: torch.Tensor
@@ -308,23 +312,17 @@ class DomainTrainer:
         saved = {}
 
         for name in adapter.target_modules:
-            if hasattr(self.layer.transformer.attention, name):
-                w = getattr(self.layer.transformer.attention, name)
-                saved[name] = w.weight.data.clone()
-                delta = adapter.get_delta(name).to(w.weight.device)
-                w.weight.data = w.weight.data + delta
-            elif hasattr(self.layer.transformer.ffn, name):
-                w = getattr(self.layer.transformer.ffn, name)
-                saved[name] = w.weight.data.clone()
-                delta = adapter.get_delta(name).to(w.weight.device)
-                w.weight.data = w.weight.data + delta
+            for container in [self.layer.transformer.attention, self.layer.transformer.ffn]:
+                if hasattr(container, name):
+                    module = getattr(container, name)
+                    delta = adapter.get_delta(name).to(module.weight.device)
+                    combined = module.weight + delta
+                    saved[module] = module.weight
+                    module.weight = torch.nn.Parameter(combined)
 
         hidden = self.layer.transformer(x)
 
-        for name, original in saved.items():
-            if hasattr(self.layer.transformer.attention, name):
-                getattr(self.layer.transformer.attention, name).weight.data = original
-            elif hasattr(self.layer.transformer.ffn, name):
-                getattr(self.layer.transformer.ffn, name).weight.data = original
+        for module, original_weight in saved.items():
+            module.weight = original_weight
 
         return hidden

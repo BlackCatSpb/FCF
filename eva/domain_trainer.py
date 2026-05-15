@@ -228,9 +228,14 @@ class DomainTrainer:
         max_steps: int = 200,
         device: str = "cpu",
     ):
-        self.layer.train()
+        adapter.to(device)
+        self.layer.eval()
+        for param in self.layer.parameters():
+            param.requires_grad = False
+        for param in adapter.get_trainable_parameters():
+            param.requires_grad = True
 
-        optimizer = torch.optim.AdamW(self.layer.parameters(), lr=1e-5)
+        optimizer = torch.optim.AdamW(adapter.get_trainable_parameters(), lr=1e-4)
 
         blocks = []
         for fact in facts:
@@ -270,7 +275,9 @@ class DomainTrainer:
                 labels = labels.to(device)
 
                 x = self.layer.embed(input_ids)
-                hidden = self.layer.forward_transformer(x)
+
+                hidden = self._forward_with_adapter(adapter, x)
+
                 logits = self.layer.forward_logits(hidden)
 
                 loss = F.cross_entropy(
@@ -278,7 +285,7 @@ class DomainTrainer:
                     labels.view(-1),
                     ignore_index=3,
                 )
-                total_loss += loss
+                total_loss += loss.item()
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.layer.parameters(), max_norm=1.0)

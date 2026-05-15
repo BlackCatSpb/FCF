@@ -306,7 +306,7 @@ class InstructionTrainer:
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             labels.view(-1),
-            ignore_index=3,
+            ignore_index=-100,
         )
 
         loss.backward()

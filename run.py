@@ -553,15 +553,24 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
                          checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "lazy"),
                          state_grammar=grammar, benchmark_interval=500)
 
+    literature = os.path.join(os.path.dirname(__file__), "real_data", "russian_literature.txt")
     war_and_peace = os.path.join(os.path.dirname(__file__), "real_data", "war_and_peace.txt")
-    use_wp = os.path.exists(war_and_peace)
+    
+    if os.path.exists(literature) and os.path.getsize(literature) > 100000:
+        train_file = literature
+        logger.info("[Lazy] Обучение на русской литературе (до 1917 г.)")
+    elif os.path.exists(war_and_peace):
+        train_file = war_and_peace
+        logger.info("[Lazy] Обучение на Войне и Мире")
+    else:
+        train_file = None
+        logger.info("[Lazy] Обучение на Wikipedia (литература не найдена)")
 
     def _background_training():
-        nonlocal use_wp
         while training_active[0]:
             try:
-                if use_wp:
-                    lt.train(max_steps=500, device="cpu", text_file=war_and_peace)
+                if train_file:
+                    lt.train(max_steps=500, device="cpu", text_file=train_file)
                 else:
                     lt.train(max_steps=500, device="cpu", use_wikipedia=True)
                 save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")

@@ -56,9 +56,9 @@ class TemporalContextCompressor:
         input_ids = input_ids.to(device)
 
         with torch.no_grad():
-            emb = layer.embed(input_ids).unsqueeze(0)
+            emb = layer.embed(input_ids)
 
-        z_turn = self.compressor(emb).squeeze(0).cpu().numpy()
+            z_turn = self.compressor(emb).detach().squeeze(0).cpu().numpy()
 
         self._turn_count += 1
         alpha = min(0.5, 1.0 / max(self._turn_count, 1))

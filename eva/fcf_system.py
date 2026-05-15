@@ -276,6 +276,11 @@ class FCFSystem:
         self.sync_gmm_to_registry()
 
         domain = self.gmm.gmms["word"].domains.get(domain_id)
+
+        result = self.layer.process_query(
+            text, self.tokenizer, max_new_tokens=max_tokens
+        )
+        confidence = result["confidence"]
         if domain is None:
             logger.debug(f"[FCF] domain {domain_id} not in word GMM, using default")
         else:

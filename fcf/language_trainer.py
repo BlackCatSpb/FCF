@@ -412,6 +412,13 @@ class LanguageTrainer:
             )
 
             c_query = self.layer.get_context_vector(eval_ids)
+
+            eval_prompt_2 = "Наука изучает закономерности природы и общества."
+            enc2 = self.tokenizer.encode(eval_prompt_2)
+            ids2 = enc2.ids if hasattr(enc2, "ids") else enc2
+            ref_ids = torch.tensor([ids2], dtype=torch.long).to(device)
+            c_ref = self.layer.get_context_vector(ref_ids)
+
             c_response = self.layer.get_context_vector(generated_ids)
 
             x = self.layer.embed(generated_ids)
@@ -426,7 +433,13 @@ class LanguageTrainer:
                 response_text=response_text,
             )
 
-            confidence = eval_result["confidence"]
+            ref_similarity = float(np.dot(
+                c_response.flatten(), c_ref.flatten()
+            ) / (np.linalg.norm(c_response) * np.linalg.norm(c_ref) + 1e-8))
+            ref_similarity = (ref_similarity + 1.0) / 2.0
+
+            confidence = eval_result["confidence"] * 0.4 + ref_similarity * 0.6
+
             self.layer.meta.record(confidence)
 
             if confidence > self.config.srg.snapshot_confidence_threshold:
@@ -440,6 +453,8 @@ class LanguageTrainer:
 
             logger.info(
                 f"[SRG] step={self.step} confidence={confidence:.3f} "
+                f"self_eval={eval_result['confidence']:.3f} "
+                f"ref_sim={ref_similarity:.3f} "
                 f"avg={self.layer.meta.average_confidence():.3f}"
             )
 

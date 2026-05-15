@@ -1,1 +1,1 @@
-{"step": 9710, "max_steps": 500, "loss": "0.2470", "tok_s": "76", "snapshots": 180, "avg_confidence": "0.931", "elapsed": "1678s", "eta": "-62447s"}
+{"step": 9720, "max_steps": 500, "loss": "0.3805", "tok_s": "75", "snapshots": 180, "avg_confidence": "0.931", "elapsed": "1747s", "eta": "-62566s"}

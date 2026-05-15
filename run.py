@@ -552,10 +552,17 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
                          checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "lazy"),
                          state_grammar=grammar, benchmark_interval=500)
 
+    war_and_peace = os.path.join(os.path.dirname(__file__), "real_data", "war_and_peace.txt")
+    use_wp = os.path.exists(war_and_peace)
+
     def _background_training():
+        nonlocal use_wp
         while training_active[0]:
             try:
-                lt.train(max_steps=500, device="cpu", use_wikipedia=True)
+                if use_wp:
+                    lt.train(max_steps=500, device="cpu", text_file=war_and_peace)
+                else:
+                    lt.train(max_steps=500, device="cpu", use_wikipedia=True)
                 save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
                 save_primordial_layer(layer, save_path)
             except Exception as e:

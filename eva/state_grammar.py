@@ -634,3 +634,14 @@ class EmergentConcept:
     concept_id: str; state_vector: np.ndarray
     parent_a: str; parent_b: str; composition_count: int = 1
     stability: float = 0.0; first_seen: float = 0.0; last_seen: float = 0.0
+
+
+class ContextualComposerV2(nn.Module):
+    def __init__(self, dim: int = 2560):
+        super().__init__(); self.dim = dim
+        self.encoder = nn.Sequential(nn.Linear(dim*3, dim), nn.SiLU(), nn.Linear(dim, dim//2), nn.SiLU(), nn.Linear(dim//2, dim))
+        self.attn = nn.MultiheadAttention(dim, 8, batch_first=True); self.norm = nn.LayerNorm(dim)
+    def forward(self, z_A, z_B, z_C):
+        ctx = self.encoder(torch.cat([z_A, z_B, z_C], dim=-1))
+        s = torch.stack([z_A, z_B, ctx], dim=1); a, _ = self.attn(s, s, s)
+        return self.norm(a.mean(dim=1))

@@ -167,22 +167,6 @@ class UnifiedStateGrammar:
             result.resonance = self.resonance.resonance_score(z_a, z_b)
             result.frontier_intensity, _ = self.frontier.frontier_score(result.result, z_a, z_b)
             result.metaphor_strength = self.metaphor.metaphor_strength(z_a, z_b)
-            try: result.superposition_uncertainty = self.superposition.collapse_uncertainty(result_t.unsqueeze(0)); except: pass
-            try: result.inheritance_path = str(self.inheritance.find_nearest_common_ancestor(label_a, label_b) or ''); except: pass
-            try: d,rules = self.distance.best_distance(0,0); result.transform_distance = d; except: pass
-            try: result.conservation_fraction = self.conservation.invariants.get(self.conservation.invariants.keys()[0],{}).get('fraction',0) if list(self.conservation.invariants.keys()) else 0; except: pass
-            try: qr = self.quantification.quantify(z_a, z_b); result.forall = qr.get('forall',0); result.exists = qr.get('exists',0); except: pass
-            try: result.gradient_val = float(self.gradient_flow.potential_value(result_t)); except: pass
-            try: result.culture_variants = [self.culture.translate(z_a, 0, i) for i in range(2)]; except: pass
-            try: result.dialectic_progress = self.dialectic.dialectical_progress(z_a, z_b, result.result); except: pass
-            try: result.best_cause = self.abduction.abduce(z_b, z_c, 1)[0][1] if self.abduction.abduce(z_b,z_c,1) else 0; except: pass
-            try: result.analogy_score = self.analogy.score_analogy(z_a, z_b, z_b, result.result); except: pass
-            try: unseen,_ = self.zero_shot.compose_unseen(z_a, z_b, z_c); result.zero_shot_result = unseen[:5] if len(unseen)>0 else []; except: pass
-            try: result.teleo_alignment = self.teleo.purpose_alignment(z_a, result.result); except: pass
-            try: result.evolution_fitness = self.evolution.best()[1] if len(self.evolution.population)>0 else 0; except: pass
-            try: payoff = self.game_theory.payoff_matrix([z_a, z_b, result.result], z_c); result.nash_eq = str(self.game_theory.nash_equilibrium(payoff)[:3]); except: pass
-            try: result.attention_left = self.attention.attention_remaining(); except: pass
-            try: result.introspect_depth = self.introspect.depth_of_self_awareness(result.result); except: pass
             result.ethical_profile = self.ethics.deontological_profile(result.result)
             result.emotional_valence, _ = self.emotion.valence_arousal(result.result)
             result.creativity = self.dream.creative_potential(

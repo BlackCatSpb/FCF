@@ -1,4 +1,4 @@
-"""
+﻿"""
 UnifiedStateGrammar — единый класс, объединяющий все 41 механизм.
 
 41 механизм в одном API:
@@ -57,7 +57,7 @@ class UnifiedStateGrammar:
         logger.info(f"[UnifiedGrammar] {41} механизмов инициализировано (dim={dim})")
 
     def _init_core(self):
-        from fcf.state_grammar import (
+        from eva.state_grammar import (
             StateValenceV2, TemporalChainV2, NegationAlgebraV2,
             SuperpositionCollapseV2, CompositionalValidatorV2,
             StateInheritanceGraphV2, EmergentGenesisV2,
@@ -78,7 +78,7 @@ class UnifiedStateGrammar:
         self.ctx_composer = ContextualComposerV2(self.dim)
 
     def _init_extended(self):
-        from fcf.state_grammar_ext import (
+        from eva.state_grammar_ext import (
             CausalReasoning, TemporalModality, EpistemicStates,
             Quantification, StateResonance, FrontierStates,
             GradientFlow, TopologicalPersistence,
@@ -96,7 +96,7 @@ class UnifiedStateGrammar:
         self.info_geom = InformationGeometry(self.dim)
 
     def _init_final(self):
-        from fcf.state_grammar_final import (
+        from eva.state_grammar_final import (
             RecursiveSelfModification, DialecticalSynthesis, Abduction,
             AnalogicalMapping, ZeroShotComposition, FractalSelfConsistency,
             TeleologicalReasoning, NarrativeCoherence, EmotionalValence,
@@ -114,7 +114,7 @@ class UnifiedStateGrammar:
         self.counterfactual = CounterfactualImagination(self.dim)
 
     def _init_deep(self):
-        from fcf.state_grammar_deep import (
+        from eva.state_grammar_deep import (
             CulturalRelativity, DreamRecombination, EthicalCalculus,
             StateEconomy, EvolutionaryPressure, GameTheoretic,
             AttentionEconomy, MetaphorGeneration, RecursiveIntrospection,

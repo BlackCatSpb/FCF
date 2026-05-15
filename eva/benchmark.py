@@ -1,4 +1,4 @@
-"""
+﻿"""
 Benchmark — end-to-end тест всей системы FCF.
 
 Загружает чекпоинт, прогоняет разнородные запросы через FCFSystem,
@@ -22,7 +22,7 @@ def run_benchmark(checkpoint_path: str = None,
       - summary: сводка (средний confidence, время, домены)
       - system: состояние системы после теста
     """
-    from fcf.fcf_system import FCFSystem
+    from eva.fcf_system import FCFSystem
 
     logger.info("=" * 60)
     logger.info("FCF Benchmark")
@@ -33,8 +33,8 @@ def run_benchmark(checkpoint_path: str = None,
     fcf.bootstrap()
 
     if checkpoint_path and os.path.exists(checkpoint_path):
-        from fcf.utils import load_primordial_layer
-        from fcf.primordial_layer import PrimordialLayer
+        from eva.utils import load_primordial_layer
+        from eva.primordial_layer import PrimordialLayer
         fcf.layer = load_primordial_layer(checkpoint_path, PrimordialLayer)
         logger.info(f"Loaded: {checkpoint_path} (snapshots={len(fcf.layer.state_storage)})")
 

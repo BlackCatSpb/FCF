@@ -1,8 +1,8 @@
-import sys
+﻿import sys
 sys.path.insert(0, '.')
-from fcf.primordial_layer import PrimordialLayer
-from fcf.utils import load_primordial_layer
-from fcf.atomic_basis import AtomicBasis
+from eva.primordial_layer import PrimordialLayer
+from eva.utils import load_primordial_layer
+from eva.atomic_basis import AtomicBasis
 
 print("Loading model...")
 layer = load_primordial_layer('checkpoints/language/step_023000', PrimordialLayer)

@@ -16,26 +16,26 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from fcf.config import load_config, FCFConfig
-from fcf.primordial_layer import PrimordialLayer
-from fcf.utils import save_primordial_layer, load_primordial_layer
-from fcf.tokenizer_utils import (
+from eva.config import load_config, FCFConfig
+from eva.primordial_layer import PrimordialLayer
+from eva.utils import save_primordial_layer, load_primordial_layer
+from eva.tokenizer_utils import (
     load_tokenizer,
     train_tokenizer_on_wikipedia,
     create_fallback_tokenizer,
 )
-from fcf.language_trainer import LanguageTrainer
-from fcf.instruction_trainer import InstructionTrainer
-from fcf.domain_trainer import DomainTrainer
-from fcf.domain_registry import DomainRegistry
-from fcf.recursive_processor import RecursiveProcessor
-from fcf.layer_crystallizer import LayerCrystallizer
-from fcf.sleep_mode import SleepMode
-from fcf.kca_engine import KCAEngine
-from fcf.state_algebra import StateAlgebra
-from fcf.hnsw_index import HNSWIndex
-from fcf.environment_tuner import EnvironmentAutoTuner
-from fcf.auto_trainer import AutoTrainer
+from eva.language_trainer import LanguageTrainer
+from eva.instruction_trainer import InstructionTrainer
+from eva.domain_trainer import DomainTrainer
+from eva.domain_registry import DomainRegistry
+from eva.recursive_processor import RecursiveProcessor
+from eva.layer_crystallizer import LayerCrystallizer
+from eva.sleep_mode import SleepMode
+from eva.kca_engine import KCAEngine
+from eva.state_algebra import StateAlgebra
+from eva.hnsw_index import HNSWIndex
+from eva.environment_tuner import EnvironmentAutoTuner
+from eva.auto_trainer import AutoTrainer
 
 
 def cmd_init(config_path: str = None):
@@ -536,8 +536,8 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
     training_active = [True]
     training_thread = None
 
-    from fcf.language_trainer import LanguageTrainer
-    from fcf.unified_grammar import UnifiedStateGrammar
+    from eva.language_trainer import LanguageTrainer
+    from eva.unified_grammar import UnifiedStateGrammar
 
     grammar = UnifiedStateGrammar(layer.config.d_model)
 
@@ -647,7 +647,7 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
 
         if user_input.lower() == "train":
             print("Запуск обучения на Wikipedia (5000 шагов)...")
-            from fcf.language_trainer import LanguageTrainer
+            from eva.language_trainer import LanguageTrainer
             lt = LanguageTrainer(layer=layer, tokenizer=tokenizer)
             lt.train(max_steps=5000, device="cpu", use_wikipedia=True)
             save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
@@ -684,7 +684,7 @@ def cmd_fcf_system(config_path: str = None, checkpoint_path: str = None):
     logger.info("EVASystem — Полный когнитивный цикл")
     logger.info("=" * 60)
 
-    from fcf.fcf_system import FCFSystem as EVASystem
+    from eva.fcf_system import FCFSystem as EVASystem
     fcf = EVASystem()
     fcf.bootstrap(checkpoint_path)
     fcf.start_background(interval=300.0)

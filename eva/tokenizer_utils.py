@@ -1,4 +1,4 @@
-"""
+﻿"""
 TokenizerUtils — обучение и загрузка BPE-токенизатора.
 
 Токенизатор обучается на русском корпусе (Wikipedia) с нуля.
@@ -107,7 +107,7 @@ def train_tokenizer_on_wikipedia(
     num_texts: int = 100000,
     min_text_length: int = 100,
 ) -> Optional["Tokenizer"]:
-    from fcf.data_manager import DataManager
+    from eva.data_manager import DataManager
 
     logger.info(f"[Tokenizer] Загрузка Wikipedia для обучения токенизатора...")
 

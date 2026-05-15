@@ -1,8 +1,8 @@
-import sys, os, json
+﻿import sys, os, json
 sys.path.insert(0, '.')
-from fcf.primordial_layer import PrimordialLayer
-from fcf.tokenizer_utils import load_tokenizer
-from fcf.utils import load_primordial_layer
+from eva.primordial_layer import PrimordialLayer
+from eva.tokenizer_utils import load_tokenizer
+from eva.utils import load_primordial_layer
 
 layer = load_primordial_layer('checkpoints/language/step_023000', PrimordialLayer)
 t = load_tokenizer('tokenizer.json')

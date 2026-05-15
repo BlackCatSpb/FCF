@@ -1,4 +1,4 @@
-"""
+﻿"""
 End-to-end test: bootstrap → train → compose → validate.
 Доказывает что система работает как единое целое.
 """
@@ -6,10 +6,10 @@ import sys, os, json, time, numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/..")
 
 def run_e2e_test():
-    from fcf.unified_grammar import UnifiedStateGrammar
-    from fcf.primordial_layer import PrimordialLayer
-    from fcf.tokenizer_utils import load_tokenizer
-    from fcf.config import load_config
+    from eva.unified_grammar import UnifiedStateGrammar
+    from eva.primordial_layer import PrimordialLayer
+    from eva.tokenizer_utils import load_tokenizer
+    from eva.config import load_config
 
     print("=" * 60)
     print("FCF End-to-End Test")
@@ -27,7 +27,7 @@ def run_e2e_test():
 
     # 2. Train 10 steps
     print("\n[2/5] Training 10 steps...")
-    from fcf.language_trainer import LanguageTrainer
+    from eva.language_trainer import LanguageTrainer
     trainer = LanguageTrainer(layer=layer, tokenizer=tokenizer, hierarchy=None,
                               checkpoint_dir="checkpoints/e2e_test")
     t0 = time.time()

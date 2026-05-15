@@ -1,9 +1,9 @@
-"""
+﻿"""
 FCFSystem — единая интеграция всех компонентов FCF v2.
 
 Назначение:
   Связывает AtomicBasis, FractalHierarchy, StreamingGMM, HNSWIndex,
-  KCAEngine, SRGPlus, SleepModeV2, CodeProvenance, IntrinsicCuriosity
+  KCAEngine, SRGPlus, SleepMode, CodeProvenance, IntrinsicCuriosity
   в единый runtime, реализующий полный когнитивный цикл.
 
 Задача:
@@ -78,7 +78,7 @@ class FCFSystem:
         4. Инициализировать FractalHierarchy
         5. Инициализировать MultiLevelGMM
         6. Инициализировать HNSWIndex
-        7. Инициализировать KCAEngine, SRGPlus, SleepModeV2
+        7. Инициализировать KCAEngine, SRGPlus, SleepMode
         """
         from .primordial_layer import PrimordialLayer
         from .tokenizer_utils import load_tokenizer
@@ -88,7 +88,7 @@ class FCFSystem:
         from .hnsw_index import HNSWIndex
         from .kca_engine import KCAEngine
         from .srg_plus import SRGPlus
-        from .sleep_mode_v2 import SleepModeV2
+        from .sleep_mode import SleepMode
         from .code_provenance import CodeProvenance
         from .intrinsic_curiosity import IntrinsicCuriosity
         from .state_algebra import StateAlgebra
@@ -154,7 +154,7 @@ class FCFSystem:
         )
         self.kca_scheduler = AdaptiveKCAScheduler()
         self.srg_plus = SRGPlus()
-        self.sleep_mode = SleepModeV2()
+        self.sleep_mode = SleepMode()
         self.provenance = CodeProvenance()
         self.curiosity = IntrinsicCuriosity()
         self.state_algebra = StateAlgebra(dim=self.config.d_model)

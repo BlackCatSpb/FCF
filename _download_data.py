@@ -1,7 +1,7 @@
-"""Download Wikipedia RU via HuggingFace datasets (works on local PC)."""
+﻿"""Download Wikipedia RU via HuggingFace datasets (works on local PC)."""
 import os, sys
 sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
-from fcf.data_manager import DataManager
+from eva.data_manager import DataManager
 
 DATA_DIR = r'C:\Users\black\OneDrive\Desktop\FCF\real_data'
 os.makedirs(DATA_DIR, exist_ok=True)

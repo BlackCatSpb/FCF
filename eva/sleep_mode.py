@@ -1,5 +1,5 @@
-"""
-SleepModeV2 — расширенная консолидация (Фаза 5).
+﻿"""
+SleepMode — расширенная консолидация (Фаза 5).
 
 Добавляет к базовому Sleep Mode:
 - Dream Mode: генерация синтетических кодов через State Algebra
@@ -141,7 +141,7 @@ class DreamGenerator:
         return accepted
 
 
-class SleepModeV2:
+class SleepMode:
     """
     Расширенный Sleep Mode: кластеризация + Forgetfulness Gate +
     Dream Mode + Adversarial Validation + Recursive Self-Improvement.

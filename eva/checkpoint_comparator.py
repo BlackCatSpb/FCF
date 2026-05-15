@@ -1,4 +1,4 @@
-"""
+﻿"""
 Checkpoint Comparator — сравнивает качество генерации на разных шагах обучения.
 Показывает прогрессию от шага 1000 до последнего.
 """
@@ -6,9 +6,9 @@ import sys, os, json, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/..")
 
 def compare_checkpoints(prompts=None, checkpoint_pattern="checkpoints/language/step_*"):
-    from fcf.primordial_layer import PrimordialLayer
-    from fcf.tokenizer_utils import load_tokenizer
-    from fcf.utils import load_primordial_layer
+    from eva.primordial_layer import PrimordialLayer
+    from eva.tokenizer_utils import load_tokenizer
+    from eva.utils import load_primordial_layer
 
     if prompts is None:
         prompts = [

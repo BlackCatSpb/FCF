@@ -164,6 +164,8 @@ class SleepModeV2:
         self.dreamer = DreamGenerator()
 
         self._forget_history: List[Dict] = []
+        self._last_cluster_labels = None
+        self._last_cluster_centroids = None
 
         self.sleep_count = 0
         self.last_query_time = time.time()
@@ -310,6 +312,9 @@ class SleepModeV2:
             kmeans = KMeans(n_clusters=n, random_state=42, n_init=3)
             labels = kmeans.fit_predict(vectors)
             clusters = len(set(labels))
+            self._last_cluster_labels = labels
+            self._last_cluster_centroids = kmeans.cluster_centers_
+            logger.info(f'[Sleep] Кластеров: {clusters}, сохранены метки')
             return clusters
         except Exception:
             return 0

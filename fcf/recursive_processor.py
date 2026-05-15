@@ -148,7 +148,7 @@ class RecursiveProcessor:
             next_token = torch.multinomial(probs, num_samples=1)
             generated = torch.cat([generated, next_token], dim=-1)
 
-            x = layer.embed(generated[:, -16:])
+            x = layer.embed(generated)
             hidden = layer.forward_transformer(x)
             logits = layer.forward_logits(hidden)
 

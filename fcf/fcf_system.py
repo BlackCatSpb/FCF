@@ -319,6 +319,12 @@ class FCFSystem:
             result["kca_confidence"] = kca_confidence
             result["kca_depth"] = kca_depth
 
+            growth = self.layer.growth.evaluate(self.layer.meta, 0.0)
+            if growth == "EXPAND_WIDTH":
+                logger.info("[Growth] Сигнал: расширение в ширину")
+            elif growth == "EXPAND_DEPTH":
+                logger.info("[Growth] Сигнал: рост в глубину")
+
             if self.atomic_basis is not None:
                 try:
                     self.atomic_basis.restore_original(self.layer) if hasattr(self.atomic_basis, 'restore_original') else None

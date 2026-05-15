@@ -656,8 +656,8 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
         if user_input.lower() == "train":
             print("Запуск обучения на Wikipedia (5000 шагов)...")
             from eva.language_trainer import LanguageTrainer
-            lt = LanguageTrainer(layer=layer, tokenizer=tokenizer)
-            lt.train(max_steps=5000, device="cpu", use_wikipedia=True)
+            lt_train = LanguageTrainer(layer=layer, tokenizer=tokenizer)
+            lt_train.train(max_steps=5000, device="cpu", use_wikipedia=True)
             save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
             save_primordial_layer(layer, save_path)
             print(f"Обучение завершено. Сохранено в {save_path}")

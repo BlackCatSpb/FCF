@@ -553,12 +553,12 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
                          checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "lazy"),
                          state_grammar=grammar, benchmark_interval=500)
 
-    logger.info("[Lazy] Загрузка danneyankeee/rus...")
-    from eva.data_manager import DataManager
-    
     rus_path = os.path.join(os.path.dirname(__file__), "real_data", "rus_dataset.txt")
+    wiki_path = os.path.join(os.path.dirname(__file__), "real_data", "wiki_ru.txt")
     
     if not os.path.exists(rus_path):
+        logger.info("[Lazy] Пробую danneyankeee/rus...")
+        from eva.data_manager import DataManager
         rus_iter = DataManager.load_rus_dataset(streaming=True)
         if rus_iter:
             texts = []
@@ -568,15 +568,21 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
                     texts.append(text)
                 if len(texts) >= 2000:
                     break
+                if i > 5000:
+                    break
             if texts:
                 with open(rus_path, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(texts))
-                logger.info(f"[Lazy] Сохранено {len(texts)} текстов из danneyankeee/rus")
+                logger.info(f"[Lazy] danneyankeee/rus: {len(texts)} текстов")
     
-    train_file = rus_path if os.path.exists(rus_path) else None
-    
-    if not train_file:
-        logger.error("[Lazy] Датасет не загружен")
+    if os.path.exists(rus_path) and os.path.getsize(rus_path) > 100000:
+        train_file = rus_path
+        logger.info("[Lazy] Датасет: danneyankeee/rus")
+    elif os.path.exists(wiki_path) and os.path.getsize(wiki_path) > 100000:
+        train_file = wiki_path
+        logger.info("[Lazy] Датасет: wiki_ru.txt (Wikipedia RU, 98% кириллица)")
+    else:
+        logger.error("[Lazy] Нет данных!")
         return
 
     def _background_training():

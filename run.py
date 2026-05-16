@@ -553,35 +553,39 @@ def cmd_lazy_learn(config_path: str = None, checkpoint_path: str = None):
                          checkpoint_dir=os.path.join(os.path.dirname(__file__), "checkpoints", "lazy"),
                          state_grammar=grammar, benchmark_interval=500)
 
-    literature = os.path.join(os.path.dirname(__file__), "real_data", "rvb_literature.txt")
-    wiki_ru = os.path.join(os.path.dirname(__file__), "real_data", "wiki_ru.txt")
-    war_and_peace = os.path.join(os.path.dirname(__file__), "real_data", "war_and_peace.txt")
+    logger.info("[Lazy] Загрузка danneyankeee/rus...")
+    from eva.data_manager import DataManager
     
-    if os.path.exists(wiki_ru) and os.path.getsize(wiki_ru) > 100000:
-        train_file = wiki_ru
-        logger.info("[Lazy] Обучение на Wikipedia RU (2K статей)")
-    elif os.path.exists(literature) and os.path.getsize(literature) > 100000:
-        train_file = literature
-        logger.info("[Lazy] Обучение на русской литературе")
-    elif os.path.exists(war_and_peace):
-        train_file = war_and_peace
-        logger.info("[Lazy] Обучение на Войне и Мире")
-    else:
-        train_file = None
-        logger.info("[Lazy] Wikipedia streaming")
+    rus_path = os.path.join(os.path.dirname(__file__), "real_data", "rus_dataset.txt")
+    
+    if not os.path.exists(rus_path):
+        rus_iter = DataManager.load_rus_dataset(streaming=True)
+        if rus_iter:
+            texts = []
+            for i, text in enumerate(rus_iter):
+                cyr = sum(1 for c in text if 0x0400 <= ord(c) <= 0x04FF)
+                if cyr > 100 and len(text) > 200:
+                    texts.append(text)
+                if len(texts) >= 2000:
+                    break
+            if texts:
+                with open(rus_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(texts))
+                logger.info(f"[Lazy] Сохранено {len(texts)} текстов из danneyankeee/rus")
+    
+    train_file = rus_path if os.path.exists(rus_path) else None
+    
+    if not train_file:
+        logger.error("[Lazy] Датасет не загружен")
+        return
 
     def _background_training():
-        while training_active[0]:
-            try:
-                if train_file:
-                    lt.train(max_steps=500, device="cpu", text_file=train_file)
-                else:
-                    lt.train(max_steps=500, device="cpu", use_wikipedia=True)
-                save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
-                save_primordial_layer(layer, save_path)
-            except Exception as e:
-                logger.warning(f"[Lazy] Ошибка: {e}")
-                time.sleep(10)
+        logger.info("[Lazy] Обучение начато (авто-остановка после изучения датасета)")
+        lt.train(max_steps=20000, device="cpu", text_file=train_file)
+        save_path = os.path.join(os.path.dirname(__file__), "checkpoints", "lazy")
+        save_primordial_layer(layer, save_path)
+        logger.info(f"[Lazy] Обучение завершено. Чекпоинт: {save_path}")
+        training_active[0] = False
 
     training_thread = threading.Thread(target=_background_training, daemon=True)
     training_thread.start()

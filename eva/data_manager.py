@@ -135,8 +135,59 @@ class DataManager:
                     except json.JSONDecodeError:
                         continue
 
-        logger.info(f"[DataManager] RuBQ загружен: {len(data)} записей")
-        return data
+    @staticmethod
+    def load_rus_dataset(streaming: bool = True) -> Optional[Iterator[str]]:
+        """danneyankeee/rus — огромный датасет русских текстов."""
+        try:
+            from datasets import load_dataset
+            ds = load_dataset("danneyankeee/rus", split="train", streaming=streaming, trust_remote_code=True)
+            logger.info("[DataManager] danneyankeee/rus загружен")
+            def text_iter():
+                for item in ds:
+                    text = item.get("text", "") or item.get("content", "") or ""
+                    if len(text) > 100:
+                        yield text
+            return text_iter()
+        except Exception as e:
+            logger.warning(f"[DataManager] rus dataset: {e}")
+            return None
+
+    @staticmethod
+    def load_ru_instruct() -> Optional[List[Dict[str, str]]]:
+        """d0rj/ru-instruct — 754K инструкций на русском."""
+        try:
+            from datasets import load_dataset
+            ds = load_dataset("d0rj/ru-instruct", split="train", streaming=True)
+            logger.info("[DataManager] d0rj/ru-instruct загружен")
+            pairs = []
+            for item in ds:
+                inst = item.get("instruction", "") or item.get("input", "")
+                out = item.get("output", "") or item.get("response", "")
+                if inst and out:
+                    pairs.append({"instruction": inst, "output": out})
+                if len(pairs) >= 10000:
+                    break
+            return pairs
+        except Exception as e:
+            logger.warning(f"[DataManager] ru-instruct: {e}")
+            return []
+
+    @staticmethod
+    def load_conversations() -> Optional[Iterator[str]]:
+        """inkoziev/Conversations — 9M диалогов на русском."""
+        try:
+            from datasets import load_dataset
+            ds = load_dataset("inkoziev/Conversations", split="train", streaming=True, trust_remote_code=True)
+            logger.info("[DataManager] inkoziev/Conversations загружен")
+            def text_iter():
+                for item in ds:
+                    text = item.get("text", "") or str(item)
+                    if len(text) > 50:
+                        yield text
+            return text_iter()
+        except Exception as e:
+            logger.warning(f"[DataManager] Conversations: {e}")
+            return None
 
     @staticmethod
     def load_conceptnet(

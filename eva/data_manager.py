@@ -140,7 +140,7 @@ class DataManager:
         """danneyankeee/rus — огромный датасет русских текстов."""
         try:
             from datasets import load_dataset
-            ds = load_dataset("danneyankeee/rus", split="train", streaming=streaming, trust_remote_code=True)
+            ds = load_dataset("danneyankeee/rus", split="train", streaming=streaming)
             logger.info("[DataManager] danneyankeee/rus загружен")
             def text_iter():
                 for item in ds:

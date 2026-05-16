@@ -154,6 +154,7 @@ class LanguageTrainer:
         block_size: int = 512,
         device: str = "cpu",
         use_wikipedia: bool = False,
+        auto_stop: bool = True,
     ) -> Dict[str, Any]:
         import sys
         from loguru import logger as loguru_logger
@@ -477,6 +478,16 @@ class LanguageTrainer:
     def _check_stop_criterion(self) -> bool:
         avg_conf = self.layer.meta.average_confidence(window=self.stop_window)
         snapshot_count = len(self.layer.state_storage)
+        trend = self.layer.meta.recent_confidence_trend(window=50)
+
+        if snapshot_count >= 100 and trend < 0.005 and avg_conf > 0.7:
+            logger.info(
+                f"[Stop] Интеллектуальная остановка: "
+                f"conf={avg_conf:.3f}, snapshots={snapshot_count}, "
+                f"trend={trend:.4f} (модель перестала учиться)"
+            )
+            return True
+
         return (
             avg_conf > self.target_confidence
             and snapshot_count > self.min_snapshots

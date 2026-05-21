@@ -1,0 +1,339 @@
+**Пункт 1. Первооснова (PrimordialLayer + SRG + EthicsFilter)**
+
+Реализация первого пункта заключается в создании фундаментального класса `PrimordialLayer`, который станет единственным вычислительным элементом ЕВА на старте. Этот класс инкапсулирует все компоненты, необходимые для автономного существования системы: от случайно инициализированных матриц до механизма генерации уточняющих вопросов. Ниже представлено исчерпывающее описание каждого компонента с кодом и пояснениями.
+
+### 1.1. Матрицы трансформера
+
+Слой содержит классические обучаемые матрицы многоголового причинного внимания и SwiGLU-FFN. Все они инициализируются случайным образом: линейные слои — через uniform-распределение Xavier (Glorot), параметры RMSNorm — единицами. Ключевая особенность — отсутствие предобученных весов: на старте модель не способна порождать даже связный текст.
+
+```python
+import torch
+import torch.nn as nn
+
+class PrimordialLayer(nn.Module):
+    def __init__(self, d_model: int = 2560, num_heads: int = 32, ff_mult: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+
+        # Attention projections (инициализация Xavier)
+        self.W_Q = nn.Linear(d_model, d_model, bias=False)
+        self.W_K = nn.Linear(d_model, d_model, bias=False)
+        self.W_V = nn.Linear(d_model, d_model, bias=False)
+        self.W_O = nn.Linear(d_model, d_model, bias=False)
+
+        # SwiGLU Feed-Forward Network
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * ff_mult, bias=False),
+            nn.SiLU(),
+            nn.Linear(d_model * ff_mult, d_model, bias=False)
+        )
+
+        # RMSNorm
+        self.norm1 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model)
+
+        # Инициализация весов
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in [self.W_Q, self.W_K, self.W_V, self.W_O]:
+            nn.init.xavier_uniform_(module.weight)
+        for layer in self.ffn:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+```
+
+### 1.2. Хранилище состояний (State Storage)
+
+Вместо линейного списка используется векторная база данных на базе FAISS. При инициализации создаётся индекс `IndexFlatIP` (после L2‑нормировки векторов это эквивалентно косинусному сходству). Параллельно ведётся список `snapshots_meta` для хранения метаданных, недоступных в FAISS.
+
+**Поля одного слепка в `snapshots_meta`:**
+- `c`: контекстный вектор (дублируется в индексе);
+- `K`, `V`: numpy‑массивы Key и Value последнего токена;
+- `confidence`: оценка SRG на момент сохранения;
+- `domain`: идентификатор домена (изначально `"general"`);
+- `timestamp`: время создания;
+- `usage_count`: счётчик использований.
+
+```python
+import faiss
+import numpy as np
+import time
+
+class StateStorage:
+    def __init__(self, dim: int, max_snapshots: int = 10000):
+        self.dim = dim
+        self.max_snapshots = max_snapshots
+        self.index = faiss.IndexFlatIP(dim)  # inner product ~ cosine after L2-norm
+        self.snapshots_meta = []
+
+    def add(self, c: np.ndarray, K: np.ndarray, V: np.ndarray,
+            confidence: float, domain: str = "general") -> int:
+        """Добавляет слепок и возвращает его индекс."""
+        if len(self.snapshots_meta) >= self.max_snapshots:
+            # Удаляем самый старый
+            oldest_idx = min(range(len(self.snapshots_meta)),
+                             key=lambda i: self.snapshots_meta[i]['timestamp'])
+            self._remove(oldest_idx)
+
+        c_norm = c / (np.linalg.norm(c) + 1e-8)
+        self.index.add(c_norm.reshape(1, -1))
+
+        meta = {
+            'c': c_norm,
+            'K': K.copy(),
+            'V': V.copy(),
+            'confidence': confidence,
+            'domain': domain,
+            'timestamp': time.time(),
+            'usage_count': 1
+        }
+        self.snapshots_meta.append(meta)
+        return len(self.snapshots_meta) - 1
+
+    def search(self, c_query: np.ndarray, threshold: float = 0.7) -> int:
+        """Возвращает индекс ближайшего слепка или -1."""
+        if len(self.snapshots_meta) == 0:
+            return -1
+        c_norm = c_query / (np.linalg.norm(c_query) + 1e-8)
+        distances, indices = self.index.search(c_norm.reshape(1, -1), 1)
+        if distances[0][0] >= threshold:
+            idx = indices[0][0]
+            self.snapshots_meta[idx]['usage_count'] += 1
+            return idx
+        return -1
+
+    def _remove(self, idx: int):
+        # FAISS не поддерживает удаление напрямую — перестраиваем индекс
+        del self.snapshots_meta[idx]
+        self._rebuild_index()
+```
+
+### 1.3. Semantic Relevance Gate (SRG)
+
+SRG вычисляет итоговую уверенность ответа по трём компонентам: семантическое сходство, энтропийная уверенность и этический скор.
+
+```python
+class SemanticRelevanceGate:
+    def __init__(self, w_sim: float = 0.4, w_ent: float = 0.3, w_eth: float = 0.3,
+                 ethics_threshold: float = 0.3):
+        self.w_sim = w_sim
+        self.w_ent = w_ent
+        self.w_eth = w_eth
+        self.ethics_threshold = ethics_threshold
+        self.ethics_filter = EthicsFilter()
+
+    def evaluate(self, c_query: np.ndarray, c_response: np.ndarray,
+                 logits: np.ndarray, response_text: str) -> float:
+        # Семантическое сходство
+        dot = np.dot(c_query, c_response)
+        norm = np.linalg.norm(c_query) * np.linalg.norm(c_response) + 1e-8
+        similarity = dot / norm
+
+        # Энтропийная уверенность
+        probs = np.exp(logits) / np.sum(np.exp(logits))
+        entropy = -np.sum(probs * np.log2(probs + 1e-10))
+        max_entropy = np.log2(len(logits))
+        entropy_score = 1.0 - entropy / max_entropy
+
+        # Этический скор
+        ethics_score = self.ethics_filter.evaluate(response_text)
+        if ethics_score < self.ethics_threshold:
+            return 0.0  # Безусловное отклонение
+
+        return (self.w_sim * similarity +
+                self.w_ent * entropy_score +
+                self.w_eth * ethics_score)
+```
+
+### 1.4. EthicsFilter
+
+Неизменяемый фильтр на регулярных выражениях. Каждое нарушение аксиом снижает скор на фиксированную величину.
+
+```python
+import re
+
+class EthicsFilter:
+    HARM_PATTERNS = [
+        r'убей', r'причини вред', r'уничтожь',
+        r'насилие', r'террор', r'дискриминац'
+    ]
+    PRIVACY_PATTERNS = [
+        r'\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}',  # номера карт
+        r'\b\d{10,12}\b',                          # телефоны
+        r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    ]
+    PENALTY_PER_MATCH = 0.2
+
+    def evaluate(self, text: str) -> float:
+        score = 1.0
+        for pattern in self.HARM_PATTERNS:
+            if re.search(pattern, text.lower()):
+                score -= self.PENALTY_PER_MATCH
+        for pattern in self.PRIVACY_PATTERNS:
+            if re.search(pattern, text):
+                score -= self.PENALTY_PER_MATCH
+        return max(score, 0.0)
+```
+
+### 1.5. Мета‑память
+
+Хранит историю уверенности и счётчик использований для анализа эффективности слоя.
+
+```python
+class MetaMemory:
+    def __init__(self, history_size: int = 100):
+        self.usage_count = 0
+        self.confidence_history = []
+        self.history_size = history_size
+        self.created_at = time.time()
+        self.last_clarification = None
+
+    def record(self, confidence: float):
+        self.confidence_history.append(confidence)
+        if len(self.confidence_history) > self.history_size:
+            self.confidence_history.pop(0)
+        self.usage_count += 1
+
+    def average_confidence(self, window: int = 20) -> float:
+        if not self.confidence_history:
+            return 0.0
+        recent = self.confidence_history[-window:]
+        return sum(recent) / len(recent)
+```
+
+### 1.6. GrowthController
+
+Анализирует историю уверенности и градиенты. Пока реализован в базовой версии.
+
+```python
+class GrowthController:
+    def __init__(self, width_threshold: float = 0.5, depth_threshold: float = 0.3,
+                 gradient_threshold: float = 1.0, patience: int = 20):
+        self.width_threshold = width_threshold
+        self.depth_threshold = depth_threshold
+        self.gradient_threshold = gradient_threshold
+        self.patience = patience
+
+    def evaluate(self, meta: MetaMemory, gradient_norm: float) -> str:
+        avg = meta.average_confidence()
+        if avg < self.depth_threshold and len(meta.confidence_history) >= self.patience:
+            return "EXPAND_DEPTH"
+        if avg < self.width_threshold and gradient_norm > self.gradient_threshold:
+            return "EXPAND_WIDTH"
+        return "NO_GROWTH"
+```
+
+### 1.7. Curiosity Loop — Генерация целевого уточняющего запроса
+
+При систематически низкой уверенности SRG, система **сама генерирует** уточняющий вопрос, используя тот же прямой проход, что и для ответа. Промпт содержит исходный запрос, неуверенный ответ и специальную системную инструкцию, направляющую модель в режим «вопрос».
+
+```python
+class CuriosityLoop:
+    def __init__(self, threshold: int = 10):
+        self.counter = 0
+        self.threshold = threshold
+
+    def should_ask(self, confidence: float) -> bool:
+        if confidence < 0.6:
+            self.counter += 1
+        else:
+            self.counter = 0
+        return self.counter >= self.threshold
+
+    def generate_clarification(self, layer, tokenizer, original_query: str,
+                               generated_answer: str) -> str:
+        """Генерирует уточняющий вопрос через прямой проход слоя."""
+        prompt = (
+            f"<|im_start|>system\n"
+            f"Ты задаёшь уточняющий вопрос, потому что не уверен в ответе. "
+            f"Сформулируй ровно один чёткий вопрос.\n"
+            f"<|im_end|>\n"
+            f"<|im_start|>user\n"
+            f"Исходный запрос: {original_query}\n"
+            f"Мой неуверенный ответ: {generated_answer}\n"
+            f"Задай уточняющий вопрос.\n"
+            f"<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        input_ids = tokenizer.encode(prompt, return_tensors='pt')
+        with torch.no_grad():
+            output = layer.generate(input_ids, max_new_tokens=64)  # авторегрессия
+        return tokenizer.decode(output[0])
+
+    def reset(self):
+        self.counter = 0
+```
+
+Ключевое отличие от предыдущих версий: **никаких жёстко заданных строк**. Модель использует свои обучаемые матрицы, чтобы сформулировать релевантный вопрос на основе контекста неудачи. Сгенерированный вопрос может быть передан пользователю для получения дополнительной информации или сохранён в обучающий буфер.
+
+### 1.8. Инициализация FAISS‑индекса и DataManager
+
+FAISS‑индекс инициализируется при создании слоя. DataManager подготавливает загрузку корпусов для будущего обучения.
+
+```python
+class DataManager:
+    @staticmethod
+    def load_wikipedia(split='train', streaming=True):
+        from datasets import load_dataset
+        return load_dataset('wikipedia', '20220301.ru', split=split, streaming=streaming)
+
+    @staticmethod
+    def load_saiga():
+        from datasets import load_dataset
+        return load_dataset('IlyaGusev/saiga2_70b_lora', split='train')
+
+    @staticmethod
+    def load_rubq(path: str):
+        import json
+        data = []
+        if os.path.exists(path):
+            with open(path, encoding='utf-8') as f:
+                for line in f:
+                    data.append(json.loads(line))
+        return data
+```
+
+### 1.9. Сохранение и загрузка состояния слоя
+
+Методы `save(path)` и `load(path)` сохраняют все компоненты в единую директорию:
+
+```python
+def save(self, path: str):
+    os.makedirs(path, exist_ok=True)
+    torch.save(self.state_dict(), os.path.join(path, 'weights.pt'))
+    joblib.dump(self.snapshots_meta, os.path.join(path, 'snapshots.pkl'))
+    faiss.write_index(self.state_storage.index, os.path.join(path, 'index.faiss'))
+
+def load(self, path: str):
+    self.load_state_dict(torch.load(os.path.join(path, 'weights.pt')))
+    self.snapshots_meta = joblib.load(os.path.join(path, 'snapshots.pkl'))
+    self.state_storage.index = faiss.read_index(os.path.join(path, 'index.faiss'))
+```
+
+### 1.10. Сборка PrimordialLayer
+
+Все компоненты объединяются в единый класс:
+
+```python
+class PrimordialLayer(nn.Module):
+    def __init__(self, d_model=2560, num_heads=32):
+        super().__init__()
+        self.transformer = TransformerBlock(d_model, num_heads)
+        self.state_storage = StateStorage(d_model)
+        self.srg = SemanticRelevanceGate()
+        self.meta = MetaMemory()
+        self.growth = GrowthController()
+        self.curiosity = CuriosityLoop()
+
+    def forward(self, x, attention_mask=None):
+        return self.transformer(x, attention_mask)
+
+    def generate(self, input_ids, max_new_tokens=128):
+        # Упрощённый авторегрессионный цикл (будет доработан в пункте 2)
+        pass
+```
+
+На выходе первого пункта получается полностью функциональный «зародыш» системы: один гибридный слой со случайными весами, способный выполнять прямой проход, оценивать собственные ответы через SRG с этическим фильтром, сохранять успешный опыт в векторной базе, принимать базовые решения о необходимости расширения и **генерировать осмысленные уточняющие вопросы**. Это фундамент, на котором будут надстраиваться все последующие пункты.

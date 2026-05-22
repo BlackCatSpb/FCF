@@ -91,6 +91,7 @@ for step in range(AFF_STEPS):
         aps = step * AFF_BATCH / max(elapsed, 0.01)
         print(f"  step={step} | {aps:.0f} a/s | pot={pf.affinity.mean():.4f}")
 
+os.makedirs(os.path.join(CKPT_DIR, "final"), exist_ok=True)
 torch.save(pf.state_dict(), os.path.join(CKPT_DIR, "final", "potential_field.pt"))
 print(f"  Done. Affinity: mean={pf.affinity.mean():.4f} std={pf.affinity.std():.4f}")
 
@@ -158,6 +159,7 @@ for step in range(1, UT_STEPS + 1):
         gc.collect()
         if DEVICE == 'cuda': torch.cuda.empty_cache()
 
+os.makedirs(os.path.join(CKPT_DIR, "unified"), exist_ok=True)
 torch.save(ut.state_dict(), os.path.join(CKPT_DIR, "unified", "transformer_final.pt"))
 print(f"  Done. Final loss: {loss.item():.4f}")
 

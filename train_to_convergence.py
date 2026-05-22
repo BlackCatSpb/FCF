@@ -115,7 +115,7 @@ def fast_strengthen(batch_ids, batch_attn):
         ui = unique_flat // V
         uj = unique_flat % V
         raw = pf.co_occurrence_count[ui, uj] / 100000.0
-        pf.affinity[ui, uj] = 0.5 + 0.5 * torch.clamp(raw, 0.0, 1.0)
+        pf.affinity[ui, uj] = (0.5 + 0.5 * torch.clamp(raw, 0.0, 1.0)).float()
 
 # ============================================================
 # TRAINING LOOP

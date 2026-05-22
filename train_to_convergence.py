@@ -130,9 +130,6 @@ MAX_STEPS = 50000  # Safety cap: never run more than 50K batches (6.4M assemblie
 
 try:
     while True:
-        if step >= MAX_STEPS:
-            print(f"\nMAX STEPS ({MAX_STEPS}) reached. Stopping.")
-            break
         # Form batch
         if pos + BLOCK + 2 > total_tokens: pos = 0
         ids_batch, lens = [], []
@@ -167,6 +164,10 @@ try:
         trainer.total_assemblies += BATCH
         trainer.step += 1
         step = trainer.step
+
+        if step >= MAX_STEPS:
+            print(f"\nMAX STEPS ({MAX_STEPS}) reached. Stopping.")
+            break
 
         # Mark active to prevent contemplation race condition
         cont.mark_active()

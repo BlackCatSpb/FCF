@@ -1,0 +1,53 @@
+{
+  "d_model": 2560,
+  "num_heads": 32,
+  "ff_mult": 4,
+  "max_snapshots": 10000,
+  "vocab_size": 50257,
+  "max_seq_len": 2048,
+  "srg": {
+    "w_sim": 0.4,
+    "w_ent": 0.3,
+    "w_eth": 0.3,
+    "ethics_threshold": 0.3,
+    "snapshot_confidence_threshold": 0.8,
+    "curiosity_confidence_threshold": 0.6
+  },
+  "growth": {
+    "width_threshold": 0.5,
+    "depth_threshold": 0.3,
+    "gradient_threshold": 1.0,
+    "patience": 20
+  },
+  "curiosity": {
+    "threshold": 10,
+    "max_clarification_tokens": 64
+  },
+  "training": {
+    "learning_rate": 0.0001,
+    "lora_learning_rate": 0.00001,
+    "weight_decay": 0.01,
+    "max_steps": null
+  },
+  "sleep": {
+    "idle_timeout_seconds": 300,
+    "sleep_interval_seconds": 7200,
+    "min_cluster_size": 5,
+    "ttl_idle_days": 7,
+    "distill_usage_threshold": 100
+  },
+  "kca": {
+    "max_iterations": 5,
+    "rho": 0.85,
+    "eta0": 0.01,
+    "osc_threshold": -0.5,
+    "gate_threshold": 0.05,
+    "lambda_gap": 0.3,
+    "lambda_contra": 0.2
+  },
+  "layers": {
+    "max_layers": 100,
+    "min_layer_interval_seconds": 300,
+    "max_recursion_depth": 5
+  }
+}

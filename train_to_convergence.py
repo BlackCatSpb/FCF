@@ -108,7 +108,7 @@ def fast_strengthen(batch_ids, batch_attn):
         assert pf.co_occurrence_count.device == i_c.device, "Device mismatch in fast_strengthen"
         # FIX 1: scatter_add для правильного накопления при дубликатах
         flat_idx = i_c * V + j_c
-        increments = 1.0 + w_c
+        increments = (1.0 + w_c).to(torch.float64)  # float64 to avoid overflow
         pf.co_occurrence_count.view(-1).scatter_add_(0, flat_idx, increments)
         # FIX 4: threshold 100K (был 500K, потом 1K)
         unique_flat = flat_idx.unique()

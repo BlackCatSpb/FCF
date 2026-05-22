@@ -1,0 +1,26 @@
+19:49:55 | INFO     | ============================================================
+19:49:55 | INFO     | Пункт 3 — Инструктивное дообучение
+19:49:55 | INFO     | Устройство: cpu
+19:49:55 | INFO     | Learning rate: 1e-05
+19:49:55 | INFO     | ============================================================
+19:49:55 | INFO     | [CPU] Потоков: 12
+19:49:55 | INFO     | [Train] Пар: 12, блоков: 12, макс. шагов: 500
+19:55:18 | INFO     | [SRG] step=100 confidence=1.000 avg=1.000 ethics=1.000
+19:55:18 | INFO     | [SRG] Ответ: user�то такое история?assistantИстория �� это наука о прошлом человеческого общества. Она изучает события, процессы и за...
+20:01:17 | INFO     | [SRG] step=200 confidence=1.000 avg=1.000 ethics=1.000
+20:01:17 | INFO     | [SRG] Ответ: user�то такое история?assistantИстория �� это наука о прошлом человеческого общества. Она изучает события, процессы и за...
+20:06:49 | INFO     | [SRG] step=300 confidence=1.000 avg=1.000 ethics=1.000
+20:06:49 | INFO     | [SRG] Ответ: user�то такое история?assistantИстория �� это наука о прошлом человеческого общества. Она изучает события, процессы и за...
+20:12:58 | INFO     | [SRG] step=400 confidence=1.000 avg=1.000 ethics=1.000
+20:12:58 | INFO     | [SRG] Ответ: user�то такое история?assistantИстория �� это наука о прошлом человеческого общества. Она изучает события, процессы и за...
+20:18:40 | INFO     | [SRG] step=500 confidence=1.000 avg=1.000 ethics=1.000
+20:18:40 | INFO     | [SRG] Ответ: user�то такое история?assistantИстория �� это наука о прошлом человеческого общества. Она изучает события, процессы и за...
+20:18:42 | INFO     | [Save] Веса сохранены: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\instruction\final/weights.pt
+20:18:42 | INFO     | [Save] Слепки сохранены: 19 шт.
+20:18:42 | INFO     | [Save] FAISS-индекс сохранён: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\instruction\final\index.faiss
+20:18:42 | INFO     | [Save] Мета-память сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\instruction\final\meta.pkl
+20:18:42 | INFO     | [Save] Конфигурация сохранена: C:\Users\black\OneDrive\Desktop\FCF\checkpoints\instruction\final\config.json
+20:18:42 | INFO     | [Save] Слой полностью сохранён в C:\Users\black\OneDrive\Desktop\FCF\checkpoints\instruction\final
+20:18:42 | INFO     | [Train] Завершено: max_steps
+20:18:42 | INFO     | [Train] Шагов: 500, токенов: 255,500, время: 1725с
+20:18:42 | INFO     | [Train] Статистика: {'steps': 500, 'elapsed_seconds': 1724.7103180885315, 'tokens_processed': 255500, 'tokens_per_second': 148.1408195453753, 'final_loss': 0.0, 'best_confidence': 0.0, 'average_confidence': 0.9996454259899125, 'snapshots_count': 19, 'usage_count': 25, 'pending_clarifications': 0, 'stop_reason': ''}

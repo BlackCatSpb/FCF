@@ -39,7 +39,7 @@ class PotentialField(nn.Module):
         self.register_buffer("affinity", torch.full((vocab_size, vocab_size), 0.5))
 
         # Счётчик co-occurrence для взвешенного обновления
-        self.register_buffer("co_occurrence_count", torch.zeros(vocab_size, vocab_size))
+        self.register_buffer("co_occurrence_count", torch.zeros(vocab_size, vocab_size, dtype=torch.float64))
 
         # Гиперпараметры
         self.ema_alpha: float = 0.0005  # tiny EMA: frequent pairs → 0.8, rare → 0.505

@@ -16,7 +16,7 @@ from eva.symbolic.advanced_methods import NGramContext
 CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints", "symbolic")
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 BATCH = 256; BLOCK = 64
-STEPS = 50000; LR = 1e-3
+STEPS = 2000; LR = 1e-3
 
 print("=" * 60)
 print("EVA Symbolic v8 — Unified Transformer Training")
@@ -26,7 +26,9 @@ print(f"Device: {DEVICE}, Batch: {BATCH}, Block: {BLOCK}")
 # === 1. LOAD AFFINITY + COMPUTE COORDINATES ===
 print("\n[1] Loading affinity + computing coordinates...")
 pf = PotentialField(156, 256)
-pf_path = os.path.join(CKPT_DIR, "step_880000", "potential_field.pt")
+pf_path = os.path.join(CKPT_DIR, "final", "potential_field.pt")
+if not os.path.exists(pf_path):
+    pf_path = os.path.join(CKPT_DIR, "step_880000", "potential_field.pt")
 if not os.path.exists(pf_path):
     pf_path = os.path.join(CKPT_DIR, "step_320000", "potential_field.pt")
 if not os.path.exists(pf_path):

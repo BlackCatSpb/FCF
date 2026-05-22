@@ -230,7 +230,7 @@ class FractalAttentionMask(nn.Module):
         # Обновить координаты символов в пространстве
         for i in range(L):
             sym = symbol_ids[0, i].item()
-            coords = self.head_projections[0] @ x[0, i]  # проекция на координаты
+            coords = x[0, i] @ self.head_projections[0]  # [d_model] @ [d_model, c_dim] → [c_dim]
             self.space.set_coordinates(0, sym, coords.detach().cpu().numpy())
 
         outputs = []
@@ -250,10 +250,12 @@ class FractalAttentionMask(nn.Module):
                     for i in range(L)
                 ])
                 mask = self.build_mask(level, entity_coords, [], scale)
-                # Attention с маской
-                attn_out = F.scaled_dot_product_attention(
-                    x, x, x, attn_mask=mask.unsqueeze(0).unsqueeze(0)
-                )
+                # Manual attention with mask (compatible with any shape)
+                q = k = v = x  # self-attention
+                attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
+                attn_scores = attn_scores + mask.unsqueeze(0).unsqueeze(0)
+                attn_weights = torch.softmax(attn_scores, dim=-1)
+                attn_out = torch.matmul(attn_weights, v)
 
             elif level >= 1 and word_boundaries:
                 # Word/sentence/domain level: группируем по границам

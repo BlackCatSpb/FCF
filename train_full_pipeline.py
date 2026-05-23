@@ -121,7 +121,7 @@ if DEVICE == 'cuda':
     ut = ut.cuda()
 print(f"  {ut.summary()}")
 
-UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 100000; UT_LR = 3e-3
+UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 200000; UT_LR = 5e-4
 opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS)
 

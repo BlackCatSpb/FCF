@@ -86,10 +86,14 @@ for step in range(AFF_STEPS):
                 raw = pf.co_occurrence_count[ui, uj] / 100000.0
                 pf.affinity[ui, uj] = (0.5 + 0.5 * torch.clamp(raw, 0.0, 1.0)).float()
 
-    if step % 10000 == 0 and step > 0:
+    if step % 5000 == 0 and step > 0:
         elapsed = time.time() - start
         aps = step * AFF_BATCH / max(elapsed, 0.01)
-        print(f"  step={step} | {aps:.0f} a/s | pot={pf.affinity.mean():.4f}")
+        pct = step * 100 // AFF_STEPS
+        bar = '#' * (pct // 4) + '-' * (25 - pct // 4)
+        print(f"\r  [{bar}] {pct}% | {aps:.0f} a/s | pot={pf.affinity.mean():.4f}", end='', flush=True)
+    if step % 10000 == 0 and step > 0:
+        print()
 
 os.makedirs(os.path.join(CKPT_DIR, "final"), exist_ok=True)
 torch.save(pf.state_dict(), os.path.join(CKPT_DIR, "final", "potential_field.pt"))
@@ -155,7 +159,9 @@ for step in range(1, UT_STEPS + 1):
     if step % 3000 == 0:
         elapsed = time.time() - start
         bps = step / max(elapsed, 0.01)
-        print(f"  step={step} | {bps:.0f} b/s | loss={loss.item():.4f} | {elapsed/3600:.1f}h")
+        pct = step * 100 // UT_STEPS
+        bar = '#' * (pct // 4) + '-' * (25 - pct // 4)
+        print(f"\r  [{bar}] {pct}% | {bps:.0f} b/s | loss={loss.item():.4f}", end='', flush=True)
         gc.collect()
         if DEVICE == 'cuda': torch.cuda.empty_cache()
 

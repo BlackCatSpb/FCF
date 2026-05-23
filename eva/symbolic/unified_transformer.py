@@ -61,9 +61,8 @@ class CoordinateEmbedding(nn.Module):
 
 class CoordinateDecoder(nn.Module):
     """
-    Декодер: ℝ¹² → ближайший символ.
-
-    Без линейного слоя. Ближайший сосед в координатном пространстве.
+    Декодер: ℝ¹² → 156 символов.
+    Обучаемый линейный классификатор + nearest neighbor fallback.
     """
 
     def __init__(self, coord_embedding: CoordinateEmbedding):
@@ -72,22 +71,27 @@ class CoordinateDecoder(nn.Module):
         self.vocab_size = coord_embedding.vocab_size
         self.coord_dim = coord_embedding.coord_dim
 
+        # Обучаемый линейный классификатор (12 → 156)
+        self.linear = nn.Linear(coord_embedding.coord_dim, coord_embedding.vocab_size)
+
+        # Температура для sharpen распределения
+        self.temperature = nn.Parameter(torch.tensor(1.0))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [B, L, coord_dim] предсказанные координаты
-        returns: [B, L, vocab_size] расстояния до каждого символа
+        returns: [B, L, vocab_size] логиты
         """
-        B, L, D = x.shape
-        # Расширяем для pairwise расстояний
+        # Основной путь: обучаемый линейный слой
+        logits = self.linear(x) * self.temperature
+
+        # Добавляем nearest-neighbor сигнал для стабильности
         coords = self.embed.coordinates  # [V, D]
-        # x: [B, L, D] → [B, L, 1, D]
-        # coords: [V, D] → [1, 1, V, D]
         diffs = x.unsqueeze(2) - coords.unsqueeze(0).unsqueeze(0)  # [B, L, V, D]
         dists = torch.norm(diffs, dim=-1)  # [B, L, V]
+        nn_scores = 1.0 / (1.0 + dists)
 
-        # Ближе = выше score (инвертируем расстояние)
-        scores = 1.0 / (1.0 + dists)
-        return scores
+        return logits + nn_scores
 
     def decode_to_ids(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, L, D] → [B, L] индексы ближайших символов."""

@@ -7,7 +7,7 @@ Phase 3: UnifiedTransformer training (gradient descent, 30K steps)
 Phase 4: Reconstruction test
 """
 
-import sys, os, time, torch, numpy as np, gc
+import sys, os, time, torch, torch.nn.functional as F, numpy as np, gc
 sys.path.insert(0, os.path.dirname(__file__))
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -139,19 +139,22 @@ coords = topo.coordinates[:156, :12].clone()
 print(f"  Coordinates: {coords.shape}")
 
 # ============================================================
-# PHASE 3: UnifiedTransformer Training
+# PHASE 3: UnifiedTransformer — affinity distillation
 # ============================================================
-print("\n[PHASE 3] UnifiedTransformer training (gradient descent)...")
+print("\n[PHASE 3] UnifiedTransformer training (affinity distillation)...")
 
 ut = UnifiedMultidimensionalTransformer(vocab_size=156, coord_dim=12)
-ut.set_symbol_coordinates(coords)
 if DEVICE == 'cuda':
     ut = ut.cuda()
 print(f"  {ut.summary()}")
 
-UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 200000; UT_LR = 5e-4
+UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 50000; UT_LR = 1e-3
 opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS)
+
+# Affinity-based soft targets
+aff_tgt = pf.affinity.to(DEVICE)  # [V, V]
+aff_tgt = aff_tgt / (aff_tgt.sum(dim=-1, keepdim=True) + 1e-8)  # normalize
 
 pos = 0; start = time.time()
 
@@ -173,29 +176,37 @@ for step in range(1, UT_STEPS + 1):
     for i, ids in enumerate(ids_batch):
         bt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
 
-    target = torch.roll(bt, -1, dims=1)
-    mask = (bt != PAD).float()
-
     ut.train()
-    loss = ut.compute_loss(bt, target, mask)
+    _, scores = ut(bt, return_scores=True)
+    
+    # Target: affinity[token] — what the symbolic layer knows
+    tgt = aff_tgt[bt.clamp(0, V-1)]  # [B, L, V]
+    mask = (bt != PAD).float()  # [B, L]
+    
+    # KL divergence: transformer output should match affinity distribution
+    log_probs = F.log_softmax(scores, dim=-1)
+    loss = -(tgt * log_probs).sum(dim=-1)  # [B, L]
+    loss = (loss * mask).sum() / (mask.sum() + 1e-8)
+    
     opt.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
     opt.step()
     sch.step()
 
-    if step % 3000 == 0:
+    if step % 5000 == 0:
         elapsed = time.time() - start
         bps = step / max(elapsed, 0.01)
         pct = step * 100 // UT_STEPS
         bar = '#' * (pct // 4) + '-' * (25 - pct // 4)
-        print(f"\r  [{bar}] {pct}% | {bps:.0f} b/s | loss={loss.item():.4f}", end='', flush=True)
+        print(f"\r  [{bar}] {pct}% | {bps:.0f} b/s | loss={loss.item():.6f}", end='', flush=True)
         gc.collect()
         if DEVICE == 'cuda': torch.cuda.empty_cache()
 
+print()
 os.makedirs(os.path.join(CKPT_DIR, "unified"), exist_ok=True)
 torch.save(ut.state_dict(), os.path.join(CKPT_DIR, "unified", "transformer_final.pt"))
-print(f"  Done. Final loss: {loss.item():.4f}")
+print(f"  Done. Final loss: {loss.item():.6f}")
 
 # ============================================================
 # PHASE 4: Reconstruction Test

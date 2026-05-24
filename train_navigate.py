@@ -45,56 +45,9 @@ ut.eval()
 print("Model loaded")
 
 # ============================================================
-# GeodesicNavigator: find paths through ℝ²⁴
+# SymbolicGenerator: generate text from coordinates
 # ============================================================
-print("\n[NAVIGATE] Geodesic navigation in ℝ²⁴...")
-
-from eva.symbolic.geodesic_navigator import GeodesicNavigator, TangentSpace
-
-# Build navigator from symbol coordinates
-navigator = GeodesicNavigator(coords[1:VT].cpu().numpy(), k_neighbors=5)
-print(f"  Navigator: {navigator.n_points} points, k={navigator.k_neighbors}")
-
-# Test: find geodesic between two concepts
-test_pairs = [
-    ("привет", "пока"),
-    ("человек", "машина"),
-    ("солнце", "луна"),
-    ("любовь", "страх"),
-]
-
-for w1, w2 in test_pairs:
-    ids1 = cv.encode(w1)[1:-1]
-    ids2 = cv.encode(w2)[1:-1]
-    
-    if len(ids1) < 2 or len(ids2) < 2:
-        continue
-    
-    # Compute centroids
-    c1 = coords[ids1].mean(dim=0).cpu().numpy()
-    c2 = coords[ids2].mean(dim=0).cpu().numpy()
-    
-    try:
-        path, path_dist = navigator.find_path(c1, c2, max_steps=10)
-        if path is not None and len(path) >= 2:
-            n_steps = len(path)
-            print(f"  '{w1}' → '{w2}': {n_steps} steps, dist={path_dist:.3f}")
-            
-            # Convert path points to nearest symbols
-            path_t = torch.tensor(np.array(path), dtype=torch.float32).to(DEVICE)
-            dists = torch.cdist(path_t, coords)
-            nearest = dists.argmin(dim=-1).clamp(1, VT-1)
-            path_text = cv.decode(nearest.tolist())
-            print(f"    Path: '{path_text}'")
-        else:
-            print(f"  '{w1}' → '{w2}': no path found")
-    except Exception as e:
-        print(f"  '{w1}' → '{w2}': error — {e}")
-
-# ============================================================
-# SymbolicGenerator: generate text from coordinate paths
-# ============================================================
-print("\n[GENERATE] Symbolic generation from coordinate paths...")
+print("\n[GENERATE] Symbolic text generation from coordinate seeds...")
 
 from eva.symbolic.symbolic_generator import SymbolicGenerator
 
@@ -106,8 +59,7 @@ generator = SymbolicGenerator(
     max_length=30,
 )
 
-# Generate text from a seed
-test_seeds = ["привет", "человек", "знания"]
+test_seeds = ["привет", "человек", "знания", "метаданные", "трансформер"]
 
 for seed in test_seeds:
     seed_ids = cv.encode(seed)[1:-1]
@@ -127,41 +79,45 @@ for seed in test_seeds:
         print(f"  '{seed}...' → error: {e}")
 
 # ============================================================
-# Full cycle: navigate + generate
+# Coordinate-based navigation: direct path interpolation
 # ============================================================
-print("\n[INTEGRATE] Navigate → Generate full cycle...")
+print("\n[NAVIGATE] Direct coordinate navigation (no external deps)...")
 
-for w1, w2 in test_pairs[:2]:
+test_pairs = [
+    ("привет", "пока"),
+    ("человек", "машина"),
+    ("солнце", "луна"),
+]
+
+for w1, w2 in test_pairs:
     ids1 = cv.encode(w1)[1:-1]
     ids2 = cv.encode(w2)[1:-1]
     if len(ids1) < 2 or len(ids2) < 2:
         continue
     
-    c1 = coords[ids1].mean(dim=0).cpu().numpy()
-    c2 = coords[ids2].mean(dim=0).cpu().numpy()
+    c1 = coords[ids1].mean(dim=0)  # centroid
+    c2 = coords[ids2].mean(dim=0)
     
-    try:
-        path, _ = navigator.find_path(c1, c2, max_steps=8)
-        if path is not None and len(path) >= 3:
-            # Generate text starting from each waypoint
-            path_t = torch.tensor(np.array(path), dtype=torch.float32).to(DEVICE)
-            dists = torch.cdist(path_t, coords)
-            waypoints = dists.argmin(dim=-1).clamp(1, VT-1).tolist()
-            
-            generated_parts = []
-            for wp in waypoints[:5]:
-                seed = [wp]
-                try:
-                    res = generator.generate(seed_ids=seed, max_new_tokens=8, top_k=20)
-                    gen = cv.decode(res)
-                    generated_parts.append(gen)
-                except:
-                    generated_parts.append("?")
-            
-            print(f"  '{w1}' → '{w2}':")
-            print(f"    Path: {cv.decode(waypoints[:5])}")
-            print(f"    Gen:  {' | '.join(generated_parts)}")
-    except Exception as e:
-        print(f"  '{w1}' → '{w2}': error — {e}")
+    # Linear path with 5 waypoints
+    n_pts = 5
+    path = torch.stack([c1 + (i/(n_pts-1))*(c2-c1) for i in range(n_pts)])
+    
+    with torch.no_grad():
+        dists = torch.cdist(path.to(DEVICE), coords)
+        nearest = dists.argmin(dim=-1).clamp(1, VT-1)
+        path_text = cv.decode(nearest.tolist())
+    
+    # Generate from each waypoint
+    parts = []
+    for wp in nearest[:4]:
+        try:
+            res = generator.generate(seed_ids=[wp.item()], max_new_tokens=6, top_k=20)
+            parts.append(cv.decode(res))
+        except:
+            parts.append("?")
+    
+    print(f"  '{w1}' → '{w2}':")
+    print(f"    Path: '{path_text}'")
+    print(f"    Gen:  {' | '.join(parts)}")
 
 print("\nDone.")

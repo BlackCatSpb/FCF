@@ -103,7 +103,7 @@ if not os.path.exists(affinity_path):
             
             if len(i_flat) > 0:
                 flat_idx = i_flat * V + j_flat
-                inc = (1.0 + w_flat).to(pf.co_occurrence_count.dtype)
+                inc = torch.ones_like(w_flat).to(pf.co_occurrence_count.dtype)  # pure co-occurrence, no random attention
                 pf.co_occurrence_count.view(-1).scatter_add_(0, flat_idx, inc)
                 
                 # Update affinity for changed pairs only
@@ -136,6 +136,16 @@ from eva.symbolic.topological_field import TopologicalField
 topo = TopologicalField(pf, coord_dim=24)
 topo._compute_coordinates_from_affinity()
 coords = topo.coordinates[:156, :24].clone()
+# Diagnostic: check coordinate quality
+import numpy as np
+topo_aff = pf.affinity.cpu().numpy()
+n = 156; D_mds = 1.0 - topo_aff[:n,:n]; np.fill_diagonal(D_mds, 0.0)
+J = np.eye(n) - np.ones((n,n))/n; B = -0.5*J@(D_mds*D_mds)@J
+eigvals = np.linalg.eigh(B)[0]; eigvals = np.sort(eigvals)[::-1]
+eff_dim = (eigvals[:24].sum() / eigvals[eigvals>0].sum()) if (eigvals>0).sum()>0 else 0
+unique_coords = len(np.unique(coords.numpy().round(decimals=6), axis=0))
+print(f"  MDS: eff_dim(24)={eff_dim:.1%}, unique_coords={unique_coords}/{n}, "
+      f"eig_range=[{eigvals[0]:.2f}, {eigvals[:24].min():.4f}]")
 print(f"  Coordinates: {coords.shape}")
 
 # ============================================================
@@ -153,9 +163,12 @@ UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 50000; UT_LR = 1e-3
 opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS)
 
-# Affinity-based soft targets
-aff_tgt = pf.affinity.to(DEVICE)  # [V, V]
-aff_tgt = aff_tgt / (aff_tgt.sum(dim=-1, keepdim=True) + 1e-8)  # normalize
+# Affinity-based soft targets — temperature-sharpened, NOT row-normalized
+aff_tgt = pf.affinity.to(DEVICE)  # [V, V] — raw affinity values
+# Temperature sharpen: only top-K continuations matter
+tau = 4.0  # sharpening factor
+aff_tgt = aff_tgt ** tau  # amplify differences
+aff_tgt = aff_tgt / (aff_tgt.sum(dim=-1, keepdim=True) + 1e-8)  # normalize AFTER sharpen
 
 pos = 0; start = time.time()
 
@@ -178,16 +191,23 @@ for step in range(1, UT_STEPS + 1):
         bt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
 
     ut.train()
-    _, scores = ut(bt, return_scores=True)
+    coords, scores = ut(bt, return_scores=True)
     
-    # Target: affinity[token] — what the symbolic layer knows
+    # KL divergence: transformer output should match affinity distribution
     tgt = aff_tgt[bt.clamp(0, V-1)]  # [B, L, V]
     mask = (bt != PAD).float()  # [B, L]
     
-    # KL divergence: transformer output should match affinity distribution
     log_probs = F.log_softmax(scores, dim=-1)
-    loss = -(tgt * log_probs).sum(dim=-1)  # [B, L]
-    loss = (loss * mask).sum() / (mask.sum() + 1e-8)
+    kl_loss = -(tgt * log_probs).sum(dim=-1)  # [B, L]
+    kl_loss = (kl_loss * mask).sum() / (mask.sum() + 1e-8)
+    
+    # Coordinate loss: predicted position should be close to correct symbol position
+    target_ids = torch.roll(bt, -1, dims=1)  # next token
+    target_coords = ut.embed(target_ids.clamp(0, V-1)).detach()  # [B, L, D]
+    coord_loss = F.mse_loss(coords, target_coords, reduction='none').mean(dim=-1)  # [B, L]
+    coord_loss = (coord_loss * mask).sum() / (mask.sum() + 1e-8)
+    
+    loss = kl_loss + 0.5 * coord_loss
     
     opt.zero_grad()
     loss.backward()

@@ -143,15 +143,9 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         # Координатный эмбеддинг (вместо nn.Embedding)
         self.embed = CoordinateEmbedding(vocab_size, coord_dim)
 
-        # FractalAttention (вместо CausalSelfAttention)
-        from .fractal_attention import FractalAttentionMask
-        self.attention = FractalAttentionMask(
-            d_model=coord_dim,
-            num_base_heads=num_heads,
-            max_scale=1 << max_scale,
-            coord_dim_per_level=coord_dim // num_levels,
-            num_levels=num_levels,
-        )
+        # NOTE: FractalAttention available via fractal_attention.py for future use
+        # self.attention = FractalAttentionMask(...) — disabled, unused
+        self.attention = None
 
         # Координатный декодер (вместо lm_head)
         self.decoder = CoordinateDecoder(self.embed)

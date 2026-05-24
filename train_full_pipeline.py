@@ -30,6 +30,14 @@ print(f"Device: {DEVICE}")
 # ============================================================
 print("\n[PHASE 1] Affinity training (count-based, no gradients)...")
 
+# Check if already trained
+affinity_path = os.path.join(CKPT_DIR, "final", "potential_field.pt")
+if os.path.exists(affinity_path):
+    print("  Loading existing affinity checkpoint...")
+    pf.load_state_dict(torch.load(affinity_path, map_location='cpu', weights_only=True))
+    print(f"  Affinity: mean={pf.affinity.mean():.4f} std={pf.affinity.std():.4f}")
+else:
+
 config = FCFConfig(); config.d_model = 256; config.vocab_size = 156; config.num_heads = 8
 layer = PrimordialLayer(config)
 if DEVICE == 'cuda': layer = layer.cuda()
@@ -47,57 +55,58 @@ print(f"  Dataset: {len(all_ids)/1e6:.1f}M tokens")
 AFF_BATCH = 128; AFF_BLOCK = 64; AFF_STEPS = 50000
 pos = 0; start = time.time()
 
-for step in range(AFF_STEPS):
-    if pos + AFF_BLOCK + 2 > len(all_ids): pos = 0
-    ids_batch, lens = [], []
-    for _ in range(AFF_BATCH):
+if not os.path.exists(affinity_path):
+    for step in range(AFF_STEPS):
         if pos + AFF_BLOCK + 2 > len(all_ids): pos = 0
-        end = min(pos + AFF_BLOCK, len(all_ids))
-        chunk = all_ids[pos:end]
-        sep = np.where((chunk == 0) | (chunk == 3))[0]
-        if len(sep) > 0 and sep[0] < AFF_BLOCK // 2:
-            end = pos + sep[0] + 1; chunk = all_ids[pos:end]
-        ids = [int(x) for x in chunk if x >= 0][:AFF_BLOCK]
-        ids_batch.append(ids); lens.append(len(ids)); pos += max(len(ids), 32)
+        ids_batch, lens = [], []
+        for _ in range(AFF_BATCH):
+            if pos + AFF_BLOCK + 2 > len(all_ids): pos = 0
+            end = min(pos + AFF_BLOCK, len(all_ids))
+            chunk = all_ids[pos:end]
+            sep = np.where((chunk == 0) | (chunk == 3))[0]
+            if len(sep) > 0 and sep[0] < AFF_BLOCK // 2:
+                end = pos + sep[0] + 1; chunk = all_ids[pos:end]
+            ids = [int(x) for x in chunk if x >= 0][:AFF_BLOCK]
+            ids_batch.append(ids); lens.append(len(ids)); pos += max(len(ids), 32)
 
-    ml = max(lens)
-    bt = torch.full((AFF_BATCH, ml), PAD, dtype=torch.long, device=DEVICE)
-    for i, ids in enumerate(ids_batch):
-        bt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
+        ml = max(lens)
+        bt = torch.full((AFF_BATCH, ml), PAD, dtype=torch.long, device=DEVICE)
+        for i, ids in enumerate(ids_batch):
+            bt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
 
-    with torch.no_grad():
-        layer.eval(); x = layer.embed(bt); layer.forward_transformer(x)
-        attn = layer.transformer.attention.last_attention
+        with torch.no_grad():
+            layer.eval(); x = layer.embed(bt); layer.forward_transformer(x)
+            attn = layer.transformer.attention.last_attention
 
-    if attn is not None:
-        for i in range(AFF_BATCH):
-            L_i = lens[i]
-            if L_i < 2: continue
-            left = bt[i, :L_i - 1]; right = bt[i, 1:L_i]
-            adj = attn[i].mean(dim=0)[torch.arange(1, L_i), torch.arange(L_i - 1)]
-            valid = (left < V) & (right < V) & (left != PAD) & (right != PAD)
-            i_idx = left[valid].long().cpu(); j_idx = right[valid].long().cpu()
-            w = adj[valid].float().cpu()
-            if len(i_idx) > 0:
-                flat = i_idx * V + j_idx
-                inc = (1.0 + w).to(pf.co_occurrence_count.dtype)
-                pf.co_occurrence_count.view(-1).scatter_add_(0, flat, inc)
-                uf = flat.unique(); ui = uf // V; uj = uf % V
-                raw = pf.co_occurrence_count[ui, uj] / 100000.0
-                pf.affinity[ui, uj] = (0.5 + 0.5 * torch.clamp(raw, 0.0, 1.0)).float()
+        if attn is not None:
+            for i in range(AFF_BATCH):
+                L_i = lens[i]
+                if L_i < 2: continue
+                left = bt[i, :L_i - 1]; right = bt[i, 1:L_i]
+                adj = attn[i].mean(dim=0)[torch.arange(1, L_i), torch.arange(L_i - 1)]
+                valid = (left < V) & (right < V) & (left != PAD) & (right != PAD)
+                i_idx = left[valid].long().cpu(); j_idx = right[valid].long().cpu()
+                w = adj[valid].float().cpu()
+                if len(i_idx) > 0:
+                    flat = i_idx * V + j_idx
+                    inc = (1.0 + w).to(pf.co_occurrence_count.dtype)
+                    pf.co_occurrence_count.view(-1).scatter_add_(0, flat, inc)
+                    uf = flat.unique(); ui = uf // V; uj = uf % V
+                    raw = pf.co_occurrence_count[ui, uj] / 100000.0
+                    pf.affinity[ui, uj] = (0.5 + 0.5 * torch.clamp(raw, 0.0, 1.0)).float()
 
-    if step % 5000 == 0 and step > 0:
-        elapsed = time.time() - start
-        aps = step * AFF_BATCH / max(elapsed, 0.01)
-        pct = step * 100 // AFF_STEPS
-        bar = '#' * (pct // 4) + '-' * (25 - pct // 4)
-        print(f"\r  [{bar}] {pct}% | {aps:.0f} a/s | pot={pf.affinity.mean():.4f}", end='', flush=True)
-    if step % 10000 == 0 and step > 0:
-        print()
+        if step % 5000 == 0 and step > 0:
+            elapsed = time.time() - start
+            aps = step * AFF_BATCH / max(elapsed, 0.01)
+            pct = step * 100 // AFF_STEPS
+            bar = '#' * (pct // 4) + '-' * (25 - pct // 4)
+            print(f"\r  [{bar}] {pct}% | {aps:.0f} a/s | pot={pf.affinity.mean():.4f}", end='', flush=True)
+        if step % 10000 == 0 and step > 0:
+            print()
 
-os.makedirs(os.path.join(CKPT_DIR, "final"), exist_ok=True)
-torch.save(pf.state_dict(), os.path.join(CKPT_DIR, "final", "potential_field.pt"))
-print(f"  Done. Affinity: mean={pf.affinity.mean():.4f} std={pf.affinity.std():.4f}")
+    os.makedirs(os.path.join(CKPT_DIR, "final"), exist_ok=True)
+    torch.save(pf.state_dict(), affinity_path)
+    print(f"\n  Done. Affinity: mean={pf.affinity.mean():.4f} std={pf.affinity.std():.4f}")
 
 # ============================================================
 # PHASE 2: MDS → Coordinates

@@ -60,31 +60,51 @@ for label in ru_labels:
 print(f"  Found {len(ru_concepts):,} Russian concepts")
 
 # ============================================================
-# Phase 2: Sample edges for Russian words
+# Phase 2: Encode ALL Russian words (fast — no ConceptNet queries)
 # ============================================================
-print("\n[PHASE 2] Processing Russian words and their edges...")
+print("\n[PHASE 2] Encoding ALL Russian words for intra-word co-occurrence...")
 
-# Take a sample of Russian labels (unique words)
-ru_words_raw = list(set(label.text.lower().strip() for label in ru_labels))
-print(f"  Unique Russian words: {len(ru_words_raw):,}")
+ru_words_all = list(set(label.text.lower().strip() for label in ru_labels))
+print(f"  Unique labels: {len(ru_words_all):,}")
 
-# Filter: only words encodable by our vocab (Cyrillic, length 2-20)
 encoded_words = {}
-for word in ru_words_raw:
+for word in ru_words_all:
     ids = cv.encode(word)[1:-1]
     if 2 <= len(ids) <= 20 and all(0 < i < VT for i in ids):
         encoded_words[word] = ids
 
-print(f"  Encodable words: {len(encoded_words):,}")
+print(f"  Encodable: {len(encoded_words):,}")
 
-# Sample edges for representative words (random sample to be fast)
+# Count intra-word co-occurrence from ALL Russian words
+cn_cooccur = np.zeros((VT, VT), dtype=np.float64)
+intra_count = 0
+
+for word, ids in encoded_words.items():
+    L = len(ids)
+    for i in range(L):
+        for j in range(i+1, min(i+5, L)):  # within 5-symbol window
+            si, sj = ids[i], ids[j]
+            if 0 < si < VT and 0 < sj < VT:
+                cn_cooccur[si, sj] += 1.0
+                cn_cooccur[sj, si] += 1.0
+    intra_count += 1
+    if intra_count % 100000 == 0:
+        print(f"\r  Processed {intra_count:,}/{len(encoded_words):,}", end='', flush=True)
+
+cn_intra_total = cn_cooccur.sum()
+print(f"\n  Intra-word pairs: {cn_intra_total:,.0f}")
+
+# ============================================================
+# Phase 3: Get edges for a larger sample of words
+# ============================================================
+print("\n[PHASE 3] Getting ConceptNet edges for 20K words...")
+
 import random
 random.seed(42)
-sample_words = random.sample(list(encoded_words.keys()), min(5000, len(encoded_words)))
+N_SAMPLE = 20000
+sample_words = random.sample(list(encoded_words.keys()), min(N_SAMPLE, len(encoded_words)))
 
 ru_edges = []
-all_ru_words = set(sample_words)
-
 for i, word in enumerate(sample_words):
     try:
         label = Label.get_or_create(text=word, language=lang_ru)[0]
@@ -108,59 +128,13 @@ for i, word in enumerate(sample_words):
     except Exception:
         pass
     
-    if (i+1) % 500 == 0:
-        print(f"\r  Processed {i+1}/{len(sample_words)} words, {len(ru_edges):,} edges", end='', flush=True)
+    if (i+1) % 2000 == 0:
+        print(f"\r  {i+1}/{len(sample_words)} words, {len(ru_edges):,} edges", end='', flush=True)
 
 print(f"\n  Total edges: {len(ru_edges):,}")
 
-# Collect ALL Russian words from edges
-for s, e, rel, w, s_ru, e_ru in ru_edges:
-    if s_ru: all_ru_words.add(s.lower().strip())
-    if e_ru: all_ru_words.add(e.lower().strip())
-
-# Encode all discovered words
-for word in all_ru_words:
-    if word not in encoded_words:
-        ids = cv.encode(word)[1:-1]
-        if 2 <= len(ids) <= 20 and all(0 < i < VT for i in ids):
-            encoded_words[word] = ids
-
-print(f"  Total Russian words: {len(all_ru_words):,}")
-print(f"  Encoded: {len(encoded_words):,}")
-
-# ============================================================
-# Phase 2: Encode Russian concepts as symbol sequences
-# ============================================================
-print("\n[PHASE 2] Encoding concepts as symbol sequences...")
-
-# Build frequency map: how often does each symbol pair co-occur via ConceptNet?
-cn_cooccur = np.zeros((VT, VT), dtype=np.float64)
-
-# Build a set of all unique Russian words from ConceptNet
-ru_words = set()
-for s, e, rel, w, s_ru, e_ru in ru_edges:
-    if s_ru:
-        ru_words.add(s.lower().strip())
-    if e_ru:
-        ru_words.add(e.lower().strip())
-
-print(f"  Unique Russian words: {len(ru_words):,}")
-
-# Encode each word and collect co-occurrences
-encoded_words = {}
-encoded_count = 0
-for word in all_ru_words:
-    ids = cv.encode(word)[1:-1]
-    if len(ids) >= 2:
-        encoded_words[word] = ids
-        encoded_count += 1
-
-print(f"  Encoded words: {encoded_count:,}")
-
-# Count symbol co-occurrences from edges
-cn_cooccur = np.zeros((VT, VT), dtype=np.float64)
-pair_count = 0
-
+# Count inter-word co-occurrence from edges
+edge_pairs = 0
 for s, e, rel, weight, s_ru, e_ru in ru_edges:
     s_lower = s.lower().strip()
     e_lower = e.lower().strip()
@@ -169,44 +143,42 @@ for s, e, rel, weight, s_ru, e_ru in ru_edges:
     e_ids = encoded_words.get(e_lower, [])
     
     if len(s_ids) >= 2 and len(e_ids) >= 2:
-        boost = weight
+        boost = weight * 100  # edge-based pairs get higher weight
         for si in s_ids:
             for ei in e_ids:
                 if 0 < si < VT and 0 < ei < VT:
                     cn_cooccur[si, ei] += boost
                     cn_cooccur[ei, si] += boost
-        pair_count += 1
-
-cn_total = cn_cooccur.sum()
-print(f"  ConceptNet co-occurrence pairs from {pair_count:,} edges: {cn_total:,.0f}")
+        edge_pairs += 1
 
 # ============================================================
-# Phase 3: Merge with existing affinity
+# Phase 4: Merge with statistical affinity
 # ============================================================
-print("\n[PHASE 3] Merging ConceptNet affinity with statistical affinity...")
+print(f"\n[PHASE 4] Merging ConceptNet affinity with statistical affinity...")
+print(f"  Intra-word pairs: {cn_intra_total:,.0f}")
+print(f"  Edge pairs: {edge_pairs:,} from {len(ru_edges):,} edges")
 
 # Load existing affinity
 aff_path = os.path.join(CKPT_DIR, "affinity_word.pt")
 aff_data = torch.load(aff_path, map_location='cpu', weights_only=True)
 stat_aff = aff_data['affinity'].numpy()
-stat_count = aff_data['co_occurrence'].numpy()
 
 print(f"  Statistical affinity: μ={stat_aff.mean():.4f} σ={np.std(stat_aff):.4f}")
 
-# Normalize ConceptNet co-occurrences to [0, 1] range
+# Normalize ConceptNet co-occurrences
 cn_max = cn_cooccur.max()
 if cn_max > 0:
     cn_norm = cn_cooccur / cn_max
 else:
     cn_norm = cn_cooccur
 
-# Merge: weighted blend
-CN_WEIGHT = 0.3  # 30% ConceptNet, 70% statistical
+# Merge: 20% ConceptNet (intra-word + edges), 80% statistical
+CN_WEIGHT = 0.20
 merged_aff = (1.0 - CN_WEIGHT) * stat_aff + CN_WEIGHT * (0.5 + 0.5 * cn_norm)
 np.fill_diagonal(merged_aff, 0.5)
 
-print(f"  ConceptNet affinity: μ={cn_norm.mean():.4f} σ={np.std(cn_norm):.4f}")
-print(f"  Merged affinity: μ={merged_aff.mean():.4f} σ={np.std(merged_aff):.4f}")
+print(f"  ConceptNet norm: μ={cn_norm.mean():.4f} σ={np.std(cn_norm):.4f}")
+print(f"  Merged (CN×{CN_WEIGHT}): μ={merged_aff.mean():.4f} σ={np.std(merged_aff):.4f}")
 
 # ============================================================
 # Phase 4: MDS on merged affinity → new coordinates

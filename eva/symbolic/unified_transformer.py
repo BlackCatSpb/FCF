@@ -83,15 +83,15 @@ class CoordinateDecoder(nn.Module):
         returns: [B, L, vocab_size] логиты
         """
         # Основной путь: обучаемый линейный слой
-        logits = self.linear(x) * self.temperature
+        logits = self.linear(x) / self.temperature.clamp(min=0.1)
 
-        # Добавляем nearest-neighbor сигнал для стабильности
+        # Nearest-neighbor: расстояние до каждого символа
         coords = self.embed.coordinates  # [V, D]
         diffs = x.unsqueeze(2) - coords.unsqueeze(0).unsqueeze(0)  # [B, L, V, D]
         dists = torch.norm(diffs, dim=-1)  # [B, L, V]
-        nn_scores = 1.0 / (1.0 + dists)
+        nn_logits = -dists  # меньше расстояние → выше счёт
 
-        return logits + nn_scores
+        return logits + nn_logits
 
     def decode_to_ids(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, L, D] → [B, L] индексы ближайших символов."""

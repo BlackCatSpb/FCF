@@ -146,6 +146,7 @@ print("\n[PHASE 3] UnifiedTransformer training (affinity distillation)...")
 ut = UnifiedMultidimensionalTransformer(vocab_size=156, coord_dim=12)
 if DEVICE == 'cuda':
     ut = ut.cuda()
+ut.set_symbol_coordinates(coords)  # CRITICAL: inject MDS coordinates
 print(f"  {ut.summary()}")
 
 UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 50000; UT_LR = 1e-3

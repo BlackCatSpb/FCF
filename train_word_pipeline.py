@@ -190,70 +190,75 @@ if DEVICE == 'cuda':
 ut.set_symbol_coordinates(coords_full.to(DEVICE))
 print(f"  {ut.summary()}")
 
-UT_STEPS = 30000; UT_LR = 1e-3; UT_BATCH = 128
-opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
-sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS)
-
-start = time.time()
-last_print = 0
-rng = np.random.RandomState(42)
-
-for step in range(1, UT_STEPS + 1):
-    # Sample random words
-    idxs = rng.randint(0, len(words), UT_BATCH)
-    batch_words = [words[i] for i in idxs]
-    max_len = max(len(w) for w in batch_words)
-    
-    bt = torch.full((UT_BATCH, max_len), PAD, dtype=torch.long, device=DEVICE)
-    mask = torch.zeros(UT_BATCH, max_len, device=DEVICE)
-    for bi, w in enumerate(batch_words):
-        bt[bi, :len(w)] = torch.tensor(w, dtype=torch.long, device=DEVICE)
-        mask[bi, :len(w)] = 1.0
-    
-    ut.train()
-    _, scores = ut(bt, return_scores=True)  # [B, L, 157]
-    
-    target = bt.clamp(1, VT-1)  # skip PAD=0
-    
-    loss = F.cross_entropy(
-        scores.view(-1, 157),
-        target.view(-1),
-        reduction='none'
-    ).view(UT_BATCH, max_len)
-    loss = (loss * mask).sum() / (mask.sum() + 1e-8)
-    
-    opt.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
-    opt.step()
-    sch.step()
-    
-    now = time.time()
-    if now - last_print >= 3 or step == 1 or step == UT_STEPS:
-        last_print = now
-        elapsed = now - start
-        eta = (elapsed / step) * (UT_STEPS - step)
-        with torch.no_grad():
-            pred = scores.argmax(dim=-1)  # [B, L]
-            correct_tokens = ((pred == target) * mask).sum().item()
-            total_tokens = mask.sum().item()
-            # Per-word accuracy
-            per_word = ((pred == target) | (mask == 0)).all(dim=1).sum().item()
-        lr = sch.get_last_lr()[0]
-        print(f"  step {step:>5d}/{UT_STEPS} | loss={loss.item():.4f} | "
-              f"tok_acc={correct_tokens/total_tokens:.3f} | "
-              f"word_acc={per_word}/{UT_BATCH} | lr={lr:.6f} | "
-              f"{elapsed:.0f}s / eta {eta:.0f}s", flush=True)
-    
-    # Early exit
-    if step > 500 and loss.item() < 0.01:
-        print(f"\n  Early exit at step {step}: loss stable.")
-        break
-
-# Save weights
+# Check for existing weights
 word_weights_path = os.path.join(CKPT_DIR, "word_weights.pt")
-torch.save({'model': ut.state_dict(), 'coords': coords_full}, word_weights_path)
-print(f"  Saved: {word_weights_path}")
+if os.path.exists(word_weights_path):
+    print("  Loading existing word weights, skipping training...")
+    ckpt = torch.load(word_weights_path, map_location='cpu', weights_only=True)
+    ut.load_state_dict(ckpt['model'])
+    ut.set_symbol_coordinates(ckpt['coords'].to(DEVICE))
+    ut = ut.to(DEVICE)
+else:
+    print(f"  {ut.summary()}")
+    UT_STEPS = 30000; UT_LR = 1e-3; UT_BATCH = 128
+    opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS)
+    
+    start = time.time()
+    last_print = 0
+    rng = np.random.RandomState(42)
+    
+    for step in range(1, UT_STEPS + 1):
+        idxs = rng.randint(0, len(words), UT_BATCH)
+        batch_words = [words[i] for i in idxs]
+        max_len = max(len(w) for w in batch_words)
+        
+        bt = torch.full((UT_BATCH, max_len), PAD, dtype=torch.long, device=DEVICE)
+        mask = torch.zeros(UT_BATCH, max_len, device=DEVICE)
+        for bi, w in enumerate(batch_words):
+            bt[bi, :len(w)] = torch.tensor(w, dtype=torch.long, device=DEVICE)
+            mask[bi, :len(w)] = 1.0
+        
+        ut.train()
+        _, scores = ut(bt, return_scores=True)
+        
+        target = bt.clamp(1, VT-1)
+        
+        loss = F.cross_entropy(
+            scores.view(-1, 157),
+            target.view(-1),
+            reduction='none'
+        ).view(UT_BATCH, max_len)
+        loss = (loss * mask).sum() / (mask.sum() + 1e-8)
+        
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
+        opt.step()
+        sch.step()
+        
+        now = time.time()
+        if now - last_print >= 3 or step == 1 or step == UT_STEPS:
+            last_print = now
+            elapsed = now - start
+            eta = (elapsed / step) * (UT_STEPS - step)
+            with torch.no_grad():
+                pred = scores.argmax(dim=-1)
+                correct_tokens = ((pred == target) * mask).sum().item()
+                total_tokens = mask.sum().item()
+                per_word = ((pred == target) | (mask == 0)).all(dim=1).sum().item()
+            lr = sch.get_last_lr()[0]
+            print(f"  step {step:>5d}/{UT_STEPS} | loss={loss.item():.4f} | "
+                  f"tok_acc={correct_tokens/total_tokens:.3f} | "
+                  f"word_acc={per_word}/{UT_BATCH} | lr={lr:.6f} | "
+                  f"{elapsed:.0f}s / eta {eta:.0f}s", flush=True)
+        
+        if step > 500 and loss.item() < 0.01:
+            print(f"\n  Early exit at step {step}: loss stable.")
+            break
+    
+    torch.save({'model': ut.state_dict(), 'coords': coords_full}, word_weights_path)
+    print(f"  Saved: {word_weights_path}")
 
 # ============================================================
 # PHASE 4: Word reconstruction test
@@ -269,7 +274,10 @@ test_words_list = [
 ]
 
 for word_text in test_words_list:
-    ids = cv.encode(word_text)
+    ids = cv.encode(word_text)[1:-1]  # strip BOS/EOS — training uses raw IDs
+    if len(ids) == 0:
+        print(f"  '{word_text}' → SKIP (empty)")
+        continue
     inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
     with torch.no_grad():
         _, scores = ut(inp, return_scores=True)

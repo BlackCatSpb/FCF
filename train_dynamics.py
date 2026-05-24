@@ -69,10 +69,9 @@ class PotentialDynamics:
         self.max_aff = 10.0
         self.target_mean = 0.5
     
-    def feed_sequence(self, ids_tensor):
-        """Feed a sequence [L] of token IDs. Apply STDP to consecutive pairs."""
-        ids = ids_tensor.long()
-        L = len(ids)
+    def feed_batch(self, bt, mask):
+        """Vectorized: feed BATCH of sequences [B, L]. ~100x faster than per-sequence loop."""
+        B, L = bt.shape
         if L < 2:
             return
         
@@ -80,42 +79,57 @@ class PotentialDynamics:
         self.pre_trace *= np.exp(-1.0 / self.tau)
         self.post_trace *= np.exp(-1.0 / self.tau)
         
-        # Update traces for all active tokens
-        for idx in ids.unique():
+        # Update traces for all active tokens in batch
+        active = bt[mask.bool()].unique()
+        for idx in active:
             if 0 < idx < self.V:
                 self.pre_trace[idx] = 1.0
                 self.post_trace[idx] = 1.0
         
-        # Apply STDP to consecutive pairs (distance 1..4)
+        # Extract all adjacent pairs across batch (dist 1..4)
         for dist in range(1, 5):
-            for i in range(L - dist):
-                pre = ids[i].item()
-                post = ids[i+dist].item()
-                if pre <= 0 or pre >= self.V or post <= 0 or post >= self.V:
-                    continue
-                
-                # STDP
-                pre_t = self.pre_trace[pre]
-                post_t = self.post_trace[post]
-                plast = self.plasticity[pre, post]
-                
-                if pre_t > 0.01:
-                    self.affinity[pre, post] += self.A_plus * pre_t * plast
-                if post_t > 0.01:
-                    self.affinity[pre, post] -= self.A_minus * post_t * plast
-                
-                self.affinity[pre, post] = self.affinity[pre, post].clamp(self.min_aff, self.max_aff)
-                
-                # LTP increment
-                dw = 0.001 * (1.0 / dist)  # closer = stronger
-                self.affinity[pre, post] += dw
-                
-                self.usage[pre, post] += 1
-                self.usage[post, pre] += 1
+            if L <= dist:
+                continue
+            left = bt[:, :L-dist].contiguous()   # [B, L-dist]
+            right = bt[:, dist:].contiguous()      # [B, L-dist]
+            pair_mask = mask[:, :L-dist] & mask[:, dist:]  # [B, L-dist]
+            
+            # Flatten valid pairs
+            valid = pair_mask & (left > 0) & (left < self.V) & (right > 0) & (right < self.V)
+            if valid.sum() == 0:
+                continue
+            
+            li = left[valid].long()   # [N]
+            ri = right[valid].long()  # [N]
+            
+            # STDP: vectorized
+            pre_t = self.pre_trace[li]    # [N]
+            post_t = self.post_trace[ri]  # [N]
+            plast = self.plasticity[li, ri]
+            
+            dw = torch.zeros(len(li), device=DEVICE)
+            
+            # Pre-before-post → strengthen
+            pre_mask = pre_t > 0.01
+            dw[pre_mask] += self.A_plus * pre_t[pre_mask] * plast[pre_mask]
+            
+            # Post-before-pre → weaken
+            post_mask = post_t > 0.01
+            dw[post_mask] -= self.A_minus * post_t[post_mask] * plast[post_mask]
+            
+            # LTP increment (closer = stronger)
+            dw += 0.001 * (1.0 / dist)
+            
+            # Apply updates
+            self.affinity[li, ri] += dw
+            self.affinity[li, ri] = self.affinity[li, ri].clamp(self.min_aff, self.max_aff)
+            
+            # Usage counting
+            self.usage[li, ri] += 1
+            self.usage[ri, li] += 1
         
         self.step_count += 1
         
-        # Periodic maintenance
         if self.step_count % 100 == 0:
             self._ltd()
             self._homeostasis()
@@ -147,12 +161,13 @@ class PotentialDynamics:
             self.plasticity = 0.5 * self.plasticity + 0.5 * (1.0 + variance).clamp(0.1, 2.0)
 
 # ============================================================
-# Run dynamics: feed 200K sequences through the affinity
+# Run dynamics: feed batches through the affinity (vectorized)
 # ============================================================
-print("\n[DYNAMICS] Feeding sequences to evolve affinity...")
+print("\n[DYNAMICS] Vectorized batch feeding...")
 dyn = PotentialDynamics(affinity)
 
-TOTAL_SEQ = 200000
+TOTAL_BATCHES = 5000
+BATCH_SIZE = 256
 SEQ_LEN = 64
 total_ids = len(all_ids)
 rng = np.random.RandomState(77)
@@ -160,28 +175,44 @@ rng = np.random.RandomState(77)
 start = time.time()
 last_print = 0
 
-for step in range(1, TOTAL_SEQ + 1):
-    # Random subsequence from corpus
-    pos = rng.randint(0, max(1, total_ids - SEQ_LEN - 1))
-    chunk = all_ids[pos:pos + SEQ_LEN]
-    valid = (chunk > 0) & (chunk < VT)
-    valid_chunk = chunk[valid]
+for step in range(1, TOTAL_BATCHES + 1):
+    # Build batch of random subsequences
+    max_len = 0
+    sequences = []
+    for _ in range(BATCH_SIZE):
+        pos = rng.randint(0, max(1, total_ids - SEQ_LEN - 1))
+        chunk = all_ids[pos:pos + SEQ_LEN]
+        valid = (chunk > 0) & (chunk < VT)
+        seq = chunk[valid]
+        if len(seq) >= 3:
+            sequences.append(seq[:SEQ_LEN])
+            max_len = max(max_len, len(seq))
     
-    if len(valid_chunk) >= 3:
-        ids_t = torch.from_numpy(valid_chunk.astype(np.int64)).to(DEVICE)
-        dyn.feed_sequence(ids_t)
+    if len(sequences) < 32:
+        continue
+    
+    max_len = min(max_len, SEQ_LEN)
+    bt = torch.zeros(BATCH_SIZE, max_len, dtype=torch.long, device=DEVICE)
+    mask = torch.zeros(BATCH_SIZE, max_len, dtype=torch.bool, device=DEVICE)
+    for bi, seq in enumerate(sequences):
+        L = min(len(seq), max_len)
+        bt[bi, :L] = torch.from_numpy(seq[:L].astype(np.int64)).to(DEVICE)
+        mask[bi, :L] = True
+    
+    dyn.feed_batch(bt, mask)
     
     now = time.time()
-    if now - last_print >= 5 or step == 1 or step == TOTAL_SEQ:
+    if now - last_print >= 5 or step == 1 or step == TOTAL_BATCHES:
         last_print = now
         elapsed = now - start
-        eta = (elapsed / step) * (TOTAL_SEQ - step)
+        eta = (elapsed / step) * (TOTAL_BATCHES - step)
         aff_mean = dyn.affinity.mean().item()
         aff_std = dyn.affinity.std().item()
         active = (dyn.usage > 10).sum().item()
-        print(f"  seq {step:>6d}/{TOTAL_SEQ} | aff μ={aff_mean:.4f} σ={aff_std:.4f}"
-              f" | active={active} | plasticity={dyn.plasticity.mean().item():.3f}"
-              f" | {elapsed:.0f}s / eta {eta:.0f}s", flush=True)
+        seqs_done = step * BATCH_SIZE
+        print(f"  batch {step:>5d}/{TOTAL_BATCHES} ({seqs_done:,} seqs)"
+              f" | aff μ={aff_mean:.4f} σ={aff_std:.4f}"
+              f" | active={active} | {elapsed:.0f}s / eta {eta:.0f}s", flush=True)
 
 # ============================================================
 # Compare: old vs new affinity, MDS, concepts

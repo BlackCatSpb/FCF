@@ -70,17 +70,21 @@ checkpoints/symbolic/
 ## Скрипты
 
 ```
-train_full_pipeline.py     ← Символы
-train_word_pipeline.py     ← Слова + Предложения (фазы 1-6)
-train_dynamics.py          ← STDP пластика
-train_contradiction.py     ← ContradictionFilter
-train_gradient.py          ← GradientFlow + InstructionGenerator
-train_dialectic.py         ← DialecticalSynthesis
+train_all.py                ← Оркестратор (запуск всех фаз)
+train_full_pipeline.py     ← Символы (100%)
+train_word_pipeline.py     ← Affinity → MDS → Words → Sentences
+train_dynamics.py          ← STDP пластика (σ ×16)
+concept_finder.py          ← V(z) потенциал + концепты
+train_contradiction.py     ← ContradictionFilter (33% forbidden)
+train_gradient.py          ← GradientFlow (барьеры 0-1.6)
+train_dialectic.py         ← DialecticalSynthesis (15/18 valid)
 train_fractal_sc.py        ← FractalSelfConsistency
-train_persistence.py       ← TopologicalPersistence
-train_conceptnet.py        ← ConceptNet валидация
-train_hierarchy.py         ← FractalHierarchy
-train_encode_decode.py     ← Полный encode→decode цикл
+train_persistence.py       ← TopologicalPersistence (>82%)
+train_conceptnet.py        ← ConceptNet validation
+train_conceptnet_full.py   ← ConceptNet enrichment (597K слов)
+train_hierarchy.py         ← FractalHierarchy verification
+train_navigate.py          ← Navigate + Generate
+train_encode_decode.py     ← Full encode→decode (100% round-trip)
 ```
 
 ---

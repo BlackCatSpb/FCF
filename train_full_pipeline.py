@@ -149,12 +149,14 @@ print(f"  Coordinates: {coords.shape}")
 # ============================================================
 # PHASE 3: UnifiedTransformer — affinity distillation
 # ============================================================
-print("\n[PHASE 3] UnifiedTransformer training (affinity distillation)...")
+print("\n[PHASE 3] UnifiedTransformer — NEXT-SYMBOL PREDICTION")
+print("  Goal: learn to generate symbols (not affinity distributions)")
+print("  Loss: CrossEntropy(predicted_symbol, correct_next_symbol)")
 
 ut = UnifiedMultidimensionalTransformer(vocab_size=156, coord_dim=24)
 if DEVICE == 'cuda':
     ut = ut.cuda()
-ut.set_symbol_coordinates(coords.to(DEVICE))  # CRITICAL: move coords to GPU
+ut.set_symbol_coordinates(coords.to(DEVICE))
 print(f"  {ut.summary()}")
 
 UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 100000; UT_LR = 1e-3
@@ -163,14 +165,6 @@ sch = torch.optim.lr_scheduler.SequentialLR(opt, [
     torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=1000),
     torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS - 1000 + 1),
 ], milestones=[1000])
-
-# Affinity-based soft targets — temperature-sharpened, NOT row-normalized
-aff_tgt = pf.affinity.to(DEVICE).clone()  # [V, V] — raw affinity values
-aff_tgt.fill_diagonal_(0.0)  # no self-targeting (symbol → same symbol)
-# Temperature sharpen: only top-K continuations matter
-tau = 4.0  # sharpening factor
-aff_tgt = aff_tgt ** tau  # amplify differences
-aff_tgt = aff_tgt / (aff_tgt.sum(dim=-1, keepdim=True) + 1e-8)  # normalize AFTER sharpen
 
 pos = 0; start = time.time()
 
@@ -192,26 +186,21 @@ for step in range(1, UT_STEPS + 1):
     for i, ids in enumerate(ids_batch):
         bt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
 
+    # Target: next symbol (shift right by 1)
+    target = torch.roll(bt, -1, dims=1).clamp(1, V-1)  # [B, L]
+    mask = (bt != PAD).float()
+
     ut.train()
-    coords, scores = ut(bt, return_scores=True)
-    
-    # KL divergence: transformer output should match affinity distribution
-    tgt = aff_tgt[bt.clamp(1, V-1)]  # skip PAD (idx=0)
-    mask = (bt != PAD).float()  # [B, L]
-    
-    log_probs = F.log_softmax(scores, dim=-1)
-    kl_loss = -(tgt * log_probs).sum(dim=-1)  # [B, L]
-    kl_loss = (kl_loss * mask).sum() / (mask.sum() + 1e-8)
-    
-    # Coordinate loss: predicted position should be close to correct symbol position
-    # Use shifted positions (exclude last column — no valid next-token target)
-    target_ids_next = bt[:, 1:]  # [B, L-1]
-    target_coords = ut.embed(target_ids_next.clamp(1, V-1)).detach()  # [B, L-1, D]
-    coord_loss = F.mse_loss(coords[:, :-1, :], target_coords, reduction='none').mean(dim=-1)  # [B, L-1]
-    coord_loss = (coord_loss * mask[:, :-1]).sum() / (mask[:, :-1].sum() + 1e-8)
-    
-    loss = kl_loss + 0.5 * coord_loss
-    
+    _, scores = ut(bt, return_scores=True)  # [B, L, V]
+
+    # Simple CrossEntropy: predict the next symbol
+    loss = F.cross_entropy(
+        scores.view(-1, V),
+        target.view(-1),
+        reduction='none',
+    ).view(UT_BATCH, ml)
+    loss = (loss * mask).sum() / (mask.sum() + 1e-8)
+
     opt.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)

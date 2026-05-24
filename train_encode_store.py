@@ -107,7 +107,7 @@ def rag_generate(seed_ids, max_new=25, temp=0.8, top_k=30):
             inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
             
             # Get current trajectory
-            emb = ut.embed(inp)
+            emb = ut.embed(inp).detach()
             current_traj = emb[0].cpu().numpy()
             
             # Retrieve similar trajectories
@@ -169,7 +169,7 @@ for seed, label in tests:
     # Show retrieved contexts for first word
     if seed == "привет":
         emb = ut.embed(torch.tensor([ids], dtype=torch.long, device=DEVICE))
-        ctx = store.get_context_for_generation(ids, emb[0].detach().cpu().numpy(), top_k=3)
+        ctx = store.find_similar(emb[0].detach().cpu().numpy(), top_k=3)
         print(f"  Contexts for '{seed}':")
         for c in ctx: print(f"    '{c['text'][:30]}' (d={c['distance']:.2f})")
     

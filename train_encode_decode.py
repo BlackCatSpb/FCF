@@ -37,16 +37,28 @@ if DEVICE == 'cuda':
     ut = ut.cuda()
 ut.set_symbol_coordinates(coords.to(DEVICE))
 
-# Load sentence weights (trained on sentences, not just words)
+# Load best available weights: CN > sentence > word
+cn_ckpt = os.path.join(CKPT_DIR, "conceptnet_weights.pt")
 sent_ckpt_path = os.path.join(CKPT_DIR, "sentence_weights.pt")
-if os.path.exists(sent_ckpt_path):
+word_path = os.path.join(CKPT_DIR, "word_weights.pt")
+
+if os.path.exists(cn_ckpt):
+    ckpt = torch.load(cn_ckpt, map_location='cpu', weights_only=True)
+    ut.load_state_dict(ckpt['model'], strict=False)
+    cn_coords = ckpt['coords'].to(DEVICE)
+    ut.set_symbol_coordinates(cn_coords.to(DEVICE))
+    print("Loaded: ConceptNet-enriched weights + coords")
+    COORDS = cn_coords
+elif os.path.exists(sent_ckpt_path):
     ckpt = torch.load(sent_ckpt_path, map_location='cpu', weights_only=True)
     ut.load_state_dict(ckpt['model'], strict=False)
     print("Loaded: sentence weights")
+    COORDS = coords
 else:
     ckpt = torch.load(os.path.join(CKPT_DIR, "word_weights.pt"), map_location='cpu', weights_only=True)
     ut.load_state_dict(ckpt['model'], strict=False)
-    print("Loaded: word weights (no sentence weights found)")
+    print("Loaded: word weights (fallback)")
+    COORDS = coords
 
 # Quick fine-tune on random text blocks with evolved coords
 print("Fine-tuning on text blocks with evolved coordinates...")

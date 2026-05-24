@@ -64,7 +64,7 @@ with torch.no_grad():
 
 print(f"  Found {n_concepts} concepts:")
 for ci in range(n_concepts):
-    chars = ''.join(cv.decode(s) for s in concept_symbols[ci][:10])
+    chars = ''.join(cv.decode([s]) for s in concept_symbols[ci][:10])
     v_c = v_func(concept_centroids[ci].unsqueeze(0).to(DEVICE)).item()
     print(f"    Concept {ci}: [{len(concept_symbols[ci]):>3d} symbols] V={v_c:.4f} | '{chars}...'")
 

@@ -1,5 +1,5 @@
 """
-EVA v8 — PotentialDynamics: живая пластика аффинной матрицы.
+EVA — PotentialDynamics: живая пластика аффинной матрицы.
 
 STDP + LTP/LTD + гомеостаз + метапластичность.
 Концепты возникают естественно: частые связи усиливаются → бассейны углубляются.
@@ -17,7 +17,7 @@ cv = CharacterVocab()
 VT = 157
 
 print("=" * 60)
-print("EVA v8 — PotentialDynamics: living affinity")
+print("EVA — PotentialDynamics: living affinity")
 print("=" * 60)
 print(f"Device: {DEVICE}")
 

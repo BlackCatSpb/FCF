@@ -1,5 +1,5 @@
 """
-EVA v8 — Word-Level Pipeline.
+EVA — Word-Level Pipeline.
 
 Phase 1: Affinity matrix from text (co-occurrence counting)
 Phase 2: MDS → topological coordinates in ℝ²⁴
@@ -24,7 +24,7 @@ VT = 157  # total vocab: PAD(0) + 156 symbols
 PAD = cv.PAD_IDX  # 0
 
 print("=" * 60)
-print("EVA v8 — Word-Level Pipeline")
+print("EVA — Word-Level Pipeline")
 print("=" * 60)
 print(f"Device: {DEVICE}")
 

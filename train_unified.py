@@ -1,5 +1,5 @@
 """
-EVA Symbolic v8 — Обучение UnifiedMultidimensionalTransformer.
+EVA Symbolic — Обучение UnifiedMultidimensionalTransformer.
 
 Символ ≡ позиция в ℝ¹². Трансформер учится навигировать по координатам.
 Loss = MSE(предсказанная_координата, координата_правильного_символа).
@@ -19,7 +19,7 @@ BATCH = 256; BLOCK = 64
 STEPS = 2000; LR = 1e-3
 
 print("=" * 60)
-print("EVA Symbolic v8 — Unified Transformer Training")
+print("EVA Symbolic — Unified Transformer Training")
 print("=" * 60)
 print(f"Device: {DEVICE}, Batch: {BATCH}, Block: {BLOCK}")
 

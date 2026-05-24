@@ -1,5 +1,5 @@
 """
-EVA Symbolic v8 — Full Training Pipeline.
+EVA Symbolic — Full Training Pipeline.
 
 Phase 3: Symbol reproduction from coordinates (no text, no dataset).
 Future: Phase 1+2 (affinity + MDS) for topological coordinates.
@@ -15,7 +15,7 @@ from eva.symbolic.unified_transformer import UnifiedMultidimensionalTransformer
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 print("=" * 60)
-print("EVA v8 — Symbol Reproduction (no dataset)")
+print("EVA — Symbol Reproduction (no dataset)")
 print("=" * 60)
 print(f"Device: {DEVICE}")
 

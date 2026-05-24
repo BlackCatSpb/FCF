@@ -1,5 +1,5 @@
 """
-EVA v8 — Step 1: ConceptFinder. 
+EVA — ConceptFinder. 
 Learns potential V(z): ℝ²⁴ → ℝ over coordinate space.
 Concepts = local minima of V(z) (regions where many trajectories converge).
 Contradictions = regions of potential barrier between concepts.
@@ -66,7 +66,7 @@ class PotentialFunction(nn.Module):
 # Training: V(z) low at trajectory points, high elsewhere
 # ============================================================
 print("=" * 60)
-print("EVA v8 — ConceptFinder: Potential V(z) over ℝ²⁴")
+print("EVA — ConceptFinder: Potential V(z) over ℝ²⁴")
 print("=" * 60)
 print(f"Device: {DEVICE}")
 

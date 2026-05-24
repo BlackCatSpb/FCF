@@ -84,8 +84,6 @@ if not os.path.exists(affinity_path):
 
         if attn is not None:
             # VECTORIZED: all BATCH sequences in one GPU operation
-        if attn is not None:
-            # VECTORIZED: all BATCH sequences in one GPU operation
             # Extract all adjacent pairs: [B, L-1, 2]
             max_len = ml
             left_all = bt[:, :max_len-1]    # [B, L-1]

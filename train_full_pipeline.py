@@ -36,7 +36,6 @@ if os.path.exists(affinity_path):
     print("  Loading existing affinity checkpoint...")
     pf.load_state_dict(torch.load(affinity_path, map_location='cpu', weights_only=True))
     print(f"  Affinity: mean={pf.affinity.mean():.4f} std={pf.affinity.std():.4f}")
-else:
 
 config = FCFConfig(); config.d_model = 256; config.vocab_size = 156; config.num_heads = 8
 layer = PrimordialLayer(config)

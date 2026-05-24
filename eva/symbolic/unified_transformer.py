@@ -145,9 +145,13 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         # Координатный эмбеддинг (вместо nn.Embedding)
         self.embed = CoordinateEmbedding(vocab_size, coord_dim)
 
-        # NOTE: FractalAttention available via fractal_attention.py for future use
-        # self.attention = FractalAttentionMask(...) — disabled, unused
-        self.attention = None
+        # FractalAttention v2 (multi-level, multi-scale)
+        from .fractal_v2 import FractalAttentionV2
+        self.attention = FractalAttentionV2(
+            d_model=coord_dim,
+            num_levels=num_levels,
+            scales_per_level=3,
+        )
 
         # Координатный декодер (вместо lm_head)
         self.decoder = CoordinateDecoder(self.embed)
@@ -196,27 +200,9 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         pos = self.pos_encoding[:, :L, :].to(device)
         x = x + pos
 
-        # 3. Multi-head self-attention with learnable projections
-        q = self.W_Q(x)
-        k = self.W_K(x)
-        v = self.W_V(x)
-        H = self.attn_heads
-        D = self.coord_dim
-        # [B, L, D] → [B, H, L, D/H]
-        q = q.view(B, L, H, D // H).transpose(1, 2)
-        k = k.view(B, L, H, D // H).transpose(1, 2)
-        v = v.view(B, L, H, D // H).transpose(1, 2)
-
-        scale = (D // H) ** 0.5
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / scale
-        causal_mask = torch.triu(torch.ones(L, L, device=device, dtype=torch.bool), diagonal=1)
-        attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_out = torch.matmul(attn_weights, v)
-
-        # Merge heads back: [B, H, L, D/H] → [B, L, D]
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)
-        attn_out = self.W_O(attn_out)
+        # 3. FractalAttention v2 (multi-level, multi-scale, manifold bias)
+        attn_out, _ = self.attention(x)
+        x = self.norm1(x + attn_out)
         x = self.norm1(x + attn_out)
 
         # 4. FFN

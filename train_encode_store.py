@@ -169,7 +169,7 @@ for seed, label in tests:
     # Show retrieved contexts for first word
     if seed == "привет":
         emb = ut.embed(torch.tensor([ids], dtype=torch.long, device=DEVICE))
-        ctx = store.get_context_for_generation(ids, emb[0].cpu().numpy(), top_k=3)
+        ctx = store.get_context_for_generation(ids, emb[0].detach().cpu().numpy(), top_k=3)
         print(f"  Contexts for '{seed}':")
         for c in ctx: print(f"    '{c['text'][:30]}' (d={c['distance']:.2f})")
     

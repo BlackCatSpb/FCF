@@ -22,7 +22,6 @@ os.makedirs(CKPT_DIR, exist_ok=True)
 cv = CharacterVocab()
 V = 156  # symbols (without PAD)
 PAD = cv.PAD_IDX  # 0
-SEP = cv.SEP_IDX   # 3
 
 print("=" * 60)
 print("EVA v8 — Word-Level Pipeline")
@@ -42,31 +41,40 @@ print(f"\nCorpus: {len(all_ids)/1e6:.1f}M tokens")
 # Pre-extract words from corpus
 # ============================================================
 print("Extracting words from corpus...")
-LETTER_RANGES = [(29,54), (57,82), (88,119), (120,152)]  # LATIN_UP, LATIN_LO, CYR_UP, CYR_LO
 
-def is_letter_or_digit(idx):
-    if 16 <= idx <= 25: return True  # digits 0-9
-    for lo, hi in LETTER_RANGES:
-        if lo <= idx <= hi: return True
-    return False
+# Precompute which IDs are letters or digits (fast vectorized check)
+_id_to_char_arr = [cv.decode([i]) for i in range(157)]
+_is_letter_digit = np.array([c.isalpha() or c.isdigit() for c in _id_to_char_arr], dtype=bool)
 
-# Extract words: contiguous letter/digit sequences (min length 2)
+# Extract words: contiguous letter/digit sequences (min length 2, max length 20)
 words = []
 i = 0
 total = len(all_ids)
-while i < total:
-    if is_letter_or_digit(all_ids[i]):
-        start = i
-        while i < total and is_letter_or_digit(all_ids[i]):
-            i += 1
-        word_len = i - start
-        if word_len >= 2 and word_len <= 20:
-            w = all_ids[start:i].tolist()
-            words.append(w)
-    else:
-        i += 1
+chunk_size = 10_000_000
+for chunk_start in range(0, total, chunk_size):
+    chunk_end = min(chunk_start + chunk_size + 20, total)  # overlap for boundaries
+    chunk = all_ids[chunk_start:chunk_end]
+    valid = _is_letter_digit[chunk]
+    
+    # Find word boundaries
+    in_word = False; start = 0
+    for j in range(len(chunk)):
+        if (chunk_start + j) >= total:
+            break
+        if valid[j]:
+            if not in_word:
+                in_word = True; start = j
+        else:
+            if in_word:
+                in_word = False
+                word_len = j - start
+                if 2 <= word_len <= 20:
+                    words.append(chunk[start:j].tolist())
+    
+    if (chunk_start + chunk_size) % 50_000_000 < chunk_size:
+        print(f"  ... {(chunk_start+chunk_size)/1e6:.0f}M tokens, {len(words):,} words")
 
-print(f"  Words extracted: {len(words):,} (min_len=2, max_len=20)")
+print(f"  Words extracted: {len(words):,}")
 
 # ============================================================
 # PHASE 1: Affinity matrix — pure co-occurrence counting

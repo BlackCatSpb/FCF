@@ -76,6 +76,8 @@ class CoordinateDecoder(nn.Module):
 
         # Температура для sharpen распределения
         self.temperature = nn.Parameter(torch.tensor(1.0))
+        # Learnable weight for nearest-neighbor signal
+        self.nn_weight = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -89,7 +91,7 @@ class CoordinateDecoder(nn.Module):
         coords = self.embed.coordinates  # [V, D]
         diffs = x.unsqueeze(2) - coords.unsqueeze(0).unsqueeze(0)  # [B, L, V, D]
         dists = torch.norm(diffs, dim=-1)  # [B, L, V]
-        nn_logits = -dists  # меньше расстояние → выше счёт
+        nn_logits = -dists * self.nn_weight  # scaled by learnable weight
 
         return logits + nn_logits
 
@@ -258,42 +260,8 @@ class UnifiedMultidimensionalTransformer(nn.Module):
 
         return generated
 
-    def compute_loss(
-        self,
-        token_ids: torch.Tensor,      # [B, L]
-        target_ids: torch.Tensor,     # [B, L] — сдвинутые на 1
-        mask: Optional[torch.Tensor] = None,  # [B, L] — PAD маска
-    ) -> torch.Tensor:
-        """
-        Композитный loss:
-
-        L_coord: MSE(предсказанная_координата, координата_правильного_символа)
-        """
-        B, L = token_ids.shape
-
-        # Forward pass
-        coords, scores = self.forward(token_ids, return_scores=True)
-
-        # L_coord: предсказанная координата должна быть близка к правильной
-        target_coords = self.embed(target_ids)  # [B, L, coord_dim]
-        coord_loss = F.mse_loss(coords, target_coords, reduction='none').mean(dim=-1)  # [B, L]
-
-        # L_class: кросс-энтропия через координатный декодер
-        class_loss = F.cross_entropy(
-            scores.view(-1, self.vocab_size),
-            target_ids.view(-1),
-            reduction='none',
-        ).view(B, L)
-
-        # Применяем маску
-        if mask is not None:
-            coord_loss = coord_loss * mask
-            class_loss = class_loss * mask
-            total = mask.sum() + 1e-8
-        else:
-            total = B * L
-
-        return (coord_loss.sum() + class_loss.sum()) / total
+    # compute_loss removed — loss is defined in train_full_pipeline.py
+    # (KL divergence + coordinate MSE)
 
     def summary(self) -> str:
         params = sum(p.numel() for p in self.parameters())

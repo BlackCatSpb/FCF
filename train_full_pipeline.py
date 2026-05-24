@@ -84,10 +84,10 @@ if not os.path.exists(affinity_path):
 
         if attn is not None:
             # VECTORIZED: all BATCH sequences in one GPU operation
-            # Extract all adjacent pairs: [B, L-1, 2]
-            max_len = ml
-            left_all = bt[:, :max_len-1]    # [B, L-1]
-            right_all = bt[:, 1:max_len]    # [B, L-1]
+        # Extract all adjacent pairs: [B, L-1, 2]
+        max_len = ml
+        left_all = bt[:, :max_len-1]    # [B, L-1]
+        right_all = bt[:, 1:max_len]    # [B, L-1]
             
             # Adjacent attention from all heads
             adj_attn = attn.mean(dim=1)[:, torch.arange(1, max_len, device=DEVICE), 
@@ -161,7 +161,10 @@ print(f"  {ut.summary()}")
 
 UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 50000; UT_LR = 1e-3
 opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
-sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS)
+sch = torch.optim.lr_scheduler.SequentialLR(opt, [
+    torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=1000),
+    torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS - 1000),
+], milestones=[1000])
 
 # Affinity-based soft targets — temperature-sharpened, NOT row-normalized
 aff_tgt = pf.affinity.to(DEVICE)  # [V, V] — raw affinity values
@@ -194,7 +197,7 @@ for step in range(1, UT_STEPS + 1):
     coords, scores = ut(bt, return_scores=True)
     
     # KL divergence: transformer output should match affinity distribution
-    tgt = aff_tgt[bt.clamp(0, V-1)]  # [B, L, V]
+    tgt = aff_tgt[bt.clamp(1, V-1)]  # skip PAD (idx=0)
     mask = (bt != PAD).float()  # [B, L]
     
     log_probs = F.log_softmax(scores, dim=-1)

@@ -254,9 +254,9 @@ for ri, r in enumerate(results[:5]):
     # Build trajectory: thesis_centroid → synthesis → antithesis_centroid
     za = centroids_t[r['ci']:r['ci']+1]
     zb = centroids_t[r['cj']:r['cj']+1]
-    syn = r['synthesis'].unsqueeze(0).to(DEVICE)
+    syn_t = r['synthesis'].view(1, -1).to(DEVICE)  # [1, 24]
     
-    traj = torch.cat([za, syn, zb], dim=0)  # [3, 24]
+    traj = torch.cat([za, syn_t, zb], dim=0)  # [3, 24]
     
     # Find nearest symbols along trajectory
     with torch.no_grad():

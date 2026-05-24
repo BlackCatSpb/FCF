@@ -45,19 +45,32 @@ ut.eval()
 print("Model loaded")
 
 # ============================================================
-# SymbolicGenerator: generate text from coordinates
+# Simple text generation via transformer autoregression
 # ============================================================
-print("\n[GENERATE] Symbolic text generation from coordinate seeds...")
+print("\n[GENERATE] Transformer autoregressive generation...")
 
-from eva.symbolic.symbolic_generator import SymbolicGenerator
-
-generator = SymbolicGenerator(
-    char_vocab=cv,
-    unified_transformer=ut,
-    coords=coords,
-    temperature=0.8,
-    max_length=30,
-)
+def generate_text(ut, coords, seed_ids, max_new=15, temperature=0.8, top_k=20):
+    """Autoregressive text generation from seed symbol IDs."""
+    ids = list(seed_ids)
+    ut.eval()
+    
+    with torch.no_grad():
+        for _ in range(max_new):
+            inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+            _, scores = ut(inp, return_scores=True)
+            logits = scores[0, -1] / temperature  # last position
+            
+            # Top-k filtering
+            topk_vals, topk_idx = torch.topk(logits, min(top_k, len(logits)))
+            probs = F.softmax(topk_vals, dim=-1)
+            next_token = topk_idx[torch.multinomial(probs, 1)].item()
+            
+            if next_token <= 0 or next_token >= VT:
+                next_token = topk_idx[0].item()  # fallback to most likely
+            
+            ids.append(next_token)
+    
+    return ids
 
 test_seeds = ["привет", "человек", "знания", "метаданные", "трансформер"]
 
@@ -66,22 +79,14 @@ for seed in test_seeds:
     if len(seed_ids) < 2:
         continue
     
-    try:
-        result = generator.generate(
-            seed_ids=seed_ids,
-            max_new_tokens=12,
-            top_k=20,
-            top_p=0.9,
-        )
-        generated = cv.decode(result)
-        print(f"  '{seed}...' → '{generated}'")
-    except Exception as e:
-        print(f"  '{seed}...' → error: {e}")
+    result = generate_text(ut, coords, seed_ids, max_new=15, temperature=0.7)
+    generated = cv.decode(result)
+    print(f"  '{seed}...' → '{generated}'")
 
 # ============================================================
-# Coordinate-based navigation: direct path interpolation
+# Navigate + Generate: direct coordinate path
 # ============================================================
-print("\n[NAVIGATE] Direct coordinate navigation (no external deps)...")
+print("\n[NAVIGATE] Path interpolation + generation...")
 
 test_pairs = [
     ("привет", "пока"),
@@ -95,10 +100,9 @@ for w1, w2 in test_pairs:
     if len(ids1) < 2 or len(ids2) < 2:
         continue
     
-    c1 = coords[ids1].mean(dim=0)  # centroid
+    c1 = coords[ids1].mean(dim=0)
     c2 = coords[ids2].mean(dim=0)
     
-    # Linear path with 5 waypoints
     n_pts = 5
     path = torch.stack([c1 + (i/(n_pts-1))*(c2-c1) for i in range(n_pts)])
     
@@ -107,17 +111,14 @@ for w1, w2 in test_pairs:
         nearest = dists.argmin(dim=-1).clamp(1, VT-1)
         path_text = cv.decode(nearest.tolist())
     
-    # Generate from each waypoint
-    parts = []
-    for wp in nearest[:4]:
-        try:
-            res = generator.generate(seed_ids=[wp.item()], max_new_tokens=6, top_k=20)
-            parts.append(cv.decode(res))
-        except:
-            parts.append("?")
+    # Generate from middle waypoint
+    mid_idx = n_pts // 2
+    mid_wp = nearest[mid_idx].item()
+    gen_ids = generate_text(ut, coords, [mid_wp], max_new=12, temperature=0.7)
+    gen_text = cv.decode(gen_ids)
     
     print(f"  '{w1}' → '{w2}':")
     print(f"    Path: '{path_text}'")
-    print(f"    Gen:  {' | '.join(parts)}")
+    print(f"    Gen:  '{gen_text}'")
 
 print("\nDone.")

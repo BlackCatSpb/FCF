@@ -159,10 +159,9 @@ for step in range(1, UT_STEPS + 1):
         mask[bi, :len(w)] = 1.0
     
     ut.train()
-    _, scores = ut(bt, return_scores=True)  # [B, L, 157]
+    _, scores = ut(bt, return_scores=True)
     target = bt.clamp(1, VT-1)
     
-    # Standard CE
     ce_loss = F.cross_entropy(
         scores.view(-1, 157),
         target.view(-1),
@@ -170,31 +169,18 @@ for step in range(1, UT_STEPS + 1):
     ).view(UT_BATCH, max_len)
     ce_loss = (ce_loss * mask).sum() / (mask.sum() + 1e-8)
     
-    # Contradiction penalty: penalize predictions to forbidden symbols
-    if forbidden_mask.any():
-        # Flatten and apply mask-based penalty
-        with torch.no_grad():
-            target_flat = target.view(-1)  # [B*L]
-            # For each token, compute if transition is forbidden
-            # Shift targets: target_t → prev_t = bt[:, :-1]
-            prev_flat = bt[:, :-1].contiguous().view(-1)  # [B*(L-1)]
-            next_flat = target[:, 1:].contiguous().view(-1)  # [B*(L-1)]
-            valid_pairs = (prev_flat > 0) & (prev_flat < VT) & (next_flat > 0) & (next_flat < VT)
-            if valid_pairs.any():
-                prev_v = prev_flat[valid_pairs].long()
-                next_v = next_flat[valid_pairs].long()
-                is_forbidden = forbidden_mask[prev_v, next_v]  # [N]
-                n_forbidden = is_forbidden.sum().item()
-                if n_forbidden > 0:
-                    # Penalize those positions in the loss
-                    # Find indices in the original loss tensor
-                    pos_mask = torch.zeros(UT_BATCH, max_len-1, dtype=torch.bool, device=DEVICE)
-                    pair_idx = 0
-                    for bi in range(UT_BATCH):
-                        for pos_ in range(max_len-1):
-                            if (prev_flat == prev_v[pair_idx]).all() and valid_pairs[bi*(max_len-1)+pos_]:
-                                pass  # complex indexing, skip for now
-                    ce_loss = ce_loss * (1.0 + 0.1 * n_forbidden / max(1, valid_pairs.sum().item()))
+    # Simple contradiction penalty: boost loss if batch has violations
+    with torch.no_grad():
+        prev_v = bt[:, :-1][mask[:, 1:].bool()].long()
+        next_v = target[:, 1:][mask[:, 1:].bool()].long()
+        valid = (prev_v > 0) & (prev_v < VT) & (next_v > 0) & (next_v < VT)
+        total_adj = valid.sum().item()
+        violations = 0
+        if valid.any():
+            violations = forbidden_mask[prev_v[valid].long(), next_v[valid].long()].sum().item()
+    
+    if violations > 0:
+        ce_loss = ce_loss + 0.01 * violations / max(total_adj, 1)
     
     opt.zero_grad()
     ce_loss.backward()
@@ -211,18 +197,8 @@ for step in range(1, UT_STEPS + 1):
             pred = scores.argmax(dim=-1)
             correct = ((pred == target) & mask.bool()).sum().item()
             tok_acc = correct / (mask.sum() + 1e-8)
-            
-            # Count contradiction violations (vectorized)
-            prev_v = bt[:, :-1][mask[:, 1:].bool()].long()
-            next_v = target[:, 1:][mask[:, 1:].bool()].long()
-            valid = (prev_v > 0) & (prev_v < VT) & (next_v > 0) & (next_v < VT)
-            if valid.any():
-                violations = forbidden_mask[prev_v[valid].long(), next_v[valid].long()].sum().item()
-                total_adj = valid.sum().item()
-            else:
-                violations = 0; total_adj = 1
-            viol_rate = violations / (total_adj + 1e-8)
-        
+        lr = sch.get_last_lr()[0]
+        viol_rate = violations / (total_adj + 1e-8)
         print(f"  step {step:>4d}/{UT_STEPS} | loss={ce_loss.item():.4f} | "
               f"tok_acc={tok_acc:.3f} | violations={violations}/{total_adj} ({viol_rate:.1%})"
               f" | {elapsed:.0f}s", flush=True)

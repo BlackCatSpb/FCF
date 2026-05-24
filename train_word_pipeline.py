@@ -20,7 +20,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 cv = CharacterVocab()
-V = 156  # symbols (without PAD)
+VT = 157  # total vocab: PAD(0) + 156 symbols
 PAD = cv.PAD_IDX  # 0
 
 print("=" * 60)
@@ -90,8 +90,8 @@ if os.path.exists(affinity_path):
     affinity = aff_data['affinity'].to(torch.float32)
     print(f"  Affinity mean={affinity.mean():.4f} std={affinity.std():.4f}")
 else:
-    co_occurrence = torch.zeros(V, V, dtype=torch.float64, device=DEVICE)
-    affinity = torch.full((V, V), 0.5, dtype=torch.float32, device=DEVICE)
+    co_occurrence = torch.zeros(VT, VT, dtype=torch.float64, device=DEVICE)
+    affinity = torch.full((VT, VT), 0.5, dtype=torch.float32, device=DEVICE)
     
     AFF_STEPS = 50000
     pos = 0
@@ -112,13 +112,13 @@ else:
         left = all_ids[pos:end]
         right = all_ids[pos+1:end+1]
         
-        valid = (left > 0) & (left < V) & (right > 0) & (right < V)
+        valid = (left > 0) & (left < VT) & (right > 0) & (right < VT)
         lv = left[valid]; rv = right[valid]
         
         if len(lv) > 0:
             lv_t = torch.from_numpy(lv).long().to(DEVICE)
             rv_t = torch.from_numpy(rv).long().to(DEVICE)
-            flat_idx = lv_t * V + rv_t
+            flat_idx = lv_t * VT + rv_t
             inc = torch.ones(len(flat_idx), dtype=torch.float64, device=DEVICE)
             co_occurrence.view(-1).index_add_(0, flat_idx, inc)
         
@@ -131,7 +131,7 @@ else:
             aps = step * chunk_size / max(elapsed, 0.01)
             total_pairs = co_occurrence.sum().item()
             # Update affinity
-            raw = co_occurrence / 100000.0
+            raw = co_occurrence / 10000.0  # lower threshold for better signal
             affinity = (0.5 + 0.5 * torch.clamp(raw, 0.0, 1.0)).float()
             pot = affinity.mean().item()
             print(f"  step {step:>5d}/{AFF_STEPS} | {aps:,.0f} pairs/s | "
@@ -154,26 +154,28 @@ print("\n[PHASE 2] MDS → topological coordinates in ℝ²⁴...")
 from eva.symbolic.topological_field import TopologicalField
 from eva.symbolic.potential_field import PotentialField
 
-pf = PotentialField(V, 256)
+pf = PotentialField(VT, 256)
 pf.affinity = torch.nn.Parameter(affinity, requires_grad=False)
 pf.co_occurrence_count = torch.nn.Parameter(co_occurrence, requires_grad=False)
 
 topo = TopologicalField(pf, coord_dim=24)
 topo._compute_coordinates_from_affinity()
-coords = topo.coordinates[:156, :24].clone()
+coords_full = topo.coordinates[:VT, :24].clone()  # [157, 24] — includes PAD
 
-# Diagnostic
-coords_np = coords.cpu().numpy()
+# Diagnostic (on symbols only, excl PAD)
+sym_coords = coords_full[1:VT].clone()  # [156, 24]
+sym_np = sym_coords.cpu().numpy()
 n = 156
 topo_aff = affinity.cpu().numpy()
-from eva.symbolic.topological_field import np as _np
-D_mds = 1.0 - topo_aff[:n,:n]; np.fill_diagonal(D_mds, 0.0)
+# MDS quality: classical scaling on 156×156 submatrix (excl PAD)
+aff_156 = topo_aff[1:VT, 1:VT]
+D_mds = 1.0 - aff_156; np.fill_diagonal(D_mds, 0.0)
 J = np.eye(n) - np.ones((n,n))/n; B = -0.5*J@(D_mds*D_mds)@J
 eigvals = np.linalg.eigh(B)[0]; eigvals = np.sort(eigvals)[::-1]
 eff_dim = (eigvals[:24].sum() / eigvals[eigvals>0].sum()) if (eigvals>0).sum()>0 else 0
-unique_coords = len(np.unique(coords_np.round(decimals=6), axis=0))
+unique_coords = len(np.unique(sym_coords.numpy().round(decimals=6), axis=0))
 print(f"  MDS: eff_dim(24)={eff_dim:.1%}, unique={unique_coords}/{n}")
-print(f"  Coordinates: {coords.shape}")
+print(f"  Coordinates: {coords_full.shape}")
 
 # ============================================================
 # PHASE 3: Word autoencoding (coordinates trajectory → words)
@@ -185,7 +187,7 @@ print("  100% per-word accuracy required.")
 ut = UnifiedMultidimensionalTransformer(vocab_size=157, coord_dim=24)
 if DEVICE == 'cuda':
     ut = ut.cuda()
-ut.set_symbol_coordinates(coords.to(DEVICE))
+ut.set_symbol_coordinates(coords_full.to(DEVICE))
 print(f"  {ut.summary()}")
 
 UT_STEPS = 30000; UT_LR = 1e-3; UT_BATCH = 128
@@ -211,7 +213,7 @@ for step in range(1, UT_STEPS + 1):
     ut.train()
     _, scores = ut(bt, return_scores=True)  # [B, L, 157]
     
-    target = bt.clamp(1, V)  # skip PAD=0
+    target = bt.clamp(1, VT-1)  # skip PAD=0
     
     loss = F.cross_entropy(
         scores.view(-1, 157),
@@ -250,7 +252,7 @@ for step in range(1, UT_STEPS + 1):
 
 # Save weights
 word_weights_path = os.path.join(CKPT_DIR, "word_weights.pt")
-torch.save({'model': ut.state_dict(), 'coords': coords}, word_weights_path)
+torch.save({'model': ut.state_dict(), 'coords': coords_full}, word_weights_path)
 print(f"  Saved: {word_weights_path}")
 
 # ============================================================

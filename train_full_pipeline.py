@@ -82,9 +82,11 @@ for step in range(1, UT_STEPS + 1):
                 milestone_path = os.path.join(CKPT_DIR, "symbol_100pct.pt")
                 torch.save({'model': ut.state_dict(), 'coords': coords, 'step': step}, milestone_path)
                 print(f"\n  *** 100% reached at step {step}! Saved: {milestone_path}")
-                if loss.item() < 0.01:
-                    print("  Early exit: loss < 0.01, training complete.")
-                    break
+
+    # Early exit: stable weights
+    if loss.item() < 0.005:
+        print(f"\n  Early exit: loss < 0.005 at step {step}, training complete.")
+        break
 
     now = time.time()
     if now - last_print >= 3 or step == 1 or step == UT_STEPS:

@@ -23,6 +23,7 @@ CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints", "symbolic")
 
 from eva.symbolic.char_vocab import CharacterVocab
 from eva.symbolic.unified_transformer import UnifiedMultidimensionalTransformer
+from eva.symbolic.grammar_head import GrammarHead
 
 cv = CharacterVocab()
 VT = 157
@@ -31,78 +32,6 @@ print("=" * 60)
 print("EVA — GrammarHead Training")
 print("=" * 60)
 print(f"Device: {DEVICE}")
-
-# ============================================================
-# GrammarHead: neural grammar layer
-# ============================================================
-class GrammarHead(nn.Module):
-    """
-    Грамматический слой поверх координатного трансформера.
-    
-    Вход:  координаты от трансформера [B, L, 24]
-    Выход: грамматически скорректированные продолжения [B, L, 157]
-    
-    Архитектура:
-    - Position-aware: учитывает позицию в слове/предложении
-    - Context window: смотрит на ±8 соседей для согласования
-    - Multi-scale: character, bigram, word уровни
-    """
-    
-    def __init__(self, coord_dim=24, vocab_size=157, hidden=64):
-        super().__init__()
-        self.coord_dim = coord_dim
-        self.vocab_size = vocab_size
-        
-        # Context-aware grammar correction
-        self.context_conv = nn.Sequential(
-            nn.Conv1d(coord_dim, hidden, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden),
-            nn.ReLU(),
-            nn.Conv1d(hidden, hidden, kernel_size=5, padding=2),
-            nn.BatchNorm1d(hidden),
-            nn.ReLU(),
-            nn.Conv1d(hidden, hidden, kernel_size=7, padding=3),
-            nn.BatchNorm1d(hidden),
-            nn.ReLU(),
-        )
-        
-        # Grammar rules encoder (learned morphological features)
-        self.grammar_encoder = nn.Sequential(
-            nn.Linear(coord_dim + hidden, hidden),
-            nn.LayerNorm(hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden // 2),
-            nn.ReLU(),
-            nn.Linear(hidden // 2, vocab_size),
-        )
-        
-        # Positional bias (where in word are we?)
-        self.pos_embed = nn.Embedding(128, coord_dim)
-    
-    def forward(self, coords, return_logits=True):
-        """
-        coords: [B, L, coord_dim] — выходные координаты трансформера
-        
-        Returns: logits [B, L, vocab_size] — grammar-corrected scores
-        """
-        B, L, D = coords.shape
-        
-        # Add positional info
-        positions = torch.arange(L, device=coords.device).clamp(0, 127)
-        pos_emb = self.pos_embed(positions).unsqueeze(0).expand(B, -1, -1)
-        x = coords + pos_emb  # [B, L, D]
-        
-        # Context convolution (captures agreement patterns)
-        ctx = self.context_conv(x.transpose(1, 2))  # [B, hidden, L]
-        ctx = ctx.transpose(1, 2)  # [B, L, hidden]
-        
-        # Combine coordinate + context
-        combined = torch.cat([x, ctx], dim=-1)  # [B, L, D + hidden]
-        
-        # Predict grammar-corrected continuations
-        logits = self.grammar_encoder(combined)  # [B, L, vocab_size]
-        
-        return logits
 
 # ============================================================
 # Load transformer
@@ -138,11 +67,16 @@ if DEVICE == 'cuda':
 print(f"GrammarHead: {sum(p.numel() for p in gh.parameters()):,} parameters")
 
 # ============================================================
-# Training: causal next-token prediction
+# Training (skip if checkpoint exists)
 # ============================================================
-print("\n[TRAIN] GrammarHead — causal next-token prediction...")
+gh_path = os.path.join(CKPT_DIR, "grammar_head.pt")
+if os.path.exists(gh_path):
+    print("\n[TRAIN] Loading existing GrammarHead checkpoint...")
+    gh.load_state_dict(torch.load(gh_path, map_location='cpu', weights_only=True)['model'])
+else:
+    print("\n[TRAIN] GrammarHead — causal next-token prediction...")
 
-npy_file = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
+    npy_file = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
 if not os.path.exists(npy_file):
     npy_file = os.path.join(os.path.dirname(__file__), "real_data", "full_corpus_ids.npy")
 all_ids = np.load(npy_file, mmap_mode='r').astype(np.int32)

@@ -42,13 +42,14 @@ class PotentialFunction(nn.Module):
     
     def find_minimum(self, z0, steps=50, lr=0.01):
         """Gradient descent from z0 to nearest local minimum."""
-        z = z0.detach().clone().requires_grad_(True)
-        opt = torch.optim.Adam([z], lr=lr)
-        for _ in range(steps):
-            opt.zero_grad()
-            loss = self(z).sum()
-            loss.backward()
-            opt.step()
+        with torch.enable_grad():
+            z = z0.detach().clone().requires_grad_(True)
+            opt = torch.optim.Adam([z], lr=lr)
+            for _ in range(steps):
+                opt.zero_grad()
+                loss = self(z).sum()
+                loss.backward()
+                opt.step()
         return z.detach()
     
     def find_saddle(self, za, zb, n_points=20):
@@ -87,7 +88,7 @@ print(f"Corpus: {len(all_ids)/1e6:.1f}M tokens")
 # Build potential model
 pf_model = PotentialFunction(dim=24, hidden=128).to(DEVICE)
 opt = torch.optim.AdamW(pf_model.parameters(), lr=1e-3)
-sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=10000)
+sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
 
 print(f"Model: {sum(p.numel() for p in pf_model.parameters()):,} parameters")
 print()
@@ -95,9 +96,8 @@ print()
 # ============================================================
 # Training loop: contrastive — low V at real points, high V at random
 # ============================================================
-STEPS = 10000
+STEPS = 5000
 BATCH = 2048
-MARGIN = 1.0
 total_ids = len(all_ids)
 
 start = time.time()
@@ -105,7 +105,6 @@ last_print = 0
 rng = np.random.RandomState(99)
 
 for step in range(1, STEPS + 1):
-    # Sample REAL trajectory points from corpus
     starts = rng.randint(0, max(1, total_ids - 3), BATCH)
     real_ids = np.array([all_ids[s] for s in starts])
     valid = (real_ids > 0) & (real_ids < VT)
@@ -116,21 +115,16 @@ for step in range(1, STEPS + 1):
     
     real_z = coords[torch.from_numpy(real_ids).long().to(DEVICE)]  # [N, 24]
     
-    # Sample RANDOM points in ℝ²⁴ (uniform on sphere)
     rand_z = torch.randn(BATCH, 24, device=DEVICE)
     rand_z = rand_z / rand_z.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     
-    # Contrastive loss: real should be BELOW margin, random ABOVE margin
     v_real = pf_model(real_z[:BATCH])
     v_rand = pf_model(rand_z)
     
-    # Hinge loss: V(real) should be low, V(rand) should be high
-    loss = v_real.mean() + F.relu(MARGIN - v_rand).mean()
-    
-    # Bonus: push real points toward each other (clustering)
-    if len(real_z) >= 64:
-        v_all = pf_model(real_z[:64])
-        loss = loss + 0.01 * v_all.std()  # encourage similar V within batch
+    # Bounded targets: V(real) → -1, V(rand) → +1
+    loss_real = ((v_real + 1.0) ** 2).mean()
+    loss_rand = ((v_rand - 1.0) ** 2).mean()
+    loss = loss_real + loss_rand
     
     opt.zero_grad()
     loss.backward()
@@ -153,35 +147,45 @@ for step in range(1, STEPS + 1):
               f"lr={lr:.6f} | {elapsed:.0f}s / eta {eta:.0f}s", flush=True)
 
 # ============================================================
-# Analysis: Find concepts (local minima of V)
+# Analysis: Find concepts (low-V regions)
 # ============================================================
 print("\n[ANALYSIS] Finding concepts in ℝ²⁴...")
-pf_model.eval()
 
-# Method 1: Find minima starting from each symbol coordinate
-print("\n  Minima from symbol coordinates:")
+# V at each symbol coordinate — low V = frequently used, high V = rare
 with torch.no_grad():
-    for i in range(1, min(VT, 20)):  # first 19 symbols
-        z0 = coords[i:i+1].to(DEVICE)
-        z_min = pf_model.find_minimum(z0, steps=30, lr=0.05)
-        v_min = pf_model(z_min).item()
-        v_start = pf_model(z0).item()
-        char = cv.decode([i])
-        moved = (z_min - z0).norm().item()
-        print(f"    [{i:>3d}] '{char}' V={v_start:.3f} → min V={v_min:.4f} (moved {moved:.3f})")
+    v_symbols = pf_model(coords[1:VT])  # [156] — V at each symbol
+    v_sorted, v_indices = v_symbols.sort()
 
-# Method 2: Cluster symbols by their minima (group into concepts)
-print("\n  Symbol clustering into concepts:")
-all_minima = []
-with torch.no_grad():
+print("\n  Potential V(z) at symbol coordinates (low = frequent):")
+print(f"    Min V: {v_sorted[0].item():.4f} (symbol {v_indices[0].item()+1} '{cv.decode([v_indices[0].item()+1])}')")
+print(f"    Max V: {v_sorted[-1].item():.4f} (symbol {v_indices[-1].item()+1} '{cv.decode([v_indices[-1].item()+1])}')")
+print(f"    Mean V: {v_symbols.mean().item():.4f}, Std: {v_symbols.std().item():.4f}")
+
+# Show top/bottom symbols by potential
+print("\n  Lowest V (most frequent symbols):")
+for i in range(10):
+    idx = v_indices[i].item() + 1
+    print(f"    [{idx:>3d}] '{cv.decode([idx])}' V={v_symbols[v_indices[i]].item():.3f}")
+
+print("\n  Highest V (rarest symbols):")
+for i in range(1, 11):
+    idx = v_indices[-i].item() + 1
+    print(f"    [{idx:>3d}] '{cv.decode([idx])}' V={v_symbols[v_indices[-i]].item():.3f}")
+
+# ============================================================
+# Find minima by gradient descent (concept basins)
+# ============================================================
+print("\n  Finding local minima from each symbol...")
+with torch.enable_grad():
+    all_minima = []
     for i in range(1, VT):
         z0 = coords[i:i+1].to(DEVICE)
         z_min = pf_model.find_minimum(z0, steps=30, lr=0.05)
-        all_minima.append(z_min)
+        all_minima.append(z_min.cpu())
 
 all_minima = torch.cat(all_minima, dim=0)  # [156, 24]
 
-# Group symbols whose minima are close (< threshold)
+# Cluster minima — concepts = groups of symbols converging to same region
 threshold = 0.15
 concept_groups = []
 used = set()
@@ -200,28 +204,39 @@ for i in range(len(all_minima)):
             used.add(j)
     concept_groups.append(group)
 
-print(f"  Found {len(concept_groups)} concept groups (threshold={threshold}):")
-for gi, group in enumerate(concept_groups[:15]):
+print(f"\n  Found {len(concept_groups)} concept groups (merge_thr={threshold}):")
+# Sort groups by size, show largest
+concept_groups.sort(key=len, reverse=True)
+for gi, group in enumerate(concept_groups[:10]):
     chars = ''.join(cv.decode([g+1]) for g in group)
-    print(f"    Group {gi}: [{len(group)} symbols] '{chars}'")
+    print(f"    Group {gi}: [{len(group):>3d} symbols] '{chars}'")
 
 # ============================================================
-# Method 3: Find saddle points between concepts
+# Saddle points between concept groups (barriers)
 # ============================================================
-print("\n  Saddle points between concept groups:")
+print("\n  Saddle points (potential barriers between concepts):")
 if len(concept_groups) >= 2:
-    for i in range(min(3, len(concept_groups))):
-        for j in range(i+1, min(i+4, len(concept_groups))):
-            za = all_minima[concept_groups[i][0]:concept_groups[i][0]+1]
-            zb = all_minima[concept_groups[j][0]:concept_groups[j][0]+1]
-            saddle, v_sad = pf_model.find_saddle(za, zb, n_points=50)
-            v_a = pf_model(za).item()
-            v_b = pf_model(zb).item()
-            barrier = v_sad.item() - max(v_a, v_b)
-            chi = cv.decode([concept_groups[i][0]+1])
-            chj = cv.decode([concept_groups[j][0]+1])
-            print(f"    '{chi}' ↔ '{chj}': barrier={barrier:.4f} "
-                  f"(V_a={v_a:.4f}, V_b={v_b:.4f}, V_saddle={v_sad.item():.4f})")
+    with torch.no_grad():
+        count = 0
+        for i in range(min(5, len(concept_groups))):
+            for j in range(i+1, min(i+4, len(concept_groups))):
+                if len(concept_groups[i]) == 0 or len(concept_groups[j]) == 0:
+                    continue
+                za = all_minima[concept_groups[i][0]:concept_groups[i][0]+1].to(DEVICE)
+                zb = all_minima[concept_groups[j][0]:concept_groups[j][0]+1].to(DEVICE)
+                saddle, v_sad = pf_model.find_saddle(za, zb, n_points=50)
+                v_a = pf_model(za).item()
+                v_b = pf_model(zb).item()
+                barrier = v_sad.item() - max(v_a, v_b)
+                chi = cv.decode([concept_groups[i][0]+1])
+                chj = cv.decode([concept_groups[j][0]+1])
+                print(f"    '{chi}' ↔ '{chj}': barrier={barrier:.4f} "
+                      f"(V_a={v_a:.4f}, V_b={v_b:.4f}, V_saddle={v_sad.item():.4f})")
+                count += 1
+                if count >= 10:
+                    break
+            if count >= 10:
+                break
 
 # Save
 pf_path = os.path.join(CKPT_DIR, "potential_function.pt")

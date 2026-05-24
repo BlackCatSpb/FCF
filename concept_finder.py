@@ -76,7 +76,7 @@ cv = CharacterVocab()
 VT = 157
 
 # Load coordinates
-coords_ckpt = torch.load(os.path.join(CKPT_DIR, "word_weights.pt"), map_location='cpu', weights_only=True)
+coords_ckpt = torch.load(os.path.join(CKPT_DIR, "evolved_affinity.pt"), map_location='cpu', weights_only=True)
 coords = coords_ckpt['coords'].to(DEVICE)  # [157, 24]
 print(f"Coords loaded: {coords.shape}")
 

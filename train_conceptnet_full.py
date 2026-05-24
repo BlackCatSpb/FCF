@@ -30,67 +30,71 @@ print(f"Device: {DEVICE}")
 # Connect to ConceptNet
 # ============================================================
 print("\n[CONNECT] Loading ConceptNet...")
-from conceptnet_lite import connect, Label, Concept, Language, edges_for
+from conceptnet_lite import connect, Label, Concept, Language, edges_for, Edge as CNEdge
 
 db_path = r"C:\Users\black\OneDrive\Desktop\EVA-Ai\conceptnet.db"
 connect(db_path)
 print(f"  Connected: {db_path}")
 
 # ============================================================
-# Phase 1: Extract ALL Russian edges from ConceptNet
+# Phase 1: Get ALL Russian labels from ConceptNet
 # ============================================================
-print("\n[PHASE 1] Extracting Russian edges from ConceptNet...")
+print("\n[PHASE 1] Getting Russian labels from ConceptNet...")
 
-# Query all concepts in Russian
 lang_ru = Language.get(name='ru')
 
-# We need to iterate through all edges. ConceptNet-lite uses Edge.select()
-from conceptnet_lite import Edge as CNEdge
+# Direct query: get labels with Russian language
+ru_labels = list(Label.select().where(Label.language == lang_ru))
+print(f"  Found {len(ru_labels):,} Russian labels")
 
-# Efficient approach: get all edges with Russian language in either start or end
-print("  Querying edges (this may take a few minutes)...")
-
-all_edges = CNEdge.select()  # iterator over all edges
-ru_edges = []
-total_scanned = 0
-start_time = time.time()
-last_report = 0
-
-for edge in all_edges:
+# Get concepts for these labels
+ru_concepts = []
+for label in ru_labels:
     try:
-        start_uri = edge.start.uri if hasattr(edge.start, 'uri') else str(edge.start)
-        end_uri = edge.end.uri if hasattr(edge.end, 'uri') else str(edge.end)
-        
-        # Check if either side is Russian
-        start_is_ru = '/ru/' in start_uri
-        end_is_ru = '/ru/' in end_uri
-        
-        if start_is_ru or end_is_ru:
-            rel = edge.relation.name if hasattr(edge.relation, 'name') else str(edge.relation)
-            weight = edge.etc.get('weight', 1.0) if hasattr(edge, 'etc') else 1.0
+        concepts = Concept.select().where(Concept.label == label)
+        for c in concepts:
+            ru_concepts.append((label.text, c))
+    except:
+        pass
+
+print(f"  Found {len(ru_concepts):,} Russian concepts")
+
+# ============================================================
+# Phase 2: Get edges for Russian concepts
+# ============================================================
+print("\n[PHASE 2] Getting edges for Russian concepts...")
+
+all_ru_words = set()
+ru_edges = []
+
+for i, (text, concept) in enumerate(ru_concepts):
+    try:
+        edges = list(edges_for([concept]))
+        for edge in edges:
+            rel = edge.relation.name
+            weight = edge.etc.get('weight', 1.0)
             
+            start_uri = edge.start.uri
+            end_uri = edge.end.uri
             start_label = start_uri.split('/')[-1] if '/' in start_uri else start_uri
             end_label = end_uri.split('/')[-1] if '/' in end_uri else end_uri
+            start_lang = start_uri.split('/')[1] if len(start_uri.split('/')) >= 2 else ''
+            end_lang = end_uri.split('/')[1] if len(end_uri.split('/')) >= 2 else ''
             
-            ru_edges.append((start_label, end_label, rel, weight, start_is_ru, end_is_ru))
-        
-        total_scanned += 1
-        now = time.time()
-        if now - last_report >= 5:
-            last_report = now
-            elapsed = now - start_time
-            rate = total_scanned / max(elapsed, 0.01)
-            print(f"\r  Scanned: {total_scanned:,} edges ({rate:,.0f}/s), "
-                  f"Russian: {len(ru_edges):,}", end='', flush=True)
+            ru_edges.append((start_label, end_label, rel, weight, start_lang == 'ru', end_lang == 'ru'))
+            
+            if start_lang == 'ru':
+                all_ru_words.add(start_label.lower().strip())
+            if end_lang == 'ru':
+                all_ru_words.add(end_label.lower().strip())
+    except:
+        pass
     
-    except Exception:
-        continue
+    if (i+1) % 500 == 0:
+        print(f"\r  Processed {i+1}/{len(ru_concepts)} concepts, "
+              f"{len(ru_edges):,} edges, {len(all_ru_words):,} unique words", end='', flush=True)
 
-    if len(ru_edges) >= 500000:
-        print(f"\n  Reached 500K Russian edges, stopping scan.")
-        break
-
-print(f"\n  Total Russian edges: {len(ru_edges):,}")
+print(f"\n  Total: {len(ru_edges):,} edges, {len(all_ru_words):,} unique Russian words")
 
 # ============================================================
 # Phase 2: Encode Russian concepts as symbol sequences
@@ -112,14 +116,19 @@ print(f"  Unique Russian words: {len(ru_words):,}")
 
 # Encode each word and collect co-occurrences
 encoded_words = {}
-for word in ru_words:
-    ids = cv.encode(word)[1:-1]  # strip BOS/EOS
+encoded_count = 0
+for word in all_ru_words:
+    ids = cv.encode(word)[1:-1]
     if len(ids) >= 2:
         encoded_words[word] = ids
+        encoded_count += 1
 
-print(f"  Encoded words: {len(encoded_words):,}")
+print(f"  Encoded words: {encoded_count:,}")
 
-# Count symbol co-occurrences from ConceptNet edges
+# Count symbol co-occurrences from edges
+cn_cooccur = np.zeros((VT, VT), dtype=np.float64)
+pair_count = 0
+
 for s, e, rel, weight, s_ru, e_ru in ru_edges:
     s_lower = s.lower().strip()
     e_lower = e.lower().strip()
@@ -128,16 +137,16 @@ for s, e, rel, weight, s_ru, e_ru in ru_edges:
     e_ids = encoded_words.get(e_lower, [])
     
     if len(s_ids) >= 2 and len(e_ids) >= 2:
-        # Boost all pairs between start word's symbols and end word's symbols
         boost = weight
         for si in s_ids:
             for ei in e_ids:
                 if 0 < si < VT and 0 < ei < VT:
                     cn_cooccur[si, ei] += boost
-                    cn_cooccur[ei, si] += boost  # symmetric
+                    cn_cooccur[ei, si] += boost
+        pair_count += 1
 
 cn_total = cn_cooccur.sum()
-print(f"  ConceptNet co-occurrence pairs: {cn_total:,.0f}")
+print(f"  ConceptNet co-occurrence pairs from {pair_count:,} edges: {cn_total:,.0f}")
 
 # ============================================================
 # Phase 3: Merge with existing affinity

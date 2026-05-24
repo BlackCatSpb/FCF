@@ -51,7 +51,7 @@ if not os.path.exists(npy_file):
 all_ids = np.load(npy_file, mmap_mode='r').astype(np.int32)
 print(f"  Dataset: {len(all_ids)/1e6:.1f}M tokens")
 
-AFF_BATCH = 128; AFF_BLOCK = 64; AFF_STEPS = 50000
+AFF_BATCH = 128; AFF_BLOCK = 64; AFF_STEPS = 200000
 pos = 0; start = time.time()
 
 # Move affinity buffers to GPU for GPU-resident training
@@ -133,7 +133,7 @@ if not os.path.exists(affinity_path):
 print("\n[PHASE 2] MDS → Coordinates in ℝ¹²...")
 
 from eva.symbolic.topological_field import TopologicalField
-topo = TopologicalField(pf, coord_dim=12)
+topo = TopologicalField(pf, coord_dim=24)
 topo._compute_coordinates_from_affinity()
 coords = topo.coordinates[:156, :12].clone()
 print(f"  Coordinates: {coords.shape}")
@@ -143,7 +143,7 @@ print(f"  Coordinates: {coords.shape}")
 # ============================================================
 print("\n[PHASE 3] UnifiedTransformer training (affinity distillation)...")
 
-ut = UnifiedMultidimensionalTransformer(vocab_size=156, coord_dim=12)
+ut = UnifiedMultidimensionalTransformer(vocab_size=156, coord_dim=24)
 if DEVICE == 'cuda':
     ut = ut.cuda()
 ut.set_symbol_coordinates(coords)  # CRITICAL: inject MDS coordinates

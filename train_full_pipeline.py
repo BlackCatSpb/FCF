@@ -54,6 +54,10 @@ print(f"  Dataset: {len(all_ids)/1e6:.1f}M tokens")
 AFF_BATCH = 128; AFF_BLOCK = 64; AFF_STEPS = 50000
 pos = 0; start = time.time()
 
+# Move affinity buffers to GPU for GPU-resident training
+pf.affinity = pf.affinity.to(DEVICE)
+pf.co_occurrence_count = pf.co_occurrence_count.to(DEVICE)
+
 if not os.path.exists(affinity_path):
     for step in range(AFF_STEPS):
         if pos + AFF_BLOCK + 2 > len(all_ids): pos = 0
@@ -78,14 +82,17 @@ if not os.path.exists(affinity_path):
             attn = layer.transformer.attention.last_attention
 
         if attn is not None:
+            # GPU-resident vectorized strengthen (no Python loops, no CPU transfers)
             for i in range(AFF_BATCH):
                 L_i = lens[i]
                 if L_i < 2: continue
-                left = bt[i, :L_i - 1]; right = bt[i, 1:L_i]
-                adj = attn[i].mean(dim=0)[torch.arange(1, L_i), torch.arange(L_i - 1)]
-                valid = (left < V) & (right < V) & (left != PAD) & (right != PAD)
-                i_idx = left[valid].long().cpu(); j_idx = right[valid].long().cpu()
-                w = adj[valid].float().cpu()
+                left = bt[i, :L_i - 1]
+                right = bt[i, 1:L_i]
+                adj = attn[i].mean(dim=0)[torch.arange(1, L_i, device=DEVICE), torch.arange(L_i - 1, device=DEVICE)]
+                valid = (left < V) & (right < V) & (left > 0) & (right > 0)
+                i_idx = left[valid].long()
+                j_idx = right[valid].long()
+                w = adj[valid].float()
                 if len(i_idx) > 0:
                     flat = i_idx * V + j_idx
                     inc = (1.0 + w).to(pf.co_occurrence_count.dtype)
@@ -103,6 +110,9 @@ if not os.path.exists(affinity_path):
         if step % 10000 == 0 and step > 0:
             print()
 
+    # Move back to CPU for saving
+    pf.affinity = pf.affinity.cpu()
+    pf.co_occurrence_count = pf.co_occurrence_count.cpu()
     os.makedirs(os.path.join(CKPT_DIR, "final"), exist_ok=True)
     torch.save(pf.state_dict(), affinity_path)
     print(f"\n  Done. Affinity: mean={pf.affinity.mean():.4f} std={pf.affinity.std():.4f}")

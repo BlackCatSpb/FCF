@@ -55,7 +55,9 @@ class PotentialFunction(nn.Module):
     def find_saddle(self, za, zb, n_points=20):
         """Find the maximum potential along line za→zb (candidate saddle)."""
         t = torch.linspace(0, 1, n_points, device=za.device)
-        points = za.unsqueeze(0) + t.unsqueeze(1) * (zb - za).unsqueeze(0)
+        # za, zb: [D] vectors
+        za_flat = za.view(-1); zb_flat = zb.view(-1)
+        points = za_flat.unsqueeze(0) + t.unsqueeze(1) * (zb_flat - za_flat).unsqueeze(0)  # [n, D]
         vals = self(points)
         idx = vals.argmax()
         return points[idx], vals[idx]
@@ -148,99 +150,67 @@ for step in range(1, STEPS + 1):
               f"lr={lr:.6f} | {elapsed:.0f}s / eta {eta:.0f}s", flush=True)
 
 # ============================================================
-# Analysis: Find concepts (low-V regions)
+# Analysis: Direct coordinate clustering → concepts
 # ============================================================
-print("\n[ANALYSIS] Finding concepts in ℝ²⁴...")
+print("\n[ANALYSIS] Concept discovery from coordinate topology...")
 
-# V at each symbol coordinate — low V = frequently used, high V = rare
-with torch.no_grad():
-    v_symbols = pf_model(coords[1:VT])  # [156] — V at each symbol
-    v_sorted, v_indices = v_symbols.sort()
+sym_coords = coords[1:VT]  # [156, 24] — symbol coordinates
+sym_coords_np = sym_coords.cpu().numpy()
 
-print("\n  Potential V(z) at symbol coordinates (low = frequent):")
-print(f"    Min V: {v_sorted[0].item():.4f} (symbol {v_indices[0].item()+1} '{cv.decode([v_indices[0].item()+1])}')")
-print(f"    Max V: {v_sorted[-1].item():.4f} (symbol {v_indices[-1].item()+1} '{cv.decode([v_indices[-1].item()+1])}')")
-print(f"    Mean V: {v_symbols.mean().item():.4f}, Std: {v_symbols.std().item():.4f}")
+# Use k-means on coordinates to find concept clusters
+from sklearn.cluster import KMeans
 
-# Show top/bottom symbols by potential
-print("\n  Lowest V (most frequent symbols):")
-for i in range(10):
-    idx = v_indices[i].item() + 1
-    print(f"    [{idx:>3d}] '{cv.decode([idx])}' V={v_symbols[v_indices[i]].item():.3f}")
+N_CONCEPTS = 8  # target number of concepts
+kmeans = KMeans(n_clusters=N_CONCEPTS, random_state=42, n_init=10)
+labels = kmeans.fit_predict(sym_coords_np)
 
-print("\n  Highest V (rarest symbols):")
-for i in range(1, 11):
-    idx = v_indices[-i].item() + 1
-    print(f"    [{idx:>3d}] '{cv.decode([idx])}' V={v_symbols[v_indices[-i]].item():.3f}")
+# Group symbols by concept
+concept_groups = [[] for _ in range(N_CONCEPTS)]
+for idx in range(156):
+    concept_groups[labels[idx]].append(idx)
 
-# ============================================================
-# Find minima by gradient descent (concept basins)
-# ============================================================
-print("\n  Finding local minima from each symbol...")
-with torch.enable_grad():
-    all_minima = []
-    for i in range(1, VT):
-        z0 = coords[i:i+1].to(DEVICE)
-        z_min = pf_model.find_minimum(z0, steps=30, lr=0.05)
-        all_minima.append(z_min.cpu())
-
-all_minima = torch.cat(all_minima, dim=0)  # [156, 24]
-
-# Cluster minima — concepts = groups of symbols converging to same region
-threshold = 0.15
-concept_groups = []
-used = set()
-
-for i in range(len(all_minima)):
-    if i in used:
-        continue
-    group = [i]
-    used.add(i)
-    for j in range(i+1, len(all_minima)):
-        if j in used:
-            continue
-        dist = (all_minima[i] - all_minima[j]).norm().item()
-        if dist < threshold:
-            group.append(j)
-            used.add(j)
-    concept_groups.append(group)
-
-print(f"\n  Found {len(concept_groups)} concept groups (merge_thr={threshold}):")
-# Sort groups by size, show largest
+# Sort groups by size
 concept_groups.sort(key=len, reverse=True)
-for gi, group in enumerate(concept_groups[:10]):
+
+print(f"\n  Found {N_CONCEPTS} concept clusters:")
+for ci, group in enumerate(concept_groups):
     chars = ''.join(cv.decode([g+1]) for g in group)
-    print(f"    Group {gi}: [{len(group):>3d} symbols] '{chars}'")
+    sym_ids = [g+1 for g in group]
+    # Compute centroid
+    centroid = sym_coords[group].mean(dim=0)
+    # Average V at centroid
+    with torch.no_grad():
+        v_centroid = pf_model(centroid.to(DEVICE)).item()
+    print(f"  Concept {ci}: [{len(group):>3d} symbols] V={v_centroid:.4f} | '{chars}'")
 
 # ============================================================
-# Saddle points between concept groups (barriers)
+# Saddle barriers between concepts
 # ============================================================
-print("\n  Saddle points (potential barriers between concepts):")
-if len(concept_groups) >= 2:
-    with torch.no_grad():
-        count = 0
-        for i in range(min(5, len(concept_groups))):
-            for j in range(i+1, min(i+4, len(concept_groups))):
-                if len(concept_groups[i]) == 0 or len(concept_groups[j]) == 0:
-                    continue
-                za = all_minima[concept_groups[i][0]:concept_groups[i][0]+1].to(DEVICE)
-                zb = all_minima[concept_groups[j][0]:concept_groups[j][0]+1].to(DEVICE)
-                saddle, v_sad = pf_model.find_saddle(za, zb, n_points=50)
-                v_a = pf_model(za).item()
-                v_b = pf_model(zb).item()
-                barrier = v_sad.item() - max(v_a, v_b)
-                chi = cv.decode([concept_groups[i][0]+1])
-                chj = cv.decode([concept_groups[j][0]+1])
-                print(f"    '{chi}' ↔ '{chj}': barrier={barrier:.4f} "
-                      f"(V_a={v_a:.4f}, V_b={v_b:.4f}, V_saddle={v_sad.item():.4f})")
-                count += 1
-                if count >= 10:
-                    break
+print("\n  Potential barriers between concepts:")
+with torch.no_grad():
+    count = 0
+    for i in range(min(6, len(concept_groups))):
+        for j in range(i+1, min(i+3, len(concept_groups))):
+            if len(concept_groups[i]) == 0 or len(concept_groups[j]) == 0:
+                continue
+            za = sym_coords[concept_groups[i][:1]].to(DEVICE)  # [1, 24]
+            zb = sym_coords[concept_groups[j][:1]].to(DEVICE)  # [1, 24]
+            saddle, v_sad = pf_model.find_saddle(za, zb, n_points=50)
+            v_a = pf_model(za).item()
+            v_b = pf_model(zb).item()
+            barrier = v_sad.item() - max(v_a, v_b)
+            chi = cv.decode([concept_groups[i][0]+1])
+            chj = cv.decode([concept_groups[j][0]+1])
+            print(f"    '{chi}' ↔ '{chj}': barrier={barrier:.4f} "
+                  f"(V_a={v_a:.4f}, V_b={v_b:.4f}, V_saddle={v_sad.item():.4f})")
+            count += 1
             if count >= 10:
                 break
+        if count >= 10:
+            break
 
 # Save
 pf_path = os.path.join(CKPT_DIR, "potential_function.pt")
-torch.save({'model': pf_model.state_dict(), 'coords': coords}, pf_path)
+torch.save({'model': pf_model.state_dict(), 'coords': coords, 'concept_labels': labels}, pf_path)
 print(f"\nSaved: {pf_path}")
 print("Done.")

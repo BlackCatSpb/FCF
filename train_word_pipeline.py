@@ -288,4 +288,126 @@ for word_text in test_words_list:
     status = "OK" if acc == 1.0 else f"ERR ({correct}/{len(ids)})"
     print(f"  '{word_text}' → '{generated}' [{status}]")
 
+# ============================================================
+# PHASE 5: Sentence autoencoding (longer sequences)
+# ============================================================
+print("\n[PHASE 5] Transformer — sentence autoencoding (GPU)")
+print("  Goal: reproduce sentences from coordinate trajectories")
+print("  Training on random blocks from corpus (len 10-128)")
+
+sent_weights_path = os.path.join(CKPT_DIR, "sentence_weights.pt")
+if os.path.exists(sent_weights_path):
+    print("  Loading existing sentence weights, skipping training...")
+    ckpt = torch.load(sent_weights_path, map_location='cpu', weights_only=True)
+    ut.load_state_dict(ckpt['model'])
+    ut.set_symbol_coordinates(ckpt['coords'].to(DEVICE))
+    ut = ut.to(DEVICE)
+else:
+    UT_SENT_STEPS = 20000; UT_LR = 1e-4; UT_BATCH = 64; MAX_LEN = 128
+    opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_SENT_STEPS)
+    
+    start = time.time()
+    last_print = 0
+    rng = np.random.RandomState(123)
+    total_ids = len(all_ids)
+    
+    for step in range(1, UT_SENT_STEPS + 1):
+        # Random blocks from corpus
+        lengths = rng.randint(10, MAX_LEN + 1, UT_BATCH)
+        starts = rng.randint(0, max(1, total_ids - max(lengths) - 1), UT_BATCH)
+        
+        max_len = max(lengths)
+        bt = torch.full((UT_BATCH, max_len), PAD, dtype=torch.long, device=DEVICE)
+        mask = torch.zeros(UT_BATCH, max_len, device=DEVICE)
+        
+        for bi in range(UT_BATCH):
+            s, l = starts[bi], lengths[bi]
+            block = all_ids[s:s+l]
+            valid = (block > 0) & (block < VT)
+            valid_block = block[valid]
+            vl = min(len(valid_block), max_len)
+            if vl < 3:
+                vl = 0
+            if vl > 0:
+                bt[bi, :vl] = torch.from_numpy(valid_block[:vl].astype(np.int64)).to(DEVICE)
+                mask[bi, :vl] = 1.0
+        
+        mask_sum = mask.sum()
+        if mask_sum < 10:
+            continue
+        
+        ut.train()
+        _, scores = ut(bt, return_scores=True)
+        
+        target = bt.clamp(1, VT-1)
+        
+        loss = F.cross_entropy(
+            scores.view(-1, 157),
+            target.view(-1),
+            reduction='none'
+        ).view(UT_BATCH, max_len)
+        loss = (loss * mask).sum() / (mask_sum + 1e-8)
+        
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
+        opt.step()
+        sch.step()
+        
+        now = time.time()
+        if now - last_print >= 3 or step == 1 or step == UT_SENT_STEPS:
+            last_print = now
+            elapsed = now - start
+            eta = (elapsed / step) * (UT_SENT_STEPS - step)
+            with torch.no_grad():
+                pred = scores.argmax(dim=-1)
+                correct_tokens = ((pred == target) * mask).sum().item()
+                total_tokens = mask_sum.item()
+                per_block = ((pred == target) | (mask == 0)).all(dim=1).sum().item()
+            lr = sch.get_last_lr()[0]
+            print(f"  step {step:>5d}/{UT_SENT_STEPS} | loss={loss.item():.4f} | "
+                  f"tok_acc={correct_tokens/total_tokens:.3f} | "
+                  f"block_acc={per_block}/{UT_BATCH} | lr={lr:.6f} | "
+                  f"{elapsed:.0f}s / eta {eta:.0f}s", flush=True)
+        
+        if step > 500 and loss.item() < 0.01:
+            print(f"\n  Early exit at step {step}: loss stable.")
+            break
+    
+    torch.save({'model': ut.state_dict(), 'coords': coords_full}, sent_weights_path)
+    print(f"  Saved: {sent_weights_path}")
+
+# ============================================================
+# PHASE 6: Sentence reconstruction test
+# ============================================================
+print("\n[PHASE 6] Sentence reconstruction test")
+print("  Matrix instructs → transformer assembles sentence")
+
+ut.eval()
+test_sentences = [
+    "привет мир",
+    "человек идёт",
+    "солнце светит ярко",
+    "мама мыла раму",
+    "я люблю программирование",
+    "трансформер понимает текст",
+    "метаданные хранят порядок",
+]
+
+for sentence in test_sentences:
+    ids = cv.encode(sentence)[1:-1]
+    if len(ids) == 0:
+        print(f"  '{sentence}' → SKIP")
+        continue
+    inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        _, scores = ut(inp, return_scores=True)
+        pred = scores[0].argmax(dim=-1).tolist()
+        generated = cv.decode(pred)
+    correct = sum(1 for p, t in zip(pred, ids) if p == t)
+    acc = correct / max(len(ids), 1)
+    status = "OK" if acc == 1.0 else f"ERR ({correct}/{len(ids)})"
+    print(f"  '{sentence}' → '{generated}' [{status}]")
+
 print("\nDone.")

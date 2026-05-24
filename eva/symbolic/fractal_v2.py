@@ -1,5 +1,5 @@
 """
-FractalAttention v2 — интегрированное фрактальное внимание для UnifiedTransformer.
+FractalAttention — интегрированное фрактальное внимание для UnifiedTransformer.
 
 Архитектура:
   12 голов = 4 уровня × 3 масштаба
@@ -22,7 +22,7 @@ from typing import List, Optional, Tuple
 from loguru import logger
 
 
-class FractalAttentionV2(nn.Module):
+class FractalAttention(nn.Module):
     """
     Фрактальное внимание — 12 голов, 4 уровня, 3 масштаба.
     Интегрируется в UnifiedTransformer вместо ручного multi-head.

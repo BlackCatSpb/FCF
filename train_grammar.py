@@ -56,13 +56,13 @@ class GrammarHead(nn.Module):
         # Context-aware grammar correction
         self.context_conv = nn.Sequential(
             nn.Conv1d(coord_dim, hidden, kernel_size=3, padding=1),
-            nn.LayerNorm(hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.Conv1d(hidden, hidden, kernel_size=5, padding=2),
-            nn.LayerNorm(hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.Conv1d(hidden, hidden, kernel_size=7, padding=3),
-            nn.LayerNorm(hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
         )
         

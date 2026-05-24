@@ -39,7 +39,7 @@ print(f"Loaded: affinity {affinity.shape}, coords {coords.shape}")
 # Load PotentialFunction if available
 pf_path = os.path.join(CKPT_DIR, "potential_function.pt")
 if os.path.exists(pf_path):
-    pf_data = torch.load(pf_path, map_location='cpu', weights_only=True)
+    pf_data = torch.load(pf_path, map_location='cpu', weights_only=False)
     from concept_finder import PotentialFunction
     v_func = PotentialFunction(dim=24, hidden=128).to(DEVICE)
     v_func.load_state_dict(pf_data['model'])

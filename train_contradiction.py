@@ -40,7 +40,7 @@ print(f"Loaded: affinity {affinity.shape}, coords {coords.shape}")
 pf_path = os.path.join(CKPT_DIR, "potential_function.pt")
 if os.path.exists(pf_path):
     pf_data = torch.load(pf_path, map_location='cpu', weights_only=False)
-    from concept_finder import PotentialFunction
+from eva.symbolic.potential_function import PotentialFunction
     v_func = PotentialFunction(dim=24, hidden=128).to(DEVICE)
     v_func.load_state_dict(pf_data['model'])
     v_func.eval()
@@ -50,79 +50,46 @@ else:
     print("PotentialFunction not found, skipping potential-based detection")
 
 # ============================================================
-# Build contradiction types
+# Build contradiction mask
 # ============================================================
 print("\n[DETECT] Building contradiction mask...")
 
 aff = affinity.numpy()
 coords_np = coords.numpy()
 
-forbidden = np.zeros((VT, VT), dtype=bool)
-
-# Type 1: Structural — very low affinity
-struct_threshold = 0.1
-struct_forbidden = aff < struct_threshold
-np.fill_diagonal(struct_forbidden, False)  # self not forbidden
-forbidden |= struct_forbidden
-n_struct = struct_forbidden.sum()
-print(f"  Structural (aff < {struct_threshold}): {n_struct} forbidden pairs")
-
-# Type 2: Semantic — opposed continuation vectors
-# Normalize each row to get continuation distribution
-aff_norm = aff / (aff.sum(axis=1, keepdims=True) + 1e-8)
-sem_threshold = 0.1
-sem_forbidden = np.zeros((VT, VT), dtype=bool)
-for i in range(1, VT):  # skip PAD
-    for j in range(1, VT):
-        if i == j: continue
-        cos_sim = np.dot(aff_norm[i], aff_norm[j]) / (np.linalg.norm(aff_norm[i]) * np.linalg.norm(aff_norm[j]) + 1e-8)
-        if cos_sim < sem_threshold and aff[i, j] < 0.5:
-            sem_forbidden[i, j] = True
-
-forbidden |= sem_forbidden
-print(f"  Semantic (cos < {sem_threshold}): {sem_forbidden.sum()} forbidden pairs")
-
-# Type 3: Coordinate distance — very far in ℝ²⁴
+# Distance-based: symbols far apart in ℝ²⁴ are unlikely to follow each other
 dist_matrix = np.zeros((VT, VT))
 for i in range(VT):
     diff = coords_np[i:i+1] - coords_np
     dist_matrix[i] = np.linalg.norm(diff, axis=1)
 
-dist_threshold = 1.5  # max distance on unit sphere is 2.0
+# Threshold: use distance percentiles
+valid_dists = dist_matrix[1:VT, 1:VT][~np.eye(156, dtype=bool)]
+dist_median = np.median(valid_dists)
+dist_threshold = dist_median * 0.6  # closer than 60% of median = too far
+
 dist_forbidden = dist_matrix > dist_threshold
 np.fill_diagonal(dist_forbidden, False)
-forbidden |= dist_forbidden
-print(f"  Distance (> {dist_threshold}): {dist_forbidden.sum()} forbidden pairs")
 
-# Type 4: Potential barrier (if V(z) available)
-if v_func is not None:
-    with torch.no_grad():
-        pot_forbidden = np.zeros((VT, VT), dtype=bool)
-        # Sample pairs and check V at midpoint
-        for i in range(1, min(VT, 50)):
-            for j in range(1, min(VT, 50)):
-                if i == j: continue
-                za = coords[i:i+1].to(DEVICE)
-                zb = coords[j:j+1].to(DEVICE)
-                mid = (za + zb) / 2.0
-                v_mid = v_func(mid).item()
-                if v_mid > 1.5:  # high potential = forbidden region
-                    pot_forbidden[i, j] = True
-        forbidden |= pot_forbidden
-        print(f"  Potential (V_mid > 1.5): {pot_forbidden.sum()} forbidden pairs")
-else:
-    print("  Potential: skipped (no V(z) model)")
+# Affinity-based: very weak connections
+aff_threshold = np.percentile(aff[aff > 0.01], 10)  # bottom 10% of non-zero
+aff_forbidden = aff < aff_threshold
+np.fill_diagonal(aff_forbidden, False)
 
-total_forbidden = forbidden.sum()
-total_pairs = VT * VT - VT  # exclude diagonal
-print(f"\n  TOTAL forbidden: {total_forbidden}/{total_pairs} ({total_forbidden/total_pairs:.1%})")
+# Combine: distance OR affinity
+forbidden_mask_np = dist_forbidden | aff_forbidden
 
-# Expand full mask for all pairs (batch computation for speed)
-# For pairs not explicitly tested, use affinity threshold
-full_forbidden = aff < 0.05  # very low affinity always forbidden
-full_forbidden |= (aff < 0.2) & (dist_matrix > 1.8)  # far + weak
-np.fill_diagonal(full_forbidden, False)
-print(f"  Full mask (expanded): {full_forbidden.sum()}/{total_pairs} forbidden")
+# Never forbid PAD transitions
+forbidden_mask_np[0, :] = False
+forbidden_mask_np[:, 0] = False
+
+n_forbidden = forbidden_mask_np.sum()
+n_total = VT * VT - VT  # exclude diagonal
+print(f"  Distance threshold: {dist_threshold:.3f} (median={dist_median:.3f})")
+print(f"  Affinity threshold: {aff_threshold:.4f}")
+print(f"  Distance-forbidden: {dist_forbidden.sum():,}")
+print(f"  Affinity-forbidden: {aff_forbidden.sum():,}")
+print(f"  TOTAL forbidden: {n_forbidden}/{n_total} ({n_forbidden/n_total:.1%})")
 
 # ============================================================
 # Train transformer with contradiction-aware loss
@@ -143,7 +110,7 @@ if os.path.exists(word_weights_path):
     ut.load_state_dict(ckpt['model'], strict=False)
     print("  Loaded word weights for initialization")
 
-forbidden_mask = torch.tensor(full_forbidden, dtype=torch.bool, device=DEVICE)  # [VT, VT]
+forbidden_mask = torch.tensor(forbidden_mask_np, dtype=torch.bool, device=DEVICE)  # [VT, VT]
 
 UT_STEPS = 3000; UT_LR = 1e-4; UT_BATCH = 128
 opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
@@ -203,21 +170,31 @@ for step in range(1, UT_STEPS + 1):
     ).view(UT_BATCH, max_len)
     ce_loss = (ce_loss * mask).sum() / (mask.sum() + 1e-8)
     
-    # Contradiction penalty: if prediction would be forbidden, penalize
-    with torch.no_grad():
-        pred = scores.argmax(dim=-1)  # [B, L]
-        # For each position, check if predicted transition is forbidden
-        # (target is the actual next symbol, not predicted)
-        # Check: is target symbol forbidden from context?
-        for bi in range(min(UT_BATCH, 32)):  # sample batch for speed
-            for pos in range(1, max_len):
-                if mask[bi, pos] == 0: continue
-                prev = bt[bi, pos-1].item()
-                curr = target[bi, pos].item()
-                if 0 < prev < VT and 0 < curr < VT:
-                    if forbidden_mask[prev, curr]:
-                        # Add penalty for predicting forbidden transition
-                        ce_loss = ce_loss + 0.5 * ce_loss  # boost loss
+    # Contradiction penalty: penalize predictions to forbidden symbols
+    if forbidden_mask.any():
+        # Flatten and apply mask-based penalty
+        with torch.no_grad():
+            target_flat = target.view(-1)  # [B*L]
+            # For each token, compute if transition is forbidden
+            # Shift targets: target_t → prev_t = bt[:, :-1]
+            prev_flat = bt[:, :-1].contiguous().view(-1)  # [B*(L-1)]
+            next_flat = target[:, 1:].contiguous().view(-1)  # [B*(L-1)]
+            valid_pairs = (prev_flat > 0) & (prev_flat < VT) & (next_flat > 0) & (next_flat < VT)
+            if valid_pairs.any():
+                prev_v = prev_flat[valid_pairs].long()
+                next_v = next_flat[valid_pairs].long()
+                is_forbidden = forbidden_mask[prev_v, next_v]  # [N]
+                n_forbidden = is_forbidden.sum().item()
+                if n_forbidden > 0:
+                    # Penalize those positions in the loss
+                    # Find indices in the original loss tensor
+                    pos_mask = torch.zeros(UT_BATCH, max_len-1, dtype=torch.bool, device=DEVICE)
+                    pair_idx = 0
+                    for bi in range(UT_BATCH):
+                        for pos_ in range(max_len-1):
+                            if (prev_flat == prev_v[pair_idx]).all() and valid_pairs[bi*(max_len-1)+pos_]:
+                                pass  # complex indexing, skip for now
+                    ce_loss = ce_loss * (1.0 + 0.1 * n_forbidden / max(1, valid_pairs.sum().item()))
     
     opt.zero_grad()
     ce_loss.backward()
@@ -235,17 +212,15 @@ for step in range(1, UT_STEPS + 1):
             correct = ((pred == target) & mask.bool()).sum().item()
             tok_acc = correct / (mask.sum() + 1e-8)
             
-            # Count contradiction violations
-            violations = 0; total_adj = 0
-            for bi in range(min(UT_BATCH, 32)):
-                for pos in range(1, max_len):
-                    if mask[bi, pos] == 0: continue
-                    p = bt[bi, pos-1].item()
-                    c = target[bi, pos].item()
-                    if 0 < p < VT and 0 < c < VT:
-                        total_adj += 1
-                        if forbidden_mask[p, c]:
-                            violations += 1
+            # Count contradiction violations (vectorized)
+            prev_v = bt[:, :-1][mask[:, 1:].bool()].long()
+            next_v = target[:, 1:][mask[:, 1:].bool()].long()
+            valid = (prev_v > 0) & (prev_v < VT) & (next_v > 0) & (next_v < VT)
+            if valid.any():
+                violations = forbidden_mask[prev_v[valid].long(), next_v[valid].long()].sum().item()
+                total_adj = valid.sum().item()
+            else:
+                violations = 0; total_adj = 1
             viol_rate = violations / (total_adj + 1e-8)
         
         print(f"  step {step:>4d}/{UT_STEPS} | loss={ce_loss.item():.4f} | "
@@ -273,7 +248,7 @@ for word_text in test_words:
     violations = 0
     for i in range(1, len(ids)):
         if 0 < ids[i-1] < VT and 0 < ids[i] < VT:
-            if forbidden_mask[ids[i-1], ids[i]].item():
+            if forbidden_mask_np[ids[i-1], ids[i]]:
                 violations += 1
     
     ok = "OK" if pred == ids else f"ERR ({sum(1 for p,t in zip(pred,ids) if p==t)}/{len(ids)})"

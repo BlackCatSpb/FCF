@@ -51,7 +51,7 @@ if not os.path.exists(npy_file):
 all_ids = np.load(npy_file, mmap_mode='r').astype(np.int32)
 print(f"  Dataset: {len(all_ids)/1e6:.1f}M tokens")
 
-AFF_BATCH = 128; AFF_BLOCK = 64; AFF_STEPS = 200000
+AFF_BATCH = 128; AFF_BLOCK = 64; AFF_STEPS = 500000  # proper training
 pos = 0; start = time.time()
 
 # Move affinity buffers to GPU for GPU-resident training
@@ -111,14 +111,12 @@ if not os.path.exists(affinity_path):
                 raw = pf.co_occurrence_count[ui, uj] / 100000.0
                 pf.affinity[ui, uj] = (0.5 + 0.5 * torch.clamp(raw, 0.0, 1.0)).float()
 
-        if step % 5000 == 0 and step > 0:
-            elapsed = time.time() - start
-            aps = step * AFF_BATCH / max(elapsed, 0.01)
-            pct = step * 100 // AFF_STEPS
-            bar = '#' * (pct // 4) + '-' * (25 - pct // 4)
-            print(f"\r  [{bar}] {pct}% | {aps:.0f} a/s | pot={pf.affinity.mean():.4f}", end='', flush=True)
-        if step % 10000 == 0 and step > 0:
-            print()
+    if step % 100 == 0:  # ~3 sec updates
+        elapsed = time.time() - start
+        aps = step * AFF_BATCH / max(elapsed, 0.01)
+        pct = step * 100 // AFF_STEPS
+        bar = '#' * (pct // 4) + '-' * (25 - pct // 4)
+        print(f"\r  [{bar}] {pct}% | {aps:.0f} a/s | pot={pf.affinity.mean():.4f}", end='', flush=True)
 
     # Move back to CPU for saving
     pf.affinity = pf.affinity.cpu()
@@ -159,7 +157,7 @@ if DEVICE == 'cuda':
 ut.set_symbol_coordinates(coords.to(DEVICE))  # CRITICAL: move coords to GPU
 print(f"  {ut.summary()}")
 
-UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 50000; UT_LR = 1e-3
+UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 100000; UT_LR = 1e-3
 opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.SequentialLR(opt, [
     torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=1000),
@@ -220,14 +218,16 @@ for step in range(1, UT_STEPS + 1):
     opt.step()
     sch.step()
 
-    if step % 5000 == 0:
+    if step % 500 == 0:
+        gc.collect()
+        if DEVICE == 'cuda': torch.cuda.empty_cache()
+    
+    if step % 100 == 0:  # ~3 sec updates
         elapsed = time.time() - start
         bps = step / max(elapsed, 0.01)
         pct = step * 100 // UT_STEPS
         bar = '#' * (pct // 4) + '-' * (25 - pct // 4)
-        print(f"\r  [{bar}] {pct}% | {bps:.0f} b/s | loss={loss.item():.6f}", end='', flush=True)
-        gc.collect()
-        if DEVICE == 'cuda': torch.cuda.empty_cache()
+        print(f"\r  [{bar}] {pct}% | {bps:.0f} b/s | loss={loss.item():.4f}", end='', flush=True)
 
 print()
 os.makedirs(os.path.join(CKPT_DIR, "unified"), exist_ok=True)

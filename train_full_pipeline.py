@@ -149,9 +149,11 @@ print(f"  Coordinates: {coords.shape}")
 # ============================================================
 # PHASE 3: UnifiedTransformer — affinity distillation
 # ============================================================
-print("\n[PHASE 3] UnifiedTransformer — NEXT-SYMBOL PREDICTION")
-print("  Goal: learn to generate symbols (not affinity distributions)")
-print("  Loss: CrossEntropy(predicted_symbol, correct_next_symbol)")
+print("\n[PHASE 3] UnifiedTransformer — DECODE: coordinates → text")
+print("  Goal: learn to ASSEMBLE symbols from metadata (not predict)")
+print("  Input:  symbol coordinates in order (the 'instructions')")
+print("  Output: exact symbol sequence (the 'assembled text')")
+print("  Loss:   CrossEntropy(output, correct_symbols)")
 
 ut = UnifiedMultidimensionalTransformer(vocab_size=156, coord_dim=24)
 if DEVICE == 'cuda':
@@ -186,14 +188,18 @@ for step in range(1, UT_STEPS + 1):
     for i, ids in enumerate(ids_batch):
         bt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
 
-    # Target: next symbol (shift right by 1)
-    target = torch.roll(bt, -1, dims=1).clamp(1, V-1)  # [B, L]
     mask = (bt != PAD).float()
 
+    # === DECODING TRAINING ===
+    # Input: symbol coordinates IN ORDER (the instruction)
+    # The transformer sees coordinates and must reconstruct the symbols
     ut.train()
     _, scores = ut(bt, return_scores=True)  # [B, L, V]
 
-    # Simple CrossEntropy: predict the next symbol
+    # Target: the symbols themselves (reconstruction, not prediction)
+    target = bt.clamp(1, V-1)  # [B, L] — the actual symbols at each position
+
+    # Loss: CrossEntropy — how well does transformer decode coordinates → symbols?
     loss = F.cross_entropy(
         scores.view(-1, V),
         target.view(-1),
@@ -226,7 +232,7 @@ print(f"  Done. Final loss: {loss.item():.6f}")
 # ============================================================
 # PHASE 4: Reconstruction Test
 # ============================================================
-print("\n[PHASE 4] Reconstruction test...")
+print("\n[PHASE 4] DECODING test: coordinates → text (assembly)...")
 ut.eval()
 
 test_sentences = [
@@ -239,12 +245,14 @@ test_sentences = [
 
 for sentence in test_sentences:
     ids = cv.encode(sentence)
-    inp = torch.tensor([ids[:-1]], dtype=torch.long, device=DEVICE)
+    # Give model the CORRECT symbol IDs as input (the instruction)
+    # Model must output those same symbols (assembly from coordinates)
+    inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
     with torch.no_grad():
         _, scores = ut(inp, return_scores=True)
     predicted = torch.argmax(scores[0], dim=-1).tolist()
-    generated = cv.decode(predicted)
-    accuracy = sum(1 for p, t in zip(predicted, ids[1:]) if p == t) / max(len(ids)-1, 1)
-    print(f"  '{sentence}' → '{generated[:60]}' ({accuracy:.0%})")
+    accuracy = sum(1 for p, t in zip(predicted, ids) if p == t) / max(len(ids), 1)
+    gen_text = cv.decode(predicted)
+    print(f"  '{sentence}' → '{gen_text[:50]}' ({accuracy:.0%})")
 
 print("\nDone.")

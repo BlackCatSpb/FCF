@@ -30,13 +30,6 @@ print(f"Device: {DEVICE}")
 # ============================================================
 print("\n[PHASE 1] Affinity training (count-based, no gradients)...")
 
-# Check if already trained
-affinity_path = os.path.join(CKPT_DIR, "final", "potential_field.pt")
-if os.path.exists(affinity_path):
-    print("  Loading existing affinity checkpoint...")
-    pf.load_state_dict(torch.load(affinity_path, map_location='cpu', weights_only=True))
-    print(f"  Affinity: mean={pf.affinity.mean():.4f} std={pf.affinity.std():.4f}")
-
 config = FCFConfig(); config.d_model = 256; config.vocab_size = 156; config.num_heads = 8
 layer = PrimordialLayer(config)
 if DEVICE == 'cuda': layer = layer.cuda()
@@ -44,6 +37,13 @@ if DEVICE == 'cuda': layer = layer.cuda()
 cv = CharacterVocab()
 pf = PotentialField(156, 256)
 V, PAD = 156, cv.PAD_IDX
+
+# Check if already trained
+affinity_path = os.path.join(CKPT_DIR, "final", "potential_field.pt")
+if os.path.exists(affinity_path):
+    print("  Loading existing affinity checkpoint...")
+    pf.load_state_dict(torch.load(affinity_path, map_location='cpu', weights_only=True))
+    print(f"  Affinity: mean={pf.affinity.mean():.4f} std={pf.affinity.std():.4f}")
 
 npy_file = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
 if not os.path.exists(npy_file):

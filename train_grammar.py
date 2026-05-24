@@ -247,8 +247,8 @@ for step in range(1, UT_STEPS + 1):
 # ============================================================
 print("\n[TEST] GrammarHead-guided generation...")
 
-def generate_with_grammar(ut, gh, coords, seed_ids, max_new=20, temperature=0.8, top_k=40):
-    """Generate text using GrammarHead to guide token selection."""
+def generate_with_grammar(ut, gh, coords, seed_ids, affinity, max_new=20, temperature=0.7, top_k=30):
+    """Generate using GrammarHead + affinity constraint."""
     ids = list(seed_ids)
     ut.eval()
     gh.eval()
@@ -257,28 +257,33 @@ def generate_with_grammar(ut, gh, coords, seed_ids, max_new=20, temperature=0.8,
         for _ in range(max_new):
             inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
             ut_coords, _ = ut(inp, return_scores=True)
-            logits = gh(ut_coords)  # [1, L, 157]
+            logits = gh(ut_coords)[0, -1] / temperature
             
-            # Last position logits
-            last_logits = logits[0, -1] / temperature
+            # Affinity boost: prefer tokens with high affinity to previous token
+            prev = ids[-1] if ids else 1
+            if 0 < prev < VT:
+                aff_boost = affinity[prev].to(DEVICE).clone()
+                aff_boost[0] = -1e9  # block PAD
+                aff_boost = aff_boost / (aff_boost.max() + 1e-8) * 2.0  # normalize
+                logits = logits + aff_boost
             
-            # Top-k + diversity
-            k = min(top_k, len(last_logits))
-            topk_vals, topk_idx = torch.topk(last_logits, k)
+            # Top-k + repetition penalty
+            k = min(top_k, len(logits) - 1)
+            topk_vals, topk_idx = torch.topk(logits, k)
             probs = F.softmax(topk_vals, dim=-1)
             
-            # Penalize repetition
-            if len(ids) >= 3:
-                for t in ids[-3:]:
-                    if t in topk_idx:
-                        idx = (topk_idx == t).nonzero(as_tuple=True)[0]
-                        probs[idx] *= 0.5
+            # Strong repetition penalty
+            if len(ids) >= 2:
+                for t in set(ids[-5:]):
+                    mask_idx = (topk_idx == t).nonzero(as_tuple=True)[0]
+                    if len(mask_idx) > 0:
+                        probs[mask_idx] *= 0.1
             
             probs = probs / probs.sum()
             next_token = topk_idx[torch.multinomial(probs, 1)].item()
             
             if next_token <= 0 or next_token >= VT:
-                continue
+                next_token = topk_idx[0].item()
             
             ids.append(next_token)
     
@@ -298,7 +303,7 @@ for seed, label in test_seeds:
     if len(ids) < 2:
         continue
     
-    result = generate_with_grammar(ut, gh, coords, ids, max_new=20, temperature=0.8)
+    result = generate_with_grammar(ut, gh, coords, ids, evolved['affinity'], max_new=20, temperature=0.7)
     gen_text = cv.decode(result)
     print(f"  '{label}...' → '{gen_text}'")
 

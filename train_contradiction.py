@@ -63,16 +63,22 @@ for i in range(VT):
     diff = coords_np[i:i+1] - coords_np
     dist_matrix[i] = np.linalg.norm(diff, axis=1)
 
-# Threshold: use distance percentiles
+# Threshold: use 90th percentile — only the truly far pairs are suspicious
 valid_dists = dist_matrix[1:VT, 1:VT][~np.eye(156, dtype=bool)]
-dist_median = np.median(valid_dists)
-dist_threshold = dist_median * 0.6  # closer than 60% of median = too far
+dist_90 = np.percentile(valid_dists, 90)
+dist_threshold = dist_90
+print(f"  Distance: median={np.median(valid_dists):.3f}, 90th={dist_90:.3f}")
 
 dist_forbidden = dist_matrix > dist_threshold
 np.fill_diagonal(dist_forbidden, False)
 
-# Affinity-based: very weak connections
-aff_threshold = np.percentile(aff[aff > 0.01], 10)  # bottom 10% of non-zero
+# Affinity-based: really weak (< bottom threshold of low-affinity pairs)
+low_aff = aff[1:VT, 1:VT][aff[1:VT, 1:VT] < 1.0]
+if len(low_aff) > 10:
+    aff_threshold = np.percentile(low_aff, 30)  # bottom 30% of < 1.0 pairs
+else:
+    aff_threshold = 0.3
+print(f"  Affinity: threshold={aff_threshold:.4f} (from {len(low_aff)} low-pairs)")
 aff_forbidden = aff < aff_threshold
 np.fill_diagonal(aff_forbidden, False)
 
@@ -84,9 +90,7 @@ forbidden_mask_np[0, :] = False
 forbidden_mask_np[:, 0] = False
 
 n_forbidden = forbidden_mask_np.sum()
-n_total = VT * VT - VT  # exclude diagonal
-print(f"  Distance threshold: {dist_threshold:.3f} (median={dist_median:.3f})")
-print(f"  Affinity threshold: {aff_threshold:.4f}")
+n_total = VT * VT - VT
 print(f"  Distance-forbidden: {dist_forbidden.sum():,}")
 print(f"  Affinity-forbidden: {aff_forbidden.sum():,}")
 print(f"  TOTAL forbidden: {n_forbidden}/{n_total} ({n_forbidden/n_total:.1%})")

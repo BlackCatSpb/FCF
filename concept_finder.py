@@ -86,6 +86,9 @@ all_ids = np.load(npy_file, mmap_mode='r').astype(np.int32)
 print(f"Corpus: {len(all_ids)/1e6:.1f}M tokens")
 
 # Build potential model
+STEPS = 5000
+BATCH = 2048
+
 pf_model = PotentialFunction(dim=24, hidden=128).to(DEVICE)
 opt = torch.optim.AdamW(pf_model.parameters(), lr=1e-3)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
@@ -94,10 +97,8 @@ print(f"Model: {sum(p.numel() for p in pf_model.parameters()):,} parameters")
 print()
 
 # ============================================================
-# Training loop: contrastive — low V at real points, high V at random
+# Training loop: anchored MSE — V(real) → -1, V(rand) → +1
 # ============================================================
-STEPS = 5000
-BATCH = 2048
 total_ids = len(all_ids)
 
 start = time.time()

@@ -30,7 +30,7 @@ print(f"Device: {DEVICE}")
 # Connect to ConceptNet
 # ============================================================
 print("\n[CONNECT] Loading ConceptNet...")
-from conceptnet_lite import connect, Label, Concept, Language, edges_for, Edge as CNEdge
+from conceptnet_lite import connect, Label, Concept, Language, edges_for
 
 db_path = r"C:\Users\black\OneDrive\Desktop\EVA-Ai\conceptnet.db"
 connect(db_path)
@@ -60,16 +60,37 @@ for label in ru_labels:
 print(f"  Found {len(ru_concepts):,} Russian concepts")
 
 # ============================================================
-# Phase 2: Get edges for Russian concepts
+# Phase 2: Sample edges for Russian words
 # ============================================================
-print("\n[PHASE 2] Getting edges for Russian concepts...")
+print("\n[PHASE 2] Processing Russian words and their edges...")
 
-all_ru_words = set()
+# Take a sample of Russian labels (unique words)
+ru_words_raw = list(set(label.text.lower().strip() for label in ru_labels))
+print(f"  Unique Russian words: {len(ru_words_raw):,}")
+
+# Filter: only words encodable by our vocab (Cyrillic, length 2-20)
+encoded_words = {}
+for word in ru_words_raw:
+    ids = cv.encode(word)[1:-1]
+    if 2 <= len(ids) <= 20 and all(0 < i < VT for i in ids):
+        encoded_words[word] = ids
+
+print(f"  Encodable words: {len(encoded_words):,}")
+
+# Sample edges for representative words (random sample to be fast)
+import random
+random.seed(42)
+sample_words = random.sample(list(encoded_words.keys()), min(5000, len(encoded_words)))
+
 ru_edges = []
+all_ru_words = set(sample_words)
 
-for i, (text, concept) in enumerate(ru_concepts):
+for i, word in enumerate(sample_words):
     try:
+        label = Label.get_or_create(text=word, language=lang_ru)[0]
+        concept = Concept.get(label=label)
         edges = list(edges_for([concept]))
+        
         for edge in edges:
             rel = edge.relation.name
             weight = edge.etc.get('weight', 1.0)
@@ -78,23 +99,34 @@ for i, (text, concept) in enumerate(ru_concepts):
             end_uri = edge.end.uri
             start_label = start_uri.split('/')[-1] if '/' in start_uri else start_uri
             end_label = end_uri.split('/')[-1] if '/' in end_uri else end_uri
-            start_lang = start_uri.split('/')[1] if len(start_uri.split('/')) >= 2 else ''
-            end_lang = end_uri.split('/')[1] if len(end_uri.split('/')) >= 2 else ''
+            start_lang = start_uri.split('/')[2] if len(start_uri.split('/')) >= 3 else ''
+            end_lang = end_uri.split('/')[2] if len(end_uri.split('/')) >= 3 else ''
             
-            ru_edges.append((start_label, end_label, rel, weight, start_lang == 'ru', end_lang == 'ru'))
-            
-            if start_lang == 'ru':
-                all_ru_words.add(start_label.lower().strip())
-            if end_lang == 'ru':
-                all_ru_words.add(end_label.lower().strip())
-    except:
+            if start_lang == 'ru' or end_lang == 'ru':
+                ru_edges.append((start_label, end_label, rel, weight, start_lang == 'ru', end_lang == 'ru'))
+    
+    except Exception:
         pass
     
     if (i+1) % 500 == 0:
-        print(f"\r  Processed {i+1}/{len(ru_concepts)} concepts, "
-              f"{len(ru_edges):,} edges, {len(all_ru_words):,} unique words", end='', flush=True)
+        print(f"\r  Processed {i+1}/{len(sample_words)} words, {len(ru_edges):,} edges", end='', flush=True)
 
-print(f"\n  Total: {len(ru_edges):,} edges, {len(all_ru_words):,} unique Russian words")
+print(f"\n  Total edges: {len(ru_edges):,}")
+
+# Collect ALL Russian words from edges
+for s, e, rel, w, s_ru, e_ru in ru_edges:
+    if s_ru: all_ru_words.add(s.lower().strip())
+    if e_ru: all_ru_words.add(e.lower().strip())
+
+# Encode all discovered words
+for word in all_ru_words:
+    if word not in encoded_words:
+        ids = cv.encode(word)[1:-1]
+        if 2 <= len(ids) <= 20 and all(0 < i < VT for i in ids):
+            encoded_words[word] = ids
+
+print(f"  Total Russian words: {len(all_ru_words):,}")
+print(f"  Encoded: {len(encoded_words):,}")
 
 # ============================================================
 # Phase 2: Encode Russian concepts as symbol sequences

@@ -153,7 +153,7 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         self.decoder = CoordinateDecoder(self.embed)
 
         # Multi-head attention projections (learnable Q, K, V, O)
-        self.attn_heads = 4  # 4 heads × 3D = 12D
+        self.attn_heads = 4  # 4 heads × (coord_dim // 4)D each
         self.W_Q = nn.Linear(coord_dim, coord_dim, bias=False)
         self.W_K = nn.Linear(coord_dim, coord_dim, bias=False)
         self.W_V = nn.Linear(coord_dim, coord_dim, bias=False)

@@ -24,4 +24,3 @@ from .word_level import WordBoundaryDetector, GrammaticalRoleDiscovery, Semantic
 from .knowledge_base import KnowledgeDomain, KnowledgeBase, CrossDomainNavigator, IntelligentContextRouter
 from .library import DomainAutoNamer, DomainIndex, CatalogEntry, LibrarianMap, LibraryStats, LibraryManager
 from .contemplation import LogicGuard, ContemplationLoop
-from .potential_trainer import PotentialTrainer

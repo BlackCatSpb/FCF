@@ -69,7 +69,7 @@ class SymbolicConceptMiner:
         topological_field,
         contradiction_filter,
         grammar,
-        logic_bridge,
+        logic_bridge=None,
         geodesic_navigator,
         min_concept_quality: float = 0.5,
         max_concepts: int = 10000,

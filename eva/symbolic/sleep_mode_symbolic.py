@@ -44,7 +44,7 @@ class SleepModeSymbolic:
         grammar,
         validator,
         explorer,
-        logic_bridge,
+        logic_bridge=None,
         idle_timeout: float = 300.0,   # сек бездействия до сна
         sleep_duration: float = 60.0,   # длительность сна
         replay_count: int = 100,        # сколько сборок переиграть

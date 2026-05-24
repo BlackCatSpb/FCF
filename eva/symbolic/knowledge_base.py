@@ -421,7 +421,7 @@ class CrossDomainNavigator:
     3. Определить, нужно ли переключать домен при генерации
     """
 
-    def __init__(self, knowledge_base: KnowledgeBase, logic_bridge):
+    def __init__(self, knowledge_base: KnowledgeBase, logic_bridge=None):
         self.kb = knowledge_base
         self.logic = logic_bridge
 

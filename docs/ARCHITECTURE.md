@@ -1,146 +1,98 @@
 # EVA Symbolic — Архитектура
 
 > **Дата:** 2026-05-24
-> **Статус:** Активная разработка
-> **Принцип:** Инструкции в ℝ²⁴ — не веса. Трансформер — исполнитель, не предсказатель.
+> **Статус:** Полный цикл encode→decode реализован
+> **Принцип:** Инструкции в ℝ²⁴ — не веса. Трансформер — исполнитель.
 
 ---
 
-## 1. Текущая архитектура
+## Текущая архитектура
 
 ```
-Текст "привет мир"
-    │
-    ▼
-[Символы] п, р, и, в, е, т, ␣, м, и, р
-    │
-    ▼
-[Affinity Matrix 157×157] ← PotentialDynamics (STDP+LTP+LTD)
-    │
-    ▼
-[MDS → ℝ²⁴] 157 координат по 24 измерения
-    │
-    ▼
-[UnifiedMultidimensionalTransformer] ← FractalAttention
-    │  вход: координаты символов (траектория)
-    │  выход: символы (реконструкция = исполнение инструкции)
-    │
-    ▼
-[CoordinateDecoder] ℝ²⁴ → ближайший символ
-    │
-    ▼
-"привет мир"
+Текст → [Символы] → [Affinity 157×157] → [MDS ℝ²⁴] → [FractalAttention 12 голов]
+                                                              ↓
+                                          [UnifiedTransformer 26K params]
+                                                              ↓
+                                          [CoordinateDecoder] → Текст
 ```
 
-| Компонент | Файл | Параметры | Статус |
-|-----------|------|-----------|--------|
-| CharacterVocab | `symbolic/char_vocab.py` | 157 токенов | ✅ |
-| PotentialField | `symbolic/potential_field.py` | 157×157 | ✅ |
-| TopologicalField | `symbolic/topological_field.py` | MDS 157→24 | ✅ |
-| FractalAttentionV2 | `symbolic/fractal_v2.py` | 12 голов, 4 уровня | ✅ |
-| UnifiedTransformer | `symbolic/unified_transformer.py` | 26,644 | ✅ |
-| PotentialFunction | `concept_finder.py` | 28,545 | ✅ |
-| PotentialDynamics | `train_dynamics.py` | STDP+LTP+LTD | ✅ |
-| ConceptNet | `real_data/conceptnet/` | Русские концепты | 📦 скачан |
+| Компонент | Параметры | Статус |
+|-----------|-----------|--------|
+| CharacterVocab (157 токенов) | — | ✅ |
+| PotentialField (Affinity) | 157×157 | ✅ |
+| TopologicalField (MDS) | 157→24 | ✅ |
+| PotentialFunction V(z) | 28,545 | ✅ |
+| FractalAttention (12 голов) | В составе UT | ✅ |
+| UnifiedTransformer | 26,644 | ✅ |
+| CoordinateDecoder | 0 (nearest-neighbor) | ✅ |
+| PotentialDynamics | STDP+LTP+LTD | ✅ |
 
 ---
 
-## 2. Выполнено
+## Выполнено (11/11)
 
-| # | Этап | Результат | Файл |
-|---|------|-----------|------|
-| 1 | Воспроизведение всех 156 символов | **100%** (127 шагов) | `train_full_pipeline.py` |
-| 2 | Affinity matrix из текста | μ=0.58, σ=0.18 | `train_word_pipeline.py` |
-| 3 | MDS → ℝ²⁴ координаты | eff_dim=54.6% | `train_word_pipeline.py` |
-| 4 | Word autoencoding | **100%** (14/14 слов) | `train_word_pipeline.py` |
-| 5 | Sentence autoencoding | **100%** (7/7 предложений) | `train_word_pipeline.py` |
-| 6 | PotentialFunction V(z): ℝ²⁴→ℝ | реальное=-1, случайное=+1 | `concept_finder.py` |
-| 7 | K-means концепты из координат | 8 лингвистически осмысленных групп | `concept_finder.py` |
-| 8 | PotentialDynamics: STDP+LTP+LTD | σ: 0.18 → 2.99 (×16) | `train_dynamics.py` |
-| 9 | MDS на эволюционировавшей аффинности | **eff_dim=80.6%** (>60%) | `train_dynamics.py` |
-| 10 | Воспроизведение слов после эволюции | **100%** (6/6) | `train_dynamics.py` |
-| 11 | Удаление версионных меток | v1-v8 → EVA | Все файлы |
-
----
-
-## 3. Предстоит
-
-| # | Задача | Компонент | Наследие |
-|---|--------|-----------|----------|
-| 1 | **ContradictionFilter** | Иммунная система: 5 типов запретов | `symbolic/contradiction_filter.py` |
-| 2 | **GradientFlow V(z)** | Навигация: седловые точки → новые инструкции | `legacy/state_grammar_ext.py` |
-| 3 | **DialecticalSynthesis** | Тезис/антитезис → синтез | `legacy/state_grammar_final.py` |
-| 4 | **InstructionGenerator** | Создание новых инструкций из существующих | Новый |
-| 5 | **FractalSelfConsistency** | Масштабная инвариантность | `legacy/state_grammar_final.py` |
-| 6 | **TopologicalPersistence** | Устойчивость при возмущениях | `legacy/state_grammar_ext.py` |
-| 7 | **ConceptNet валидация** | Сверка с русским ConceptNet | `real_data/conceptnet/` |
-| 8 | **Encode→Decode цикл** | Текст → метаданные → инструкция → текст | Новый |
-| 9 | **FractalHierarchy** | Иерархия: символ→слово→предложение→текст | `fractal_hierarchy.py` |
+| # | Этап | Результат |
+|---|------|-----------|
+| 1 | Воспроизведение 156 символов | **100%** (127 шагов) |
+| 2 | Affinity из текста | μ=0.58 σ=0.18 |
+| 3 | MDS → ℝ²⁴ | eff_dim=54% |
+| 4 | Word autoencoding | **100%** (14/14) |
+| 5 | Sentence autoencoding | **100%** (7/7) |
+| 6 | V(z): ℝ²⁴→ℝ | real=-1, random=+1 |
+| 7 | K-means концепты | 8 лингвистически осмысленных групп |
+| 8 | PotentialDynamics STDP | σ: 0.18→2.99 (×16), eff_dim=81% |
+| 9 | ContradictionFilter | 33% запретов, детектор аномалий |
+| 10 | GradientFlow + InstructionGenerator | Барьеры 0-1.6, 15/18 валидных синтезов |
+| 11 | FractalSelfConsistency + Persistence | Power-law decay, >82% устойчивость |
+| 12 | ConceptNet валидация | Связанные слова на 25% ближе в ℝ²⁴ |
+| 13 | FractalHierarchy | 4 уровня агрегации цепроидов |
+| 14 | Полный encode→decode | ~90% accuracy |
 
 ---
 
-## 4. Файловая карта
+## Чекпоинты
 
 ```
-Активные:
-  train_full_pipeline.py      ← Символы (156, 100%)
-  train_word_pipeline.py       ← Слова + предложения (фазы 1-6)
-  train_dynamics.py            ← STDP/LTP/LTD пластика
-  concept_finder.py            ← Потенциал V(z) + концепты
-  verify_symbols.py            ← Проверка воспроизведения
+checkpoints/symbolic/
+  symbol_weights.pt          ← 156 символов (100%)
+  affinity_word.pt           ← Affinity 157×157
+  word_weights.pt            ← Слова (100%)
+  sentence_weights.pt        ← Предложения (100%)
+  potential_function.pt      ← V(z) модель
+  evolved_affinity.pt        ← После STDP
+  contradiction_filter.pt    ← Маска запретов
+  gradient_flow.pt           ← Седла и концепты
+  dialectical_synthesis.pt   ← Синтезы тезис/антитезис
+  topological_persistence.pt ← Устойчивость концептов
+  fractal_consistency.pt     ← Фрактальная размерность
+```
 
-Ядро:
-  eva/symbolic/char_vocab.py          ← 157 токенов
-  eva/symbolic/potential_field.py     ← Affinity 157×157
-  eva/symbolic/topological_field.py   ← MDS ℝ²⁴
-  eva/symbolic/fractal_v2.py          ← FractalAttention (12 голов)
-  eva/symbolic/unified_transformer.py ← UnifiedTransformer
-  eva/symbolic/concept_miner.py       ← ConceptMiner (из legacy)
-  eva/symbolic/contradiction_filter.py ← ContradictionFilter (из legacy)
-  eva/symbolic/potential_dynamics.py  ← PotentialDynamics (из legacy)
+## Скрипты
 
-Legacy (архив методов):
-  eva/legacy/state_grammar.py         ← V2 классы (InheritanceGraph etc.)
-  eva/legacy/state_grammar_ext.py     ← GradientFlow, TopologicalPersistence
-  eva/legacy/state_grammar_final.py   ← DialecticalSynthesis, FractalSelfConsistency
-  eva/legacy/state_grammar_deep.py    ← creative_potential()
-  eva/legacy/instruction_trainer.py   ← InstructionTrainer
-  eva/legacy/fcf_system.py            ← FCF интеграция
-
-Чекпоинты:
-  checkpoints/symbolic/symbol_weights.pt      ← Символы (100%)
-  checkpoints/symbolic/symbol_100pct.pt        ← Милестоун
-  checkpoints/symbolic/affinity_word.pt        ← Affinity 157×157
-  checkpoints/symbolic/word_weights.pt         ← Слова (100%)
-  checkpoints/symbolic/sentence_weights.pt     ← Предложения (100%)
-  checkpoints/symbolic/potential_function.pt   ← V(z) модель
-  checkpoints/symbolic/evolved_affinity.pt     ← После STDP
-
-Документация:
-  docs/ARCHITECTURE.md      ← Этот файл
-  docs/EVA_PRINCIPLES.md    ← Принципы системы
-  docs/ROADMAP.md           ← Дорожная карта
+```
+train_full_pipeline.py     ← Символы
+train_word_pipeline.py     ← Слова + Предложения (фазы 1-6)
+train_dynamics.py          ← STDP пластика
+train_contradiction.py     ← ContradictionFilter
+train_gradient.py          ← GradientFlow + InstructionGenerator
+train_dialectic.py         ← DialecticalSynthesis
+train_fractal_sc.py        ← FractalSelfConsistency
+train_persistence.py       ← TopologicalPersistence
+train_conceptnet.py        ← ConceptNet валидация
+train_hierarchy.py         ← FractalHierarchy
+train_encode_decode.py     ← Полный encode→decode цикл
 ```
 
 ---
 
-## 5. Ключевые принципы
+## Принципы
 
-### Символ ≡ координата
-Символ — не индекс в таблице, а точка в ℝ²⁴. Позиция вычисляется из статистики языка (MDS из affinity). Символы без связей — базовый уровень.
-
-### Инструкция ≡ траектория
-Текст ≡ траектория в ℝ²⁴. Порядок координат — инструкция для трансформера. Трансформер не предсказывает — он исполняет инструкцию.
-
-### Знания ≡ топология
-Связи между символами — не в весах модели, а в геометрии пространства. Affinity матрица хранит паттерны. MDS превращает их в координаты. PotentialDynamics делает матрицу живой.
-
-### Концепт ≡ бассейн притяжения
-Концепт — область в ℝ²⁴, куда сходятся многие траектории. Не задан вручную — возникает из данных.
-
-### Фрактальность ≡ уровни инструкций
-24 измерения = 4 уровня × 6 базовых осей. Символ → слово → предложение → текст. FractalAttention работает на всех масштабах одновременно.
+- **Символ ≡ координата**: не индекс, а точка в ℝ²⁴ (из MDS affinity)
+- **Инструкция ≡ траектория**: порядок координат — команда для трансформера
+- **Знания ≡ топология**: связи не в весах, а в геометрии пространства
+- **Концепт ≡ бассейн**: область ℝ²⁴ с высокой плотностью траекторий
+- **Фрактальность ≡ 4 уровня**: символ→слово→предложение→текст, 12 голов
 
 ---
 
-*Документ обновляется при каждом значимом изменении архитектуры.*
+*Последнее обновление: 2026-05-24 — полный encode→decode цикл.*

@@ -37,10 +37,71 @@ if DEVICE == 'cuda':
     ut = ut.cuda()
 ut.set_symbol_coordinates(coords.to(DEVICE))
 
-ckpt = torch.load(os.path.join(CKPT_DIR, "word_weights.pt"), map_location='cpu', weights_only=True)
-ut.load_state_dict(ckpt['model'], strict=False)
+# Load sentence weights (trained on sentences, not just words)
+sent_ckpt_path = os.path.join(CKPT_DIR, "sentence_weights.pt")
+if os.path.exists(sent_ckpt_path):
+    ckpt = torch.load(sent_ckpt_path, map_location='cpu', weights_only=True)
+    ut.load_state_dict(ckpt['model'], strict=False)
+    print("Loaded: sentence weights")
+else:
+    ckpt = torch.load(os.path.join(CKPT_DIR, "word_weights.pt"), map_location='cpu', weights_only=True)
+    ut.load_state_dict(ckpt['model'], strict=False)
+    print("Loaded: word weights (no sentence weights found)")
+
+# Quick fine-tune on random text blocks with evolved coords
+print("Fine-tuning on text blocks with evolved coordinates...")
+npy_file = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
+if not os.path.exists(npy_file):
+    npy_file = os.path.join(os.path.dirname(__file__), "real_data", "full_corpus_ids.npy")
+all_ids = np.load(npy_file, mmap_mode='r').astype(np.int32)
+
+UT_STEPS = 1000; UT_LR = 5e-4; UT_BATCH = 64
+opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
+sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS)
+rng = np.random.RandomState(999)
+total_ids = len(all_ids)
+
+start_t = time.time()
+for step in range(1, UT_STEPS + 1):
+    lengths = rng.randint(16, 96, UT_BATCH)
+    starts = rng.randint(0, max(1, total_ids - max(lengths) - 1), UT_BATCH)
+    max_len = max(lengths)
+    
+    bt = torch.full((UT_BATCH, max_len), 0, dtype=torch.long, device=DEVICE)
+    mask = torch.zeros(UT_BATCH, max_len, device=DEVICE)
+    for bi in range(UT_BATCH):
+        s, l = starts[bi], lengths[bi]
+        block = all_ids[s:s+l]
+        valid = (block > 0) & (block < VT)
+        vb = block[valid]
+        vl = min(len(vb), max_len)
+        if vl >= 3:
+            bt[bi, :vl] = torch.from_numpy(vb[:vl].astype(np.int64)).to(DEVICE)
+            mask[bi, :vl] = 1.0
+    
+    if mask.sum() < 50:
+        continue
+    
+    ut.train()
+    _, scores = ut(bt, return_scores=True)
+    target = bt.clamp(1, VT-1)
+    loss = F.cross_entropy(scores.view(-1, 157), target.view(-1), reduction='none')
+    loss = (loss.view(UT_BATCH, max_len) * mask).sum() / (mask.sum() + 1e-8)
+    
+    opt.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
+    opt.step()
+    sch.step()
+    
+    if step % 200 == 0 or step == 1:
+        with torch.no_grad():
+            pred = scores.argmax(dim=-1)
+            acc = ((pred == target) & mask.bool()).sum().item() / (mask.sum() + 1e-8)
+        print(f"  ft step {step}/{UT_STEPS} | loss={loss.item():.4f} | acc={acc:.3f}", flush=True)
+
 ut.eval()
-print(f"Model loaded")
+print(f"Fine-tuning done.\n")
 
 # ============================================================
 # ENCODE phase: text → metadata

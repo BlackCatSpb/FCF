@@ -147,13 +147,11 @@ print(f"  MDS: eff_dim(24)={eff_dim:.1%}, unique_coords={unique_coords}/{n}, "
 print(f"  Coordinates: {coords.shape}")
 
 # ============================================================
-# PHASE 3: UnifiedTransformer — affinity distillation
+# PHASE 3: Symbol reproduction — ALL 156 symbols, GPU only
 # ============================================================
-print("\n[PHASE 3] UnifiedTransformer — DECODE: coordinates → text")
-print("  Goal: learn to ASSEMBLE symbols from metadata (not predict)")
-print("  Input:  symbol coordinates in order (the 'instructions')")
-print("  Output: exact symbol sequence (the 'assembled text')")
-print("  Loss:   CrossEntropy(output, correct_symbols)")
+print("\n[PHASE 3] UnifiedTransformer — SYMBOL REPRODUCTION (156 symbols, GPU)")
+print("  Goal: reproduce ALL 156 symbols from their coordinates")
+print("  No sequences. No text. Just symbols.")
 
 ut = UnifiedMultidimensionalTransformer(vocab_size=156, coord_dim=24)
 if DEVICE == 'cuda':
@@ -161,51 +159,21 @@ if DEVICE == 'cuda':
 ut.set_symbol_coordinates(coords.to(DEVICE))
 print(f"  {ut.summary()}")
 
-UT_BATCH = 256; UT_BLOCK = 64; UT_STEPS = 100000; UT_LR = 1e-3
+UT_STEPS = 50000; UT_LR = 1e-3
 opt = torch.optim.AdamW(ut.parameters(), lr=UT_LR, weight_decay=0.01)
-sch = torch.optim.lr_scheduler.SequentialLR(opt, [
-    torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=1000),
-    torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS - 1000 + 1),
-], milestones=[1000])
+sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=UT_STEPS)
 
-pos = 0; start = time.time()
+# Constant batch: all 156 symbols (skip PAD=0)
+all_symbols = torch.arange(1, 157, dtype=torch.long, device=DEVICE)  # 1..156
+symbol_batch = all_symbols.unsqueeze(0)  # [1, 156]
+
+start = time.time()
 
 for step in range(1, UT_STEPS + 1):
-    if pos + UT_BLOCK + 2 > len(all_ids): pos = 0
-    ids_batch, lens = [], []
-    for _ in range(UT_BATCH):
-        if pos + UT_BLOCK + 2 > len(all_ids): pos = 0
-        end = min(pos + UT_BLOCK, len(all_ids))
-        chunk = all_ids[pos:end]
-        sep = np.where((chunk == 0) | (chunk == 3))[0]
-        if len(sep) > 0 and sep[0] < UT_BLOCK // 2:
-            end = pos + sep[0] + 1; chunk = all_ids[pos:end]
-        ids = [int(x) for x in chunk if x >= 0][:UT_BLOCK]
-        ids_batch.append(ids); lens.append(len(ids)); pos += max(len(ids), 32)
-
-    ml = max(lens)
-    bt = torch.full((UT_BATCH, ml), PAD, dtype=torch.long, device=DEVICE)
-    for i, ids in enumerate(ids_batch):
-        bt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
-
-    mask = (bt != PAD).float()
-
-    # === DECODING TRAINING ===
-    # Input: symbol coordinates IN ORDER (the instruction)
-    # The transformer sees coordinates and must reconstruct the symbols
     ut.train()
-    _, scores = ut(bt, return_scores=True)  # [B, L, V]
+    _, scores = ut(symbol_batch, return_scores=True)  # [1, 156, V]
 
-    # Target: the symbols themselves (reconstruction, not prediction)
-    target = bt.clamp(1, V-1)  # [B, L] — the actual symbols at each position
-
-    # Loss: CrossEntropy — how well does transformer decode coordinates → symbols?
-    loss = F.cross_entropy(
-        scores.view(-1, V),
-        target.view(-1),
-        reduction='none',
-    ).view(UT_BATCH, ml)
-    loss = (loss * mask).sum() / (mask.sum() + 1e-8)
+    loss = F.cross_entropy(scores.view(-1, V), symbol_batch.view(-1))
 
     opt.zero_grad()
     loss.backward()
@@ -213,46 +181,39 @@ for step in range(1, UT_STEPS + 1):
     opt.step()
     sch.step()
 
-    if step % 500 == 0:
-        gc.collect()
-        if DEVICE == 'cuda': torch.cuda.empty_cache()
-    
-    if step % 100 == 0:  # ~3 sec updates
+    if step % 500 == 0 or step == 1:
         elapsed = time.time() - start
-        bps = step / max(elapsed, 0.01)
-        pct = step * 100 // UT_STEPS
-        bar = '#' * (pct // 4) + '-' * (25 - pct // 4)
-        print(f"\r  [{bar}] {pct}% | {bps:.0f} b/s | loss={loss.item():.4f}", end='', flush=True)
-
-print()
-os.makedirs(os.path.join(CKPT_DIR, "unified"), exist_ok=True)
-torch.save(ut.state_dict(), os.path.join(CKPT_DIR, "unified", "transformer_final.pt"))
-print(f"  Done. Final loss: {loss.item():.6f}")
+        eta = (elapsed / step) * (UT_STEPS - step)
+        with torch.no_grad():
+            predicted = scores[0].argmax(dim=-1)  # [156]
+            correct = (predicted == all_symbols).sum().item()
+        lr = sch.get_last_lr()[0]
+        sys.stdout.write(f"\r  step {step}/{UT_STEPS} | loss={loss.item():.4f} | "
+                         f"correct={correct}/156 ({correct/156:.0%}) | lr={lr:.6f} | "
+                         f"elapsed={elapsed:.0f}s eta={eta:.0f}s")
+        if step % 500 == 0:
+            sys.stdout.write("\n")
 
 # ============================================================
-# PHASE 4: Reconstruction Test
+# PHASE 4: Final symbol test — 100% or fail
 # ============================================================
-print("\n[PHASE 4] DECODING test: coordinates → text (assembly)...")
+print("\n[PHASE 4] FINAL TEST: reproduce ALL 156 symbols")
 ut.eval()
+with torch.no_grad():
+    _, scores = ut(symbol_batch, return_scores=True)
+    predicted = scores[0].argmax(dim=-1)
+    correct = (predicted == all_symbols).sum().item()
 
-test_sentences = [
-    "привет мир",
-    "человек идёт",
-    "солнце светит",
-    "мама мыла раму",
-    "я люблю программирование",
-]
-
-for sentence in test_sentences:
-    ids = cv.encode(sentence)
-    # Give model the CORRECT symbol IDs as input (the instruction)
-    # Model must output those same symbols (assembly from coordinates)
-    inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
-    with torch.no_grad():
-        _, scores = ut(inp, return_scores=True)
-    predicted = torch.argmax(scores[0], dim=-1).tolist()
-    accuracy = sum(1 for p, t in zip(predicted, ids) if p == t) / max(len(ids), 1)
-    gen_text = cv.decode(predicted)
-    print(f"  '{sentence}' → '{gen_text[:50]}' ({accuracy:.0%})")
+print(f"  Result: {correct}/156 ({correct/156:.0%})")
+if correct == 156:
+    print("  SUCCESS: all 156 symbols reproduced")
+else:
+    failed = [(i, cv.id_to_char[i+1], cv.id_to_char[p.item()]) 
+              for i, p in enumerate(predicted) if p.item() != (i+1)]
+    print(f"  FAIL: {156 - correct} symbols wrong")
+    for fid, expected, got in failed[:10]:
+        print(f"    id={fid+1} expected='{expected}' got='{got}'")
+    print(f"  Checkpoint saved for debugging")
+    torch.save({'model': ut.state_dict(), 'coords': coords}, 'PHASE3_FAIL.pt')
 
 print("\nDone.")

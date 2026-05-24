@@ -135,7 +135,7 @@ print("\n[PHASE 2] MDS → Coordinates in ℝ¹²...")
 from eva.symbolic.topological_field import TopologicalField
 topo = TopologicalField(pf, coord_dim=24)
 topo._compute_coordinates_from_affinity()
-coords = topo.coordinates[:156, :12].clone()
+coords = topo.coordinates[:156, :24].clone()
 print(f"  Coordinates: {coords.shape}")
 
 # ============================================================

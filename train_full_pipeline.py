@@ -57,10 +57,11 @@ symbol_batch = all_symbols.unsqueeze(0)  # [1, 156]
 
 start = time.time()
 last_print = 0
+first_100pct_saved = False
 
 for step in range(1, UT_STEPS + 1):
     ut.train()
-    _, scores = ut(symbol_batch, return_scores=True)  # [1, 156, V]
+    _, scores = ut(symbol_batch, return_scores=True)
 
     loss = F.cross_entropy(scores.view(-1, V+1), symbol_batch.view(-1))
 
@@ -69,6 +70,18 @@ for step in range(1, UT_STEPS + 1):
     torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
     opt.step()
     sch.step()
+
+    # Save milestone when 100% first achieved
+    if not first_100pct_saved:
+        with torch.no_grad():
+            pred_check = scores[0].argmax(dim=-1)
+            if (pred_check == all_symbols).sum().item() == 156:
+                first_100pct_saved = True
+                CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints", "symbolic")
+                os.makedirs(CKPT_DIR, exist_ok=True)
+                milestone_path = os.path.join(CKPT_DIR, "symbol_100pct.pt")
+                torch.save({'model': ut.state_dict(), 'coords': coords, 'step': step}, milestone_path)
+                print(f"\n  *** 100% reached at step {step}! Saved: {milestone_path}")
 
     now = time.time()
     if now - last_print >= 3 or step == 1 or step == UT_STEPS:
@@ -94,6 +107,14 @@ with torch.no_grad():
     correct_count = (predicted == all_symbols).sum().item()
 
 print(f"  Result: {correct_count}/156 ({correct_count/156:.0%})")
+
+# Save weights always
+CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints", "symbolic")
+os.makedirs(CKPT_DIR, exist_ok=True)
+symbol_path = os.path.join(CKPT_DIR, "symbol_weights.pt")
+torch.save({'model': ut.state_dict(), 'coords': coords}, symbol_path)
+print(f"  Weights saved: {symbol_path}")
+
 if correct_count == 156:
     print("  SUCCESS: all 156 symbols reproduced")
 else:

@@ -60,6 +60,7 @@ pf.co_occurrence_count = pf.co_occurrence_count.to(DEVICE)
 
 if not os.path.exists(affinity_path):
     for step in range(AFF_STEPS):
+        # Batch formation
         if pos + AFF_BLOCK + 2 > len(all_ids): pos = 0
         ids_batch, lens = [], []
         for _ in range(AFF_BATCH):
@@ -82,24 +83,33 @@ if not os.path.exists(affinity_path):
             attn = layer.transformer.attention.last_attention
 
         if attn is not None:
-            # GPU-resident vectorized strengthen (no Python loops, no CPU transfers)
-            for i in range(AFF_BATCH):
-                L_i = lens[i]
-                if L_i < 2: continue
-                left = bt[i, :L_i - 1]
-                right = bt[i, 1:L_i]
-                adj = attn[i].mean(dim=0)[torch.arange(1, L_i, device=DEVICE), torch.arange(L_i - 1, device=DEVICE)]
-                valid = (left < V) & (right < V) & (left > 0) & (right > 0)
-                i_idx = left[valid].long()
-                j_idx = right[valid].long()
-                w = adj[valid].float()
-                if len(i_idx) > 0:
-                    flat = i_idx * V + j_idx
-                    inc = (1.0 + w).to(pf.co_occurrence_count.dtype)
-                    pf.co_occurrence_count.view(-1).scatter_add_(0, flat, inc)
-                    uf = flat.unique(); ui = uf // V; uj = uf % V
-                    raw = pf.co_occurrence_count[ui, uj] / 100000.0
-                    pf.affinity[ui, uj] = (0.5 + 0.5 * torch.clamp(raw, 0.0, 1.0)).float()
+            # VECTORIZED: all BATCH sequences in one GPU operation
+            # Extract all adjacent pairs: [B, L-1, 2]
+            max_len = ml
+            left_all = bt[:, :max_len-1]    # [B, L-1]
+            right_all = bt[:, 1:max_len]    # [B, L-1]
+            
+            # Adjacent attention from all heads
+            adj_attn = attn.mean(dim=1)[:, torch.arange(1, max_len, device=DEVICE), 
+                                          torch.arange(max_len-1, device=DEVICE)]
+            
+            # Valid mask (non-PAD, valid symbol range)
+            valid = (left_all > 0) & (left_all < V) & (right_all > 0) & (right_all < V)
+            
+            # Flatten batch and positions
+            i_flat = left_all[valid].long()   # [N]
+            j_flat = right_all[valid].long()  # [N]
+            w_flat = adj_attn[valid].float()  # [N]
+            
+            if len(i_flat) > 0:
+                flat_idx = i_flat * V + j_flat
+                inc = (1.0 + w_flat).to(pf.co_occurrence_count.dtype)
+                pf.co_occurrence_count.view(-1).scatter_add_(0, flat_idx, inc)
+                
+                # Update affinity for changed pairs only
+                uf = flat_idx.unique(); ui = uf // V; uj = uf % V
+                raw = pf.co_occurrence_count[ui, uj] / 100000.0
+                pf.affinity[ui, uj] = (0.5 + 0.5 * torch.clamp(raw, 0.0, 1.0)).float()
 
         if step % 5000 == 0 and step > 0:
             elapsed = time.time() - start

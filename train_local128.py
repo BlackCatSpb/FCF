@@ -45,7 +45,7 @@ npy = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
 if not os.path.exists(npy): npy = os.path.join(os.path.dirname(__file__), "real_data", "full_corpus_ids.npy")
 data = np.load(npy, mmap_mode='r').astype(np.int32); total = len(data)
 
-STEPS = 100000; LR = 3e-4; B = 16; ML = 64
+STEPS = 100000; LR = 3e-4; B = 32; ML = 64
 SAVE_EVERY = 5000; THINK_EVERY = 1000; GEN_EVERY = 5000
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)

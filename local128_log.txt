@@ -1,0 +1,1 @@
+[23:08:01] START: 100000 steps, 128-dim, 1.6M params, batch=16

@@ -56,7 +56,18 @@ N_HEADS = N_LEVELS * SCALES  # 32
 
 print(f"\nArchitecture: dim={D_MODEL}, ff={D_FF}, layers={N_LAYERS}, heads={N_HEADS}")
 
-evolved = torch.load(os.path.join(CKPT, "evolved_affinity.pt"), map_location='cpu', weights_only=True)
+# Load evolved affinity (check multiple locations) 
+evolved = None
+for p in [os.path.join(CKPT, "evolved_affinity.pt"), "evolved_affinity.pt",
+          os.path.join(os.path.dirname(__file__), "evolved_affinity.pt")]:
+    if os.path.exists(p):
+        evolved = torch.load(p, map_location='cpu', weights_only=True)
+        print(f"Loaded affinity from: {p}")
+        break
+if evolved is None:
+    print("FATAL: evolved_affinity.pt not found!")
+    print("Download from GitHub releases and place in checkpoints/symbolic/ or root")
+    sys.exit(1)
 coords = evolved['coords'].to(DEVICE)
 
 # Pad to 128-dim
@@ -87,10 +98,17 @@ for ckpt_name in ["unified_latest.pt", "gfre_latest.pt", "v2_latest.pt"]:
 # ============================================================
 # Data
 # ============================================================
-npy = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
-if not os.path.exists(npy): npy = os.path.join(os.path.dirname(__file__), "real_data", "full_corpus_ids.npy")
+npy = None
+for p in [os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy"),
+          "connected_ru.npy",
+          os.path.join(os.path.dirname(__file__), "real_data", "full_corpus_ids.npy")]:
+    if os.path.exists(p):
+        npy = p; break
+if npy is None:
+    print("FATAL: connected_ru.npy not found!")
+    sys.exit(1)
 data = np.load(npy, mmap_mode='r').astype(np.int32); total = len(data)
-print(f"Corpus: {total/1e6:.1f}M tokens")
+print(f"Corpus: {npy} ({total/1e6:.1f}M tokens)")
 
 # Trajectory store
 store_path = os.path.join(CKPT, "trajectory_store.pkl")

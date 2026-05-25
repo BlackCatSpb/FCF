@@ -120,16 +120,13 @@ reflector = SelfReflection(); learner = ActiveLearner()
 # ============================================================
 # Training config
 # ============================================================
-STEPS = 200000; LR = 5e-4; B = 512; ML = 256
+STEPS = 200000; LR = 5e-4; B = 128; ML = 128
+GRAD_ACCUM = 1  # no accumulation — fit in VRAM
 GRAD_ACCUM = 2  # effective batch = B * GRAD_ACCUM
 THINK_EVERY = 2000; SAVE_EVERY = 5000
 
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01, betas=(0.9, 0.95))
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
-try:
-    scaler = torch.amp.GradScaler('cuda') if DEVICE == 'cuda' else None
-except AttributeError:
-    scaler = torch.cuda.amp.GradScaler() if DEVICE == 'cuda' else None
 rng = np.random.RandomState(42)
 
 def log(msg):
@@ -138,10 +135,10 @@ def log(msg):
     with open(LOG, 'a', encoding='utf-8') as f: f.write(line + '\n'); f.flush()
 
 log(f"START: {STEPS} steps, dim={D_MODEL}, heads={N_HEADS}, layers={N_LAYERS}")
-log(f"  batch={B}×{GRAD_ACCUM}={B*GRAD_ACCUM}, fp16, think_every={THINK_EVERY}")
+log(f"  batch={B}×{GRAD_ACCUM}, fp16")
 log(f"  Model: {total_params:,} params")
-log(f"  VRAM estimate: ~{total_params*4/1e9*3:.1f} GB (FP32 weights + optimizer + batch)")
 
+torch.cuda.empty_cache()
 t0 = time.time()
 total_think_perceived = 0; total_think_contemplated = 0
 
@@ -165,35 +162,28 @@ for s in range(1, STEPS + 1):
         
         if mask.sum() < 50: continue
         
-        try:
-            ctx = torch.amp.autocast('cuda')
-        except AttributeError:
-            ctx = torch.cuda.amp.autocast()
-        with ctx:
-            ut.train()
-            _, scores = ut(bt, return_scores=True)
-            target = bt[:, 1:].clamp(1, VT - 1).contiguous()
-            pred = scores[:, :-1, :].contiguous(); t_mask = mask[:, 1:]
-            
-            loss = F.cross_entropy(pred.view(-1, 157), target.view(-1), reduction='none')
-            loss = (loss.view(B, ml - 1) * t_mask).sum() / (t_mask.sum() + 1e-8)
-            loss = loss / GRAD_ACCUM
+        ut.train()
+        _, scores = ut(bt, return_scores=True)
+        target = bt[:, 1:].clamp(1, VT - 1).contiguous()
+        pred = scores[:, :-1, :].contiguous(); t_mask = mask[:, 1:]
         
-        scaler.scale(loss).backward()
+        loss = F.cross_entropy(pred.view(-1, 157), target.view(-1), reduction='none')
+        loss = (loss.view(B, ml - 1) * t_mask).sum() / (t_mask.sum() + 1e-8)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
+        opt.step()
         
         with torch.no_grad():
             acc = (pred.argmax(-1) == target) & t_mask.bool()
-            acc = acc.sum().item() / (t_mask.sum() + 1e-8)
+            acc_val = acc.sum().item() / (t_mask.sum() + 1e-8)
         
-        accum_loss += loss.item() * GRAD_ACCUM; accum_acc += acc; accum_count += 1
+        accum_loss += loss.item(); accum_acc += acc_val; accum_count += 1
+        
+        opt.zero_grad()
     
     if accum_count == 0: continue
     accum_loss /= accum_count; accum_acc /= accum_count
-    
-    scaler.unscale_(opt)
-    torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
-    scaler.step(opt)
-    scaler.update()
     sch.step()
     
     # === Think loop ===

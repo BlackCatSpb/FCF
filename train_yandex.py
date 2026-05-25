@@ -123,7 +123,7 @@ reflector = SelfReflection(); learner = ActiveLearner()
 STEPS = 200000; LR = 5e-4; B = 128; ML = 128
 GRAD_ACCUM = 1  # no accumulation — fit in VRAM
 GRAD_ACCUM = 2  # effective batch = B * GRAD_ACCUM
-THINK_EVERY = 2000; SAVE_EVERY = 5000
+THINK_EVERY = 2000; SAVE_EVERY = 500
 
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01, betas=(0.9, 0.95))
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)

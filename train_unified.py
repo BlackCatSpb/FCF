@@ -68,7 +68,7 @@ GENETIC_GENERATIONS = 10
 # ============================================================
 # Hyperparams
 # ============================================================
-STEPS = 100000; LR = 5e-4; B = 32; ML = 128; SAVE_EVERY = 10000
+STEPS = 100000; LR = 5e-4; B = 32; ML = 128; SAVE_EVERY = 5000
 THINK_EVERY = 500  # think every N training steps
 THINK_ITERS = 3     # how many perception+contemplation cycles per think session
 

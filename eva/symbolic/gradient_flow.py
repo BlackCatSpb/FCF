@@ -146,8 +146,14 @@ class GradientFlowSolver:
             
             # Decode equilibrium
             with torch.no_grad():
-                scores = self.decoder.forward(z)
-                eq_id = scores.argmax(dim=-1).item()
+                z_dec = z.unsqueeze(0) if z.dim() == 2 else z  # [1, 64] → [1, 1, 64]? No, already [1, 64] → need [1, 1, 64]
+                z_dec = z.unsqueeze(1) if z.dim() == 2 else z_dec  # [1, 64] → [1, 1, 64]
+                # Actually decoder expects [B, L, D]. z is [1, 64] from grad descent.
+                # Reshape to [1, 1, 64]
+                if z.dim() == 2:
+                    z_dec = z.unsqueeze(1)  # [1, 64] → [1, 1, 64]
+                scores = self.decoder.forward(z_dec)  # [1, 1, 157]
+                eq_id = scores[0, 0].argmax(dim=-1).item()
                 eq_text = char_vocab.decode([eq_id]) if char_vocab else str(eq_id)
                 basin_depth = self.V.V_real(z).item()
             
@@ -162,7 +168,7 @@ class GradientFlowSolver:
             
             hypotheses.append(FlowHypothesis(
                 trajectory=traj_np,
-                equilibrium_z=z.cpu().numpy().squeeze(0),
+                equilibrium_z=z.detach().cpu().numpy().squeeze(0),
                 equilibrium_text=eq_text,
                 basin_depth=basin_depth,
                 path_length=step + 1,

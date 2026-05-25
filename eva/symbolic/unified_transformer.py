@@ -7,7 +7,7 @@ RoPE, RMSNorm, Pre-norm, SwiGLU. ~141K параметров.
 
 import torch, torch.nn as nn, torch.nn.functional as F, math
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
 
 
@@ -228,7 +228,107 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         
         return x, scores
     
-    def summary(self) -> str:
+    def reason(
+        self,
+        query_ids: List[int],
+        num_hypotheses: int = 5,
+        temperature: float = 0.15,
+        char_vocab=None,
+    ) -> Dict:
+        """
+        GFRE reasoning: gradient flow from query to equilibrium.
+        Заменяет generate() для задач требующих РАССУЖДЕНИЯ.
+        
+        Returns: {answer, alternatives, reasoning_trace, confidence}
+        """
+        from .gradient_flow import CompositePotentialField, GradientFlowSolver
+        from .self_reflection import SelfReflection
+        
+        device = next(self.parameters()).device
+        
+        # Encode query to coordinate
+        if isinstance(query_ids, list):
+            query_ids = [i for i in query_ids if 0 < i < self.vocab_size]
+        if len(query_ids) == 0:
+            return {'answer': '', 'alternatives': [], 'reasoning_trace': None, 'confidence': 0}
+        
+        inp = torch.tensor([query_ids], dtype=torch.long, device=device)
+        z0 = self.embed(inp).mean(dim=1)  # [1, 64] — query centroid
+        
+        # Build solver (lazy init from existing components)
+        V_real = None
+        for name, mod in self.named_modules():
+            if hasattr(mod, 'forward') and 'V' in name:
+                pass
+        
+        # Use simple gradient flow: descend V_real from decoder proximity
+        class QuerySolver:
+            def __init__(self, decoder, embed, vocab_size):
+                self.decoder = decoder; self.embed = embed; self.V = vocab_size
+            
+            def V_query(self, z):
+                """Potential: distance to nearest valid symbol."""
+                z_dec = z.unsqueeze(1) if z.dim() == 2 else z  # [1,64] → [1,1,64]
+                scores = self.decoder.forward(z_dec)  # [1,1,V]
+                probs = torch.softmax(scores[0,0], dim=-1)
+                entropy = -(probs * torch.log(probs + 1e-8)).sum()
+                return entropy  # low entropy = confident = "real"
+            
+            def gradient(self, z):
+                z = z.detach().requires_grad_(True)
+                V = self.V_query(z)
+                grad = torch.autograd.grad(V, z)[0]
+                return grad
+        
+        qs = QuerySolver(self.decoder, self.embed, self.vocab_size)
+        reflector = SelfReflection()
+        
+        hypotheses = []
+        for seed in range(num_hypotheses):
+            torch.manual_seed(seed)
+            z = z0.clone().detach()
+            trajectory = [z.cpu().numpy()]
+            
+            with torch.enable_grad():
+                for step in range(50):
+                    grad = qs.gradient(z)
+                    noise = torch.randn_like(z) * np.sqrt(2 * temperature * 0.05)
+                    z = z - 0.05 * grad + noise
+                    z = z / z.norm(dim=-1, keepdim=True).clamp(1e-8)
+                    trajectory.append(z.detach().cpu().numpy())
+                    if torch.norm(grad) < 1e-3:
+                        break
+            
+            with torch.no_grad():
+                z_dec = z.unsqueeze(1)
+                scores = self.decoder.forward(z_dec)
+                eq_id = scores[0, 0].argmax(dim=-1).item()
+                eq_text = char_vocab.decode([eq_id]) if char_vocab else str(eq_id)
+                entropy = qs.V_query(z).item()
+            
+            traj_np = np.array(trajectory).squeeze(1)
+            diag = reflector.diagnose(traj_np)
+            
+            hypotheses.append({
+                'text': eq_text,
+                'z': z.detach().cpu().numpy().squeeze(0),
+                'entropy': entropy,
+                'path_length': step + 1,
+                'confidence': diag.confidence,
+                'trajectory': traj_np,
+            })
+        
+        hypotheses.sort(key=lambda h: h['entropy'])
+        best = hypotheses[0]
+        
+        return {
+            'answer': best['text'],
+            'alternatives': [h['text'] for h in hypotheses[1:3]],
+            'reasoning_trace': best['trajectory'],
+            'confidence': best['confidence'],
+            'basin_depth': best['entropy'],
+            'all_hypotheses': hypotheses,
+        }
         params = sum(p.numel() for p in self.parameters())
         return (f"UnifiedTransformer(dim={self.coord_dim}, heads={self.num_layers*4*4}, "
                 f"layers={self.num_layers}, params={params:,})")

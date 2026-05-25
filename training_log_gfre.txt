@@ -1,1 +1,4 @@
-[19:52:30] START GFRE: 50000 steps, dim=64, layers=3, dual loss (CE + gradient)
+[19:55:52] START GFRE: 50000 steps, dim=64, layers=3, dual loss (CE + gradient)
+[19:57:27]   step    500/50000 | CE=2.7920 GF=0.0392 acc=0.230 | 2min
+[19:59:01]   step   1000/50000 | CE=2.6917 GF=0.0385 acc=0.238 | 3min
+[20:00:46]   step   1500/50000 | CE=2.6096 GF=0.0284 acc=0.260 | 5min

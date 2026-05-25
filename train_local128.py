@@ -45,6 +45,30 @@ npy = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
 if not os.path.exists(npy): npy = os.path.join(os.path.dirname(__file__), "real_data", "full_corpus_ids.npy")
 data = np.load(npy, mmap_mode='r').astype(np.int32); total = len(data)
 
+# Extract words for word-aligned sampling
+print("Extracting words for boundary-aligned sampling...")
+_id_to_char = [cv.decode([i]) for i in range(157)]
+_is_letter = np.array([c.isalpha() or c.isdigit() for c in _id_to_char], dtype=bool)
+
+words_list = []
+i = 0
+chunk_size = 20_000_000
+for cs in range(0, total, chunk_size):
+    ce = min(cs + chunk_size + 20, total)
+    chunk = data[cs:ce]
+    vm = _is_letter[chunk]
+    in_word = False; st = 0
+    for j in range(len(chunk)):
+        if (cs + j) >= total: break
+        if vm[j]:
+            if not in_word: in_word = True; st = j
+        elif in_word:
+            in_word = False
+            wl = j - st
+            if 2 <= wl <= 20:
+                words_list.append(chunk[st:j].tolist())
+print(f"  Words: {len(words_list):,}")
+
 STEPS = 100000; LR = 3e-4; B = 32; ML = 64
 SAVE_EVERY = 5000; THINK_EVERY = 1000; GEN_EVERY = 5000
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01)
@@ -60,16 +84,27 @@ log(f"START: {STEPS} steps, 128-dim, 1.6M params, batch={B}")
 
 t0 = time.time()
 for s in range(1, STEPS + 1):
-    lens = rng.randint(16, ML+1, B)
-    starts = rng.randint(0, max(1, total - max(lens) - 1), B)
-    ml = max(lens)
-    bt = torch.full((B, ml), 0, dtype=torch.long, device=DEVICE)
-    mask = torch.zeros(B, ml, device=DEVICE)
+    # Sample words, concatenate to block length
+    ids_flat = []
+    while len(ids_flat) < ML:
+        widx = rng.randint(0, len(words_list))
+        ids_flat.extend(words_list[widx])
+        ids_flat.append(7)  # space
+    ids_flat = ids_flat[:ML]
     
-    for bi in range(B):
-        vb = data[starts[bi]:starts[bi]+lens[bi]]; vb = vb[(vb>0)&(vb<VT)]
-        vl = min(len(vb), ml)
-        if vl >= 4: bt[bi,:vl] = torch.from_numpy(vb[:vl].astype(np.int64)).to(DEVICE); mask[bi,:vl] = 1.0
+    bt = torch.full((B, ML), 0, dtype=torch.long, device=DEVICE)
+    mask = torch.ones(B, ML, device=DEVICE)
+    bt[0, :len(ids_flat)] = torch.tensor(ids_flat, dtype=torch.long, device=DEVICE)
+    
+    # Pad shorter sequences
+    for bi in range(1, B):
+        ids2 = []
+        while len(ids2) < ML:
+            widx = rng.randint(0, len(words_list))
+            ids2.extend(words_list[widx])
+            ids2.append(7)
+        ids2 = ids2[:ML]
+        bt[bi, :len(ids2)] = torch.tensor(ids2, dtype=torch.long, device=DEVICE)
     
     if mask.sum() < 20: continue
     

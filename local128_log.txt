@@ -3,3 +3,4 @@
 [23:12:29]   step    3000 | loss=0.9160 acc=0.718 | 3min
 [23:16:13]   step    3500 | loss=0.7552 acc=0.758 | 7min
 [23:19:54] START: 100000 steps, 128-dim, 1.6M params, batch=32
+[23:22:57] START: 100000 steps, 128-dim, 1.6M params, batch=32

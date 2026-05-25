@@ -59,6 +59,12 @@ if os.path.exists(store_path): store.load(store_path)
 
 reflector = SelfReflection(); learner = ActiveLearner(); causal = CausalDiscovery(store)
 
+# Genetics config
+from train_genetics import fitness, mutate, crossover
+GENETICS_EVERY = 10000
+POP_SIZE = 50
+GENETIC_GENERATIONS = 10
+
 # ============================================================
 # Hyperparams
 # ============================================================
@@ -161,6 +167,46 @@ for s in range(1, STEPS + 1):
     if s % SAVE_EVERY == 0:
         torch.save({'ut': ut.state_dict(), 'step': s}, os.path.join(CKPT, f"unified_{s}.pt"))
         torch.save({'ut': ut.state_dict(), 'step': s}, os.path.join(CKPT, "unified_latest.pt"))
+        
+        # === Genetic evolution ===
+        if s % GENETICS_EVERY == 0 and store.total_stored > POP_SIZE:
+            ut.eval()
+            pop = []
+            indices = np.random.choice(store.total_stored, POP_SIZE * 2, replace=False)
+            for idx in indices:
+                traj = store.trajectories[idx]
+                if traj.shape[1] < 64:
+                    padded = np.zeros((traj.shape[0], 64)); padded[:, :traj.shape[1]] = traj
+                    padded[:, 24:] = np.random.randn(traj.shape[0], 40) * 0.02
+                    traj = padded / (np.linalg.norm(padded, axis=1, keepdims=True) + 1e-8)
+                if len(traj) >= 4:
+                    pop.append({'trajectory': traj, 'ids': store.ids_list[idx]})
+            pop = pop[:POP_SIZE]
+            
+            for ind in pop: ind['fitness'] = fitness(ind['trajectory'], ind['ids'])
+            pop.sort(key=lambda x: x['fitness'], reverse=True)
+            
+            for gen in range(GENETIC_GENERATIONS):
+                elite = pop[:5]; new_pop = list(elite)
+                while len(new_pop) < POP_SIZE:
+                    if random.random() < 0.3:
+                        parent = random.choice(pop[:POP_SIZE//2])
+                        child_traj = mutate(parent['trajectory'])
+                        child = {'trajectory': child_traj, 'ids': parent['ids']}
+                    else:
+                        p1 = random.choice(pop[:POP_SIZE//4])
+                        p2 = random.choice(pop[:POP_SIZE//2])
+                        if id(p1) == id(p2): p2 = random.choice(pop)
+                        child_traj = crossover(p1['trajectory'], p2['trajectory'])
+                        child = {'trajectory': child_traj, 'ids': p1['ids']}
+                    child['fitness'] = fitness(child['trajectory'], child['ids'])
+                    new_pop.append(child)
+                pop = sorted(new_pop, key=lambda x: x['fitness'], reverse=True)[:POP_SIZE]
+            
+            gen_best = pop[0]['fitness']
+            gen_avg = np.mean([p['fitness'] for p in pop])
+            log(f"  ├─ genetics: gen={GENETIC_GENERATIONS} best={gen_best:.4f} avg={gen_avg:.4f}")
+            ut.train()
         
         with torch.no_grad():
             acc = (pred.argmax(-1) == target) & t_mask.bool()

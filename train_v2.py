@@ -35,7 +35,6 @@ STEPS = 100000; LR = 1e-3; B = 96; ML = 128
 SAVE_EVERY = 10000
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01, betas=(0.9, 0.95))
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
-scaler = torch.amp.GradScaler('cuda') if DEVICE == 'cuda' else None
 rng = np.random.RandomState(42)
 
 def log(msg):
@@ -45,7 +44,7 @@ def log(msg):
         f.write(line + '\n')
         f.flush()
 
-log(f"START v2: {STEPS} steps, dim=64, heads=16, layers=3, fp16")
+log(f"START v2: {STEPS} steps, dim=64, heads=16, layers=3")
 log(f"Model: {sum(p.numel() for p in ut.parameters()):,} params, batch={B}, block={ML}")
 t0 = time.time()
 
@@ -64,27 +63,19 @@ for s in range(1, STEPS + 1):
     
     if mask.sum() < 50: continue
     
-    with torch.amp.autocast('cuda'):
-        ut.train()
-        _, scores = ut(bt, return_scores=True)
-        target = bt[:, 1:].clamp(1, VT - 1).contiguous()
-        pred = scores[:, :-1, :].contiguous()
-        t_mask = mask[:, 1:]
-        
-        loss = F.cross_entropy(pred.view(-1, 157), target.view(-1), reduction='none')
-        loss = (loss.view(B, ml - 1) * t_mask).sum() / (t_mask.sum() + 1e-8)
+    ut.train()
+    _, scores = ut(bt, return_scores=True)
+    target = bt[:, 1:].clamp(1, VT - 1).contiguous()
+    pred = scores[:, :-1, :].contiguous()
+    t_mask = mask[:, 1:]
+    
+    loss = F.cross_entropy(pred.view(-1, 157), target.view(-1), reduction='none')
+    loss = (loss.view(B, ml - 1) * t_mask).sum() / (t_mask.sum() + 1e-8)
     
     opt.zero_grad()
-    if scaler:
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
-        scaler.step(opt)
-        scaler.update()
-    else:
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
-        opt.step()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
+    opt.step()
     sch.step()
     
     if s % SAVE_EVERY == 0:

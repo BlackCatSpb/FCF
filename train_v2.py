@@ -31,7 +31,7 @@ npy = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
 if not os.path.exists(npy): npy = os.path.join(os.path.dirname(__file__), "real_data", "full_corpus_ids.npy")
 data = np.load(npy, mmap_mode='r').astype(np.int32); total = len(data)
 
-STEPS = 100000; LR = 1e-3; B = 96; ML = 128
+STEPS = 100000; LR = 1e-3; B = 32; ML = 128
 SAVE_EVERY = 10000
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01, betas=(0.9, 0.95))
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
@@ -88,7 +88,7 @@ for s in range(1, STEPS + 1):
                    os.path.join(CKPT, "v2_latest.pt"))
         elapsed = time.time() - t0; eta = (elapsed / s) * (STEPS - s) if s > 0 else 0
         log(f"  step {s:>6d}/{STEPS} | loss={loss.item():.4f} | acc={acc:.3f} | {elapsed/60:.0f}min | eta {eta/60:.0f}min")
-    elif s % 500 == 0:
+    elif s % 200 == 0:
         with torch.no_grad():
             acc = (pred.argmax(-1) == target) & t_mask.bool()
             acc = acc.sum().item() / (t_mask.sum() + 1e-8)

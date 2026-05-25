@@ -111,7 +111,7 @@ for s in range(1, STEPS + 1):
     ut.train(); _, scores = ut(bt, return_scores=True)
     target = bt[:,1:].clamp(1,VT-1).contiguous(); pred = scores[:,:-1].contiguous(); tm = mask[:,1:]
     loss = F.cross_entropy(pred.view(-1,157), target.view(-1), reduction='none')
-    loss = (loss.view(B, ml-1)*tm).sum()/(tm.sum()+1e-8)
+    loss = (loss.view(B, ML-1)*tm).sum()/(tm.sum()+1e-8)
     opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(ut.parameters(),1.0); opt.step(); sch.step()
     
     if s % SAVE_EVERY == 0:

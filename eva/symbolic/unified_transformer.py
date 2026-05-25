@@ -1,254 +1,234 @@
 """
-UnifiedMultidimensionalTransformer — единое ℝ¹² пространство.
+EVA — UnifiedMultidimensionalTransformer v2.
 
-Символ ≡ позиция в ℝ¹². Не индекс.
-Трансформер навигирует по координатам, а не выбирает из словаря.
-FractalAttention на 4 уровнях × 3 масштаба = 12 голов.
-
-Архитектура:
-  Text → CharVocab → координаты из TopologicalField → ℝ¹²
-       → FractalAttention (12 голов) → предсказанная координата
-       → nearest_symbol(координата) → output символ
-
-GPU-native: 12-dim × 12 heads = 144 ops/head — идеально для 2000+ ядер.
+64-dim координатное пространство, 16 голов (4×4), 3 слоя.
+RoPE, RMSNorm, Pre-norm, SwiGLU. ~141K параметров.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch, torch.nn as nn, torch.nn.functional as F, math
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Tuple, Optional
 from dataclasses import dataclass
-from loguru import logger
 
 
 # ============================================================
-# 1. CoordinateEmbedding — символ → ℝ¹² (без lookup)
+# RoPE — Rotary Position Embeddings
+# ============================================================
+
+class RoPE(nn.Module):
+    """Rotary Position Embedding — кодирует позицию поворотом вектора."""
+    
+    def __init__(self, dim: int, max_seq_len: int = 512, theta: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("freqs", freqs)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, D = x.shape
+        positions = torch.arange(L, device=x.device).float()
+        freqs = self.freqs.to(x.device)
+        angles = torch.outer(positions, freqs)  # [L, D/2]
+        
+        cos = angles.cos().unsqueeze(0).unsqueeze(2)  # [1, L, 1, D/2]
+        sin = angles.sin().unsqueeze(0).unsqueeze(2)
+        
+        x_reshaped = x.view(B, L, -1, 2)  # [B, L, D/2, 2]
+        x0, x1 = x_reshaped[..., 0], x_reshaped[..., 1]
+        
+        rotated = torch.stack([
+            x0 * cos.squeeze(2) - x1 * sin.squeeze(2),
+            x1 * cos.squeeze(2) + x0 * sin.squeeze(2),
+        ], dim=-1)
+        
+        return rotated.view(B, L, D)
+
+
+# ============================================================
+# RMSNorm
+# ============================================================
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (LLaMA style)."""
+    
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+
+# ============================================================
+# 1. CoordinateEmbedding — символ → ℝ⁶⁴ (без lookup)
 # ============================================================
 
 class CoordinateEmbedding(nn.Module):
-    """
-    Координатный эмбеддинг.
-    НЕ nn.Embedding. Каждый символ имеет фиксированную позицию в ℝ¹².
-    Позиции загружаются из TopologicalField (MDS на affinity).
-    """
-
-    def __init__(self, vocab_size: int = 156, coord_dim: int = 12):
+    """Координатный эмбеддинг. Позиции из TopologicalField MDS."""
+    
+    def __init__(self, vocab_size: int = 157, coord_dim: int = 64):
         super().__init__()
         self.vocab_size = vocab_size
         self.coord_dim = coord_dim
-
-        # Координаты символов — загружаются извне, не обучаются
-        self.register_buffer("coordinates", torch.randn(vocab_size, coord_dim) * 0.1)
-
-        # Масштабный фактор (обучаемый)
+        self.register_buffer("coordinates", torch.randn(vocab_size, coord_dim) * 0.02)
         self.scale = nn.Parameter(torch.ones(1))
-
+    
     def set_coordinates(self, coords: torch.Tensor):
-        """Загрузить координаты из TopologicalField MDS."""
-        assert coords.shape[0] == self.vocab_size, f"Expected {self.vocab_size}, got {coords.shape[0]}"
+        assert coords.shape[0] == self.vocab_size
         self.coordinates.copy_(coords[:, :self.coord_dim])
-
+    
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """
-        token_ids: [B, L] индексы символов
-        returns: [B, L, coord_dim] координаты в ℝ¹²
-        """
-        # Clamp to valid range
         ids = token_ids.clamp(0, self.vocab_size - 1)
         return self.coordinates[ids] * self.scale
 
 
-class CoordinateDecoder(nn.Module):
-    """
-    Декодер: ℝ¹² → 156 символов.
-    Обучаемый линейный классификатор + nearest neighbor fallback.
-    """
+# ============================================================
+# 2. CoordinateDecoder — ℝ⁶⁴ → 157 символов
+# ============================================================
 
+class CoordinateDecoder(nn.Module):
+    """Обучаемый линейный классификатор + nearest neighbor."""
+    
     def __init__(self, coord_embedding: CoordinateEmbedding):
         super().__init__()
         self.embed = coord_embedding
         self.vocab_size = coord_embedding.vocab_size
         self.coord_dim = coord_embedding.coord_dim
-
-        # Обучаемый линейный классификатор (12 → 156)
-        self.linear = nn.Linear(coord_embedding.coord_dim, coord_embedding.vocab_size)
-
-        # Температура для sharpen распределения
+        
+        self.linear = nn.Linear(self.coord_dim, self.vocab_size)
         self.temperature = nn.Parameter(torch.tensor(1.0))
-        # Learnable weight for nearest-neighbor signal
         self.nn_weight = nn.Parameter(torch.tensor(0.1))
-
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, L, coord_dim] предсказанные координаты
-        returns: [B, L, vocab_size] логиты
-        """
-        # Основной путь: обучаемый линейный слой
         logits = self.linear(x) / self.temperature.clamp(min=0.1)
-
-        # Nearest-neighbor: расстояние до каждого символа
-        coords = self.embed.coordinates  # [V, D]
-        diffs = x.unsqueeze(2) - coords.unsqueeze(0).unsqueeze(0)  # [B, L, V, D]
-        dists = torch.norm(diffs, dim=-1)  # [B, L, V]
-        nn_logits = -dists * self.nn_weight  # scaled by learnable weight
-
+        
+        coords = self.embed.coordinates
+        diffs = x.unsqueeze(2) - coords.unsqueeze(0).unsqueeze(0)
+        dists = torch.norm(diffs, dim=-1)
+        nn_logits = -dists * self.nn_weight
+        
         return logits + nn_logits
-
+    
     def decode_to_ids(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, L, D] → [B, L] индексы ближайших символов."""
-        scores = self.forward(x)  # [B, L, V]
-        return torch.argmax(scores, dim=-1)
-
-    def decode_to_text(self, x: torch.Tensor, char_vocab) -> List[str]:
-        """Декодировать в читаемый текст."""
-        ids = self.decode_to_ids(x)
-        results = []
-        for b in range(ids.shape[0]):
-            text = char_vocab.decode(ids[b].tolist())
-            results.append(text)
-        return results
+        return self.forward(x).argmax(dim=-1)
 
 
 # ============================================================
-# 2. UnifiedMultidimensionalTransformer
+# 3. SwiGLU FFN
+# ============================================================
+
+class SwiGLUFFN(nn.Module):
+    """Gated FFN: (SiLU(x·W_gate) ⊙ (x·W_up)) · W_down"""
+    
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.W_gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.W_up = nn.Linear(dim, hidden_dim, bias=False)
+        self.W_down = nn.Linear(hidden_dim, dim, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = F.silu(self.W_gate(x))
+        up = self.W_up(x)
+        return self.W_down(gate * up)
+
+
+# ============================================================
+# 4. TransformerBlock (Pre-norm, FractalAttention, SwiGLU)
+# ============================================================
+
+class TransformerBlock(nn.Module):
+    """Один блок: Pre-norm Attention + Pre-norm FFN."""
+    
+    def __init__(self, dim: int, num_levels: int = 4, scales_per_level: int = 4,
+                 d_ff: int = 128):
+        super().__init__()
+        self.dim = dim
+        
+        from .fractal_v2 import FractalAttention
+        self.attention = FractalAttention(
+            d_model=dim,
+            num_levels=num_levels,
+            scales_per_level=scales_per_level,
+        )
+        
+        self.norm_attn = RMSNorm(dim)
+        self.norm_ffn = RMSNorm(dim)
+        self.ffn = SwiGLUFFN(dim, d_ff)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-norm Attention
+        attn_out, _ = self.attention(self.norm_attn(x))
+        x = x + attn_out
+        
+        # Pre-norm FFN
+        x = x + self.ffn(self.norm_ffn(x))
+        
+        return x
+
+
+# ============================================================
+# 5. UnifiedMultidimensionalTransformer
 # ============================================================
 
 class UnifiedMultidimensionalTransformer(nn.Module):
-    """
-    Трансформер в едином ℝ¹² пространстве.
-
-    Отличие от PrimordialLayer:
-    - Нет nn.Embedding → CoordinateEmbedding
-    - Нет lm_head → CoordinateDecoder
-    - Вместо CausalSelfAttention → FractalAttention
-    - d_model = 12 (не 256)
-    """
-
+    """Координатный трансформер: 64-dim, 16 голов (4×4), 3 слоя, ~141K params."""
+    
     def __init__(
         self,
-        vocab_size: int = 156,
-        coord_dim: int = 12,
-        num_heads: int = 12,       # 4 уровня × 3 масштаба
+        vocab_size: int = 157,
+        coord_dim: int = 64,
+        num_heads: int = 16,
         num_levels: int = 4,
-        max_scale: int = 3,
-        ff_mult: int = 4,
-        max_seq_len: int = 512,
+        scales_per_level: int = 4,
+        num_layers: int = 3,
+        d_ff: int = 128,
+        max_seq_len: int = 1024,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.coord_dim = coord_dim
-        self.num_heads = num_heads
-        self.num_levels = num_levels
-        self.max_scale = max_scale
-
-        # Координатный эмбеддинг (вместо nn.Embedding)
+        self.num_layers = num_layers
+        
         self.embed = CoordinateEmbedding(vocab_size, coord_dim)
-
-        # FractalAttention (multi-level, multi-scale)
-        from .fractal_v2 import FractalAttention
-        self.attention = FractalAttention(
-            d_model=coord_dim,
-            num_levels=num_levels,
-            scales_per_level=3,
-        )
-
-        # Координатный декодер (вместо lm_head)
+        self.rope = RoPE(coord_dim, max_seq_len)
         self.decoder = CoordinateDecoder(self.embed)
-
-        # Multi-head attention projections (learnable Q, K, V, O)
-        self.attn_heads = 4  # 4 heads × (coord_dim // 4)D each
-        self.W_Q = nn.Linear(coord_dim, coord_dim, bias=False)
-        self.W_K = nn.Linear(coord_dim, coord_dim, bias=False)
-        self.W_V = nn.Linear(coord_dim, coord_dim, bias=False)
-        self.W_O = nn.Linear(coord_dim, coord_dim, bias=False)
-        hidden_dim = coord_dim * ff_mult
-        self.ffn = nn.Sequential(
-            nn.Linear(coord_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, coord_dim),
-        )
-
-        # Normalization
-        self.norm1 = nn.LayerNorm(coord_dim)
-        self.norm2 = nn.LayerNorm(coord_dim)
-
-        # Position encoding (RoPE-like, но для ℝ¹²)
-        self.pos_encoding = nn.Parameter(torch.randn(1, max_seq_len, coord_dim) * 0.02)
-
+        
+        self.layers = nn.ModuleList([
+            TransformerBlock(coord_dim, num_levels, scales_per_level, d_ff)
+            for _ in range(num_layers)
+        ])
+        
+        self.norm_final = RMSNorm(coord_dim)
+    
     def set_symbol_coordinates(self, coords: torch.Tensor):
-        """Загрузить координаты символов из MDS."""
         self.embed.set_coordinates(coords)
-
+    
     def forward(
         self,
-        token_ids: torch.Tensor,  # [B, L]
+        token_ids: torch.Tensor,
         return_scores: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass.
-
-        Returns: (координаты [B, L, coord_dim], scores [B, L, V] если return_scores)
-        """
         B, L = token_ids.shape
-        device = token_ids.device
-
-        # 1. Токены → координаты в ℝ¹²
-        x = self.embed(token_ids)  # [B, L, coord_dim]
-
-        # 2. Добавляем позиционное кодирование
-        pos = self.pos_encoding[:, :L, :].to(device)
-        x = x + pos
-
-        # 3. FractalAttention v2 (multi-level, multi-scale, manifold bias)
-        attn_out, _ = self.attention(x)
-        x = self.norm1(x + attn_out)
-        x = self.norm1(x + attn_out)
-
-        # 4. FFN
-        ffn_out = self.ffn(x)
-        x = self.norm2(x + ffn_out)
-
-        # 5. Декодер: координаты → scores (расстояния до символов)
+        
+        x = self.embed(token_ids)
+        x = self.rope(x)
+        
+        for layer in self.layers:
+            x = layer(x)
+        
+        x = self.norm_final(x)
+        
         scores = None
         if return_scores:
             scores = self.decoder.forward(x)
-
+        
         return x, scores
-
-    @torch.no_grad()
-    def generate(
-        self,
-        prompt_ids: List[int],
-        max_new: int = 128,
-        temperature: float = 0.7,
-    ) -> List[int]:
-        """
-        Генерация: навигация по координатному пространству.
-        """
-        device = next(self.parameters()).device
-        generated = list(prompt_ids)
-        context = list(prompt_ids)
-
-        for _ in range(max_new):
-            # Forward pass
-            inp = torch.tensor([context[-512:]], dtype=torch.long, device=device)
-            coords, scores = self.forward(inp, return_scores=True)
-
-            # Scores для последней позиции
-            last_scores = scores[0, -1] / max(temperature, 0.1)  # [V]
-            probs = F.softmax(last_scores, dim=-1)
-
-            # Sample
-            next_token = torch.multinomial(probs, 1).item()
-            generated.append(next_token)
-            context.append(next_token)
-
-        return generated
-
-    # compute_loss removed — loss is defined in train_full_pipeline.py
-    # (KL divergence + coordinate MSE)
-
+    
     def summary(self) -> str:
         params = sum(p.numel() for p in self.parameters())
-        return f"UnifiedTransformer(dim={self.coord_dim}, heads={self.num_heads}, params={params:,})"
+        return (f"UnifiedTransformer(dim={self.coord_dim}, heads={self.num_layers*4*4}, "
+                f"layers={self.num_layers}, params={params:,})")

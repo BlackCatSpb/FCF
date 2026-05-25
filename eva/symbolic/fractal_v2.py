@@ -23,51 +23,37 @@ from loguru import logger
 
 
 class FractalAttention(nn.Module):
-    """
-    Фрактальное внимание — 12 голов, 4 уровня, 3 масштаба.
-    Интегрируется в UnifiedTransformer вместо ручного multi-head.
-    """
-
-    def __init__(
-        self,
-        d_model: int = 24,
-        num_levels: int = 4,
-        scales_per_level: int = 3,
-    ):
+    """Фрактальное внимание — num_levels × scales_per_level голов."""
+    
+    def __init__(self, d_model: int = 64, num_levels: int = 4, scales_per_level: int = 4):
         super().__init__()
         self.d_model = d_model
         self.num_levels = num_levels
         self.scales_per_level = scales_per_level
-        self.total_heads = num_levels * scales_per_level  # 12
-        self.head_dim = d_model // self.total_heads  # 24//12 = 2
-
-        # Если head_dim слишком мал (<2), группируем головы
+        self.total_heads = num_levels * scales_per_level
+        self.head_dim = d_model // self.total_heads
+        
         if self.head_dim < 2:
-            self.total_heads = d_model // 2  # минимум dim=2 на голову
+            self.total_heads = d_model // 2
             self.head_dim = 2
         self.heads_per_level = self.total_heads // num_levels
-
-        # Q, K, V проекции для всех голов
+        
         self.W_Q = nn.Linear(d_model, self.total_heads * self.head_dim, bias=False)
         self.W_K = nn.Linear(d_model, self.total_heads * self.head_dim, bias=False)
         self.W_V = nn.Linear(d_model, self.total_heads * self.head_dim, bias=False)
         self.W_O = nn.Linear(self.total_heads * self.head_dim, d_model, bias=False)
-
-        # Уровневые bias — обучаемые
+        
         self.level_bias = nn.Parameter(torch.zeros(num_levels, 1, 1))
-
-        # Масштабы для каждого уровня
-        self.scales = nn.Parameter(torch.tensor([1.0, 2.0, 4.0]).repeat(num_levels))
-
-        # Gate-сеть: насколько активен каждый уровень в текущем контексте
+        
+        # Scales: 1, 2, 4, 8 for 4-per-level, or 1, 2, 4 for 3-per-level
+        default_scales = [1.0, 2.0, 4.0, 8.0][:scales_per_level]
+        self.scales = nn.Parameter(torch.tensor(default_scales).repeat(num_levels))
+        
         self.gate_net = nn.Sequential(
-            nn.Linear(d_model, 32),
-            nn.ReLU(),
-            nn.Linear(32, num_levels),
-            nn.Sigmoid(),
+            nn.Linear(d_model, 32), nn.ReLU(),
+            nn.Linear(32, num_levels), nn.Sigmoid(),
         )
-
-        # Координатная проекция: ℝ^D → ℝ^2 (для manifold bias)
+        
         self.coord_proj = nn.Linear(d_model, 2, bias=False)
 
     def compute_manifold_bias(

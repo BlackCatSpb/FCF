@@ -1,7 +1,9 @@
-torch>=2.5.0
+# EVA — Dependencies
+torch>=2.0.0
 numpy>=1.24.0
-faiss-cpu>=1.7.4
-tokenizers>=0.13.0
-datasets>=2.14.0
-scipy>=1.10.0
+scikit-learn>=1.3.0
 loguru>=0.7.0
+psutil>=5.9.0
+conceptnet-lite>=0.2.0
+jupyter>=1.0.0
+ipywidgets>=8.0.0

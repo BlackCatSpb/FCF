@@ -1,0 +1,2 @@
+[19:26:42] START v2: 100000 steps, dim=64, heads=16, layers=3, fp16
+[19:26:42] Model: 140,616 params, batch=96, block=128

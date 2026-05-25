@@ -41,7 +41,9 @@ rng = np.random.RandomState(42)
 def log(msg):
     t = time.strftime("%H:%M:%S"); line = f"[{t}] {msg}"
     print(line, flush=True)
-    with open(LOG, 'a', encoding='utf-8') as f: f.write(line + '\n')
+    with open(LOG, 'a', encoding='utf-8') as f:
+        f.write(line + '\n')
+        f.flush()
 
 log(f"START v2: {STEPS} steps, dim=64, heads=16, layers=3, fp16")
 log(f"Model: {sum(p.numel() for p in ut.parameters()):,} params, batch={B}, block={ML}")
@@ -95,7 +97,7 @@ for s in range(1, STEPS + 1):
                    os.path.join(CKPT, "v2_latest.pt"))
         elapsed = time.time() - t0; eta = (elapsed / s) * (STEPS - s) if s > 0 else 0
         log(f"  step {s:>6d}/{STEPS} | loss={loss.item():.4f} | acc={acc:.3f} | {elapsed/60:.0f}min | eta {eta/60:.0f}min")
-    elif s % 1000 == 0:
+    elif s % 500 == 0:
         with torch.no_grad():
             acc = (pred.argmax(-1) == target) & t_mask.bool()
             acc = acc.sum().item() / (t_mask.sum() + 1e-8)

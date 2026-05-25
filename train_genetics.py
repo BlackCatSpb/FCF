@@ -149,7 +149,13 @@ population = []
 if store.total_stored > 0:
     indices = rng.choice(min(store.total_stored, 5000), POP_SIZE * 2, replace=False)
     for idx in indices:
-        traj = store.trajectories[idx]
+        traj = store.trajectories[idx]  # [L, 24] from old store
+        # Pad to 64-dim
+        if traj.shape[1] < 64:
+            padded = np.zeros((traj.shape[0], 64))
+            padded[:, :traj.shape[1]] = traj
+            padded[:, 24:] = np.random.randn(traj.shape[0], 40) * 0.02
+            traj = padded / (np.linalg.norm(padded, axis=1, keepdims=True) + 1e-8)
         ids = store.ids_list[idx]
         if len(traj) >= 4:
             population.append({'trajectory': traj, 'ids': ids, 'text': store.texts[idx]})
@@ -191,9 +197,9 @@ for gen in range(1, GENERATIONS + 1):
             child = {'trajectory': child_traj, 'ids': child_ids, 'text': ''}
         else:
             # Crossover
-            p1 = random.choice(population[:POP_SIZE//4])  # top quarter
+            p1 = random.choice(population[:POP_SIZE//4])
             p2 = random.choice(population[:POP_SIZE//2])
-            if p1 == p2: p2 = random.choice(population)
+            if id(p1) == id(p2): p2 = random.choice(population)
             child_traj = crossover(p1['trajectory'], p2['trajectory'])
             child = {'trajectory': child_traj, 'ids': p1['ids'], 'text': ''}
         

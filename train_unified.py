@@ -39,7 +39,7 @@ ut = UnifiedMultidimensionalTransformer(vocab_size=157, coord_dim=64, num_levels
     scales_per_level=4, num_layers=3, d_ff=128).to(DEVICE)
 ut.set_symbol_coordinates(coords64)
 
-for ckpt_name in ["gfre_latest.pt", "v2_latest.pt"]:
+for ckpt_name in ["unified_latest.pt", "gfre_latest.pt", "v2_latest.pt"]:
     ckpt_path = os.path.join(CKPT, ckpt_name)
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)

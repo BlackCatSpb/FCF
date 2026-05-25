@@ -45,23 +45,23 @@ npy = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
 if not os.path.exists(npy): npy = os.path.join(os.path.dirname(__file__), "real_data", "full_corpus_ids.npy")
 data = np.load(npy, mmap_mode='r').astype(np.int32); total = len(data)
 
-# Extract sentence-like blocks (contiguous text, bounded by EOS tokens)
-print("Extracting sentence blocks...")
-EOS = 3
-sentence_blocks = []
-i = 0
-while i < total - 1:
-    if data[i] <= 0 or data[i] >= VT:
-        i += 1; continue
-    start = i
-    while i < total and not (data[i] == EOS or data[i] <= 0):
-        i += 1
-    block = data[start:i]
-    valid = block[(block > 0) & (block < VT)]
-    if len(valid) >= 4:
-        sentence_blocks.append(valid.tolist())
-    i += 1
-print(f"  Sentence blocks: {len(sentence_blocks):,} (avg len={np.mean([len(b) for b in sentence_blocks[:10000]]):.0f})")
+def sample_sentence_block(rng, max_len=64):
+    """Pick random position, find sentence boundary, extract contiguous text."""
+    ids_flat = []
+    attempts = 0
+    while len(ids_flat) < max_len and attempts < 20:
+        pos = rng.randint(0, total - 10)
+        # Find non-special start
+        while pos < total - 1 and (data[pos] <= 0 or data[pos] >= VT or data[pos] == 3):
+            pos += 1
+        # Read until EOS or max_len
+        end = min(pos + max_len, total)
+        block = data[pos:end]
+        valid = block[(block > 0) & (block < VT)]
+        ids_flat.extend([int(x) for x in valid])
+        attempts += 1
+    
+    return ids_flat[:max_len]
 
 STEPS = 100000; LR = 3e-4; B = 32; ML = 64
 SAVE_EVERY = 5000; THINK_EVERY = 1000; GEN_EVERY = 5000
@@ -78,26 +78,12 @@ log(f"START: {STEPS} steps, 128-dim, 1.6M params, batch={B}")
 
 t0 = time.time()
 for s in range(1, STEPS + 1):
-    # Sample sentences, concatenate to fill block
-    ids_flat = []
-    while len(ids_flat) < ML:
-        sidx = rng.randint(0, len(sentence_blocks))
-        ids_flat.extend(sentence_blocks[sidx])
-        ids_flat.append(EOS)
-    ids_flat = ids_flat[:ML]
-    
-    bt = torch.full((B, ML), 0, dtype=torch.long, device=DEVICE)
+    bt = torch.zeros(B, ML, dtype=torch.long, device=DEVICE)
     mask = torch.ones(B, ML, device=DEVICE)
-    bt[0, :len(ids_flat)] = torch.tensor(ids_flat, dtype=torch.long, device=DEVICE)
     
-    for bi in range(1, B):
-        ids2 = []
-        while len(ids2) < ML:
-            sidx = rng.randint(0, len(sentence_blocks))
-            ids2.extend(sentence_blocks[sidx])
-            ids2.append(EOS)
-        ids2 = ids2[:ML]
-        bt[bi, :len(ids2)] = torch.tensor(ids2, dtype=torch.long, device=DEVICE)
+    for bi in range(B):
+        ids = sample_sentence_block(rng, ML)
+        bt[bi, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
     
     if mask.sum() < 20: continue
     

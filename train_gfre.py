@@ -94,7 +94,7 @@ if os.path.exists(contra_path):
 # Build GFRE
 # ============================================================
 V_composite = CompositePotentialField(V_real, contradiction, coords64).to(DEVICE)
-solver = GradientFlowSolver(V_composite, ut.decoder, coords64, dt=0.05, max_steps=100)
+solver = GradientFlowSolver(V_composite, ut.decoder, coords64, dt=0.05, max_steps=30)
 reflector = SelfReflection(contradiction, coords64)
 learner = ActiveLearner(entropy_threshold=2.5, confidence_threshold=0.4)
 causal = CausalDiscovery()
@@ -152,45 +152,26 @@ for s in range(1, STEPS + 1):
     ce_loss = F.cross_entropy(pred.view(-1, 157), target.view(-1), reduction='none')
     ce_loss = (ce_loss.view(B, ml - 1) * t_mask).sum() / (t_mask.sum() + 1e-8)
     
-    # === Gradient flow loss (new) ===
-    # Sample a few sequences for gradient flow training
+    # === Gradient flow loss (every 50th step, fast mode) ===
     gf_loss = torch.tensor(0.0, device=DEVICE)
-    with torch.no_grad():
-        for bi in range(min(4, B)):
-            ids = bt[bi][mask[bi].bool()][:16].tolist()
-            if len(ids) < 4: continue
-            
-            z0 = ut.embed(torch.tensor([ids[:4]], dtype=torch.long, device=DEVICE)).mean(dim=1)
-            
-            # Run gradient flow
-            hyps = solver.solve(z0, temperature=0.1, num_hypotheses=1, char_vocab=cv)
-            if hyps:
-                # Target: the equilibrium should be close to actual next symbol coordinate
-                target_z = ut.embed(torch.tensor([[ids[4]]], dtype=torch.long, device=DEVICE)).squeeze(0).squeeze(0)
-                eq_z = torch.tensor(hyps[0].equilibrium_z, device=DEVICE).float()
-                gf_loss = gf_loss + F.mse_loss(eq_z, target_z)
-    
-    gf_loss = gf_loss / 4.0
-    
-    # === Self-reflection + active learning ===
-    with torch.no_grad():
-        uncertain = 0
-        for bi in range(min(8, B)):
-            ids = bt[bi][mask[bi].bool()][:12].tolist()
-            if len(ids) < 4: continue
-            
-            z0 = ut.embed(torch.tensor([ids[:4]], dtype=torch.long, device=DEVICE)).mean(dim=1)
-            hyps = solver.solve(z0, temperature=0.05, num_hypotheses=1, char_vocab=cv)
-            if hyps:
-                diag = reflector.diagnose(hyps[0].trajectory, ids)
-                should, urg, reason = learner.should_query(diagnostic=diag)
-                if should: uncertain += 1
-        
-        if uncertain > 2:
-            total_uncertain += 1
+    if s % 50 == 0:
+        with torch.no_grad():
+            for bi in range(min(2, B)):
+                ids = bt[bi][mask[bi].bool()][:12].tolist()
+                if len(ids) < 4: continue
+                z0 = ut.embed(torch.tensor([ids[:4]], dtype=torch.long, device=DEVICE)).mean(dim=1)
+                hyps = solver.solve(z0, temperature=0.1, num_hypotheses=1, char_vocab=cv)
+                if hyps:
+                    target_z = ut.embed(torch.tensor([[ids[4]]], dtype=torch.long, device=DEVICE)).squeeze(0).squeeze(0)
+                    eq_z = torch.tensor(hyps[0].equilibrium_z, device=DEVICE).float()
+                    gf_loss = gf_loss + F.mse_loss(eq_z, target_z)
+            gf_loss = gf_loss / 2.0
     
     # === Combined loss ===
-    loss = ce_loss + 0.01 * gf_loss
+    if s % 50 == 0:
+        loss = ce_loss + 0.01 * gf_loss
+    else:
+        loss = ce_loss
     
     opt.zero_grad()
     loss.backward()

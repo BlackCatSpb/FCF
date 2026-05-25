@@ -1,1 +1,1 @@
-[19:49:41] START GFRE: 50000 steps, dim=64, layers=3, dual loss (CE + gradient)
+[19:52:30] START GFRE: 50000 steps, dim=64, layers=3, dual loss (CE + gradient)

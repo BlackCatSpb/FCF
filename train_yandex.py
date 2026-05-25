@@ -126,7 +126,10 @@ THINK_EVERY = 2000; SAVE_EVERY = 5000
 
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01, betas=(0.9, 0.95))
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
-scaler = torch.amp.GradScaler('cuda') if DEVICE == 'cuda' else None
+try:
+    scaler = torch.amp.GradScaler('cuda') if DEVICE == 'cuda' else None
+except AttributeError:
+    scaler = torch.cuda.amp.GradScaler() if DEVICE == 'cuda' else None
 rng = np.random.RandomState(42)
 
 def log(msg):
@@ -162,7 +165,11 @@ for s in range(1, STEPS + 1):
         
         if mask.sum() < 50: continue
         
-        with torch.amp.autocast('cuda'):
+        try:
+            ctx = torch.amp.autocast('cuda')
+        except AttributeError:
+            ctx = torch.cuda.amp.autocast()
+        with ctx:
             ut.train()
             _, scores = ut(bt, return_scores=True)
             target = bt[:, 1:].clamp(1, VT - 1).contiguous()

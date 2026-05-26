@@ -58,17 +58,28 @@ while i < total - 1:
 print(f"Sentences: {len(sentences):,}")
 sent_ptr = 0
 
-def gen_text(ids, n=40, T=0.8):
+def gen_text(ids, n=40, T=0.6):
     ids = list(ids)
+    # Cyrillic-only mask: block Latin, digits, special chars during generation
+    cyrillic_mask = torch.zeros(157, device=DEVICE)
+    for i in range(157):
+        ch = cv.decode([i])
+        if ch and (ch.isalpha() and ord(ch) > 127 or ch in ' ,.!?;:()-—…«»\"\'\n'):
+            cyrillic_mask[i] = 1
+    cyrillic_mask[0] = 0  # block PAD
+    
     with torch.no_grad():
         for _ in range(n):
             _, sc = ut(torch.tensor([ids], dtype=torch.long, device=DEVICE), return_scores=True)
             logits = sc[0, -1] / T
+            # Block non-Cyrillic
+            logits = logits + (cyrillic_mask - 1) * 1e9
+            
             sl, si = logits.sort(descending=True); cp = F.softmax(sl, dim=-1).cumsum(dim=-1)
             cut = (cp > 0.95).nonzero(as_tuple=True)[0]
-            k = cut[0].item() + 1 if len(cut) > 0 else 30; k = min(max(k, 3), 50)
+            k = cut[0].item() + 1 if len(cut) > 0 else 20; k = min(max(k, 3), 40)
             v, idx = logits.topk(k); p = F.softmax(v, dim=-1)
-            for t in set(ids[-5:]): m = (idx == t).nonzero(as_tuple=True)[0]; p[m] *= 0.2
+            for t in set(ids[-5:]): m = (idx == t).nonzero(as_tuple=True)[0]; p[m] *= 0.3
             p /= p.sum(); nt = idx[torch.multinomial(p, 1)].item()
             if nt <= 0 or nt >= VT: nt = idx[0].item()
             ids.append(nt)

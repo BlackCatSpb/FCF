@@ -98,6 +98,9 @@ for s in range(1, STEPS + 1):
         with torch.no_grad(): acc = ((pred.argmax(-1) == target) & tm.bool()).sum().item() / (tm.sum() + 1e-8)
         print(f"  {s:>6d} | loss={loss.item():.4f} acc={acc:.3f} | {int((time.time()-t0)/60)}min", flush=True)
     
+    if s % 500 == 0:
+        torch.save({'ut': ut.state_dict(), 'step': s}, os.path.join(CKPT, "wp_latest.pt"))
+    
     if s % 5000 == 0:
         ut.eval()
         print(f"\n  ── GEN @ step {s} ──")
@@ -108,7 +111,5 @@ for s in range(1, STEPS + 1):
                 print(f"  '{w}' → '{gtxt}'")
         print()
         ut.train()
-        torch.save({'ut': ut.state_dict(), 'step': s}, os.path.join(CKPT, f"wp_{s}.pt"))
-        torch.save({'ut': ut.state_dict(), 'step': s}, os.path.join(CKPT, "wp_latest.pt"))
 
 print("Done.")

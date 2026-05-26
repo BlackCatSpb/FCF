@@ -11,6 +11,7 @@ os.makedirs(CKPT, exist_ok=True)
 
 from eva.symbolic.char_vocab import CharacterVocab
 from eva.symbolic.unified_transformer import UnifiedMultidimensionalTransformer
+from eva.symbolic.trajectory_store import TrajectoryStore, HierarchicalTrajectory
 cv = CharacterVocab(); VT = cv.vocab_size
 
 print("=" * 60)
@@ -63,11 +64,109 @@ while i < total - 1:
 print(f"Blocks: {len(blocks):,}")
 sent_ptr = 0
 
+# Trajectory store for hierarchical metadata
+store = TrajectoryStore(max_trajectories=100000)
+
+def extract_hierarchical(ut, ids_list, text):
+    """Extract multi-level metadata from autoencoded text."""
+    if len(ids_list) < 5: return None
+    
+    inp = torch.tensor([ids_list], dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        x, scores, weights = ut(inp, return_scores=True, return_weights=True)
+    
+    traj = x[0].cpu().numpy()  # [L, 128]
+    
+    # Find word boundaries from <W> and </W> tokens
+    w_open = cv.WORD_OPEN_IDX
+    w_close = cv.WORD_CLOSE_IDX
+    boundaries = []
+    in_word = False; start = 0
+    for i, tid in enumerate(ids_list):
+        if tid == w_open:
+            in_word = True; start = i + 1
+        elif tid == w_close and in_word:
+            boundaries.append((start, i))
+            in_word = False
+    
+    if len(boundaries) < 1: return None
+    
+    # Word centroids and weights
+    w_centroids = np.zeros((len(boundaries), 128))
+    w_weights = np.zeros(len(boundaries))
+    for wi, (s, e) in enumerate(boundaries):
+        if e > s:
+            w_centroids[wi] = traj[s:e].mean(axis=0)
+            w_weights[wi] = weights[0, s:e].mean().cpu().item()
+    
+    # Connection coords
+    conn_coords = np.zeros((max(0, len(boundaries)-1), 128))
+    for wi in range(len(boundaries)-1):
+        conn_coords[wi] = w_centroids[wi+1] - w_centroids[wi]
+    
+    sent_centroid = traj.mean(axis=0)
+    
+    return HierarchicalTrajectory(
+        symbol_trajectory=traj, word_boundaries=boundaries,
+        word_centroids=w_centroids, word_weights=w_weights,
+        connection_coords=conn_coords, sentence_centroid=sent_centroid,
+        text=text, ids=ids_list,
+    )
+
 STEPS = 100000; LR = 5e-3; B = 32; ML = 96
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
 
-def gen_text(ids, n=40, T=0.6):
+def multi_level_generate(seed_text, max_new=40, T=0.6):
+    """MultiLevelGenerator: encode → retrieve → fuse → decode."""
+    ids = cv.encode(seed_text)[1:-1]
+    if len(ids) < 2: return seed_text
+    
+    # Encode query
+    htraj = extract_hierarchical(ut, ids, seed_text)
+    if htraj is None or store.total_stored < 5:
+        return gen_text(ids, max_new, T)
+    
+    # Retrieve similar
+    similar = store.find_similar_hierarchical(htraj, top_k=5)
+    if not similar:
+        return gen_text(ids, max_new, T)
+    
+    # Fuse: average the continuation coords from retrieved trajectories
+    fused = htraj.symbol_trajectory.copy()
+    for sim in similar:
+        sim_traj = sim.symbol_trajectory
+        min_len = min(len(fused), len(sim_traj))
+        if min_len > 0:
+            fused[:min_len] = 0.7 * fused[:min_len] + 0.3 * sim_traj[:min_len]
+    
+    # Decode fused coordinates
+    ids_out = list(ids)
+    fused_t = torch.tensor(fused, dtype=torch.float32, device=DEVICE)
+    with torch.no_grad():
+        for _ in range(max_new):
+            inp = torch.tensor([ids_out], dtype=torch.long, device=DEVICE)
+            _, sc = ut(inp, return_scores=True)
+            logits = sc[0, -1] / T
+            
+            # Boost from retrieved next tokens
+            for sim in similar:
+                if len(sim.ids) > len(ids_out):
+                    nxt = sim.ids[len(ids_out)]
+                    if 0 < nxt < VT:
+                        logits[nxt] += 2.0
+            
+            sl, si = logits.sort(descending=True)
+            cp = F.softmax(sl, dim=-1).cumsum(dim=-1)
+            cut = (cp > 0.95).nonzero(as_tuple=True)[0]
+            k = cut[0].item() + 1 if len(cut) > 0 else 20; k = min(max(k, 3), 40)
+            v, idx = logits.topk(k); p = F.softmax(v, dim=-1)
+            for t in set(ids_out[-5:]): m = (idx == t).nonzero(as_tuple=True)[0]; p[m] *= 0.3
+            p /= p.sum(); nt = idx[torch.multinomial(p, 1)].item()
+            if nt <= 0 or nt >= VT: nt = idx[0].item()
+            ids_out.append(nt)
+    
+    return cv.decode(ids_out)
     ids = list(ids)
     mask = torch.zeros(VT, device=DEVICE)
     for i in range(VT):
@@ -114,14 +213,20 @@ for s in range(1, STEPS + 1):
     
     if s % 500 == 0:
         torch.save({'ut': ut.state_dict(), 'step': s}, os.path.join(CKPT, "wp_latest.pt"))
+        # Store hierarchical metadata for a sample block
+        ut.eval()
+        sample = blocks[(s // 500) % len(blocks)]
+        htraj = extract_hierarchical(ut, sample, cv.decode(sample)[:40])
+        if htraj:
+            store.store_hierarchical(htraj)
+        ut.train()
     
     if s % 5000 == 0:
         ut.eval()
-        print(f"\n  GEN @ {s}")
-        for w in ['<S><W>привет</W>', '<S><W>князь</W>', '<S><W>Наташа</W>', '<S><W>война</W>', '<S><W>Пьер</W>']:
-            ids = cv.encode(w)[1:-1]
-            if len(ids) >= 2:
-                print(f"  {w[:20]} -> {gen_text(ids, 35, 0.6)}")
+        print(f"\n  GEN @ {s} (store: {store.total_stored})")
+        for w in ['привет', 'князь', 'Наташа', 'война', 'Пьер']:
+            gtxt = multi_level_generate(w, 35, 0.6)
+            print(f"  '{w}' -> {gtxt}")
         print()
         ut.train()
 

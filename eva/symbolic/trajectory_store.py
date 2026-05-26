@@ -9,25 +9,111 @@ Knowledge = trajectories in ℝ²⁴, not weights.
 
 import torch, numpy as np, pickle, os, time
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+
+@dataclass
+class HierarchicalTrajectory:
+    """Multi-level trajectory — agent's proposed structure."""
+    symbol_trajectory: np.ndarray       # [L, D] — raw coords
+    word_boundaries: List[Tuple[int,int]]  # [(start,end),...]
+    word_centroids: np.ndarray          # [num_words, D]
+    word_weights: np.ndarray            # [num_words]
+    connection_coords: np.ndarray       # [num_words-1, D]
+    sentence_centroid: np.ndarray       # [D]
+    text: str
+    ids: List[int]
+    length: int = 0
+    
+    def __post_init__(self):
+        self.length = len(self.ids)
+
 
 class TrajectoryStore:
     """
-    Хранилище траекторий с быстрым поиском похожих.
-    
-    Каждая запись:
-    - traj: [L, 24] — координаты траектории
-    - ids: [L] — ID символов
-    - text: str — исходный текст
-    - centroid: [24] — центр масс траектории
-    - length: int — длина
+    Хранилище траекторий: flat + hierarchical.
     """
     
-    def __init__(self, max_trajectories=1000000, index_dim=8):
+    def __init__(self, max_trajectories=1000000):
         self.max_trajectories = max_trajectories
-        self.index_dim = index_dim  # use first N dims for indexing
         
-        self.trajectories = []      # list of numpy arrays [L, 24]
-        self.ids_list = []          # list of lists [L]
+        self.trajectories = []      # [L, D] flat
+        self.ids_list = []          # [L]
+        self.texts = []             # str
+        self.centroids = []         # [D]
+        self.first_coords = []      # [D]
+        self.lengths = []           # int
+        self.total_stored = 0
+        
+        # Hierarchical storage
+        self.hierarchical = []      # List[HierarchicalTrajectory]
+    
+    def store_hierarchical(self, htraj: HierarchicalTrajectory):
+        """Store multi-level trajectory (agent's proposed method)."""
+        if self.total_stored >= self.max_trajectories:
+            cutoff = self.max_trajectories // 10
+            self.trajectories = self.trajectories[cutoff:]
+            self.ids_list = self.ids_list[cutoff:]
+            self.texts = self.texts[cutoff:]
+            self.centroids = self.centroids[cutoff:]
+            self.first_coords = self.first_coords[cutoff:]
+            self.lengths = self.lengths[cutoff:]
+            self.hierarchical = self.hierarchical[cutoff:]
+            self.total_stored = len(self.trajectories)
+        
+        self.hierarchical.append(htraj)
+        # Also store flat for backward compat
+        self.trajectories.append(htraj.symbol_trajectory)
+        self.ids_list.append(htraj.ids)
+        self.texts.append(htraj.text)
+        self.centroids.append(htraj.sentence_centroid)
+        self.first_coords.append(htraj.symbol_trajectory[0] if len(htraj.symbol_trajectory) > 0 else np.zeros(htraj.sentence_centroid.shape))
+        self.lengths.append(htraj.length)
+        self.total_stored += 1
+    
+    def find_similar_hierarchical(self, query_htraj, level_weights=None, top_k=10):
+        """Multi-level similarity search (agent's proposed method)."""
+        if level_weights is None:
+            level_weights = {1: 0.4, 2: 0.3, 3: 0.2, 4: 0.1}
+        
+        if not self.hierarchical:
+            return []
+        
+        scores = []
+        for i, h in enumerate(self.hierarchical):
+            s = 0.0
+            
+            # Level 1: Symbol trajectory similarity
+            q_sym = query_htraj.symbol_trajectory
+            h_sym = h.symbol_trajectory
+            min_len = min(len(q_sym), len(h_sym))
+            if min_len > 0:
+                sym_dist = np.linalg.norm(q_sym[:min_len] - h_sym[:min_len], axis=1).mean()
+                s += level_weights.get(1, 0) * (1.0 / (1.0 + sym_dist))
+            
+            # Level 2: Word centroid similarity
+            if len(query_htraj.word_centroids) > 0 and len(h.word_centroids) > 0:
+                q_wc = query_htraj.word_centroids.mean(axis=0)
+                h_wc = h.word_centroids.mean(axis=0)
+                w_sim = np.dot(q_wc, h_wc) / (np.linalg.norm(q_wc) * np.linalg.norm(h_wc) + 1e-8)
+                s += level_weights.get(2, 0) * max(0, w_sim)
+            
+            # Level 3: Connection pattern similarity
+            if len(query_htraj.connection_coords) > 0 and len(h.connection_coords) > 0:
+                q_cc = query_htraj.connection_coords.mean(axis=0)
+                h_cc = h.connection_coords.mean(axis=0)
+                c_sim = np.dot(q_cc, h_cc) / (np.linalg.norm(q_cc) * np.linalg.norm(h_cc) + 1e-8)
+                s += level_weights.get(3, 0) * max(0, c_sim)
+            
+            # Level 4: Sentence centroid distance
+            sc_dist = np.linalg.norm(query_htraj.sentence_centroid - h.sentence_centroid)
+            s += level_weights.get(4, 0) * (1.0 / (1.0 + sc_dist))
+            
+            scores.append((s, i))
+        
+        scores.sort(key=lambda x: x[0], reverse=True)
+        return [self.hierarchical[i] for _, i in scores[:top_k]]
         self.texts = []             # source texts
         self.centroids = []         # [N, 24]
         self.first_coords = []      # [N, 24] — first point (start index)

@@ -11,19 +11,19 @@ os.makedirs(CKPT, exist_ok=True)
 
 from eva.symbolic.char_vocab import CharacterVocab
 from eva.symbolic.unified_transformer import UnifiedMultidimensionalTransformer
-cv = CharacterVocab(); VT = 157
+cv = CharacterVocab(); VT = cv.vocab_size
 
 print("=" * 60)
 print("EVA — War & Peace Training")
 print("=" * 60)
 
 # Fresh coordinates
-c128 = torch.zeros(157, 128, device=DEVICE)
+c128 = torch.zeros(VT, 128, device=DEVICE)
 g = torch.Generator(device=DEVICE).manual_seed(42)
-c128[:, :] = torch.randn(157, 128, generator=g, device=DEVICE) * 0.02
+c128[:, :] = torch.randn(VT, 128, generator=g, device=DEVICE) * 0.02
 c128 = c128 / c128.norm(dim=-1, keepdim=True).clamp(1e-8)
 
-ut = UnifiedMultidimensionalTransformer(vocab_size=157, coord_dim=128, num_levels=8,
+ut = UnifiedMultidimensionalTransformer(vocab_size=VT, coord_dim=128, num_levels=8,
     scales_per_level=4, num_layers=6, d_ff=512).to(DEVICE)
 ut.set_symbol_coordinates(c128)
 print(f"Model: {sum(p.numel() for p in ut.parameters()):,} params")
@@ -61,8 +61,8 @@ sent_ptr = 0
 def gen_text(ids, n=40, T=0.6):
     ids = list(ids)
     # Cyrillic-only mask: block Latin, digits, special chars during generation
-    cyrillic_mask = torch.zeros(157, device=DEVICE)
-    for i in range(157):
+    cyrillic_mask = torch.zeros(VT, device=DEVICE)
+    for i in range(VT):
         ch = cv.decode([i])
         if ch and (ch.isalpha() and ord(ch) > 127 or ch in ' ,.!?;:()-—…«»\"\'\n'):
             cyrillic_mask[i] = 1

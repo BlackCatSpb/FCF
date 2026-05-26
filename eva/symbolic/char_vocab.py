@@ -18,28 +18,65 @@ ALL_CHARS = sorted(set(RUSSIAN_CHARS + LATIN_CHARS + DIGITS + PUNCTUATION))
 
 class CharacterVocab:
     """Символьный словарь: каждый символ — отдельный токен."""
-
+    
     def __init__(self):
         self.PAD_IDX = 0
         self.UNK_IDX = 1
         self.BOS_IDX = 2
         self.EOS_IDX = 3
-
+        
+        self.WORD_OPEN_IDX = 157
+        self.WORD_CLOSE_IDX = 158
+        self.SENT_OPEN_IDX = 159
+        self.SENT_CLOSE_IDX = 160
+        
         self._char_to_idx: Dict[str, int] = {
             "<PAD>": self.PAD_IDX,
             "<UNK>": self.UNK_IDX,
             "<BOS>": self.BOS_IDX,
             "<EOS>": self.EOS_IDX,
+            "<W>": self.WORD_OPEN_IDX,
+            "</W>": self.WORD_CLOSE_IDX,
+            "<S>": self.SENT_OPEN_IDX,
+            "</S>": self.SENT_CLOSE_IDX,
         }
         self._idx_to_char: Dict[int, str] = {v: k for k, v in self._char_to_idx.items()}
-
+        
         idx = 4
         for ch in ALL_CHARS:
             self._char_to_idx[ch] = idx
             self._idx_to_char[idx] = ch
             idx += 1
-
+        
         self.vocab_size = len(self._char_to_idx)
+        self.max_char_idx = idx - 1
+    
+    def encode_with_boundaries(self, text: str) -> List[int]:
+        """Encode text with word and sentence boundary tokens."""
+        import re
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?…])\s+(?=[А-ЯЁA-Z])', text)
+        result = []
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent: continue
+            result.append(self.SENT_OPEN_IDX)
+            # Split sentence into words
+            words = sent.split()
+            for word in words:
+                # Remove punctuation from word boundaries for clean token
+                clean = word.strip('.,;:!?()[]{}«»—–-…\"\'')
+                if clean:
+                    result.append(self.WORD_OPEN_IDX)
+                    for ch in clean:
+                        result.append(self._char_to_idx.get(ch, self.UNK_IDX))
+                    result.append(self.WORD_CLOSE_IDX)
+                # Add punctuation back as separate tokens
+                for ch in word:
+                    if ch in '.,;:!?()[]{}«»—–-…\"\'':
+                        result.append(self._char_to_idx.get(ch, self.UNK_IDX))
+            result.append(self.SENT_CLOSE_IDX)
+        return result
 
     def encode(self, text: str) -> List[int]:
         """Кодирует текст в последовательность символьных индексов."""

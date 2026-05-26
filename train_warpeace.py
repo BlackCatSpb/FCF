@@ -38,6 +38,26 @@ opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
 rng = np.random.RandomState(42)
 
+# Sequential with random offset per block: covers ALL text
+sentences = []
+i = 0
+while i < total - 1:
+    if data[i] == cv.EOS_IDX:
+        start = i + 1
+    else:
+        start = i
+    # Find EOS
+    while i < total and data[i] != cv.EOS_IDX:
+        i += 1
+    sent = data[start:i]
+    valid = sent[(sent > 0) & (sent < VT)]
+    if len(valid) >= 4:
+        sentences.append(valid.tolist())
+    i += 1
+
+print(f"Sentences: {len(sentences):,}")
+sent_ptr = 0
+
 def gen_text(ids, n=40, T=0.8):
     ids = list(ids)
     with torch.no_grad():
@@ -56,15 +76,17 @@ def gen_text(ids, n=40, T=0.8):
 
 t0 = time.time()
 for s in range(1, STEPS + 1):
-    # Sample contiguous blocks
+    # Sequential sentence-based sampling (covers ALL text in order)
     bt = torch.zeros(B, ML, dtype=torch.long, device=DEVICE)
     mask = torch.ones(B, ML, device=DEVICE)
     for bi in range(B):
-        pos = rng.randint(0, max(1, total - ML))
-        ids = data[pos:pos+ML]
-        valid = ids[(ids > 0) & (ids < VT)]
-        vl = min(len(valid), ML)
-        if vl > 0: bt[bi, :vl] = torch.from_numpy(valid[:vl].astype(np.int64)).to(DEVICE)
+        ids_flat = []
+        while len(ids_flat) < ML:
+            ids_flat.extend(sentences[sent_ptr % len(sentences)])
+            ids_flat.append(cv.EOS_IDX)
+            sent_ptr += 1
+        ids_flat = ids_flat[:ML]
+        bt[bi, :len(ids_flat)] = torch.tensor(ids_flat, dtype=torch.long, device=DEVICE)
     
     ut.train(); _, scores = ut(bt, return_scores=True)
     target = bt[:, 1:].clamp(1, VT-1).contiguous(); pred = scores[:, :-1].contiguous(); tm = mask[:, 1:]

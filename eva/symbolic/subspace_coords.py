@@ -27,7 +27,8 @@ class MultiSubspaceEmbedding(nn.Module):
     
     def set_coordinates(self, coords):
         assert coords.shape[0] == self.vocab_size
-        self.symbol_coords.copy_(coords[:, :self.sym_dim])
+        with torch.no_grad():
+            self.symbol_coords.copy_(coords[:, :self.sym_dim])
     
     def forward(self, token_ids):
         ids = token_ids.clamp(0, self.vocab_size - 1)

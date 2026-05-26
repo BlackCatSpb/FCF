@@ -220,6 +220,10 @@ for s in range(1, STEPS + 1):
         if htraj:
             store.store_hierarchical(htraj)
         ut.train()
+        
+        # Save store periodically
+        if s % 5000 == 0 and store.total_stored > 0:
+            store.save(os.path.join(CKPT, "trajectory_store.pkl"))
     
     if s % 5000 == 0:
         ut.eval()

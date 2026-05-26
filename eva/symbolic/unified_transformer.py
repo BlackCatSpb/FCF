@@ -183,6 +183,10 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         self.rope = RoPE(coord_dim, max_seq_len)
         self.decoder = CoordinateDecoder(self.embed)
         
+        # Multi-subspace projections (agent Phase 3)
+        from .subspace_coords import MultiSubspaceEmbedding
+        self.subspace = MultiSubspaceEmbedding(vocab_size, coord_dim, sym_dim=32)
+        
         self.layers = nn.ModuleList([
             TransformerBlock(coord_dim, max_levels, total_heads, d_ff)
             for _ in range(num_layers)
@@ -190,20 +194,27 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         
         self.norm_final = RMSNorm(coord_dim)
         
-        # Word weight encoder
         from .subspace_coords import WordWeightEncoder
         self.word_weight = WordWeightEncoder(coord_dim)
         
-        # Connection coordinate head
         from .adaptive_fractal import ConnectionCoordinateHead
         self.connection_head = ConnectionCoordinateHead(coord_dim)
     
     def set_symbol_coordinates(self, coords: torch.Tensor):
         self.embed.set_coordinates(coords)
+        self.subspace.set_coordinates(coords)
     
     def forward(self, token_ids, return_scores=False, return_weights=False):
         B, L = token_ids.shape
+        
+        # Base symbol embedding
         x = self.embed(token_ids)
+        
+        # Multi-subspace: enrich with word/connection/sentence projections
+        sym = self.subspace(token_ids)  # [B, L, 32]
+        # Pad sym to full dim and add to base
+        x = x + F.pad(sym, (0, self.coord_dim - 32))
+        
         x = self.rope(x)
         
         for layer in self.layers:

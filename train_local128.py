@@ -45,21 +45,29 @@ npy = os.path.join(os.path.dirname(__file__), "real_data", "connected_ru.npy")
 if not os.path.exists(npy): npy = os.path.join(os.path.dirname(__file__), "real_data", "full_corpus_ids.npy")
 data = np.load(npy, mmap_mode='r').astype(np.int32); total = len(data)
 
-def sample_sentence_block(rng, max_len=64):
-    """Pick random position, find sentence boundary, extract contiguous text."""
+# Also load Wikipedia for diversity
+wiki_path = os.path.join(os.path.dirname(__file__), "real_data", "wiki_ru.npy")
+wiki_data = np.load(wiki_path, mmap_mode='r').astype(np.int32) if os.path.exists(wiki_path) else None
+wiki_total = len(wiki_data) if wiki_data is not None else 0
+print(f"Corpus: {total/1e6:.1f}M + Wiki: {wiki_total/1e6:.1f}M tokens")
+
+def sample_block(rng, max_len=64):
+    """Pick from connected_ru (70%) or wiki (30%)."""
+    if wiki_data is not None and rng.random() < 0.3:
+        src, limit = wiki_data, wiki_total
+    else:
+        src, limit = data, total
+    
     ids_flat = []
-    attempts = 0
-    while len(ids_flat) < max_len and attempts < 20:
-        pos = rng.randint(0, total - 10)
-        # Find non-special start
-        while pos < total - 1 and (data[pos] <= 0 or data[pos] >= VT or data[pos] == 3):
+    for _ in range(10):
+        pos = rng.randint(0, limit - 10)
+        while pos < limit - 1 and (src[pos] <= 0 or src[pos] >= VT or src[pos] == 3):
             pos += 1
-        # Read until EOS or max_len
-        end = min(pos + max_len, total)
-        block = data[pos:end]
+        end = min(pos + max_len, limit)
+        block = src[pos:end]
         valid = block[(block > 0) & (block < VT)]
         ids_flat.extend([int(x) for x in valid])
-        attempts += 1
+        if len(ids_flat) >= max_len: break
     
     return ids_flat[:max_len]
 
@@ -82,7 +90,7 @@ for s in range(1, STEPS + 1):
     mask = torch.ones(B, ML, device=DEVICE)
     
     for bi in range(B):
-        ids = sample_sentence_block(rng, ML)
+        ids = sample_block(rng, ML)
         bt[bi, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
     
     if mask.sum() < 20: continue

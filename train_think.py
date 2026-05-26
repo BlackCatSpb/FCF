@@ -73,14 +73,22 @@ ut = UnifiedMultidimensionalTransformer(vocab_size=157, coord_dim=64, num_levels
 ut.set_symbol_coordinates(coords64)
 
 # Load best weights
-for ckpt_name in ["gfre_latest.pt", "v2_latest.pt"]:
-    ckpt_path = os.path.join(CKPT, ckpt_name)
+# Load best weights — War & Peace checkpoint
+for ckpt_name in ["wp_latest.pt"]:
+    ckpt_path = os.path.join(CKPT_DIR, ckpt_name)
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
         if 'ut' in ckpt: ut.load_state_dict(ckpt['ut'], strict=False)
         else: ut.load_state_dict(ckpt['model'], strict=False)
         print(f"Loaded: {ckpt_name}")
         break
+else:
+    print("No checkpoint found — waiting 30s...")
+    time.sleep(30)
+    if os.path.exists(os.path.join(CKPT_DIR, "wp_latest.pt")):
+        ckpt = torch.load(os.path.join(CKPT_DIR, "wp_latest.pt"), map_location='cpu', weights_only=True)
+        ut.load_state_dict(ckpt['ut'], strict=False)
+        print("Loaded: wp_latest.pt")
 ut.eval()
 
 # Load TrajectoryStore
@@ -169,7 +177,7 @@ def contemplate(seed_z=None, steps=10) -> list:
     
     return discoveries
 
-def think_loop(minutes=60, perceive_every=10, contemplate_every=30):
+def think_loop(minutes=60*24, perceive_every=30, contemplate_every=60):
     """Main continuous think loop."""
     log(f"THINK LOOP START: {minutes}min, perceive={perceive_every}s, contemplate={contemplate_every}s")
     

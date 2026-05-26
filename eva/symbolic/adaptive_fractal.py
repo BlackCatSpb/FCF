@@ -126,8 +126,9 @@ class AdaptiveFractalAttention(nn.Module):
                 level_outputs.append(out)
             
             if level_outputs:
-                level_out = torch.stack(level_outputs, dim=1)  # [B, n_heads, L, Dh]
-                level_out = level_out.permute(0, 2, 1, 3).reshape(B, L, n_heads * Dh)  # [B, L, n_heads*Dh]
+                actual_n = len(level_outputs)
+                level_out = torch.stack(level_outputs, dim=1)  # [B, actual_n, L, Dh]
+                level_out = level_out.permute(0, 2, 1, 3).reshape(B, L, actual_n * Dh)
                 outputs.append(level_out)
             
             head_offset += n_heads

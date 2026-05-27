@@ -248,7 +248,28 @@ for s in range(1, STEPS + 1):
     
     if s % 50 == 0:
         with torch.no_grad(): acc = ((pred.argmax(-1) == target) & tm.bool()).sum().item() / (tm.sum() + 1e-8)
-        print(f"  {s:>6d} | loss={loss.item():.4f} acc={acc:.3f} | {int((time.time()-t0)/60)}min", flush=True)
+        elapsed = int((time.time()-t0)/60)
+        print(f"  {s:>6d} | loss={loss.item():.4f} acc={acc:.3f} | {elapsed}min", flush=True)
+        
+        # Mini-consolidation: perception + generation + store
+        if s % 50 == 0 and store.total_stored < 5000:
+            ut.eval()
+            with torch.no_grad():
+                # Perception: autoencode random block
+                pos = rng.randint(0, max(1, total - 32))
+                pids = [int(x) for x in data[pos:pos+32] if 0 < x < VT]
+                if len(pids) >= 8:
+                    inp = torch.tensor([pids], dtype=torch.long, device=DEVICE)
+                    emb = ut.embed(inp)
+                    htraj = HierarchicalTrajectory(
+                        symbol_trajectory=emb[0].cpu().numpy(),
+                        word_boundaries=[], word_centroids=np.zeros((0,128)),
+                        word_weights=np.zeros(0), connection_coords=np.zeros((0,128)),
+                        sentence_centroid=emb[0].mean(dim=0).cpu().numpy(),
+                        text=cv.decode(pids)[:30], ids=pids,
+                    )
+                    store.store_hierarchical(htraj)
+            ut.train()
     
     if s % 500 == 0:
         torch.save({'ut': ut.state_dict(), 'step': s}, os.path.join(CKPT, "wp_latest.pt"))

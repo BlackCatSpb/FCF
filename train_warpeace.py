@@ -2,7 +2,8 @@
 EVA — Hierarchical Training on War & Peace.
 Boundary tokens <W></W> <S></S>, adaptive levels, word weights.
 """
-import torch, torch.nn.functional as F, numpy as np, sys, os, time, re
+
+import torch, torch.nn as nn, torch.nn.functional as F, numpy as np, sys, os, time, re
 sys.path.insert(0, os.path.dirname(__file__))
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -11,6 +12,7 @@ os.makedirs(CKPT, exist_ok=True)
 
 from eva.symbolic.char_vocab import CharacterVocab
 from eva.symbolic.unified_transformer import UnifiedMultidimensionalTransformer
+from eva.symbolic.fractal_conv import TrajectoryPredictor
 from eva.symbolic.trajectory_store import TrajectoryStore, HierarchicalTrajectory
 cv = CharacterVocab(); VT = cv.vocab_size
 
@@ -29,16 +31,37 @@ ut = UnifiedMultidimensionalTransformer(vocab_size=VT, coord_dim=128, max_levels
     total_heads=32, num_layers=6, d_ff=128).to(DEVICE)
 ut.set_symbol_coordinates(c128)
 
+# ===== TrajLoss: auxiliary головка для предсказания следующей координаты =====
+traj_predictor = TrajectoryPredictor(128).to(DEVICE)
+traj_loss_weight = 0.1  # коэффициент aux loss
+
+# ===== Dilated KV-Cache: храним прореженные K/V для экономии VRAM =====
+dilated_kv_active = True  # можно отключить для сравнения
+dilated_rates = [1, 2, 4, 8]  # для каждого уровня attention
+
+def apply_dilated_kv(embeddings, level):
+    """Subsample embeddings: для level>0 храним каждый rate-й токен."""
+    rate = dilated_rates[min(level, len(dilated_rates)-1)]
+    if rate <= 1 or not dilated_kv_active:
+        return embeddings
+    L = embeddings.shape[1]
+    indices = torch.arange(0, L, rate, device=embeddings.device)
+    return embeddings[:, indices, :]
+
 # Resume from checkpoint if exists
 start_step = 0
 wp_path = os.path.join(CKPT, "wp_latest.pt")
 if os.path.exists(wp_path):
     ckpt = torch.load(wp_path, map_location='cpu', weights_only=True)
     ut.load_state_dict(ckpt['ut'], strict=False)
+    if 'traj_predictor' in ckpt:
+        traj_predictor.load_state_dict(ckpt['traj_predictor'])
     start_step = ckpt.get('step', 0)
     print(f"Resumed from step {start_step}")
 
 print(f"Model: {sum(p.numel() for p in ut.parameters()):,} params")
+traj_params = sum(p.numel() for p in traj_predictor.parameters())
+print(f"TrajPredictor: {traj_params:,} params (aux loss)")
 
 # Load & encode War & Peace with boundaries (skip if already have data)
 npy_path = os.path.join(os.path.dirname(__file__), "real_data", "war_and_peace_boundary.npy")
@@ -134,9 +157,29 @@ def extract_hierarchical(ut, ids_list, text):
     )
 
 STEPS = 100000; LR = 5e-3; B = 8; ML = 128
-opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01)
+opt = torch.optim.AdamW(list(ut.parameters()) + list(traj_predictor.parameters()), lr=LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
 rng = np.random.RandomState(42)
+
+
+def traj_loss_fn(hidden_states, token_ids):
+    """
+    TrajLoss: предсказать следующую 128d координату из hidden states последнего слоя.
+    hidden_states: [B, L, 128] — выход трансформера (norm_final)
+    token_ids: [B, L]
+    """
+    with torch.no_grad():
+        next_hidden = ut.embed(token_ids[:, 1:])  # [B, L-1, 128]
+        next_hidden = next_hidden / (next_hidden.norm(dim=-1, keepdim=True) + 1e-8)
+    
+    current = hidden_states[:, :-1, :]  # [B, L-1, 128]
+    delta_pred = traj_predictor(current)  # [B, L-1, 128]
+    
+    next_pred = current + delta_pred
+    next_pred = next_pred / (next_pred.norm(dim=-1, keepdim=True) + 1e-8)
+    
+    loss = F.mse_loss(next_pred, next_hidden)
+    return loss
 
 def multi_level_generate(seed_text, max_new=40, T=0.6):
     """MultiLevelGenerator: encode → retrieve → fuse → decode."""
@@ -207,30 +250,10 @@ def multi_level_generate(seed_text, max_new=40, T=0.6):
             ids_out.append(nt)
     
     return cv.decode(ids_out)
-    ids = list(ids)
-    mask = torch.zeros(VT, device=DEVICE)
-    for i in range(VT):
-        ch = cv.decode([i])
-        if ch and (ch.isalpha() and ord(ch) > 127 or ch in ' ,.!?;:()-…«»\"\'\n' or '<W>' in ch or '</W>' in ch or '<S>' in ch or '</S>' in ch):
-            mask[i] = 1
-    mask[0] = 0
-    with torch.no_grad():
-        for _ in range(n):
-            _, sc = ut(torch.tensor([ids], dtype=torch.long, device=DEVICE), return_scores=True)
-            logits = sc[0, -1] / T
-            logits = logits + (mask - 1) * 1e9
-            sl, si = logits.sort(descending=True); cp = F.softmax(sl, dim=-1).cumsum(dim=-1)
-            cut = (cp > 0.95).nonzero(as_tuple=True)[0]
-            k = cut[0].item() + 1 if len(cut) > 0 else 20; k = min(max(k, 3), 40)
-            v, idx = logits.topk(k); p = F.softmax(v, dim=-1)
-            for t in set(ids[-5:]): m = (idx == t).nonzero(as_tuple=True)[0]; p[m] *= 0.3
-            p /= p.sum(); nt = idx[torch.multinomial(p, 1)].item()
-            if nt <= 0 or nt >= VT: nt = idx[0].item()
-            ids.append(nt)
-    return cv.decode(ids)
+
 
 t0 = time.time()
-for s in range(1, STEPS + 1):
+for s in range(1 + start_step, STEPS + 1):
     bt = torch.zeros(B, ML, dtype=torch.long, device=DEVICE)
     mask = torch.ones(B, ML, device=DEVICE)
     for bi in range(B):
@@ -241,22 +264,40 @@ for s in range(1, STEPS + 1):
         ids_flat = ids_flat[:ML]
         bt[bi, :len(ids_flat)] = torch.tensor(ids_flat, dtype=torch.long, device=DEVICE)
     
-    ut.train(); _, scores = ut(bt, return_scores=True)
+    ut.train(); hiddens, scores = ut(bt, return_scores=True)
     target = bt[:, 1:].clamp(1, VT-1).contiguous(); pred = scores[:, :-1].contiguous(); tm = mask[:, 1:]
+    
+    # Основной CE-loss
     loss = F.cross_entropy(pred.view(-1, VT), target.view(-1), reduction='none')
     loss = (loss.view(B, ML-1) * tm).sum() / (tm.sum() + 1e-8)
-    opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0); opt.step(); sch.step()
+    
+    # SubHSM group auxiliary loss: группа из hidden states
+    h_for_group = hiddens[:, :-1].contiguous()
+    group_logits = ut.decoder.group_classifier(h_for_group)  # [B, L-1, 4]
+    target_groups = ut.decoder.group_ids[target]  # [B, L-1]
+    group_loss = F.cross_entropy(group_logits.view(-1, 4), target_groups.view(-1), reduction='none')
+    group_loss = (group_loss.view(B, ML-1) * tm).sum() / (tm.sum() + 1e-8)
+    loss = loss + 0.05 * group_loss
+    
+    # TrajLoss: предсказание следующей координаты из hidden states
+    t_loss = traj_loss_fn(hiddens, bt)
+    loss = loss + traj_loss_weight * t_loss
+    
+    opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(ut.parameters(), 1.0)
+    torch.nn.utils.clip_grad_norm_(traj_predictor.parameters(), 1.0)
+    opt.step(); sch.step()
     
     if s % 50 == 0:
         with torch.no_grad(): acc = ((pred.argmax(-1) == target) & tm.bool()).sum().item() / (tm.sum() + 1e-8)
         elapsed = int((time.time()-t0)/60)
-        print(f"  {s:>6d} | loss={loss.item():.4f} acc={acc:.3f} | {elapsed}min", flush=True)
+        tloss_val = t_loss.item()
+        gloss_val = group_loss.item()
+        print(f"  {s:>6d} | loss={loss.item():.4f} acc={acc:.3f} traj={tloss_val:.4f} grp={gloss_val:.3f} | {elapsed}min", flush=True)
         
-        # Mini-consolidation: perception + generation + store
+        # Mini-consolidation: perception + generation + store (каждые 50 шагов)
         if s % 50 == 0 and store.total_stored < 5000:
             ut.eval()
             with torch.no_grad():
-                # Perception: autoencode random block
                 pos = rng.randint(0, max(1, total - 32))
                 pids = [int(x) for x in data[pos:pos+32] if 0 < x < VT]
                 if len(pids) >= 8:
@@ -269,16 +310,21 @@ for s in range(1, STEPS + 1):
                         sentence_centroid=emb[0].mean(dim=0).cpu().numpy(),
                         text=cv.decode(pids)[:30], ids=pids,
                     )
+                    # Learnable consolidation
+                    htraj = store.consolidate(htraj, device=DEVICE)
                     store.store_hierarchical(htraj)
             ut.train()
     
     if s % 500 == 0:
-        torch.save({'ut': ut.state_dict(), 'step': s}, os.path.join(CKPT, "wp_latest.pt"))
+        torch.save({
+            'ut': ut.state_dict(),
+            'traj_predictor': traj_predictor.state_dict(),
+            'step': s
+        }, os.path.join(CKPT, "wp_latest.pt"))
         # Build static topology every 5000 steps
         if s % 5000 == 0 and s > 0:
             ut.eval()
             affinity = torch.eye(VT) * 0.5
-            # Simple affinity from co-occurrence in training blocks
             with torch.no_grad():
                 aff = torch.zeros(VT, VT, device=DEVICE)
                 for _ in range(50):
@@ -298,7 +344,31 @@ for s in range(1, STEPS + 1):
         sample = blocks[(s // 500) % len(blocks)]
         htraj = extract_hierarchical(ut, sample, cv.decode(sample)[:40])
         if htraj:
+            htraj = store.consolidate(htraj, device=DEVICE)
             store.store_hierarchical(htraj)
+        
+        # Generate sample every 500 steps
+        seeds = ["Я", "Он", "Мы", "—"]
+        gen_texts = []
+        with torch.no_grad():
+            for sd in seeds:
+                gids = list(sd.encode('utf-8'))
+                ids_out = gids[:3]
+                for _ in range(30):
+                    inp = torch.tensor([ids_out], dtype=torch.long, device=DEVICE)
+                    _, sc = ut(inp, return_scores=True)
+                    logits = sc[0, -1] / 0.8
+                    sl, si = logits.sort(descending=True)
+                    v = sl[:15]; idx = si[:15]; p = F.softmax(v, dim=-1)
+                    for t in set(ids_out[-5:]):
+                        m = (idx == t).nonzero(as_tuple=True)[0]
+                        if len(m) > 0: p[m[0]] *= 0.3
+                    p /= p.sum()
+                    nt = idx[torch.multinomial(p, 1)].item()
+                    if nt < 4: nt = idx[0].item()
+                    ids_out.append(nt)
+                gen_texts.append(cv.decode(ids_out)[:60])
+        print(f"  Gen500: {gen_texts[0][:40]}|{gen_texts[1][:40]}")
         ut.train()
         
         # Save store periodically
@@ -319,6 +389,7 @@ for s in range(1, STEPS + 1):
         print(f"  Coherent generations: {results.get('coherent_ratio',0):.0%}")
         print(f"  Avg confidence: {results.get('avg_confidence',0):.3f}")
         print(f"  Avg curvature: {results.get('avg_curvature',0):.4f}")
+        print(f"  TrajLoss: {t_loss.item():.4f}")
         
         print(f"\n  Generation samples:")
         for seed, text in results.get('generation', {}).items():

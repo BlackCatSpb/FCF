@@ -91,7 +91,7 @@ class CoordinateEmbedding(nn.Module):
 # ============================================================
 
 class CoordinateDecoder(nn.Module):
-    """Обучаемый линейный классификатор + nearest neighbor."""
+    """Subspace Hierarchical Softmax (SubHSM) + nearest neighbor."""
     
     def __init__(self, coord_embedding: CoordinateEmbedding):
         super().__init__()
@@ -102,19 +102,72 @@ class CoordinateDecoder(nn.Module):
         self.linear = nn.Linear(self.coord_dim, self.vocab_size)
         self.temperature = nn.Parameter(torch.tensor(1.0))
         self.nn_weight = nn.Parameter(torch.tensor(0.1))
+        
+        # --- SubHSM: 4 группы по ~40 токенов ---
+        n_groups = 4
+        group_size = (self.vocab_size + n_groups - 1) // n_groups
+        self.group_size = group_size
+        
+        # Register buffer: group_id and local_id for each vocab token
+        group_ids = torch.zeros(self.vocab_size, dtype=torch.long)
+        local_ids = torch.zeros(self.vocab_size, dtype=torch.long)
+        for i in range(self.vocab_size):
+            group_ids[i] = i // group_size
+            local_ids[i] = i % group_size
+        self.register_buffer('group_ids', group_ids)
+        self.register_buffer('local_ids', local_ids)
+        
+        self.group_classifier = nn.Linear(self.coord_dim, n_groups)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Full logits
         logits = self.linear(x) / self.temperature.clamp(min=0.1)
         
+        # Nearest neighbor branch
         coords = self.embed.coordinates
         diffs = x.unsqueeze(2) - coords.unsqueeze(0).unsqueeze(0)
         dists = torch.norm(diffs, dim=-1)
         nn_logits = -dists * self.nn_weight
         
-        return logits + nn_logits
+        full_logits = logits + nn_logits
+        
+        # --- SubHSM auxiliary logits ---
+        group_logits = self.group_classifier(x)  # [B, L, 4]
+        full_logits = full_logits + group_logits[:, :, :1] * 0  # no-op, just for group aux
+        
+        return full_logits
+    
+    def forward_subhsm(self, x: torch.Tensor):
+        """Returns (full_logits, group_logits) for combined loss."""
+        B, L, D = x.shape
+        full_logits = self.forward(x)
+        
+        # Aggregate per-group log-sum-exp
+        gs = self.group_size
+        n_groups = 4
+        group_logits = torch.stack([
+            full_logits[:, :, g*gs:(g+1)*gs].logsumexp(dim=-1)
+            for g in range(n_groups)
+        ], dim=-1)  # [B, L, 4]
+        
+        return full_logits, group_logits
     
     def decode_to_ids(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward(x).argmax(dim=-1)
+        logits = self.forward(x)
+        # Fast hierarchical decoding: top group → top token in group
+        group_logits = self.group_classifier(x)  # [B, L, 4]
+        best_group = group_logits.argmax(dim=-1)  # [B, L]
+        gs = self.group_size
+        B, L = best_group.shape
+        result = torch.zeros(B, L, dtype=torch.long, device=x.device)
+        for b in range(B):
+            for i in range(L):
+                g = best_group[b, i].item()
+                start = g * gs
+                end = min(start + gs, self.vocab_size)
+                local_logits = logits[b, i, start:end]
+                result[b, i] = start + local_logits.argmax()
+        return result
 
 
 # ============================================================
@@ -220,8 +273,11 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         
         x = self.rope(x)
         
+        # Coordinate Residual Stream — сквозной поток координат
+        coord_stream = torch.zeros_like(x)
+        
         for layer in self.layers:
-            x = layer(x, token_ids)
+            x, coord_stream = layer(x, token_ids=token_ids, coord_stream=coord_stream)
         
         x = self.norm_final(x)
         

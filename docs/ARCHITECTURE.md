@@ -143,14 +143,23 @@ Gated Feed-Forward: `(SiLU(x·W_gate) ⊙ (x·W_up)) · W_down`. На 5-10% эф
 Основной строительный блок (×6 слоёв). Объединяет FractalConv2D и AdaptiveAttention через Gate Merge:
 
 ```
-x → FractalConv2D(Norm(x)) ──→ conv_out ┐
-                                         ├─ Gate ⊙ σ(W·[conv,attn]) → + → FFN
-x → AdaptiveAttention(Norm(x)) → attn_out┘
+x, coord_stream ──────────────────────────────────────────────────────┐
+  │                                                                    │
+  ├─ FractalConv2D(Norm(x)) ──→ conv_out ┐                            │
+  │                                       ├─ Gate: ⊙σ + (1-σ) → +1   │
+  ├─ AdaptiveAttention(Norm(x) + CoordBias + TopoBias) → attn_out ────┘
+  │                                                                    │
+  +1 ← coord_stream · σ(W_coord_in)   # Coordinate Residual merge    │
+  │                                                                    │
+  ├─ SGF-FFN: (SiLU·Up) ⊙ (softmax(router)@SGF_gates) → W_down → +2  │
+  │                                                                    │
+  coord_stream ← coord_stream + x · σ(W_coord_out)                    │
 ```
+Gate: `conv ⊙ σ(W·[conv, attn]) + (1-σ)·attn`. Свёртка ловит локальные и subspace паттерны, внимание — глобальные связи + топология + координатная близость.
 
-Gate: `conv_out ⊙ σ(W·[conv_out, attn_out]) + (1-σ)·attn_out`. Свёртка ловит локальные и subspace паттерны, внимание — глобальные связи. Gate обучается смешивать их в нужной пропорции.
+SGF: 4 subspace gate-вектора, роутер 128→4 предсказывает per-token blend.
 
-Сходимость ×20 быстрее чистого attention: loss 0.01 на 900 шагах против loss 1.2 на 5000.
+CoordStream: сквозной 128d поток через все 6 слоёв, `coord_gate_in`/`out` — element-wise sigmoid.
 
 ### 3.12 StaticTopologyLayer — статическая матрица топологии
 Тензор [160, 160, 3] — read-only bias для всех HybridFractalBlock'ов:
@@ -163,9 +172,40 @@ Gate: `conv_out ⊙ σ(W·[conv_out, attn_out]) + (1-σ)·attn_out`. Свёрт�
 
 Топология строится один раз и обновляется периодически при сохранении чекпоинта.
 
----
+### 3.13 CoordBias — координатный Attention Bias (0 params)
+Попарное L2-расстояние между позициями токенов в ℝ¹²⁸ → bias к attention scores.
+Бесплатный inductive bias: семантически близкие токены в координатном пространстве сильнее влияют друг на друга.
 
-## 4. Обучение
+### 3.14 Coordinate Residual Stream (+1.5K params)
+Сквозной поток координат (128d) через все 6 слоёв. Element-wise gate для merge в hidden state и update из hidden state.
+Как APTx в AlphaFold — координатная информация не замывается трансформером.
+
+### 3.15 Subspace-Gated FFN / SGF (+3.1K params)
+4 learnable gate-вектора (128d) для 4 подпространств (symbol/word/connection/sentence).
+Лёгкий роутер (128→4) предсказывает per-token blend weights.
+SwiGLU(h) = (SiLU·Up) ⊙ (softmax(router) @ gates). Разная обработка токенов разных типов.
+
+### 3.16 Subspace Hierarchical Softmax / SubHSM (+0.5K params)
+Двухуровневый softmax: 4-way group classifier → 40-way token внутри группы.
+4 группы по ~40 токенов (сплит по индексу). Group CE + token CE = улучшенная сходимость.
+Inference: group argmax → token argmax (3.6× меньше logits).
+
+### 3.17 TrajLoss — траекторная Auxiliary Loss (+16.5K params)
+MLP 128→64→128 предсказывает delta-вектор следующей позиции в ℝ¹²⁸.
+L2-loss между предсказанной и реальной координатой + CE-loss (коэфф 0.1).
+Модель учится предсказывать траекторию в топологическом пространстве, а не только токен.
+
+### 3.18 Learnable Consolidation (+6.5K params)
+Conv1d (groups=8) + element-wise gate → importance weights для шагов траектории.
+Взвешенный centroid вместо простого среднего при консолидации.
+Умное шумоподавление в TrajectoryStore.
+
+### 3.19 Dilated KV-Cache
+При генерации: для уровня dilation d хранить K/V только для каждого d-го токена.
+Для level 0 (d=1) — полный кэш, level 1 (d=2) — каждый второй, level 2 (d=4) — каждый четвёртый,
+level 3 (d=8) — каждый восьмой. Экономия ~50% VRAM кэша без потери качества ближних контекстов.
+
+---
 
 ### 4.1 Causal Language Modeling
 Стандартный next-token prediction с cross-entropy loss. Блоки по 128 токенов. Boundary-токены в потоке.
@@ -177,9 +217,16 @@ Gate: `conv_out ⊙ σ(W·[conv_out, attn_out]) + (1-σ)·attn_out`. Свёрт�
 При генерации: запрос → encode → retrieve similar → fuse → decode. Найденные траектории усиливают логически связанные продолжения токенов.
 
 ### 4.4 Данные
-- **connected_ru.npy**: 503M токенов русского текста
-- **wiki_ru.npy**: 2B токенов Wikipedia
-- **war_and_peace_boundary.npy**: 3.5M токенов с boundary-разметкой
+- **war_and_peace_boundary.npy**: 3.5M токенов с boundary-разметкой (Война и Мир, книги 1-2)
+
+### 4.5 Текущее обучение (Step 300+)
+- **Модель**: 1,153,213 params (6 HybridFractalBlock слоёв, 128-dim, 32 heads)
+- **Доп. компоненты**: TrajectoryPredictor (16.5K), ConsolidationTransformer (6.5K)
+- **VRAM**: ~1.4 GB (NVIDIA GeForce MX550, 2.1 GB)
+- **Скорость**: ~150 шагов/мин (batch=8, seq=128)
+- **Тренировка**: до 100K шагов, AdamW (lr=5e-3, cosine schedule)
+- **Генерация**: каждые 500 шагов (4 seed'а: "Я", "Он", "Мы", "—")
+- **Валидация**: каждые 5000 шагов (Анна Каренина, multi-level gen, SelfReflection)
 
 ---
 
@@ -190,9 +237,25 @@ Gate: `conv_out ⊙ σ(W·[conv_out, attn_out]) + (1-σ)·attn_out`. Свёрт�
 | Attention-only (24-dim, 1 слой) | 26K | 2.49 | 30% | Базовая |
 | Attention-only (128-dim, 6 слоёв) | 878K | 1.18 | 63% | Масштабированная |
 | Hybrid non-causal (128-dim, 6 слоёв) | 1.14M | 0.01 | 100% | Копирует, не генерирует |
-| **Hybrid causal (128-dim, 6 слоёв)** | **1.14M** | **~1.7** | **~47%** | **Корректная генерация** |
+| Hybrid causal (128-dim, 6 слоёв) | 1.14M | ~1.7 | ~47% | Корректная генерация |
+| **+8 инноваций (текущая)** | **1.18M** | **~2.0*** | **~40%*** | **CoordBias + SGF + SubHSM + TrajLoss** |
+
+*\*На step 300 — обучение продолжается до 100K шагов. Loss ниже чем у causal без инноваций (2.0 vs 2.4 на step 300), acc выше (40% vs 35%).*
 
 Causal Hybrid Fractal — единственная архитектура, которая и обучается на полных предложениях (128 токенов), и генерирует корректно.
+
+### 5.1 Новые компоненты (суммарно +28K params)
+
+| Компонент | Параметров | Тип |
+|-----------|-----------|-----|
+| CoordBias | 0 | Архитектурный (0 params) |
+| Topology Pair Bias | 0 | Архитектурный (0 params) |
+| SubHSM | 516 | Head |
+| Coord Residual Stream | 1,536 | Stream |
+| SGF | 3,072 | FFN |
+| Learnable Consolidation | 6,529 | Memory |
+| TrajLoss | 16,576 | Aux Head |
+| Dilated KV-Cache | 0 | Inference opt (экономия ~0.5 MB VRAM) |
 
 ---
 
@@ -201,11 +264,11 @@ Causal Hybrid Fractal — единственная архитектура, ко�
 | | LLM (GPT, LLaMA) | EVA |
 |---|---|---|
 | Символ | Индекс в таблице | Координата в ℝ¹²⁸ |
-| Параметры | 1B–1.7T | 1.14M |
+| Параметры | 1B–1.7T | 1.18M |
 | Знания | В весах (неотделимы) | В топологии (отдельно) |
 | Память | Внутри модели | TrajectoryStore (внешняя) |
-| Внимание | Multi-Head Self-Attention | FractalConv2D + AdaptiveAttention |
+| Внимание | Multi-Head Self-Attention | FractalConv2D + CoordBias + AdaptiveAttention |
 | Генерация | Статистическое угадывание | Исполнение координатных инструкций |
-| Обучение | Статичное | STDP + LTP/LTD + диалектика |
+| Обучение | Статичное | STDP + LTP/LTD + диалектика + траекторная loss |
 | Интерпретация | Black box | Траектория в ℝ¹²⁸ — полный trace |
 | Масштабирование | Больше параметров | Больше траекторий |

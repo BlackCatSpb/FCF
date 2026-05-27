@@ -1,13 +1,11 @@
 """
 EVA — TrajectoryStore: база всех траекторий декодирования.
-
 Хранит каждую траекторию (координаты + метаданные) при encode→decode.
 При генерации — извлекает похожие траектории как контекст (RAG).
-
 Knowledge = trajectories in ℝ²⁴, not weights.
 """
 
-import torch, numpy as np, pickle, os, time
+import torch, torch.nn as nn, torch.nn.functional as F, numpy as np, pickle, os, time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
@@ -30,10 +28,89 @@ class HierarchicalTrajectory:
         self.length = len(self.ids)
 
 
+class ConsolidationTransformer(nn.Module):
+    """
+    Learnable Consolidation: Conv1d + element-wise gate — взвешивание шагов траектории.
+    ~6.5K params.
+    """
+    
+    def __init__(self, d_model=128):
+        super().__init__()
+        self.d_model = d_model
+        # Conv1d с groups=8 для лёгкости
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=8)
+        # Element-wise gate (128 params вместо full Linear)
+        self.gate = nn.Parameter(torch.zeros(d_model))
+        self.importance_head = nn.Linear(d_model, 1)
+    
+    def forward(self, traj: torch.Tensor) -> torch.Tensor:
+        L, D = traj.shape
+        conv_in = traj.unsqueeze(0).transpose(1, 2)  # [1, D, L]
+        conv_out = self.conv(conv_in).transpose(1, 2)  # [1, L, D]
+        
+        # Element-wise gate
+        gate = torch.sigmoid(self.gate)  # [D]
+        combined = gate * conv_out + (1 - gate) * traj.unsqueeze(0)
+        
+        weights = self.importance_head(combined).squeeze(-1)
+        weights = F.softmax(weights, dim=-1)
+        return weights.squeeze(0)
+
+
 class TrajectoryStore:
     """
     Хранилище траекторий: flat + hierarchical.
     """
+    
+    def __init__(self, max_trajectories=1000000):
+        self.max_trajectories = max_trajectories
+        
+        self.trajectories = []      # [L, D] flat
+        self.ids_list = []          # [L]
+        self.texts = []             # str
+        self.centroids = []         # [D]
+        self.first_coords = []      # [D]
+        self.lengths = []           # int
+        self.total_stored = 0
+        
+        # Hierarchical storage
+        self.hierarchical = []      # List[HierarchicalTrajectory]
+        
+        # Learnable Consolidation
+        self.consolidation_net = None  # Lazy init on first use
+    
+    def _lazy_init_consolidation(self, device='cpu'):
+        if not hasattr(self, 'consolidation_net') or self.consolidation_net is None:
+            self.consolidation_net = ConsolidationTransformer(d_model=128).to(device)
+    
+    def consolidate(self, htraj: HierarchicalTrajectory, device='cpu') -> HierarchicalTrajectory:
+        """
+        Learnable consolidation: взвесить шаги траектории через Transformer-encoder.
+        Возвращает новую HierarchicalTrajectory с взвешенным centroid.
+        """
+        if len(htraj.symbol_trajectory) < 3:
+            return htraj
+        
+        self._lazy_init_consolidation(device)
+        
+        traj_t = torch.tensor(htraj.symbol_trajectory, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            weights = self.consolidation_net.forward(traj_t).cpu().numpy()  # [L]
+        
+        # Weighted centroid вместо простого среднего
+        weighted_centroid = (htraj.symbol_trajectory * weights[:, np.newaxis]).sum(axis=0)
+        
+        # Возвращаем новый объект с улучшенными метриками
+        return HierarchicalTrajectory(
+            symbol_trajectory=htraj.symbol_trajectory,
+            word_boundaries=htraj.word_boundaries,
+            word_centroids=htraj.word_centroids,
+            word_weights=htraj.word_weights,
+            connection_coords=htraj.connection_coords,
+            sentence_centroid=weighted_centroid,
+            text=htraj.text,
+            ids=htraj.ids,
+        )
     
     def __init__(self, max_trajectories=1000000):
         self.max_trajectories = max_trajectories

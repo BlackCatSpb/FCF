@@ -90,10 +90,16 @@ class AdaptiveFractalAttention(nn.Module):
         sigma = scale * 0.5
         return torch.exp(-dists ** 2 / (2 * sigma ** 2 + 1e-8))
     
-    def forward(self, x):
+    def forward(self, x, topology_bias=None):
         B, L, D = x.shape
         H = self.effective_heads
         Dh = self.head_dim
+        
+        # --- CoordBias: pairwise L2 distance in full ℝ^D ---
+        with torch.no_grad():
+            x_norm = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+            coord_dists = torch.cdist(x_norm, x_norm, p=2)  # [B, L, L]
+            coord_bias = -0.1 * coord_dists  # близкие токены получают +, далёкие -
         
         num_active, head_alloc, level_probs = self.level_controller(x)
         
@@ -116,7 +122,11 @@ class AdaptiveFractalAttention(nn.Module):
                 
                 scale = self.level_controller.level_scales[level].item()
                 manifold_bias = self.compute_manifold_bias(x, scale)
-                scores = scores + manifold_bias + self.level_bias[level]
+                scores = scores + manifold_bias + self.level_bias[level] + coord_bias
+                
+                # StaticTopology pair-wise bias (если передан)
+                if topology_bias is not None:
+                    scores = scores + topology_bias
                 
                 causal = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
                 scores = scores.masked_fill(causal, float('-inf'))
@@ -134,7 +144,7 @@ class AdaptiveFractalAttention(nn.Module):
             head_offset += n_heads
         
         if not outputs:
-            return x
+            return x, level_probs
         
         combined = torch.cat(outputs, dim=-1)  # [B, L, H*Dh]
         if combined.shape[-1] < H * Dh:

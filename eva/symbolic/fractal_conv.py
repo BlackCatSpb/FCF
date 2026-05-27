@@ -65,7 +65,8 @@ class FractalConv2D(nn.Module):
 
 class HybridFractalBlock(nn.Module):
     """
-    Гибридный блок: FractalConv2D + SparseAttention + StaticTopology + Gate + FFN.
+    Гибридный блок: FractalConv2D + SparseAttention + StaticTopology + Gate + SGF-FFN.
+    Coordinate Residual Stream + Subspace-Gated FFN.
     """
     
     def __init__(self, dim=128, max_levels=8, total_heads=32, d_ff=128, topology_layer=None):
@@ -90,24 +91,68 @@ class HybridFractalBlock(nn.Module):
         
         from .unified_transformer import SwiGLUFFN
         self.ffn = SwiGLUFFN(dim, d_ff)
+        
+        # --- Coordinate Residual Stream: gate-векторы 128d ---
+        self.coord_gate_in = nn.Parameter(torch.zeros(dim))
+        self.coord_gate_out = nn.Parameter(torch.zeros(dim))
+        
+        # --- Subspace-Gated FFN (SGF): 4 subspace gate vectors ---
+        self.sgf_router = nn.Linear(dim, 4)
+        self.sgf_gates = nn.Parameter(torch.randn(4, dim))
     
-    def forward(self, x, token_ids=None):
-        # 1. FractalConv
+    def forward(self, x, token_ids=None, coord_stream=None):
+        # Если coord_stream не передан, инициализируем нулями
+        if coord_stream is None:
+            coord_stream = torch.zeros_like(x)
+        
+        # --- 1. FractalConv ---
         conv_out = self.fractal_conv(self.norm_conv(x))
         
-        # 2. Attention + Topology bias
-        attn_out, _ = self.attention(self.norm_attn(x))
+        # --- 2. Attention + Topology bias + CoordBias ---
+        topo_bias = None
+        if self.topology is not None and token_ids is not None:
+            topo_bias = self.topology.get_topology_bias(token_ids)
+        attn_out, _ = self.attention(self.norm_attn(x), topology_bias=topo_bias)
         
-        # 3. Gate merge
+        # --- 3. Gate merge ---
         combined = torch.cat([conv_out, attn_out], dim=-1)
         gate = self.gate_conv(combined).sigmoid()
         
-        x = x + gate * conv_out + (1 - gate) * attn_out
+        # --- 4. Coordinate Residual Stream: merge into hidden ---
+        coord_gate = torch.sigmoid(self.coord_gate_in)  # [D]
+        x = x + gate * conv_out + (1 - gate) * attn_out + coord_stream * coord_gate
         
-        # 4. FFN
-        x = x + self.ffn(self.norm_ffn(x))
+        # --- 5. SGF-FFN (Subspace-Gated) ---
+        x_norm = self.norm_ffn(x)
+        gate_s = F.silu(self.ffn.W_gate(x_norm))
+        up = self.ffn.W_up(x_norm)
+        swiglu = gate_s * up
         
-        return x
+        # Subspace routing: predict blend weights per token
+        route = F.softmax(self.sgf_router(x_norm), dim=-1)  # [B, L, 4]
+        sgf_gate = route @ self.sgf_gates  # [B, L, D]
+        swiglu = swiglu * torch.sigmoid(sgf_gate)
+        
+        x = x + self.ffn.W_down(swiglu)
+        
+        # --- 6. Update coordinate residual stream ---
+        coord_gate_out = torch.sigmoid(self.coord_gate_out)
+        coord_stream = coord_stream + x * coord_gate_out
+        
+        return x, coord_stream
+
+
+class TrajectoryPredictor(nn.Module):
+    """MLP 128→64→128: предсказывает delta-вектор следующей позиции в ℝ¹²⁸ для TrajLoss."""
+    def __init__(self, dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, 64), nn.GELU(),
+            nn.Linear(64, dim),
+        )
+        self.apply(lambda m: m.weight.data.mul_(0.02) if hasattr(m, 'weight') and m.weight.dim() >= 2 else None)
+    def forward(self, x):
+        return self.net(x)
 
 
 # ============================================================

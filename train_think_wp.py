@@ -21,76 +21,55 @@ ut = UnifiedMultidimensionalTransformer(vocab_size=VT, coord_dim=128, max_levels
     total_heads=32, num_layers=6, d_ff=128).to(DEVICE)
 ut.set_symbol_coordinates(c128)
 
-print("Think Loop — waiting for wp_latest.pt...")
+print("Think Loop — lightweight mode. Reading wp_latest.pt periodically...")
+print("Waiting for training to produce checkpoint...")
 while not os.path.exists(os.path.join(CKPT, "wp_latest.pt")):
     time.sleep(5)
 
-ckpt = torch.load(os.path.join(CKPT, "wp_latest.pt"), map_location='cpu', weights_only=True)
-ut.load_state_dict(ckpt['ut'], strict=False)
-ut.eval()
-print(f"Loaded wp_latest.pt (step {ckpt.get('step','?')})")
-
-# Load trajectory store
-store_path = os.path.join(CKPT, "trajectory_store.pkl")
-store = TrajectoryStore()
-if os.path.exists(store_path):
-    store.load(store_path)
-
-# Load War & Peace for perception
-npy = os.path.join(os.path.dirname(__file__), "real_data", "war_and_peace.npy")
-data = np.load(npy, mmap_mode='r').astype(np.int32)
-total = len(data)
-rng = np.random.RandomState()
-
+# Load model briefly for inference, then unload
+last_step = 0
 iterations = 0
-print("Think loop started. Press Ctrl+C to stop.\n")
+
 while True:
     try:
-        # Perception: read sentence from W&P, generate continuation
-        pos = rng.randint(0, max(1, total - 64))
-        ids = [int(x) for x in data[pos:pos+64] if 0 < x < VT]
-        if len(ids) >= 10:
-            text = cv.decode(ids[:50])
-            # Contemplate: autoregressive continuation
-            with torch.no_grad():
-                inp = torch.tensor([ids[:20]], dtype=torch.long, device=DEVICE)
-                for _ in range(10):
-                    _, sc = ut(inp, return_scores=True)
-                    logits = sc[0, -1] / 0.8
-                    _, idx = torch.topk(logits, 20)
-                    p = torch.softmax(logits[idx], dim=-1)
-                    nt = idx[torch.multinomial(p, 1)].item()
-                    inp = torch.cat([inp, torch.tensor([[nt]], device=DEVICE)], dim=1)
-                gen_text = cv.decode(inp[0, len(ids[:20]):].tolist())
-            # Store trajectory
-            emb = ut.embed(inp)
-            traj = emb[0].cpu().numpy()
-            store.store(text[:40], ids[:50], traj)
+        time.sleep(6)
+        ckpt_path = os.path.join(CKPT, "wp_latest.pt")
+        if not os.path.exists(ckpt_path):
+            continue
         
-        # Contemplation
-        if iterations % 3 == 0:
-            ids = [cv.WORD_OPEN_IDX] + [random.randint(1, 156)] + [cv.WORD_CLOSE_IDX]
-            with torch.no_grad():
-                inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
-                for _ in range(8):
+        # Check if checkpoint updated
+        mtime = os.path.getmtime(ckpt_path)
+        current_step = torch.load(ckpt_path, map_location='cpu', weights_only=True).get('step', 0)
+        
+        if current_step == last_step and iterations > 0:
+            iterations += 1
+            if iterations % 10 == 0:
+                print(f"  think: {iterations} cycles, step={current_step}, store={store.total_stored}", flush=True)
+            continue
+        
+        last_step = current_step
+        
+        # Load model, do inference, unload
+        ut.load_state_dict(torch.load(ckpt_path, map_location='cpu', weights_only=True)['ut'], strict=False)
+        ut.eval()
+        
+        with torch.no_grad():
+            # Perception: sample random text, generate continuation
+            pos = rng.randint(0, max(1, total - 32))
+            ids = [int(x) for x in data[pos:pos+32] if 0 < x < VT]
+            if len(ids) >= 8:
+                inp = torch.tensor([ids[:16]], dtype=torch.long, device=DEVICE)
+                for _ in range(6):
                     _, sc = ut(inp, return_scores=True)
                     _, idx = torch.topk(sc[0, -1], 10)
                     p = torch.softmax(sc[0, -1][idx], dim=-1)
                     nt = idx[torch.multinomial(p, 1)].item()
                     inp = torch.cat([inp, torch.tensor([[nt]], device=DEVICE)], dim=1)
+                gen_text = cv.decode(inp[0].tolist())
+                if iterations % 10 == 0:
+                    print(f"  think: step={current_step} store={store.total_stored} gen='{gen_text[:30]}...'", flush=True)
         
         iterations += 1
-        if iterations % 10 == 0:
-            # Reload model (training updates it)
-            if os.path.exists(os.path.join(CKPT, "wp_latest.pt")):
-                try:
-                    c = torch.load(os.path.join(CKPT, "wp_latest.pt"), map_location='cpu', weights_only=True)
-                    if c.get('step', 0) > ckpt.get('step', 0):
-                        ut.load_state_dict(c['ut'], strict=False)
-                        ckpt = c
-                except: pass
-            print(f"  think: {iterations} cycles, store: {store.total_stored}", flush=True)
         
-        time.sleep(6)
     except KeyboardInterrupt:
         break

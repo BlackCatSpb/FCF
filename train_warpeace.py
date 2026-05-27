@@ -125,12 +125,31 @@ def multi_level_generate(seed_text, max_new=40, T=0.6):
     # Encode query
     htraj = extract_hierarchical(ut, ids, seed_text)
     if htraj is None or store.total_stored < 5:
-        return gen_text(ids, max_new, T)
+        # Fallback: simple autoregressive
+        ids_out = list(ids)
+        with torch.no_grad():
+            for _ in range(max_new):
+                inp = torch.tensor([ids_out], dtype=torch.long, device=DEVICE)
+                _, sc = ut(inp, return_scores=True)
+                logits = sc[0, -1] / T
+                _, idx = logits.topk(20); p = F.softmax(logits[idx], dim=-1)
+                nt = idx[torch.multinomial(p, 1)].item()
+                ids_out.append(nt)
+        return cv.decode(ids_out)
     
     # Retrieve similar
     similar = store.find_similar_hierarchical(htraj, top_k=5)
     if not similar:
-        return gen_text(ids, max_new, T)
+        # Fallback: simple autoregressive
+        ids_out = list(ids)
+        with torch.no_grad():
+            for _ in range(max_new):
+                _, sc = ut(torch.tensor([ids_out], dtype=torch.long, device=DEVICE), return_scores=True)
+                logits = sc[0, -1] / T
+                _, idx = logits.topk(20); p = F.softmax(logits[idx], dim=-1)
+                nt = idx[torch.multinomial(p, 1)].item()
+                ids_out.append(nt)
+        return cv.decode(ids_out)
     
     # Fuse: average the continuation coords from retrieved trajectories
     fused = htraj.symbol_trajectory.copy()

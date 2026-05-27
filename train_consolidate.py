@@ -217,7 +217,7 @@ while True:
                         logits[ids_out[-1]] -= 10.0
                     # Penalize token if it appears in last 8 positions
                     for t in set(ids_out[-8:]):
-                        logits[t] -= 3.0
+                        if t < VT: logits[t] -= 3.0
                     
                     _, idx = torch.topk(logits, 20)
                     p = torch.softmax(logits[idx], dim=-1)

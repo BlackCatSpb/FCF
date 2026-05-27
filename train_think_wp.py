@@ -9,16 +9,16 @@ DEVICE = 'cuda'; CKPT = os.path.join(os.path.dirname(__file__), "checkpoints", "
 from eva.symbolic.char_vocab import CharacterVocab
 from eva.symbolic.unified_transformer import UnifiedMultidimensionalTransformer
 from eva.symbolic.trajectory_store import TrajectoryStore
-cv = CharacterVocab(); VT = 157
+cv = CharacterVocab(); VT = cv.vocab_size
 
 # Fresh coords like training
-c128 = torch.zeros(157, 128, device=DEVICE)
+c128 = torch.zeros(VT, 128, device=DEVICE)
 g = torch.Generator(device=DEVICE).manual_seed(42)
 c128[:, :] = torch.randn(157, 128, generator=g, device=DEVICE) * 0.02
 c128 = c128 / c128.norm(dim=-1, keepdim=True).clamp(1e-8)
 
-ut = UnifiedMultidimensionalTransformer(vocab_size=157, coord_dim=128, num_levels=8,
-    scales_per_level=4, num_layers=6, d_ff=512).to(DEVICE)
+ut = UnifiedMultidimensionalTransformer(vocab_size=VT, coord_dim=128, max_levels=8,
+    total_heads=32, num_layers=6, d_ff=128).to(DEVICE)
 ut.set_symbol_coordinates(c128)
 
 print("Think Loop — waiting for wp_latest.pt...")

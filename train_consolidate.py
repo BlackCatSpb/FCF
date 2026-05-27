@@ -206,10 +206,22 @@ while True:
                 for _ in range(150):
                     _, sc = ut(torch.tensor([ids_out], dtype=torch.long, device=DEVICE), return_scores=True)
                     logits = sc[0, -1] / 0.6
+                    
+                    # Strong repetition penalty: block if last 3 are same char
+                    if len(ids_out) >= 3 and ids_out[-1] == ids_out[-2] == ids_out[-3]:
+                        logits[ids_out[-1]] -= 10.0
+                    # Penalize token if it appears in last 8 positions
+                    for t in set(ids_out[-8:]):
+                        logits[t] -= 3.0
+                    
                     _, idx = torch.topk(logits, 20)
                     p = torch.softmax(logits[idx], dim=-1)
                     nt = idx[torch.multinomial(p, 1)].item()
                     ids_out.append(nt)
+                    
+                    # Stop at sentence boundary
+                    if nt == cv.SENT_CLOSE_IDX and len(ids_out) > 20:
+                        break
             import re
             gen_text = cv.decode(ids_out)
             # Strip boundary tokens, preserve word spacing

@@ -16,6 +16,7 @@ DEVICE = 'cuda'; CKPT = os.path.join(os.path.dirname(__file__), "checkpoints", "
 from eva.symbolic.char_vocab import CharacterVocab
 from eva.symbolic.unified_transformer import UnifiedMultidimensionalTransformer
 from eva.symbolic.trajectory_store import TrajectoryStore, HierarchicalTrajectory
+from eva.symbolic.dynamic_vocab import LatentCodeOperator
 
 cv = CharacterVocab(); VT = cv.vocab_size
 
@@ -156,10 +157,14 @@ print("=" * 60)
 cycle = 0
 total_perceived = 0
 total_generated = 0
+total_synthesized = 0
 total_stored = store.total_stored
 t0 = time.time()
 last_step = ckpt['step']
 rng = np.random.RandomState()
+
+# Latent code operator for trajectory synthesis
+latent_op = LatentCodeOperator(store, c128)
 
 while True:
     try:
@@ -260,9 +265,29 @@ while True:
                 print(f"  Semantic clusters (>0.5 sim): {len(sims)} pairs")
             print(f"  {'='*50}\n")
         
-        # Save store periodically
+        # Save store periodically + synthesize new trajectories
         if cycle % 100 == 0:
+            # Synthesize new trajectories from existing ones
+            if store.total_stored >= 10:
+                for _ in range(5):
+                    idx = rng.randint(0, store.total_stored)
+                    query_ids = store.ids_list[idx][:10]
+                    if len(query_ids) < 3: continue
+                    synth_traj = latent_op.synthesize(query_ids, top_k=5)
+                    if synth_traj is not None and len(synth_traj) >= 4:
+                        htraj = HierarchicalTrajectory(
+                            symbol_trajectory=synth_traj,
+                            word_boundaries=[], word_centroids=np.zeros((0,128)),
+                            word_weights=np.zeros(0), connection_coords=np.zeros((0,128)),
+                            sentence_centroid=synth_traj.mean(axis=0),
+                            text=f"SYNTH:{cv.decode(query_ids)[:20]}", ids=query_ids,
+                        )
+                        store.store_hierarchical(htraj)
+                        total_synthesized += 1
+            
             store.save(store_path)
+            if total_synthesized > 0:
+                print(f"         synthesized: {total_synthesized} new trajectories")
     
     except KeyboardInterrupt:
         print(f"\nStopped. Saving store ({total_stored} entries)...")

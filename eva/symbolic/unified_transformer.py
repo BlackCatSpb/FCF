@@ -187,8 +187,9 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         from .subspace_coords import MultiSubspaceEmbedding
         self.subspace = MultiSubspaceEmbedding(vocab_size, coord_dim, sym_dim=32)
         
+        from .fractal_conv import HybridFractalBlock
         self.layers = nn.ModuleList([
-            TransformerBlock(coord_dim, max_levels, total_heads, d_ff)
+            HybridFractalBlock(coord_dim, max_levels, total_heads, d_ff)
             for _ in range(num_layers)
         ])
         

@@ -212,7 +212,9 @@ while True:
                     ids_out.append(nt)
             import re
             gen_text = cv.decode(ids_out)
-            w_tags = re.findall(r'<W>(.*?)</W>', gen_text)
+            # Strip boundary tokens for clean output
+            clean = gen_text.replace('<S>','').replace('</S>',' ').replace('<W>','').replace('</W>','')
+            clean = re.sub(r'\s+', ' ', clean).strip()
             total_generated += 1
         
         # PROGRESS every 10 cycles
@@ -224,7 +226,7 @@ while True:
             
             # Show latest generation
             if total_generated > 0:
-                print(f"         gen: '{gen_text[:70]}...'")
+                print(f"         gen: '{clean[:70]}'")
         
         # FULL REPORT every 50 cycles
         if cycle % 50 == 0:

@@ -14,7 +14,7 @@ cv = CharacterVocab(); VT = cv.vocab_size
 # Fresh coords like training
 c128 = torch.zeros(VT, 128, device=DEVICE)
 g = torch.Generator(device=DEVICE).manual_seed(42)
-c128[:, :] = torch.randn(157, 128, generator=g, device=DEVICE) * 0.02
+c128[:, :] = torch.randn(VT, 128, generator=g, device=DEVICE) * 0.02
 c128 = c128 / c128.norm(dim=-1, keepdim=True).clamp(1e-8)
 
 ut = UnifiedMultidimensionalTransformer(vocab_size=VT, coord_dim=128, max_levels=8,

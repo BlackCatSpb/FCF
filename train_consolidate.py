@@ -150,4 +150,106 @@ if store.total_stored >= 5:
         print(f"    {sim:.3f}: '{t1}' ↔ '{t2}'")
 
 print("\n" + "=" * 60)
-print("Consolidation complete.")
+print("CONTINUOUS CONSOLIDATION — Ctrl+C to stop")
+print("=" * 60)
+
+cycle = 0
+total_perceived = 0
+total_generated = 0
+total_stored = store.total_stored
+t0 = time.time()
+last_step = ckpt['step']
+rng = np.random.RandomState()
+
+while True:
+    try:
+        cycle += 1
+        
+        # Reload model if training updated it
+        if os.path.exists(wp):
+            ckpt = torch.load(wp, map_location='cpu', weights_only=True)
+            if ckpt['step'] > last_step:
+                ut.load_state_dict(ckpt['ut'], strict=False)
+                last_step = ckpt['step']
+        
+        # PERCEPTION: read random block, autoencode
+        pos = rng.randint(0, max(1, total - 64))
+        ids = [int(x) for x in data[pos:pos+64] if 0 < x < VT]
+        if len(ids) >= 12:
+            inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+            with torch.no_grad():
+                emb = ut.embed(inp)
+                _, scores = ut(inp, return_scores=True)
+                pred = scores[0].argmax(dim=-1).tolist()
+            correct = sum(1 for p, t in zip(pred, ids) if p == t)
+            acc = correct / len(ids)
+            
+            # Extract hierarchical metadata
+            htraj = HierarchicalTrajectory(
+                symbol_trajectory=emb[0].cpu().numpy(),
+                word_boundaries=[], word_centroids=np.zeros((0,128)),
+                word_weights=np.zeros(0), connection_coords=np.zeros((0,128)),
+                sentence_centroid=emb[0].mean(dim=0).cpu().numpy(),
+                text=cv.decode(ids)[:40], ids=ids,
+            )
+            store.store_hierarchical(htraj)
+            total_perceived += 1
+            total_stored = store.total_stored
+        
+        # GENERATION: try random seed every 5 cycles
+        if cycle % 5 == 0:
+            seed_words = ['привет','Пьер','князь','Наташа','война','мир','солнце']
+            seed = seed_words[cycle % len(seed_words)]
+            gids = [cv.SENT_OPEN_IDX, cv.WORD_OPEN_IDX] + cv.encode(seed)[1:-1] + [cv.WORD_CLOSE_IDX, cv.SENT_CLOSE_IDX]
+            ids_out = list(gids)
+            with torch.no_grad():
+                for _ in range(30):
+                    _, sc = ut(torch.tensor([ids_out], dtype=torch.long, device=DEVICE), return_scores=True)
+                    logits = sc[0, -1] / 0.6
+                    _, idx = torch.topk(logits, 20)
+                    p = torch.softmax(logits[idx], dim=-1)
+                    nt = idx[torch.multinomial(p, 1)].item()
+                    ids_out.append(nt)
+            import re
+            gen_text = cv.decode(ids_out)
+            w_tags = re.findall(r'<W>(.*?)</W>', gen_text)
+            total_generated += 1
+        
+        # PROGRESS every 10 cycles
+        if cycle % 10 == 0:
+            elapsed = time.time() - t0
+            vram = torch.cuda.memory_allocated() / 1e9
+            print(f"  [{cycle:>4d}] perceived={total_perceived} gen={total_generated} "
+                  f"store={total_stored} | VRAM={vram:.1f}GB | {elapsed:.0f}s", flush=True)
+            
+            # Show latest generation
+            if total_generated > 0:
+                print(f"         gen: '{gen_text[:70]}...'")
+        
+        # FULL REPORT every 50 cycles
+        if cycle % 50 == 0:
+            print(f"\n  === REPORT @ cycle {cycle} ===")
+            print(f"  Store: {store.total_stored} total, {len(store.hierarchical)} hierarchical")
+            if store.hierarchical:
+                n_words = [len(h.word_boundaries) for h in store.hierarchical if h.word_boundaries]
+                if n_words:
+                    print(f"  Avg words/entry: {np.mean(n_words):.1f}")
+            # Concept discovery
+            if len(store.hierarchical) >= 5:
+                centroids = np.array([h.sentence_centroid for h in store.hierarchical])
+                sims = []
+                for i in range(len(centroids)):
+                    for j in range(i+1, len(centroids)):
+                        s = np.dot(centroids[i], centroids[j]) / (np.linalg.norm(centroids[i])*np.linalg.norm(centroids[j])+1e-8)
+                        if s > 0.5: sims.append(s)
+                print(f"  Semantic clusters (>0.5 sim): {len(sims)} pairs")
+            print(f"  {'='*50}\n")
+        
+        # Save store periodically
+        if cycle % 100 == 0:
+            store.save(store_path)
+    
+    except KeyboardInterrupt:
+        print(f"\nStopped. Saving store ({total_stored} entries)...")
+        store.save(store_path)
+        break

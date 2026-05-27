@@ -28,26 +28,42 @@ c128 = c128 / c128.norm(dim=-1, keepdim=True).clamp(1e-8)
 ut = UnifiedMultidimensionalTransformer(vocab_size=VT, coord_dim=128, max_levels=8,
     total_heads=32, num_layers=6, d_ff=128).to(DEVICE)
 ut.set_symbol_coordinates(c128)
+
+# Resume from checkpoint if exists
+start_step = 0
+wp_path = os.path.join(CKPT, "wp_latest.pt")
+if os.path.exists(wp_path):
+    ckpt = torch.load(wp_path, map_location='cpu', weights_only=True)
+    ut.load_state_dict(ckpt['ut'], strict=False)
+    start_step = ckpt.get('step', 0)
+    print(f"Resumed from step {start_step}")
+
 print(f"Model: {sum(p.numel() for p in ut.parameters()):,} params")
 
-# Load & encode War & Peace with boundaries
-print("Encoding War & Peace with boundary tokens...")
-all_ids = []
-for book in [1, 2]:
-    path = rf"C:\Users\black\OneDrive\Desktop\Толстой Лев. Война и мир. Книга {book} - royallib.ru.txt"
-    with open(path, 'r', encoding='windows-1251') as f:
-        raw = f.read()
-    raw = re.sub(r'\r\n|\r', '\n', raw)
-    sents = re.split(r'(?<=[.!?…])\s+(?=[А-ЯЁA-Z])', raw)
-    for s in sents:
-        s = s.strip()
-        if len(s) >= 4:
-            ids = cv.encode_with_boundaries(s)
-            if len(ids) >= 5:
-                all_ids.extend(ids)
-    print(f"  Book {book}: {len(sents):,} sentences")
+# Load & encode War & Peace with boundaries (skip if already have data)
+npy_path = os.path.join(os.path.dirname(__file__), "real_data", "war_and_peace_boundary.npy")
+if os.path.exists(npy_path) and start_step > 0:
+    data = np.load(npy_path, mmap_mode='r').astype(np.int32)
+    print(f"Loaded pre-encoded data: {len(data)/1e6:.2f}M tokens")
+else:
+    print("Encoding War & Peace with boundary tokens...")
+    all_ids = []
+    for book in [1, 2]:
+        path = rf"C:\Users\black\OneDrive\Desktop\Толстой Лев. Война и мир. Книга {book} - royallib.ru.txt"
+        with open(path, 'r', encoding='windows-1251') as f:
+            raw = f.read()
+        raw = re.sub(r'\r\n|\r', '\n', raw)
+        sents = re.split(r'(?<=[.!?…])\s+(?=[А-ЯЁA-Z])', raw)
+        for s in sents:
+            s = s.strip()
+            if len(s) >= 4:
+                ids = cv.encode_with_boundaries(s)
+                if len(ids) >= 5:
+                    all_ids.extend(ids)
+        print(f"  Book {book}: {len(sents):,} sentences")
+    data = np.array(all_ids, dtype=np.int32)
+    np.save(npy_path, data)
 
-data = np.array(all_ids, dtype=np.int32)
 total = len(data)
 print(f"Total: {total/1e6:.2f}M tokens")
 
@@ -66,6 +82,10 @@ sent_ptr = 0
 
 # Trajectory store for hierarchical metadata
 store = TrajectoryStore(max_trajectories=100000)
+store_pkl_path = os.path.join(CKPT, "trajectory_store.pkl")
+if os.path.exists(store_pkl_path):
+    store.load(store_pkl_path)
+    print(f"Store loaded: {store.total_stored} entries")
 
 def extract_hierarchical(ut, ids_list, text):
     """Extract multi-level metadata from autoencoded text."""

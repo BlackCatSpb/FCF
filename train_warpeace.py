@@ -252,6 +252,25 @@ for s in range(1, STEPS + 1):
     
     if s % 500 == 0:
         torch.save({'ut': ut.state_dict(), 'step': s}, os.path.join(CKPT, "wp_latest.pt"))
+        # Build static topology every 5000 steps
+        if s % 5000 == 0 and s > 0:
+            ut.eval()
+            affinity = torch.eye(VT) * 0.5
+            # Simple affinity from co-occurrence in training blocks
+            with torch.no_grad():
+                aff = torch.zeros(VT, VT, device=DEVICE)
+                for _ in range(50):
+                    ids = [int(x) for x in data[rng.randint(0,total-ML):rng.randint(0,total-ML)+ML] if 0 < x < VT]
+                    for k in range(len(ids)-1):
+                        if 0 < ids[k] < VT and 0 < ids[k+1] < VT:
+                            aff[ids[k], ids[k+1]] += 1
+                aff = aff / aff.max().clamp(min=1)
+            ut.topology.topology[:, :, 0] = aff.cpu()
+            ut.topology.build_from_store(store)
+            if s % 5000 == 0:
+                nz = (aff > 0).sum().item()
+                print(f"         topology: {nz} connections, fast_paths: {len(ut.topology.fast_path_values)}")
+        ut.train()
         # Store hierarchical metadata for a sample block
         ut.eval()
         sample = blocks[(s // 500) % len(blocks)]

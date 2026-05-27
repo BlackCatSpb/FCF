@@ -219,7 +219,7 @@ while True:
             total_generated += 1
         
         # PROGRESS every 10 cycles
-        if cycle % 10 == 0:
+        if cycle % 5 == 0:
             elapsed = time.time() - t0
             vram = torch.cuda.memory_allocated() / 1e9
             print(f"  [{cycle:>4d}] perceived={total_perceived} gen={total_generated} "
@@ -227,7 +227,7 @@ while True:
             
             # Show latest generation
             if total_generated > 0:
-                print(f"         gen: '{clean[:70]}'")
+                print(f"         gen: '{clean[:120]}'")
         
         # FULL REPORT every 50 cycles
         if cycle % 50 == 0:

@@ -136,6 +136,7 @@ def extract_hierarchical(ut, ids_list, text):
 STEPS = 100000; LR = 5e-3; B = 8; ML = 128
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
+rng = np.random.RandomState(42)
 
 def multi_level_generate(seed_text, max_new=40, T=0.6):
     """MultiLevelGenerator: encode → retrieve → fuse → decode."""

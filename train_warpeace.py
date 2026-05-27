@@ -307,10 +307,28 @@ for s in range(1, STEPS + 1):
     
     if s % 5000 == 0:
         ut.eval()
-        print(f"\n  GEN @ {s} (store: {store.total_stored})")
-        for w in ['привет', 'князь', 'Наташа', 'война', 'Пьер']:
-            gtxt = multi_level_generate(w, 35, 0.6)
-            print(f"  '{w}' -> {gtxt}")
+        from eva.symbolic.validation_suite import evaluate_model
+        results = evaluate_model(ut, cv, store, data, total, CKPT, rng)
+        
+        print(f"\n  === VALIDATION @ step {s} ===")
+        print(f"  Store: {store.total_stored} entries")
+        
+        if results.get('anna_karenina_acc'):
+            print(f"  Anna Karenina accuracy: {results['anna_karenina_acc']:.1%} ({results.get('anna_karenina_samples',0)} sentences)")
+        
+        print(f"  Coherent generations: {results.get('coherent_ratio',0):.0%}")
+        print(f"  Avg confidence: {results.get('avg_confidence',0):.3f}")
+        print(f"  Avg curvature: {results.get('avg_curvature',0):.4f}")
+        
+        print(f"\n  Generation samples:")
+        for seed, text in results.get('generation', {}).items():
+            print(f"    '{seed}': {text[:90]}")
+        
+        if results.get('multi_level_gen'):
+            print(f"\n  Multi-level generation:")
+            for seed, text in results['multi_level_gen'].items():
+                print(f"    '{seed}': {text[:90]}")
+        
         print()
         ut.train()
 

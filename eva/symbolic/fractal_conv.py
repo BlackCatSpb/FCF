@@ -31,25 +31,32 @@ class FractalConv2D(nn.Module):
             
             conv = nn.Conv2d(1, ch_per_level, (k_L, k_D),
                            dilation=(dil_L, dil_D),
-                           padding=((k_L-1)*dil_L//2, (k_D-1)*dil_D//2))
+                           padding=(0, (k_D-1)*dil_D//2))  # manual causal padding for L, symmetric for D
             self.levels.append(conv)
             total_ch += ch_per_level
         
         self.proj = nn.Linear(total_ch, out_dim) if total_ch != out_dim else nn.Identity()
     
     def forward(self, x):
-        # x: [B, L, D] → reshape for Conv2D
         B, L, D = x.shape
         x2d = x.unsqueeze(1)  # [B, 1, L, D]
         
         level_outs = []
-        for conv in self.levels:
-            out = conv(x2d)  # [B, C_l, L, D]
-            # Pool over D dimension: mean
+        for l, conv in enumerate(self.levels):
+            # Causal: pad only on LEFT side (past context)
+            dil_L = 2 ** l
+            k_L = 3 if l < 2 else 5
+            left_pad = (k_L - 1) * dil_L
+            
+            # Manual left-only padding
+            x_padded = F.pad(x2d, (0, 0, left_pad, 0))  # pad dim=-2 (L) on left
+            
+            out = conv(x_padded)  # [B, C_l, L, D]
+            out = out[:, :, :L, :]  # trim to original length
             out = out.mean(dim=-1)  # [B, C_l, L]
             level_outs.append(out.transpose(1, 2))  # [B, L, C_l]
         
-        combined = torch.cat(level_outs, dim=-1)  # [B, L, total_ch]
+        combined = torch.cat(level_outs, dim=-1)
         
         if isinstance(self.proj, nn.Linear):
             return self.proj(combined)

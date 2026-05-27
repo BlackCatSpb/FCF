@@ -188,8 +188,10 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         self.subspace = MultiSubspaceEmbedding(vocab_size, coord_dim, sym_dim=32)
         
         from .fractal_conv import HybridFractalBlock
+        from .static_topology import StaticTopologyLayer
+        self.topology = StaticTopologyLayer(vocab_size, coord_dim)
         self.layers = nn.ModuleList([
-            HybridFractalBlock(coord_dim, max_levels, total_heads, d_ff)
+            HybridFractalBlock(coord_dim, max_levels, total_heads, d_ff, self.topology)
             for _ in range(num_layers)
         ])
         
@@ -219,7 +221,7 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         x = self.rope(x)
         
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, token_ids)
         
         x = self.norm_final(x)
         

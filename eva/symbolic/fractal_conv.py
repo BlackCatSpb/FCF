@@ -58,45 +58,40 @@ class FractalConv2D(nn.Module):
 
 class HybridFractalBlock(nn.Module):
     """
-    Гибридный блок: FractalConv2D + SparseAttention + Gate + FFN.
-    
-    Заменяет TransformerBlock. На всех 6 слоях.
+    Гибридный блок: FractalConv2D + SparseAttention + StaticTopology + Gate + FFN.
     """
     
-    def __init__(self, dim=128, max_levels=8, total_heads=32, d_ff=128):
+    def __init__(self, dim=128, max_levels=8, total_heads=32, d_ff=128, topology_layer=None):
         super().__init__()
         self.dim = dim
         
-        # FractalConv2D для локальных + subspace паттернов
         self.fractal_conv = FractalConv2D(dim, dim)
         
-        # Sparse attention для глобальных связей (только на ключевых токенах)
         from .adaptive_fractal import AdaptiveFractalAttention
         self.attention = AdaptiveFractalAttention(
             d_model=dim, max_levels=max_levels, total_heads=total_heads
         )
         
-        # Gate: conv_out ⊙ σ(attention_out)
+        self.topology = topology_layer
+        
         self.gate_conv = nn.Linear(dim * 2, dim)
         
-        # Pre-norm
         from .unified_transformer import RMSNorm
         self.norm_conv = RMSNorm(dim)
         self.norm_attn = RMSNorm(dim)
         self.norm_ffn = RMSNorm(dim)
         
-        # FFN
         from .unified_transformer import SwiGLUFFN
         self.ffn = SwiGLUFFN(dim, d_ff)
     
-    def forward(self, x):
-        # 1. FractalConv — локальные + subspace паттерны
+    def forward(self, x, token_ids=None):
+        # 1. FractalConv
         conv_out = self.fractal_conv(self.norm_conv(x))
         
-        # 2. Sparse attention — глобальные связи
+        # 2. Attention + Topology bias
         attn_out, _ = self.attention(self.norm_attn(x))
         
-        # 3. Gate merge: conv_out ⊙ σ(project([conv_out, attn_out]))
+        # 3. Gate merge
         combined = torch.cat([conv_out, attn_out], dim=-1)
         gate = self.gate_conv(combined).sigmoid()
         

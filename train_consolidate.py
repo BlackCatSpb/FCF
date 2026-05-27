@@ -212,8 +212,9 @@ while True:
                     ids_out.append(nt)
             import re
             gen_text = cv.decode(ids_out)
-            # Strip boundary tokens for clean output
-            clean = gen_text.replace('<S>','').replace('</S>',' ').replace('<W>','').replace('</W>','')
+            # Strip boundary tokens, preserve word spacing
+            clean = gen_text.replace('</W><W>', ' ').replace('</W></S><S><W>', ' ').replace('</S><S>', ' ')
+            clean = clean.replace('<S>','').replace('</S>','').replace('<W>','').replace('</W>','')
             clean = re.sub(r'\s+', ' ', clean).strip()
             total_generated += 1
         

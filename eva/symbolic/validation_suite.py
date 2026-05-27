@@ -49,7 +49,7 @@ def evaluate_model(ut, cv, store, data, total, CKPT, rng, device='cuda'):
     results['coherent_ratio'] = total_coherent / len(seeds)
     
     # === 2. UNFAMILIAR TEXT TEST ===
-    anna_path = r"C:\Users\black\OneDrive\Desktop\Толстой Лев. Анна Каренина.txt"
+    anna_path = r"C:\Users\black\OneDrive\Desktop\Анна Каренина.txt"
     if not os.path.exists(anna_path):
         anna_path = None
         # Try to find any other untrained text

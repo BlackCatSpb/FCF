@@ -173,8 +173,8 @@ while True:
                 last_step = ckpt['step']
         
         # PERCEPTION: read random block, autoencode
-        pos = rng.randint(0, max(1, total - 64))
-        ids = [int(x) for x in data[pos:pos+64] if 0 < x < VT]
+        pos = rng.randint(0, max(1, total - 128))
+        ids = [int(x) for x in data[pos:pos+128] if 0 < x < VT]
         if len(ids) >= 12:
             inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
             with torch.no_grad():
@@ -203,7 +203,7 @@ while True:
             gids = [cv.SENT_OPEN_IDX, cv.WORD_OPEN_IDX] + cv.encode(seed)[1:-1] + [cv.WORD_CLOSE_IDX, cv.SENT_CLOSE_IDX]
             ids_out = list(gids)
             with torch.no_grad():
-                for _ in range(30):
+                for _ in range(150):
                     _, sc = ut(torch.tensor([ids_out], dtype=torch.long, device=DEVICE), return_scores=True)
                     logits = sc[0, -1] / 0.6
                     _, idx = torch.topk(logits, 20)
@@ -227,7 +227,7 @@ while True:
             
             # Show latest generation
             if total_generated > 0:
-                print(f"         gen: '{clean[:120]}'")
+                print(f"         gen: '{clean[:500]}'")
         
         # FULL REPORT every 50 cycles
         if cycle % 50 == 0:

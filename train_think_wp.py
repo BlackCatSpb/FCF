@@ -46,22 +46,38 @@ iterations = 0
 print("Think loop started. Press Ctrl+C to stop.\n")
 while True:
     try:
-        # Perception: read sentence from W&P
+        # Perception: read sentence from W&P, generate continuation
         pos = rng.randint(0, max(1, total - 64))
         ids = [int(x) for x in data[pos:pos+64] if 0 < x < VT]
         if len(ids) >= 10:
             text = cv.decode(ids[:50])
-            # Reason about it
-            result = ut.reason(ids[:20], num_hypotheses=2, temperature=0.2, char_vocab=cv)
-            # Store trajectory
+            # Contemplate: autoregressive continuation
             with torch.no_grad():
-                inp = torch.tensor([ids[:50]], dtype=torch.long, device=DEVICE)
-                traj = ut.embed(inp)[0].cpu().numpy()
-                store.store(text[:40], ids[:50], traj)
+                inp = torch.tensor([ids[:20]], dtype=torch.long, device=DEVICE)
+                for _ in range(10):
+                    _, sc = ut(inp, return_scores=True)
+                    logits = sc[0, -1] / 0.8
+                    _, idx = torch.topk(logits, 20)
+                    p = torch.softmax(logits[idx], dim=-1)
+                    nt = idx[torch.multinomial(p, 1)].item()
+                    inp = torch.cat([inp, torch.tensor([[nt]], device=DEVICE)], dim=1)
+                gen_text = cv.decode(inp[0, len(ids[:20]):].tolist())
+            # Store trajectory
+            emb = ut.embed(inp)
+            traj = emb[0].cpu().numpy()
+            store.store(text[:40], ids[:50], traj)
         
         # Contemplation
         if iterations % 3 == 0:
-            ut.reason([random.randint(1, 156)], num_hypotheses=1, temperature=0.3, char_vocab=cv)
+            ids = [cv.WORD_OPEN_IDX] + [random.randint(1, 156)] + [cv.WORD_CLOSE_IDX]
+            with torch.no_grad():
+                inp = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+                for _ in range(8):
+                    _, sc = ut(inp, return_scores=True)
+                    _, idx = torch.topk(sc[0, -1], 10)
+                    p = torch.softmax(sc[0, -1][idx], dim=-1)
+                    nt = idx[torch.multinomial(p, 1)].item()
+                    inp = torch.cat([inp, torch.tensor([[nt]], device=DEVICE)], dim=1)
         
         iterations += 1
         if iterations % 10 == 0:

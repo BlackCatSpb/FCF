@@ -133,7 +133,7 @@ def extract_hierarchical(ut, ids_list, text):
         text=text, ids=ids_list,
     )
 
-STEPS = 100000; LR = 5e-3; B = 16; ML = 256
+STEPS = 100000; LR = 5e-3; B = 8; ML = 128
 opt = torch.optim.AdamW(ut.parameters(), lr=LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
 

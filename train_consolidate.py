@@ -97,10 +97,10 @@ for seed in seeds:
             nt = idx[torch.multinomial(p, 1)].item()
             ids_out.append(nt)
     text = cv.decode(ids_out)
-    # Count real Russian words (>1 char, no boundary tokens)
-    words = [w for w in text.replace('<S>',' ').replace('</S>',' ').replace('<W>',' ').replace('</W>',' ').split() if len(w) > 1]
-    real_words = sum(1 for w in words if all(ord(c) > 127 or c in '-') for c in w)
-    print(f"  '{seed}' -> {text[:80]}")
+    # Extract words between <W> tags
+    import re
+    w_tags = re.findall(r'<W>(.*?)</W>', text)
+    print(f"  '{seed}' -> {text[:90]} ({len(w_tags)} words)")
 
 # 3. STORE ANALYSIS: what patterns exist?
 print(f"\n[3] STORE ANALYSIS — {store.total_stored} trajectories")

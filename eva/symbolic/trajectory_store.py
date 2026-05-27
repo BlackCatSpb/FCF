@@ -263,6 +263,7 @@ class TrajectoryStore:
             'first_coords': self.first_coords,
             'lengths': self.lengths,
             'total_stored': self.total_stored,
+            'hierarchical': self.hierarchical,
         }
         with open(path, 'wb') as f:
             pickle.dump(data, f)
@@ -277,4 +278,5 @@ class TrajectoryStore:
         self.first_coords = data['first_coords']
         self.lengths = data['lengths']
         self.total_stored = data['total_stored']
+        self.hierarchical = data.get('hierarchical', [])
         return self

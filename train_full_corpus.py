@@ -7,6 +7,12 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
+# Colab override: if colab_config.py exists, its constants take priority
+try:
+    from eva.symbolic.colab_config import *
+except ImportError:
+    pass
+
 DEVICE = 'cuda'
 CKPT = os.path.join(os.path.dirname(__file__), "checkpoints", "symbolic")
 os.makedirs(CKPT, exist_ok=True)

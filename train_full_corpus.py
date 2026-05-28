@@ -85,7 +85,7 @@ sent_ptr = start_step * 8  # approximate continuation
 
 store = TrajectoryStore(max_trajectories=50000)
 
-STEPS = 100000; LR = 5e-3; B = 8; ML = 128
+STEPS = 100000; LR = 5e-3; B = 12; ML = 192
 opt = torch.optim.AdamW(list(ut.parameters()) + list(traj_predictor.parameters()), lr=LR, weight_decay=0.01)
 sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=STEPS)
 rng = np.random.RandomState(seed=42)
@@ -197,7 +197,7 @@ for s in range(1 + start_step, STEPS + 1):
             sent_ptr += 1
         ids_flat = ids_flat[:ML]
         sent_cut = 0; word_cut = 0
-        for cut in range(len(ids_flat), max(len(ids_flat) - 30, 0), -1):
+        for cut in range(len(ids_flat), max(len(ids_flat) - 50, 0), -1):
             if ids_flat[cut - 1] == cv.SENT_CLOSE_IDX and sent_cut == 0:
                 sent_cut = cut
             if ids_flat[cut - 1] == cv.WORD_CLOSE_IDX and word_cut == 0:

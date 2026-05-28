@@ -405,8 +405,8 @@ class RecursiveTensorPotentialField(nn.Module):
         # Symbol coordinates for quantization (set externally)
         self.register_buffer('sym_coords', torch.zeros(num_symbols, coord_dim))
 
-        # Depth scale (learnable)
-        self.depth_scale = nn.Parameter(torch.tensor(0.5))
+        # Depth scale per level (learnable вектор)
+        self.depth_scale = nn.Parameter(torch.ones(max_depth) * 0.5)
         self.max_cap = 4096  # макс общее число путей
 
     def set_symbol_coordinates(self, coords):
@@ -490,9 +490,9 @@ class RecursiveTensorPotentialField(nn.Module):
                 subs_flat = subs.reshape(Nk, self.coord_dim)  # [N*K, D]
                 gates_flat = gates.reshape(Nk)  # [N*K]
 
-                # Scale = parent_scale * depth_scale * gate
+                # Scale = parent_scale * depth_scale[depth-1] * gate
                 parent_scales = frontier_scale.unsqueeze(-1).expand(-1, self.K).reshape(Nk)
-                new_scales = parent_scales * self.depth_scale * gates_flat
+                new_scales = parent_scales * self.depth_scale[depth-1] * gates_flat
 
                 # Gate filter
                 keep = gates_flat > 0.05
@@ -514,15 +514,26 @@ class RecursiveTensorPotentialField(nn.Module):
         """
         vectors: [B, L, D] — hidden states from transformer
         Returns: scalar MSE loss = ||compose(decompose(x)) - x||²
+        + diversity loss = mean(cosine(v_i, v_j)) for i≠j
+        + gate entropy bonus: -0.01 × H(gates)
         """
         B, L, D = vectors.shape
         flat = vectors.reshape(B * L, D)
         subs, gates = self.decompose(flat)  # [BL, K, D], [BL, K]
         recon = self.compose(subs)  # [BL, D]
         loss = F.mse_loss(recon, flat)
+
+        # Diversity: mean cosine between subvectors for i≠j
+        subs_norm = F.normalize(subs, dim=-1)  # [BL, K, D]
+        cos_mat = torch.bmm(subs_norm, subs_norm.transpose(1, 2))  # [BL, K, K]
+        K = cos_mat.shape[1]
+        mask = 1.0 - torch.eye(K, device=cos_mat.device).unsqueeze(0)  # [1, K, K]
+        diversity = (cos_mat * mask).sum(dim=(1, 2)) / (K * (K - 1))
+        diversity = diversity.mean()
+
         # Gate entropy bonus: encourage sparsity
         entropy = -(gates * torch.log(gates + 1e-10)).sum(dim=-1).mean()
-        return loss - 0.01 * entropy
+        return loss + 0.1 * diversity - 0.01 * entropy
 
 
 

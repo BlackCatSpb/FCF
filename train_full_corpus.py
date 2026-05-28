@@ -263,6 +263,21 @@ for s in range(1 + start_step, STEPS + 1):
         print(f"  Gen2500: {gen_texts[0][:40]}|{gen_texts[1][:40]}|{gen_texts[2][:40]}", flush=True)
 
     if s % 5000 == 0:
+        # Colab: sync checkpoints to Drive every 5000 steps
+        try:
+            DRIVE_DIR
+        except NameError:
+            pass
+        else:
+            if os.path.exists(DRIVE_DIR):
+                import shutil
+                os.makedirs(DRIVE_DIR, exist_ok=True)
+                for fn in ('full_latest.pt', 'full_best.pt'):
+                    src_f = os.path.join(CKPT, fn)
+                    if os.path.exists(src_f):
+                        shutil.copy2(src_f, os.path.join(DRIVE_DIR, fn))
+                        print(f'  [sync] {fn} -> Drive')
+
         ut.eval()
         from eva.symbolic.validation_suite import evaluate_model
         results = evaluate_model(ut, cv, store, data, total, CKPT, rng)

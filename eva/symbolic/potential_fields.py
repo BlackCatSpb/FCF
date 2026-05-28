@@ -538,11 +538,10 @@ class RecursiveTensorPotentialField(nn.Module):
                 frontier = subs_flat[keep]
                 frontier_scale = new_scales[keep]
 
-        # Combine all BFS levels
+        # Combine all BFS levels (different N per level -> can't stack)
         if all_vecs:
-            all_bias = torch.stack(all_vecs)
-            all_scale = torch.stack(all_scales).unsqueeze(-1)
-            bias = bias + (all_bias * all_scale).sum(dim=0)
+            for lvl_bias, lvl_scale in zip(all_vecs, all_scales):
+                bias = bias + (lvl_bias * lvl_scale.unsqueeze(-1)).sum(dim=0)
 
         return bias
 

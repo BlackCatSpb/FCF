@@ -452,6 +452,7 @@ class RecursiveTensorPotentialField(nn.Module):
 
         BFS по дереву декомпозиции, все quantize — batched.
         Cycle detection: ||sub - parent|| < 0.01 → geometric series unfold.
+        Chunked P[syms] gather to cap memory at ~1 MB per level.
         """
         device = x.device
         valid = context_ids[context_ids < self.num_symbols]
@@ -464,11 +465,24 @@ class RecursiveTensorPotentialField(nn.Module):
         if self.max_depth == 0:
             return bias
 
-        # ========= Level 1+ : batched BFS with cycle detection =========
+        # Chunked gather: process P[syms] in batches to cap intermediate memory
+        def _gather_biases(syms):
+            batch = 256
+            outs = []
+            for i in range(0, len(syms), batch):
+                c = syms[i:i+batch]
+                g = self.base_tpf.P[c]  # [≤batch, V, V]
+                if len(valid) > 0:
+                    outs.append(g[:, valid].mean(dim=1))
+                else:
+                    outs.append(g.mean(dim=1))
+            return torch.cat(outs, dim=0)  # [N, V]
+
+        # ========= Level 1+ : batched BFS with cap + cycle detection =========
         all_vecs = []
         all_scales = []
+        total_paths = 0
 
-        # Frontier: текущий уровень
         frontier = x.unsqueeze(0)  # [1, D]
         frontier_scale = torch.ones(1, device=device)
 
@@ -477,10 +491,20 @@ class RecursiveTensorPotentialField(nn.Module):
             if N == 0:
                 break
 
-            # Quantize frontier
+            # Budget cap: stop if adding this level exceeds max_cap
+            if total_paths + N > self.max_cap:
+                remaining = self.max_cap - total_paths
+                if remaining <= 0:
+                    break
+                idx = torch.randperm(N, device=device)[:remaining]
+                frontier = frontier[idx]
+                frontier_scale = frontier_scale[idx]
+                N = remaining
+            total_paths += N
+
+            # Quantize frontier → bias
             syms = self.quantize(frontier)  # [N]
-            gathered = self.base_tpf.P[syms]  # [N, V, V]
-            level_biases = gathered[:, valid].mean(dim=1) if len(valid) > 0 else gathered.mean(dim=1)
+            level_biases = _gather_biases(syms)  # [N, V]
             all_vecs.append(level_biases)
             all_scales.append(frontier_scale)
 
@@ -496,35 +520,28 @@ class RecursiveTensorPotentialField(nn.Module):
                 new_scales = parent_scales * self.depth_scale[depth-1] * gates_flat
 
                 # ── Cycle detection ──
-                # Expand parents to match sub_flat layout: [N, D] → [N, K, D] → [N*K, D]
                 parent_flat = frontier.unsqueeze(1).expand(-1, self.K, -1).reshape(Nk, self.coord_dim)
                 diff_norm = (subs_flat - parent_flat).norm(dim=-1)  # [N*K]
-                cycle_mask = diff_norm < 0.01  # [N*K] — bool
+                cycle_mask = diff_norm < 0.01
 
                 if cycle_mask.any():
-                    # Geometric series: r = depth_scale * gate
-                    # Sum: 1 + r + r² + ... = 1/(1 - r) for |r| < 1
-                    r = self.depth_scale[depth-1] * gates_flat[cycle_mask]  # [num_cycles]
-                    series_sum = (1.0 / (1.0 - r + 1e-10)).clamp(max=10.0)  # [num_cycles], cap at 10
-                    # Bias for cycle paths at this level
+                    r = self.depth_scale[depth-1] * gates_flat[cycle_mask]
+                    series_sum = (1.0 / (1.0 - r + 1e-10)).clamp(max=10.0)
                     cycle_idx = torch.where(cycle_mask)[0]
                     parent_idx = cycle_idx // self.K
-                    cycle_bias = level_biases[parent_idx]  # [num_cycles, V]
+                    cycle_bias = level_biases[parent_idx]
                     cycle_contrib = cycle_bias * (frontier_scale[parent_idx] * series_sum).unsqueeze(-1)
                     bias = bias + cycle_contrib.sum(dim=0)
 
-                # Gate filter + exclude cycle paths from further recursion
+                # Gate filter + exclude cycles
                 keep = (gates_flat > 0.05) & (~cycle_mask)
-                frontier = subs_flat[keep]  # [M, D]
+                frontier = subs_flat[keep]
                 frontier_scale = new_scales[keep]
 
-                if len(all_vecs) > self.max_cap:
-                    break
-
-        # Combine all BFS levels (non-cycle paths)
+        # Combine all BFS levels
         if all_vecs:
-            all_bias = torch.stack(all_vecs)  # [L, V]
-            all_scale = torch.stack(all_scales).unsqueeze(-1)  # [L, 1]
+            all_bias = torch.stack(all_vecs)
+            all_scale = torch.stack(all_scales).unsqueeze(-1)
             bias = bias + (all_bias * all_scale).sum(dim=0)
 
         return bias

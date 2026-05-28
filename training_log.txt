@@ -1,0 +1,11 @@
+============================================================
+EVA — Recursive Training on Full Corpus
+============================================================
+Vocab: 160 tokens
+Traceback (most recent call last):
+  File "C:\Users\black\OneDrive\Desktop\FCF\train_full_corpus.py", line 48, in <module>
+    ut.load_state_dict(ckpt['ut'], strict=False)
+  File "C:\Users\black\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py", line 2584, in load_state_dict
+    raise RuntimeError(
+RuntimeError: Error(s) in loading state_dict for UnifiedMultidimensionalTransformer:
+	size mismatch for tensor_potential.depth_scale: copying a param with shape torch.Size([]) from checkpoint, the shape in current model is torch.Size([8]).

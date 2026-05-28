@@ -45,11 +45,17 @@ start_step = 0
 ckpt_path = os.path.join(CKPT, "full_latest.pt")
 if os.path.exists(ckpt_path):
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
-    ut.load_state_dict(ckpt['ut'], strict=False)
-    if 'tensor_potential.P' in ckpt['ut']:
+    # Remove keys with shape mismatches (depth_scale changed scalar→vector[8])
+    old_sd = ckpt['ut']
+    for k in list(old_sd.keys()):
+        if k in ut.state_dict() and old_sd[k].shape != ut.state_dict()[k].shape:
+            print(f"  Skip shape mismatch: {k} {old_sd[k].shape} → {ut.state_dict()[k].shape}")
+            del old_sd[k]
+    ut.load_state_dict(old_sd, strict=False)
+    if 'tensor_potential.P' in old_sd:
         print("Migrating old TPF.P → RecursiveTPF.base_tpf.P")
         with torch.no_grad():
-            ut.tensor_potential.base_tpf.P.data.copy_(ckpt['ut']['tensor_potential.P'])
+            ut.tensor_potential.base_tpf.P.data.copy_(old_sd['tensor_potential.P'])
     if 'traj_predictor' in ckpt:
         traj_predictor.load_state_dict(ckpt['traj_predictor'])
     start_step = ckpt.get('step', 0)

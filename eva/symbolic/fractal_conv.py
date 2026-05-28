@@ -100,44 +100,36 @@ class HybridFractalBlock(nn.Module):
         self.sgf_router = nn.Linear(dim, 4)
         self.sgf_gates = nn.Parameter(torch.randn(4, dim))
     
-    def forward(self, x, token_ids=None, coord_stream=None):
-        # Если coord_stream не передан, инициализируем нулями
+    def forward(self, x, token_ids=None, coord_stream=None, capture_attn=False):
         if coord_stream is None:
             coord_stream = torch.zeros_like(x)
         
-        # --- 1. FractalConv ---
         conv_out = self.fractal_conv(self.norm_conv(x))
         
-        # --- 2. Attention + Topology bias + CoordBias ---
         topo_bias = None
         if self.topology is not None and token_ids is not None:
             topo_bias = self.topology.get_topology_bias(token_ids)
-        attn_out, _ = self.attention(self.norm_attn(x), topology_bias=topo_bias)
+        attn_out, _ = self.attention(self.norm_attn(x), topology_bias=topo_bias,
+                                      return_attn=capture_attn)
         
-        # --- 3. Gate merge ---
         combined = torch.cat([conv_out, attn_out], dim=-1)
         gate = self.gate_conv(combined).sigmoid()
         
-        # --- 4. Coordinate Residual Stream: merge into hidden ---
-        coord_gate = torch.sigmoid(self.coord_gate_in)  # [D]
-        x = x + gate * conv_out + (1 - gate) * attn_out + coord_stream * coord_gate
+        coord_in_g = torch.sigmoid(self.coord_gate_in)
+        x = x + gate * conv_out + (1 - gate) * attn_out + coord_stream * coord_in_g
         
-        # --- 5. SGF-FFN (Subspace-Gated) ---
+        # SGF-FFN
         x_norm = self.norm_ffn(x)
         gate_s = F.silu(self.ffn.W_gate(x_norm))
         up = self.ffn.W_up(x_norm)
         swiglu = gate_s * up
-        
-        # Subspace routing: predict blend weights per token
-        route = F.softmax(self.sgf_router(x_norm), dim=-1)  # [B, L, 4]
-        sgf_gate = route @ self.sgf_gates  # [B, L, D]
+        route = F.softmax(self.sgf_router(x_norm), dim=-1)
+        sgf_gate = route @ self.sgf_gates
         swiglu = swiglu * torch.sigmoid(sgf_gate)
-        
         x = x + self.ffn.W_down(swiglu)
         
-        # --- 6. Update coordinate residual stream ---
-        coord_gate_out = torch.sigmoid(self.coord_gate_out)
-        coord_stream = coord_stream + x * coord_gate_out
+        coord_out_g = torch.sigmoid(self.coord_gate_out)
+        coord_stream = coord_stream + x * coord_out_g
         
         return x, coord_stream
 

@@ -80,7 +80,7 @@ class TrajectoryStore:
         self.consolidation_net = None  # Lazy init on first use
     
     def _lazy_init_consolidation(self, device='cpu'):
-        if not hasattr(self, 'consolidation_net') or self.consolidation_net is None:
+        if self.consolidation_net is None:
             self.consolidation_net = ConsolidationTransformer(d_model=128).to(device)
     
     def consolidate(self, htraj: HierarchicalTrajectory, device='cpu') -> HierarchicalTrajectory:
@@ -111,20 +111,6 @@ class TrajectoryStore:
             text=htraj.text,
             ids=htraj.ids,
         )
-    
-    def __init__(self, max_trajectories=1000000):
-        self.max_trajectories = max_trajectories
-        
-        self.trajectories = []      # [L, D] flat
-        self.ids_list = []          # [L]
-        self.texts = []             # str
-        self.centroids = []         # [D]
-        self.first_coords = []      # [D]
-        self.lengths = []           # int
-        self.total_stored = 0
-        
-        # Hierarchical storage
-        self.hierarchical = []      # List[HierarchicalTrajectory]
     
     def store_hierarchical(self, htraj: HierarchicalTrajectory):
         """Store multi-level trajectory (agent's proposed method)."""
@@ -191,13 +177,7 @@ class TrajectoryStore:
         
         scores.sort(key=lambda x: x[0], reverse=True)
         return [self.hierarchical[i] for _, i in scores[:top_k]]
-        self.texts = []             # source texts
-        self.centroids = []         # [N, 24]
-        self.first_coords = []      # [N, 24] — first point (start index)
-        self.lengths = []           # [N]
-        
-        self.total_stored = 0
-        
+
     def store(self, text, ids, trajectory):
         """
         Сохранить траекторию декодирования.

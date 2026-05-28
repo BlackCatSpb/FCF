@@ -99,13 +99,13 @@ def evaluate_model(ut, cv, store, data, total, CKPT, rng, device='cuda'):
             ids_out = list(ids)
             with torch.no_grad():
                 for _ in range(60):
-                    _, sc = ut(torch.tensor([ids_out], dtype=torch.long, device=device), return_scores=True)
+                    h, sc = ut(torch.tensor([ids_out], dtype=torch.long, device=device), return_scores=True)
                     logits = sc[0, -1] / 0.6
                     
                     # Boost from retrieved similar trajectories
                     if store.total_stored >= 5:
                         similar = store.find_similar(
-                            ut.embed(torch.tensor([ids_out], device=device))[0].cpu().numpy(),
+                            h[0].cpu().numpy(),
                             top_k=3
                         )
                         for sim in similar:

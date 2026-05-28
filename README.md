@@ -2,8 +2,8 @@
 
 > **Не LLM. Не статистический попугай.**  
 > Символ ≡ координата в ℝ¹²⁸. Текст ≡ траектория. Трансформер ≡ навигатор.  
-> Знания — в геометрии пространства, не в весах.  
-> **1.14M параметров. 160 токенов. Полный цикл encode→decode.**
+> Знания — в геометрии пространства, рекурсивном тензоре потенциалов и топологии путей, не в весах.  
+> **~5.5M параметров. 160 токенов. Полный цикл train→think→generate.**
 
 ---
 
@@ -11,105 +11,99 @@
 
 Обычный ИИ: «привет» → токен #4521 → вектор → угадать следующий токен.
 
-**EVA**: «привет» → 6 точек в ℝ¹²⁸ → траектория → найти путь → исполнить инструкцию.
+**EVA**: «привет» → 6 точек в ℝ¹²⁸ → траектория → рекурсивная декомпозиция координаты → bias от тензора потенциалов на каждом уровне иерархии → генерация.
 
-Модель не «предсказывает следующее слово». Она **навигирует в координатном пространстве**, где каждый символ — точка, каждое слово — путь, а знание — топология всех возможных путей.
+Модель не «предсказывает следующее слово». Она **навигирует в координатном пространстве**, где каждый символ — точка, каждое слово — путь, а знание — тензор потенциалов [160×160×160] + рекурсивная декомпозиция на K=6 субвекторов + топология всех возможных путей.
+
+---
+
+## Текущее состояние
+
+**Training** на **full_corpus_encoded.npy** (106.5M токенов, 680K предложений).  
+Resume с чекпоинта ~step 6500, RecursiveTF вместо flat TPF.
+
+| Параметр | Значение |
+|----------|----------|
+| Ядро трансформера | 6 HybridFractalBlock слоёв, 128-dim, 32 heads |
+| TensorPotentialField | [160,160,160] — 4M params (base) |
+| RecursiveTPF | base + decomp / compose / gate — 4,293,383 params |
+| WordValenceField | outer-product — 74K params |
+| Всего параметров | ~5.49M |
+| Батч | B=8, seq=128 (обрезка до `</S>` → `</W>`) |
+| Шагов | 100 000 |
+| Оптимизатор | AdamW (lr=5e-3, cosine → 0) |
+| VRAM | ~0.7 GB (MX550) |
+| Скорость | ~160 шагов/мин |
+| Recovery | strict=False — старый TPF.P → base_tpf.P |
 
 ---
 
 ## Архитектура
 
 ```
-Текст → Boundary Tokens → HybridFractalBlock ×6 → Координаты → Декодер → Текст
-              │                    │
-         <W></W><S></S>      Conv2D + Attention
-                                 │
-                          StaticTopology [160,160,3]
-                                 │
-                          TrajectoryStore (Fast Path)
+Текст → CharacterVocab (boundary-токены) → CoordinateEmbedding [ℝ¹²⁸]
+  → MultiSubspaceEmbedding → RoPE → HybridFractalBlock ×6
+  → RMSNorm → CoordinateDecoder (SubHSM) → Текст
+
+Генерация:
+  CE_logits
+    + RecursiveTPF.recursive_bias(x=hidden, context=ids) × 0.1
+    + WVF.get_valence_bias(word_coord, context) × 0.05
+    → top-20 → adaptive repetition penalty (p × 0.5^freq)
+    → softmax → multinomial
+
+Thinking Phase (каждые 500 шагов):
+  Co-occurrence affinity (500 samples) → RecursiveTPF.init_from_affinity()
+  Capture attention → TPF.update() (10 блоков)
+  Extract trajectories → TrajectoryStore.consolidate()
+  Build topology → Fast Path cache
+
+Composition Loss (каждый шаг):
+  hidden [B,L,D] → RecursiveTPF.composition_loss()
+    = MSE(decompose → compose, identity) - 0.01 × gate_entropy
 ```
 
-| Компонент | Назначение | Параметры |
-|-----------|-----------|-----------|
-| **CharacterVocab** | 160 токенов + boundary-разметка | 0 |
-| **CoordinateEmbedding** | Символ → ℝ¹²⁸ (MDS из affinity) | 0 |
-| **RoPE** | Rotary Position Embedding | 0 |
-| **FractalConv2D** | Многомерная фрактальная свёртка (L×Dim) | В составе блока |
-| **AdaptiveAttention** | 32 головы, динамические уровни 1-8 | В составе блока |
-| **HybridFractalBlock ×6** | Conv2D + Attention + Gate Merge | ~190K/блок |
-| **StaticTopologyLayer** | Матрица [160,160,3]: affinity, barrier, forbidden | ~500 |
-| **SwiGLU FFN** | Gated Feed-Forward | В составе блока |
-| **RMSNorm** | Pre-norm нормализация | ~256 |
-| **WordWeightEncoder** | Обратное внимание — вес слов | ~50K |
-| **CoordinateDecoder** | ℝ¹²⁸ → 160 классов | ~10K |
-| **TrajectoryStore** | Иерархическая память (4 уровня) | ∞ |
+| Компонент | Параметры |
+|-----------|-----------|
+| **HybridFractalBlock ×6** | ~1.14M |
+| **RecursiveTensorPotentialField** | 4,293,383 |
+| — base TensorPotentialField [V×V×V] | 4,096,000 |
+| — decomp_proj (128→K·128) | 98,304 |
+| — compose_proj (K·128→128) | 98,304 |
+| — gate_net (128→6→softmax) | 774 |
+| — depth_scale (learnable) | 1 |
+| **WordValenceField** | 74,305 |
+| **TrajectoryPredictor** | 16,576 |
+| **ConsolidationTransformer** | 6,529 |
+| **SentenceContextField** | 3 |
+| **StaticTopologyLayer** | ~500 |
+| **All other** (embeds, norms, decoders) | ~40K |
 
----
+## Инновации (21 total)
 
-## Что работает
-
-| # | Возможность | Результат |
-|---|-----------|-----------|
-| 1 | Воспроизведение всех символов | 100% |
-| 2 | Affinity matrix из текста | 160×160 |
-| 3 | MDS → ℝ¹²⁸ координаты | eff_dim >80% |
-| 4 | Word/Sentence autoencoding | 100% |
-| 5 | STDP пластика (PotentialDynamics) | σ ×16 |
-| 6 | V(z) скалярный потенциал | real=-1, random=+1 |
-| 7 | K-means концепты | 8 лингвистических групп |
-| 8 | ContradictionFilter | 5 типов запретов |
-| 9 | GradientFlow + седловые точки | Барьеры 0-1.6 |
-| 10 | DialecticalSynthesis | 15/18 валидных синтезов |
-| 11 | TopologicalPersistence | >82% устойчивость |
-| 12 | FractalSelfConsistency | Power-law decay |
-| 13 | ConceptNet enrichment | 597K русских слов |
-| 14 | Trajectory Genetics | Мутация, кроссовер, селекция |
-| 15 | Полный encode→decode цикл | 100% round-trip |
-| 16 | Causal генерация с boundary-tokens | Реальные персонажи Толстого |
-| 17 | **HybridFractalBlock** | Сходимость ×20 быстрее |
-| 18 | **StaticTopologyLayer** | Fast Path кэш траекторий |
-| 19 | Иерархический TrajectoryStore | 4 уровня метаданных |
-| 20 | Autonomous Consolidation | 2690+ траекторий |
-
----
-
-## Ключевые отличия от LLM
-
-| | LLM (GPT, LLaMA) | EVA |
-|---|---|---|
-| **Принцип** | Статистическое угадывание | Навигация в ℝ¹²⁸ |
-| **Символ** | Индекс в таблице | Координата (MDS из языка) |
-| **Параметры** | 1B–1.7T | **1 144 990** |
-| **Знания** | В миллиардах весов | В топологии (отдельно) |
-| **Память** | Внутри модели | TrajectoryStore (внешняя) |
-| **Внимание** | Multi-Head Self-Attention | **FractalConv2D + AdaptiveAttention** |
-| **Генерация** | softmax(logits) | **Исполнение координатных инструкций** |
-| **Обучение** | Статичное, $100M+ | **STDP + LTP/LTD + диалектика** |
-| **Интерпретация** | Black box | **Траектория в ℝ¹²⁸ — полный trace** |
-| **Масштабирование** | Больше параметров | Больше траекторий (модель не растёт) |
-| **2+2=4** | Статистически | **Единственный путь в ℝ¹²⁸** |
-
----
-
-## Научные инновации
-
-### Символ как координата
-Позиция символа в ℝ¹²⁸ **вычисляется** из статистики языка через MDS, а не задаётся случайно. Символы, часто встречающиеся рядом, получают близкие координаты. «п» и «р» рядом. «ъ» и «ь» далеко.
-
-### Иерархические метаданные
-Четыре уровня вложенности: символ → слово → связь → предложение. Каждый уровень — своё подпространство в ℝ¹²⁸. FractalConv2D видит все уровни одновременно.
-
-### Статическая топология
-Матрица [160, 160, 3] предвычисляет affinity, potential barrier и forbidden для каждой пары символов. Используется как read-only bias в attention + Fast Path кэш для мгновенной генерации.
-
-### Живая пластика
-Affinity матрица эволюционирует через STDP (Spike-Timing-Dependent Plasticity): часто используемые связи усиливаются, неиспользуемые ослабляются. LTP/LTD + гомеостаз. Модель улучшается от использования.
-
-### Фрактальная размерность
-Conv2D + Attention с dilation 1,2,4,8 по обеим осям (L и Dim). Один блок видит и соседние символы, и целые предложения, и меж-subspace корреляции.
-
-### Диалектический синтез
-Новые концепты через гегелевскую диалектику: тезис ⊕ антитезис → синтез. Седловая точка между концептами → градиентный спуск → новая котловина.
+| # | Инновация | Параметров | Суть |
+|---|-----------|-----------|------|
+| 1 | **CharacterVocab** | 0 | Символьный словарь с boundary-токенами `<W></W><S></S>` |
+| 2 | **CoordinateEmbedding** | 0 | Символ → точка в ℝ¹²⁸, не lookup-таблица |
+| 3 | **FractalConv2D** | В блоке | Causal свёртка по L × Dim с dilation 1,2,4,8 |
+| 4 | **AdaptiveAttention** | В блоке | Динамический аллокатор голов по уровням сложности |
+| 5 | **HybridFractalBlock** | ~190K | Conv2D + Attention + Gate Merge + SGF + CoordStream |
+| 6 | **StaticTopologyLayer** | ~500 | [160,160,3] + Fast Path cache (10K) |
+| 7 | **SubHSM** | 516 | 4-group hierarchical softmax + bias |
+| 8 | **CoordBias** | 0 | L2-distance bias в attention scores |
+| 9 | **Coordinate Residual Stream** | 1,536 | Сквозной поток координат через все слои |
+| 10 | **SGF — Subspace-Gated FFN** | 3,072 | 4 gate-вектора + роутер для разных подпространств |
+| 11 | **TrajLoss** | 16,576 | Aux loss на предсказание следующей координаты |
+| 12 | **Learnable Consolidation** | 6,529 | Conv1d + gate для взвешенной консолидации |
+| 13 | **Dilated KV-Cache** | 0 | Прореженный кэш для экономии VRAM |
+| 14 | **TensorPotentialField** | 4,096,000 | [V×V×V] — динамический символьный потенциал |
+| 15 | **WordValenceField** | 74,305 | Outer-product MLP → valence matrix |
+| 16 | **SentenceContextField** | 3 | RBF-поле из top-K центров внимания |
+| 17 | **SemanticRelevanceGate** | 0 | Фильтр по similarity + entropy + ethics |
+| 18 | **GradientFlowSolver** | 0 | Langevin + oscillation damping |
+| 19 | **KCACycle** | 0 | Adam-коррекция латентного кода |
+| 20 | **Adaptive Repetition Penalty** | 0 | p × 0.5^freq по всем токенам |
+| 21 | **RecursiveTensorPotentialField** | 197,383 | Координата → K=6 субвекторов → BFS quantize → bias на каждом уровне |
 
 ---
 
@@ -118,51 +112,68 @@ Conv2D + Attention с dilation 1,2,4,8 по обеим осям (L и Dim). Од
 ```bash
 git clone https://github.com/BlackCatSpb/FCF.git
 cd FCF
-pip install torch numpy scikit-learn loguru psutil
+pip install torch numpy scikit-learn
 
-# Иерархическое обучение на Войне и Мире
-python train_warpeace.py
+# Кодирование корпуса
+python encode_full_corpus.py
 
-# Консолидация знаний
-python train_consolidate.py
+# Обучение с Resume (старый TPF.P → base_tpf.P)
+python train_full_corpus.py
 ```
+
+Чекпоинты: `checkpoints/symbolic/full_latest.pt` (каждые 500), `full_best.pt` (по curvature).  
+Resume автоматически мигрирует старый TPF.P в RecursiveTPF.base_tpf.P.
 
 ---
 
 ## Структура проекта
 
 ```
-EVA/
-├── train_warpeace.py         ← Иерархическое обучение
-├── train_consolidate.py      ← Автономная консолидация
-├── train_unified.py          ← Train+Think цикл
-├── train_genetics.py         ← Эволюция траекторий
-├── train_yandex.py           ← V100-оптимизированное обучение
+FCF/
+├── train_full_corpus.py         ← Основное обучение (106M токенов, RecursiveTPF)
+├── encode_full_corpus.py        ← Кодирование текста в ID
 │
-├── eva/symbolic/             ← Символьное ядро (27 модулей)
-│   ├── unified_transformer.py  ← Координатный трансформер
-│   ├── fractal_conv.py         ← HybridFractalBlock
-│   ├── adaptive_fractal.py     ← AdaptiveAttention
-│   ├── static_topology.py      ← Статическая топология
-│   ├── potential_field.py      ← Affinity matrix
-│   ├── potential_function.py   ← V(z) потенциал
-│   ├── topological_field.py    ← MDS проекция
-│   ├── trajectory_store.py     ← Иерархическая память
-│   ├── subspace_coords.py      ← MultiSubspace + WordWeight
-│   ├── contradiction_filter.py ← Иммунная система
-│   ├── gradient_flow.py        ← GFRE
-│   ├── self_reflection.py      ← Анализ траекторий
-│   └── ...
+├── eva/symbolic/
+│   ├── unified_transformer.py   ← Координатный трансформер + enhanced_generate
+│   ├── adaptive_fractal.py      ← AdaptiveAttention + LevelController
+│   ├── fractal_conv.py          ← HybridFractalBlock + SGF + CoordStream
+│   ├── potential_fields.py      ← RecursiveTPF + TPF + WVF + SCF + SRG + KCA
+│   ├── trajectory_store.py      ← Иерархическая память + ConsolidationTransformer
+│   ├── static_topology.py       ← Топология [160,160,3] + Fast Path
+│   ├── subspace_coords.py       ← MultiSubspace + WordWeightEncoder
+│   ├── char_vocab.py            ← 160 токенов + boundary-разметка
+│   ├── self_reflection.py       ← Анализ траекторий (кривизна, confidence)
+│   └── validation_suite.py      ← Автоматическая валидация
 │
 ├── docs/
-│   ├── ARCHITECTURE.md       ← Полное описание архитектуры
-│   ├── PARAMS_CALC.md        ← Математический расчёт
-│   ├── LLM_IMPROVEMENTS.md   ← Заимствования из LLM
-│   └── CONVOLUTION_DESIGN.md ← Свёрточная оптимизация
+│   ├── ARCHITECTURE.md          ← Полное описание архитектуры
+│   └── ...
 │
-└── checkpoints/symbolic/     ← Чекпоинты и TrajectoryStore
+├── real_data/
+│   ├── full_corpus_ru.txt       ← Исходный текст (172 MB)
+│   └── full_corpus_encoded.npy  ← Закодированный корпус (106M токенов)
+│
+└── checkpoints/symbolic/
+    ├── full_latest.pt           ← Последний чекпоинт
+    ├── full_best.pt             ← Лучший по curvature
+    └── trajectory_store_full.pkl ← Иерархическая память
 ```
 
 ---
 
-*«Модель не имитирует язык. Она строит карту символьного пространства и учится по ней перемещаться. Знания — не в весах, а в геометрии пространства.»*
+## Ключевые отличия от LLM
+
+| | LLM (GPT, LLaMA) | EVA |
+|---|---|---|
+| **Принцип** | Статистическое угадывание | Навигация + рекурсивные потенциалы |
+| **Параметры** | 1B–1.7T | **~5.5M** |
+| **Знания** | В весах (неотделимы) | Топология + RecursiveTPF + TrajectoryStore |
+| **Bias** | Нет (raw CE) | **RecursiveTPF + WVF + SubHSM** |
+| **Bias-структура** | Одноуровневый | **Батчевый BFS quantize на K=6 субвекторах** |
+| **Ретенция** | Context window | Внешняя память траекторий |
+| **Масштабирование** | Больше параметров | Больше траекторий (модель не растёт) |
+| **VRAM** | 8–80 GB | **~0.7 GB** |
+
+---
+
+*«Модель не имитирует язык. Она строит карту символьного пространства, рекурсивно декомпозирует каждую координату на субвекторы, заполняет тензор потенциалов на всех уровнях иерархии и учится перемещаться по этой карте, используя bias от каждого уровня рекурсии.»*

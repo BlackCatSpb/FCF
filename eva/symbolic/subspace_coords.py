@@ -16,14 +16,6 @@ class MultiSubspaceEmbedding(nn.Module):
         
         self.symbol_coords = nn.Parameter(torch.randn(vocab_size, sym_dim) * 0.02)
         self.scale = nn.Parameter(torch.ones(1))
-        
-        # Projectors to other subspaces
-        self.to_word = nn.Linear(total_dim, sym_dim)
-        self.to_conn = nn.Linear(total_dim, sym_dim)
-        self.to_sent = nn.Linear(total_dim, sym_dim)
-        
-        # Subspace weights (learned importance)
-        self.subspace_weights = nn.Parameter(torch.ones(4))  # sym, word, conn, sent
     
     def set_coordinates(self, coords):
         assert coords.shape[0] == self.vocab_size
@@ -34,10 +26,6 @@ class MultiSubspaceEmbedding(nn.Module):
         ids = token_ids.clamp(0, self.vocab_size - 1)
         sym = self.symbol_coords[ids] * self.scale  # [B, L, sym_dim]
         return sym
-    
-    def full_coords(self, x_transformer):
-        """x_transformer: [B, L, total_dim] — output from transformer."""
-        return x_transformer
 
 
 class WordWeightEncoder(nn.Module):

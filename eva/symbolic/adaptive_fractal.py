@@ -16,9 +16,7 @@ class LevelController(nn.Module):
         super().__init__()
         self.max_levels = max_levels
         self.total_heads = total_heads
-        self.min_levels = 1
         
-        self.complexity_conv = nn.Conv1d(d_model, 1, kernel_size=5, padding=2)
         self.level_gate = nn.Sequential(
             nn.Linear(d_model, 64), nn.ReLU(),
             nn.Linear(64, max_levels), nn.Softmax(dim=-1)
@@ -27,31 +25,22 @@ class LevelController(nn.Module):
         # Scales per level: 1, 2, 4, 8, 16, 32, 64, 128
         self.register_buffer('level_scales', torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]))
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x: [B, L, D]
-        Returns: (num_active_levels [B], head_allocation [B, max_levels], level_probs [B, max_levels])
+        Returns: (head_allocation [B, max_levels], level_probs [B, max_levels])
         """
-        B, L, D = x.shape
-        
-        complexity = self.complexity_conv(x.transpose(1, 2)).squeeze(1)  # [B, L]
-        mean_complexity = complexity.mean(dim=-1, keepdim=True)  # [B, 1]
-        
         level_probs = self.level_gate(x.mean(dim=1))  # [B, max_levels]
-        
-        active_mask = level_probs > 0.05
-        num_active = active_mask.sum(dim=-1, keepdim=True).float()  # [B, 1]
-        num_active = num_active.clamp(self.min_levels, self.max_levels)
         
         head_allocation = (level_probs * self.total_heads).round().long()
         head_allocation = head_allocation.clamp(min=1)
         
         # Normalize allocations to sum to total_heads
-        total_alloc = head_allocation.sum(dim=-1, keepdim=True)  # [B, 1]
+        total_alloc = head_allocation.sum(dim=-1, keepdim=True)
         head_allocation = (head_allocation.float() * self.total_heads / total_alloc.clamp(min=1)).round().long()
         head_allocation = head_allocation.clamp(min=1)
         
-        return num_active, head_allocation, level_probs
+        return head_allocation, level_probs
 
 
 class AdaptiveFractalAttention(nn.Module):
@@ -90,18 +79,18 @@ class AdaptiveFractalAttention(nn.Module):
         sigma = scale * 0.5
         return torch.exp(-dists ** 2 / (2 * sigma ** 2 + 1e-8))
     
-    def forward(self, x, topology_bias=None):
+    def forward(self, x, topology_bias=None, return_attn=False):
         B, L, D = x.shape
         H = self.effective_heads
         Dh = self.head_dim
         
-        # --- CoordBias: pairwise L2 distance in full ℝ^D ---
+        # CoordBias
         with torch.no_grad():
             x_norm = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
-            coord_dists = torch.cdist(x_norm, x_norm, p=2)  # [B, L, L]
-            coord_bias = -0.1 * coord_dists  # близкие токены получают +, далёкие -
+            coord_dists = torch.cdist(x_norm, x_norm, p=2)
+            coord_bias = -0.1 * coord_dists
         
-        num_active, head_alloc, level_probs = self.level_controller(x)
+        head_alloc, level_probs = self.level_controller(x)
         
         q = self.W_Q(x).view(B, L, H, Dh)
         k = self.W_K(x).view(B, L, H, Dh)
@@ -110,21 +99,25 @@ class AdaptiveFractalAttention(nn.Module):
         outputs = []
         head_offset = 0
         
+        # Для захвата attention weights (среднее по головам)
+        attn_accum = torch.zeros(B, L, L, device=x.device) if return_attn else None
+        n_captured = 0
+        
         for level in range(self.max_levels):
             n_heads = int(head_alloc[0, level].item())
             if n_heads == 0: continue
+            
+            scale = self.level_controller.level_scales[level].item()
+            level_manifold_bias = self.compute_manifold_bias(x, scale)
+            level_bias_val = self.level_bias[level]
             
             level_outputs = []
             for h in range(head_offset, head_offset + n_heads):
                 if h >= H: break
                 
                 scores = torch.matmul(q[:, :, h], k[:, :, h].transpose(-2, -1)) / (Dh ** 0.5)
+                scores = scores + level_manifold_bias + level_bias_val + coord_bias
                 
-                scale = self.level_controller.level_scales[level].item()
-                manifold_bias = self.compute_manifold_bias(x, scale)
-                scores = scores + manifold_bias + self.level_bias[level] + coord_bias
-                
-                # StaticTopology pair-wise bias (если передан)
                 if topology_bias is not None:
                     scores = scores + topology_bias
                 
@@ -132,21 +125,29 @@ class AdaptiveFractalAttention(nn.Module):
                 scores = scores.masked_fill(causal, float('-inf'))
                 
                 attn = F.softmax(scores, dim=-1)
+                
+                if return_attn and attn_accum is not None:
+                    attn_accum += attn
+                    n_captured += 1
+                
                 out = torch.matmul(attn, v[:, :, h])
                 level_outputs.append(out)
             
             if level_outputs:
                 actual_n = len(level_outputs)
-                level_out = torch.stack(level_outputs, dim=1)  # [B, actual_n, L, Dh]
+                level_out = torch.stack(level_outputs, dim=1)
                 level_out = level_out.permute(0, 2, 1, 3).reshape(B, L, actual_n * Dh)
                 outputs.append(level_out)
             
             head_offset += n_heads
         
+        if return_attn and n_captured > 0:
+            self.last_attn_weights = attn_accum / n_captured  # [B, L, L]
+        
         if not outputs:
             return x, level_probs
         
-        combined = torch.cat(outputs, dim=-1)  # [B, L, H*Dh]
+        combined = torch.cat(outputs, dim=-1)
         if combined.shape[-1] < H * Dh:
             pad = torch.zeros(B, L, H * Dh - combined.shape[-1], device=x.device)
             combined = torch.cat([combined, pad], dim=-1)

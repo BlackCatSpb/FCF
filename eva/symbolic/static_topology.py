@@ -29,8 +29,9 @@ class StaticTopologyLayer(nn.Module):
         self.register_buffer('topology', torch.zeros(vocab_size, vocab_size, 3))
         
         # Fast Path cache: центроид → список успешных траекторий
-        self.register_buffer('fast_path_keys', torch.zeros(0, coord_dim))
+        self.fast_path_keys = []  # List of centroid tensors
         self.fast_path_values = []  # List of trajectory continuations
+        self.max_fast_path = 10000  # cap to prevent unbounded growth
         
         # Обучаемый projection: топология → bias для attention
         self.topo_proj = nn.Linear(3, 1, bias=False)
@@ -97,61 +98,32 @@ class StaticTopologyLayer(nn.Module):
         return bias
     
     def get_optimal_direction(self, token_ids: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        """
-        Найти оптимальное направление движения из текущей позиции.
-        
-        Returns: direction [B, L, D] — вектор следующего шага
-        """
         B, L = token_ids.shape
         ids = token_ids.clamp(0, self.vocab_size - 1)
-        
-        # Для каждого токена найти топ-1 продолжение по affinity
-        directions = torch.zeros(B, L, self.coord_dim, device=token_ids.device)
-        
-        for b in range(B):
-            for i in range(L):
-                curr = ids[b, i].item()
-                # Найти самый вероятный следующий токен (исключая запреты)
-                aff = self.topology[curr, :, 0].clone()
-                forb = self.topology[curr, :, 1] > 0.5  # barrier > 0.5 → трудно
-                aff[forb] = -1e9
-                best_next = aff.argmax().item()
-                
-                # Направление = координата_next - координата_curr
-                directions[b, i] = coords[best_next] - coords[curr]
-        
-        return directions
+        aff = self.topology[ids, :, 0]
+        forb = self.topology[ids, :, 1] > 0.5
+        aff = aff.masked_fill(forb, -1e9)
+        best_next = aff.argmax(dim=-1)
+        return coords[best_next] - coords[ids]
     
     def cache_fast_path(self, query_centroid: torch.Tensor, continuation_ids: list):
-        """
-        Кэшировать успешную траекторию для Fast Path генерации.
-        
-        Args:
-            query_centroid: [D] — центроид запроса
-            continuation_ids: [L] — успешное продолжение
-        """
+        if len(self.fast_path_keys) >= self.max_fast_path:
+            self.fast_path_keys = self.fast_path_keys[self.max_fast_path // 4:]
+            self.fast_path_values = self.fast_path_values[self.max_fast_path // 4:]
+        self.fast_path_keys.append(query_centroid.detach().cpu())
         self.fast_path_values.append(continuation_ids)
-        if len(self.fast_path_keys) == 0:
-            self.fast_path_keys = query_centroid.unsqueeze(0)
-        else:
-            self.fast_path_keys = torch.cat([self.fast_path_keys, query_centroid.unsqueeze(0)])
     
     def fast_path_lookup(self, query_centroid: torch.Tensor, top_k=5, threshold=0.1):
-        """
-        Fast Path: найти кэшированную траекторию по центроиду запроса.
-        
-        Returns: список продолжений или None если нет близких
-        """
         if len(self.fast_path_keys) == 0:
             return None
         
-        dists = torch.norm(self.fast_path_keys - query_centroid, dim=-1)
+        stacked = torch.stack([k.to(query_centroid.device) for k in self.fast_path_keys], dim=0)
+        dists = torch.norm(stacked - query_centroid.unsqueeze(0), dim=-1)
         min_dist, min_idx = dists.min(dim=0)
         
         if min_dist < threshold:
             return [self.fast_path_values[min_idx.item()]]
         
-        # Top-K ближайших
         _, top_indices = dists.topk(min(top_k, len(dists)), largest=False)
         return [self.fast_path_values[i.item()] for i in top_indices]
     
@@ -160,11 +132,14 @@ class StaticTopologyLayer(nn.Module):
         if trajectory_store.total_stored == 0:
             return
         
+        n = min(trajectory_store.total_stored, self.max_fast_path)
         for i in range(trajectory_store.total_stored):
+            if len(self.fast_path_keys) >= self.max_fast_path:
+                break
             centroid = trajectory_store.centroids[i]
             ids = trajectory_store.ids_list[i]
             if len(ids) > 5:
                 self.cache_fast_path(
                     torch.tensor(centroid),
-                    ids[5:]  # продолжение после первых 5 токенов
+                    ids[5:]
                 )

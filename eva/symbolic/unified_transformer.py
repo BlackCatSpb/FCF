@@ -131,43 +131,28 @@ class CoordinateDecoder(nn.Module):
         
         full_logits = logits + nn_logits
         
-        # --- SubHSM auxiliary logits ---
-        group_logits = self.group_classifier(x)  # [B, L, 4]
-        full_logits = full_logits + group_logits[:, :, :1] * 0  # no-op, just for group aux
+        # SubHSM bias: each token's logits boosted by its group affinity
+        group_probs = F.softmax(self.group_classifier(x), dim=-1)
+        gs = self.group_size
+        for g in range(4):
+            start = g * gs
+            end = min(start + gs, self.vocab_size)
+            full_logits[:, :, start:end] += group_probs[:, :, g:g+1]
         
         return full_logits
     
-    def forward_subhsm(self, x: torch.Tensor):
-        """Returns (full_logits, group_logits) for combined loss."""
-        B, L, D = x.shape
-        full_logits = self.forward(x)
-        
-        # Aggregate per-group log-sum-exp
-        gs = self.group_size
-        n_groups = 4
-        group_logits = torch.stack([
-            full_logits[:, :, g*gs:(g+1)*gs].logsumexp(dim=-1)
-            for g in range(n_groups)
-        ], dim=-1)  # [B, L, 4]
-        
-        return full_logits, group_logits
-    
     def decode_to_ids(self, x: torch.Tensor) -> torch.Tensor:
         logits = self.forward(x)
-        # Fast hierarchical decoding: top group → top token in group
-        group_logits = self.group_classifier(x)  # [B, L, 4]
-        best_group = group_logits.argmax(dim=-1)  # [B, L]
+        group_logits = self.group_classifier(x)
+        best_group = group_logits.argmax(dim=-1)
         gs = self.group_size
-        B, L = best_group.shape
-        result = torch.zeros(B, L, dtype=torch.long, device=x.device)
-        for b in range(B):
-            for i in range(L):
-                g = best_group[b, i].item()
-                start = g * gs
-                end = min(start + gs, self.vocab_size)
-                local_logits = logits[b, i, start:end]
-                result[b, i] = start + local_logits.argmax()
-        return result
+        start = best_group * gs
+        offsets = torch.arange(gs, device=x.device).unsqueeze(0).unsqueeze(0)
+        idx = start.unsqueeze(-1) + offsets
+        idx = idx.clamp(max=self.vocab_size - 1)
+        gathered = logits.gather(-1, idx)
+        local_best = gathered.argmax(dim=-1)
+        return (start + local_best).clamp(max=self.vocab_size - 1)
 
 
 # ============================================================
@@ -253,14 +238,18 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         from .subspace_coords import WordWeightEncoder
         self.word_weight = WordWeightEncoder(coord_dim)
         
-        from .adaptive_fractal import ConnectionCoordinateHead
-        self.connection_head = ConnectionCoordinateHead(coord_dim)
+        from .potential_fields import RecursiveTensorPotentialField, WordValenceField
+        self.tensor_potential = RecursiveTensorPotentialField(num_symbols=vocab_size, coord_dim=coord_dim, max_depth=8)
+        self.word_valence = WordValenceField(coord_dim, hidden_dim=128, num_symbols=vocab_size)
+        
+        self.last_attention = None  # для захвата attention weights (среднее по головам)
     
     def set_symbol_coordinates(self, coords: torch.Tensor):
         self.embed.set_coordinates(coords)
         self.subspace.set_coordinates(coords)
+        self.tensor_potential.set_symbol_coordinates(coords)
     
-    def forward(self, token_ids, return_scores=False, return_weights=False):
+    def forward(self, token_ids, return_scores=False, return_weights=False, capture_attn=False):
         B, L = token_ids.shape
         
         # Base symbol embedding
@@ -268,16 +257,19 @@ class UnifiedMultidimensionalTransformer(nn.Module):
         
         # Multi-subspace: enrich with word/connection/sentence projections
         sym = self.subspace(token_ids)  # [B, L, 32]
-        # Pad sym to full dim and add to base
         x = x + F.pad(sym, (0, self.coord_dim - 32))
         
         x = self.rope(x)
         
-        # Coordinate Residual Stream — сквозной поток координат
+        # Coordinate Residual Stream
         coord_stream = torch.zeros_like(x)
         
+        self.last_attention = None  # сброс
         for layer in self.layers:
-            x, coord_stream = layer(x, token_ids=token_ids, coord_stream=coord_stream)
+            x, coord_stream = layer(x, token_ids=token_ids, coord_stream=coord_stream,
+                                     capture_attn=capture_attn)
+            if capture_attn and hasattr(layer.attention, 'last_attn_weights'):
+                self.last_attention = layer.attention.last_attn_weights  # [B, H, L, L]
         
         x = self.norm_final(x)
         
@@ -292,6 +284,68 @@ class UnifiedMultidimensionalTransformer(nn.Module):
             return x, scores, weights
         return x, scores
     
+    def update_tensor_potential(self, token_ids, lr=0.01, metrics=None):
+        self.eval()
+        with torch.no_grad():
+            inp = token_ids if isinstance(token_ids, torch.Tensor) else torch.tensor([token_ids], device=next(self.parameters()).device)
+            _ = self.forward(inp, capture_attn=True)
+            if self.last_attention is not None:
+                # last_attention: [B, L, L] (mean across heads) → [B, 1, L, L]
+                attn_4d = self.last_attention.unsqueeze(1)
+                # symbol_idx: [B] tensor of the last token in each sequence
+                sym_idx = inp[:, -1] if inp.shape[1] > 1 else inp[:, 0]
+                if metrics:
+                    self.tensor_potential.update_with_reflection(sym_idx, attn_4d, metrics, base_lr=lr)
+                else:
+                    self.tensor_potential.update(sym_idx, attn_4d, lr=lr)
+        self.train()
+    
     def summary(self) -> str:
         params = sum(p.numel() for p in self.parameters())
         return f"UnifiedTransformer(dim={self.coord_dim}, layers={self.num_layers}, adaptive, params={params:,})"
+    
+    def enhanced_generate(self, prompt_ids, cv, max_new=128, temperature=0.8):
+        """
+        Генерация с bias от TensorPotentialField и WordValenceField.
+        """
+        device = next(self.parameters()).device
+        ids = list(prompt_ids)
+        self.eval()
+        with torch.no_grad():
+            for _ in range(max_new):
+                inp = torch.tensor([ids], dtype=torch.long, device=device)
+                h, logits = self.forward(inp, return_scores=True)
+                logits = logits[0, -1].clone() / temperature
+                
+                # TensorPotentialField bias (recursive)
+                if len(ids) > 1:
+                    last_sym = ids[-1]
+                    if last_sym < self.tensor_potential.num_symbols:
+                        bias_sym = self.tensor_potential.recursive_bias(
+                            h[0, -1], torch.tensor(ids, device=device))
+                        logits += bias_sym.to(device) * 0.1
+                
+                # WordValenceField bias
+                word_coord = h[0, :].mean(dim=0)
+                bias_word = self.word_valence.get_valence_bias(
+                    word_coord, torch.tensor(ids, device=device))
+                logits += bias_word.to(device) * 0.05
+                
+                # Adaptive repetition penalty: считать частоту всех сгенерированных
+                freq = {}
+                for t in ids:
+                    freq[t] = freq.get(t, 0) + 1
+                sl, si = logits.sort(descending=True)
+                v = sl[:20]; idx = si[:20]; p = F.softmax(v, dim=-1)
+                for rank_i, t in enumerate(idx.tolist()):
+                    cnt = freq.get(t, 0)
+                    if cnt > 0:
+                        p[rank_i] *= (0.5 ** cnt)
+                p /= p.sum()
+                nt = idx[torch.multinomial(p, 1)].item()
+                if nt < 4: nt = idx[0].item()
+                ids.append(nt)
+                if nt == cv.SENT_CLOSE_IDX:
+                    break
+        self.train()
+        return cv.decode(ids)

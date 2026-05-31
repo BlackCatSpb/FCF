@@ -29,26 +29,92 @@ class MultiSubspaceEmbedding(nn.Module):
 
 
 class WordWeightEncoder(nn.Module):
-    """Обратное внимание: важные слова получают больший вес."""
+    """
+    Пулинг токенов в слово: trainable weighted attention + boundary-aware.
     
-    def __init__(self, d_model=128):
+    Три механизма:
+    1. Self-attention across tokens → weights
+    2. Boundary-weighted pool: WORD_OPEN/CLOSE сигнализируют границы
+    3. Обучаемый word-вектор (weighted sum h с attention weights)
+    
+    Returns:
+        word_vectors: [B, N_words, D] — центроиды слов
+        word_weights: [B, N_words] — важность каждого слова
+        boundaries: [B, L, 3] — soft boundary scores (start/inside/end)
+    """
+    
+    def __init__(self, d_model=128, n_heads=4):
         super().__init__()
-        self.weight_query = nn.Linear(d_model, d_model)
-        self.weight_key = nn.Linear(d_model, d_model)
-        self.importance_direction = nn.Parameter(torch.randn(d_model))
-        nn.init.normal_(self.importance_direction, 0, 0.02)
-    
-    def forward(self, x, boundary_mask=None):
-        """
-        x: [B, L, D]
-        Returns: weights [B, L], coord_shift [B, L, D]
-        """
-        q = self.weight_query(x)
-        k = self.weight_key(x)
-        attn = torch.softmax(q @ k.transpose(-2, -1) / (x.shape[-1] ** 0.5), dim=-1)
-        weights = attn.sum(dim=-2)  # [B, L]
-        weights = weights / (weights.max(dim=-1, keepdim=True)[0] + 1e-8)
+        self.d_model = d_model
+        self.n_heads = n_heads
+        head_dim = d_model // n_heads
         
-        direction = self.importance_direction / (self.importance_direction.norm() + 1e-8)
-        coord_shift = weights.unsqueeze(-1) * direction.unsqueeze(0).unsqueeze(0)
-        return weights, coord_shift
+        self.scale = d_model ** -0.5
+        
+        self.to_q = nn.Linear(d_model, d_model)
+        self.to_k = nn.Linear(d_model, d_model)
+        self.to_v = nn.Linear(d_model, d_model)
+        
+        # Boundary detection: h → (word_start, inside, word_end) logits
+        self.boundary_proj = nn.Linear(d_model, d_model // 2)
+        self.boundary_out = nn.Linear(d_model // 2, 3)
+        
+        # Word vector projection: weighted sum → word centroid
+        self.word_proj = nn.Linear(d_model, d_model)
+        
+        # Global word importance
+        self.importance = nn.Sequential(
+            nn.Linear(d_model, 32), nn.SiLU(),
+            nn.Linear(32, 1), nn.Sigmoid(),
+        )
+    
+    def forward(self, x, boundary_logits=None):
+        """
+        x: [B, L, D] — hidden states
+        boundary_logits: [B, L, 3] or None — from BoundaryDetectionHead
+        
+        Returns:
+            word_vecs: [B, N, D] (padded to max_words)
+            word_weights: [B, N]
+            boundaries: [B, L, 3] — refined boundary scores
+        """
+        B, L, D = x.shape
+
+        # Token importance via multi-head attention
+        q = self.to_q(x).view(B, L, self.n_heads, D // self.n_heads).transpose(1, 2)
+        k = self.to_k(x).view(B, L, self.n_heads, D // self.n_heads).transpose(1, 2)
+        v = self.to_v(x).view(B, L, self.n_heads, D // self.n_heads).transpose(1, 2)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        causal = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+        attn = attn.masked_fill(causal, float('-inf'))
+        attn = torch.softmax(attn, dim=-1)
+
+        token_weights = attn.mean(dim=1).mean(dim=-2)
+
+        # Boundary scores: use shared BoundaryDetectionHead output if available
+        if boundary_logits is not None:
+            boundaries = boundary_logits
+        else:
+            h = F.silu(self.boundary_proj(x))
+            boundaries = self.boundary_out(h)
+
+        boundary_probs = torch.softmax(boundaries, dim=-1)
+        word_start_mask = boundary_probs[..., 0] > 0.5
+        word_ids = torch.cumsum(word_start_mask.int(), dim=-1)
+        N_words = word_ids.max().item() + 1
+
+        # Vectorized scatter-add
+        idx = word_ids.unsqueeze(-1).expand(-1, -1, D)
+        w = token_weights.unsqueeze(-1)
+        word_vecs = torch.zeros(B, N_words, D, device=x.device)
+        word_vecs.scatter_add_(1, idx, x * w)
+
+        count_idx = word_ids.unsqueeze(-1)
+        word_counts = torch.zeros(B, N_words, 1, device=x.device)
+        word_counts.scatter_add_(1, count_idx, w)
+
+        word_vecs = word_vecs / (word_counts + 1e-8)
+        word_weights = self.importance(word_vecs).squeeze(-1)
+
+        return word_vecs, word_weights, boundaries

@@ -25,6 +25,7 @@ class CharacterVocab:
         self.BOS_IDX = 2
         self.EOS_IDX = 3
         
+        self.GAP_FILLER_IDX = 156         # fills the gap at idx=156 (contiguous 0-160)
         self.WORD_OPEN_IDX = 157
         self.WORD_CLOSE_IDX = 158
         self.SENT_OPEN_IDX = 159
@@ -35,6 +36,7 @@ class CharacterVocab:
             "<UNK>": self.UNK_IDX,
             "<BOS>": self.BOS_IDX,
             "<EOS>": self.EOS_IDX,
+            "<GAP>": self.GAP_FILLER_IDX,
             "<W>": self.WORD_OPEN_IDX,
             "</W>": self.WORD_CLOSE_IDX,
             "<S>": self.SENT_OPEN_IDX,
@@ -84,9 +86,13 @@ class CharacterVocab:
 
     def decode(self, ids: List[int], skip_special: bool = True) -> str:
         """Декодирует индексы обратно в строку."""
+        skip = {self.PAD_IDX, self.UNK_IDX, self.BOS_IDX, self.EOS_IDX,
+                self.GAP_FILLER_IDX,
+                self.WORD_OPEN_IDX, self.WORD_CLOSE_IDX,
+                self.SENT_OPEN_IDX, self.SENT_CLOSE_IDX}
         chars = []
         for i in ids:
-            if skip_special and i in (self.PAD_IDX, self.UNK_IDX, self.BOS_IDX, self.EOS_IDX):
+            if skip_special and i in skip:
                 continue
             chars.append(self._idx_to_char.get(i, "?"))
         return "".join(chars)

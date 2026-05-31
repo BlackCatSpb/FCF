@@ -6,6 +6,7 @@ HybridFractalBlock: conv → attention → gate → FFN на всех уровн
 """
 
 import torch, torch.nn as nn, torch.nn.functional as F
+from .heads import MoEFFN
 
 
 class FractalConv2D(nn.Module):
@@ -89,16 +90,11 @@ class HybridFractalBlock(nn.Module):
         self.norm_attn = RMSNorm(dim)
         self.norm_ffn = RMSNorm(dim)
         
-        from .unified_transformer import SwiGLUFFN
-        self.ffn = SwiGLUFFN(dim, d_ff)
+        self.ffn = MoEFFN(dim, d_ff, n_experts=4, top_k=2)
         
         # --- Coordinate Residual Stream: gate-векторы 128d ---
         self.coord_gate_in = nn.Parameter(torch.zeros(dim))
         self.coord_gate_out = nn.Parameter(torch.zeros(dim))
-        
-        # --- Subspace-Gated FFN (SGF): 4 subspace gate vectors ---
-        self.sgf_router = nn.Linear(dim, 4)
-        self.sgf_gates = nn.Parameter(torch.randn(4, dim))
     
     def forward(self, x, token_ids=None, coord_stream=None, capture_attn=False):
         if coord_stream is None:
@@ -118,15 +114,8 @@ class HybridFractalBlock(nn.Module):
         coord_in_g = torch.sigmoid(self.coord_gate_in)
         x = x + gate * conv_out + (1 - gate) * attn_out + coord_stream * coord_in_g
         
-        # SGF-FFN
-        x_norm = self.norm_ffn(x)
-        gate_s = F.silu(self.ffn.W_gate(x_norm))
-        up = self.ffn.W_up(x_norm)
-        swiglu = gate_s * up
-        route = F.softmax(self.sgf_router(x_norm), dim=-1)
-        sgf_gate = route @ self.sgf_gates
-        swiglu = swiglu * torch.sigmoid(sgf_gate)
-        x = x + self.ffn.W_down(swiglu)
+        # MoE FFN (per-token expert routing)
+        x = x + self.ffn(self.norm_ffn(x))
         
         coord_out_g = torch.sigmoid(self.coord_gate_out)
         coord_stream = coord_stream + x * coord_out_g

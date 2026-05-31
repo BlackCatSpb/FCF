@@ -1,807 +1,735 @@
-# EVA Symbolic — Архитектура (полная)
-
-> Символ ≡ координата в ℝ¹²⁸. Текст ≡ траектория.  
-> Трансформер ≡ навигатор. Знания ≡ рекурсивный тензор потенциалов + топология + память траекторий.  
-> **5.49M параметров. 160 токенов. 21 инновация. 100K шагов обучения.**
-
----
+# EVA Architecture v4 — Technical Reference
 
 ## 0. Философия
 
-EVA не предсказывает следующий токен. EVA **навигирует в символьном пространстве**:
-- Получает запрос → кодирует в координаты ℝ¹²⁸ → вычисляет траекторию через 6 слоёв
-- На каждом шаге генерации: hidden state [128] → рекурсивная декомпозиция на K=6 субвекторов
-- Каждый субвектор квантизуется к ближайшему символу → bias из тензора потенциалов
-- Bias от каждого уровня рекурсии → взвешенная сумма → коррекция CE logits
-- Мультиномиальный sampling с адаптивным repetition penalty
+### 0.1 Отказ от next-token prediction
 
-Знания отделены от модели: координаты [160×128], affinity [160×160], тензор [160×160×160], топология [160×160×3], иерархическая память TrajectoryStore. Модель — только исполнитель.
+Стандартные LLM решают задачу:
+
+```
+P(w_t | w_{<t}) = softmax(h_t · W)    где h_t — скрытое состояние, W — матрица декодера
+```
+
+Это **статистическая аппроксимация**. Модель не знает, что такое "смысл" — она знает только совместную встречаемость токенов.
+
+EVA решает другую задачу:
+
+```
+z_t = f(token_t)                       — символ → координата
+z_{t+1} = z_t + ∇P(z_t)               — следующая координата через градиент поля
+token_{t+1} = argmin ||z_{t+1} - E||   — координата → ближайший символ
+```
+
+### 0.2 Почему координаты?
+
+В природе смысл — это не метка, а положение в пространстве. Слова-синонимы находятся рядом, слова-антонимы — далеко, но в одном направлении. Глаголы и существительные занимают разные области.
+
+### 0.3 Почему поле аттракторов?
+
+Знания не должны быть "зашиты" в веса модели. Они должны быть отделимым словарём прецедентов — набором точек в пространстве с указанием, куда от них обычно движутся.
 
 ---
 
-## 1. Фундаментальные принципы
+## 1. MultiScaleRoPE
 
-### 1.1 Символ как координата в ℝ¹²⁸
-Каждый из 160 символов — точка на единичной гиперсфере в 128-мерном пространстве. Позиция не случайна:
-- Инициализация: `~N(0, 0.02)` с нормировкой на единичную сферу
-- Координаты разделяют семантическое пространство: символы, часто встречающиеся вместе, имеют близкие координаты
-- `CoordinateEmbedding` — `nn.Parameter`, а не `nn.Embedding`: это позиция, не индекс
+### 1.1 Принцип
 
-**Почему 128?** Нижняя граница для 160 символов при разделимости (160 точек требуют минимум log₂(160) ≈ 8 dim для однозначной идентификации; 128 dim даёт избыточность для семантической структуры + рекурсивной декомпозиции на K субвекторов).
-
-### 1.2 Текст как иерархическая траектория
-- Символ → точка в ℝ¹²⁸
-- Слово → последовательность точек + boundary-токены `<W>...</W>`
-- Предложение → последовательность слов + boundary-токены `<S>...</S>`
-- Текст → последовательность предложений
-
-Вся иерархия — объекты одного типа (точки в ℝ¹²⁸), разница только в масштабе.
-
-### 1.3 Отделение знаний от модели
-Модель (ядро ~1.14M параметров) — **навигатор**, не хранилище:
-
-| Компонент | Параметров | Тип | Обновление |
-|-----------|-----------|-----|-----------|
-| Transformer core (6 HybridFractalBlock) | ~1.14M | Модель | SGD каждый шаг |
-| CoordinateEmbedding | 20,480 | Координаты | SGD каждый шаг |
-| RecursiveTensorPotentialField | 4,293,383 | Потенциал | Thinking phase (каждые 500) |
-| WordValenceField | 74,305 | Валентность | SGD каждый шаг |
-| TrajectoryStore | 0 (внешняя) | Память | Thinking phase |
-| StaticTopologyLayer | ~500 | Топология | Thinking phase |
-
-Модель можно заменить — знания останутся в координатах, потенциале, топологии и памяти.
-
-### 1.4 Генерация как навигация
-Генерация — не `P(next_token | context)`, а **исполнение инструкции**:
-1. Трансформер кодирует запрос → траектория [L, 128]
-2. На каждом шаге: hidden state → рекурсивная декомпозиция → bias от потенциалов всех уровней
-3. Sampling: top-20 с adaptive repetition penalty
-
-### 1.5 Рекурсивная декомпозиция как иерархический bias
-Плоский bias (один символ → один тензор [V]) не различает контексты.  
-Рекурсивная декомпозиция: каждая координата раскладывается на K=6 субвекторов, каждый квантизуется к символу, bias от каждого символа взвешивается gate-механизмом и масштабом глубины.
-
-### 1.6 Масштабирование через траектории, не параметры
-LLM растут за счёт увеличения числа параметров (1B → 1.7T).  
-EVA растёт за счёт накопления траекторий (10 → 100K → 1M). Модель не растёт — растёт память.
-
----
-
-## 2. Компоненты системы (детально)
-
-### 2.1 CharacterVocab — символьный словарь
-**Тип**: PURE — 0 параметров, правила.
-
-160 токенов:
-- 0 PAD, 1 UNK, 2 BOS, 3 EOS
-- 152 печатных символа: А-Я (32), а-я (32), A-Z (26), a-z (26), 0-9 (10), пунктуация (26)
-- 4 boundary-токена: `<W>` (157), `</W>` (158), `<S>` (159), `</S>` (160)
-
-`encode_with_boundaries(text, max_word_len=20)`:
-```
-"Привет, мир!" → 
-<S><W>П</W><W>р</W><W>и</W><W>в</W><W>е</W><W>т</W><W>,</W> <W>м</W><W>и</W><W>р</W><W>!</W></S>
-```
-
-Каждое слово обёрнуто в `<W>...</W>` — это даёт **иерархическую структуру** без потери символьной детализации. Предложение — в `<S>...</S>`.
-
-### 2.2 RecursiveTensorPotentialField — рекурсивный тензор потенциалов
-
-**Параметров**: 4,293,383. **Инновация #21**.
-
-#### 2.2.1 Базовая структура — TPF [V×V×V]
-Трёхмерный тензор `P ∈ ℝ^{160×160×160}` (4,096,000 params).  
-`P[i][j][k]` — сила связи от символа j к символу k, активируемая символом i.
-
-Инициализация: `P[i][j][k] = affinity[i][j] × affinity[j][k]` — цепное правило: если i→j и j→k сильные связи, то P[i][j][k] высок.
-
-Обновление (thinking phase): захват attention weights из transformer, накопление в P с модуляцией quality (confidence, curvature, contradictions).
-
-#### 2.2.2 Рекурсивная обёртка — decomp + compose + gate
-```
-x [128] ──→ decomp_proj [128 → K·128] ──→ reshape [K, 128] ──→ [v₁, v₂, ..., v₆]
-                │
-                └── gate_net [128 → K → softmax] ──→ [g₁, g₂, ..., g₆]
-```
-
-**decomp_proj**: `nn.Linear(128, K·128, bias=False)` = 98,304 params.  
-Проецирует координату в K параллельных 128-мерных подпространств. Без bias — декомпозиция должна быть чисто линейной.
-
-**compose_proj**: `nn.Linear(K·128, 128, bias=False)` = 98,304 params.  
-Восстанавливает исходную координату из K субвекторов. Используется только в composition loss, не в генерации.
-
-**gate_net**: `nn.Linear(128, K) → Softmax` = 768 + 6 = 774 params.  
-Предсказывает вес каждого субвектора: какие субвекторы важны для данного контекста.
-
-**depth_scale**: `nn.Parameter(ones[8] × 0.5)` = 8 params.  
-Обучаемый масштаб для каждого уровня глубины. Позволяет модели решать, какие уровни рекурсии важны. Начальное значение 0.5 — равномерный вклад всех уровней.
-
-#### 2.2.3 Батчевый BFS — quantize + bias на каждом уровне
+RoPE (Rotary Position Embedding) кодирует позицию tokens через вращение в 2D-плоскостях:
 
 ```
-Level 0: quantize(x) → P[idx] → bias_0 [V]
-Level 1: decompose(x) → [v₁..v₆] → gate-filter → quantize each → P[idx] → bias_1 × depth_scale[1] × gate
-Level 2: decompose(each survivor) → ... → bias_2 × depth_scale[2] × Π(gates_along_path)
-...
-Max depth: 8, max paths: 4096
+f(x_m, m) = R_θ_m · x_m
+
+где R_θ_m — матрица вращения на угол m·θ для каждой пары измерений
+
+θ_k = base^(2k/d) для стандартного RoPE
 ```
 
-**quantize** — batched `cdist(vectors, sym_coords) → argmin`.  
-N векторов → один вызов `torch.cdist`. Ноль Python `item()` — все операции на GPU.
-
-**Budget cap**: `total_paths` — кумулятивное число путей через все уровни. При превышении `max_cap(4096)` — BFS останавливается. Если уровень частично укладывается в бюджет — случайная подвыборка.
-
-**Chunked gather**: `P[syms]` обрабатывается батчами по 256 символов. Каждый батч → `[256, 160, 160]` = 6.5 MB. Итоговый `level_biases` стримится через `cat`. Без chunked gather: N=4096 → `[4096, 160, 160]` = 400 MB за один вызов.
-
-**Gate filter**: `g_k < 0.05` → ветка отбрасывается.  
-При обучении гейты равномерны (H ≈ ln6), ветвится 6× на каждом уровне. После 20K+ шагов гейты заостряются (1-2 активных субвектора), дерево сужается.
-
-**Scale на глубине d**: `parent_scale × depth_scale[d] × g_k`.  
-- `depth_scale[0]` = 0.5 (уровень 1), `depth_scale[3]` может стать 0.1 (уровень 4 неважен) или 0.9 (уровень 4 критичен)
-- Каждый уровень — свой learnable масштаб
-
-#### 2.2.4 Cycle → Tensor Product Unfold
-Если `||v_k - x||₂ < 0.01` — субвектор почти совпадает с родителем (цикл).  
-Такие ветки не продолжают рекурсию — вместо этого bias добавляется через **геометрическую сумму**:
+EVA модифицирует распределение θ:
 
 ```
-r = depth_scale[d] × gate_k        # коэффициент рекурсии
-sum_{t=0}^{∞} r^t = 1 / (1 - r)    # геометрический ряд
-bias += cycle_bias × scale_parent × (1 / (1 - r))
+θ_k = 500 · (200000 / 500)^(k/192)   для k = 0 .. 191
 ```
 
-Циклы отсекаются от `frontier` (`keep &= ~cycle_mask`) — они не ветвятся дальше, их вклад учтён аналитически.  
-Максимум ряда ограничен 10 (clip), чтобы избежать взрыва при r → 1.
+### 1.2 Свойства
 
-#### 2.2.5 Composition Loss — auxiliary loss для decomp/compose
+- **θ_0 = 500** (dim 0-1): период 2π·500 ≈ 3140 позиций — высокая частота, различает соседние символы
+- **θ_191 = 200000** (dim 382-383): период 2π·200000 ≈ 1.26M позиций — низкая частота, различает глобальные структуры
+- **Логарифмическая шкала**: каждый dim получает θ, в 1.03 раза больше предыдущего
+
+### 1.3 Реализация
 
 ```python
-def composition_loss(vectors):        # vectors: [B, L, D]
-    flat = vectors.reshape(B*L, D)    # [BL, D]
-    subs, gates = decompose(flat)     # [BL, K, D], [BL, K]
-    recon = compose(subs)             # [BL, D]
-    
-    # MSE reconstruction
-    loss = MSE(recon, flat)
-    
-    # Diversity: субвекторы должны быть разными
-    subs_norm = F.normalize(subs, dim=-1)
-    cos_mat = bmm(subs_norm, subs_norm.transpose)    # [BL, K, K]
-    mask = 1 - eye(K)                                 # диагональ исключена
-    diversity = mean(cos_mat * mask)                  # средний cosine i≠j
-    loss += 0.1 * diversity
-    
-    # Gate entropy bonus: не коллапсить к одному субвектору
-    entropy = -mean(Σ g·log(g))
-    loss -= 0.01 * entropy
-    
-    return loss
-```
-
-**Три компонента composition loss**:
-
-| Компонент | Назначение | Начальное значение | Желаемое значение |
-|-----------|-----------|-------------------|-------------------|
-| MSE recon | decomp→compose ≈ identity | ~0.0004 | 0 |
-| Diversity ×0.1 | субвекторы разные | ~0 | >0 (cos → 0) |
-| Entropy ×(−0.01) | не коллапсить к одному | −0.0179 | −0.01 (H→1) |
-
-Diversity loss предотвращает ситуацию, когда все K субвекторов равны x/K — заставляет их покрывать разные подпространства.
-
-Gate entropy бонус: при равномерных гейтах H=ln6≈1.79, loss contribution = −0.0179.  
-Наблюдаемое значение: `comp=−0.0178` — гейты равномерны, сеть учит identity.
-
-#### 2.2.6 Delegation к Base TPF
-- `init_from_affinity(affinity)` → `base_tpf.init_from_affinity(affinity)`
-- `update(sym_idx, attn_weights, lr)` → `base_tpf.update(sym_idx, attn_weights, lr)`
-- `update_with_reflection(sym_idx, attn_weights, metrics, lr)` → `base_tpf.update_with_reflection(...)`
-- `forward(sym_idx)` → `base_tpf(sym_idx)`
-- `get_bias(sym_idx, target_ids)` → `base_tpf.get_bias(sym_idx, target_ids)`
-
-Resume из старого чекпоинта: `strict=False` + ручная миграция `tensor_potential.P → tensor_potential.base_tpf.P`.  
-Shape-мисматчи (depth_scale scalar → vector[8]) автоматически пропускаются.
-
-#### 2.2.7 Полный bias для генерации
-```python
-bias = P[quantize(x), valid, :].mean(dim=0)   # Level 0
-for depth in range(1, max_depth+1):
-    N = frontier.shape[0]
-    syms = quantize(frontier)                  # [N]
-    bias += P[syms, valid, :].mean(dim=1) * scale[depth]
-    
-    subs, gates = decompose(frontier)           # [N, K, D], [N, K]
-    keep = gates > 0.05
-    frontier = subs[keep]                       # новый frontier
-    scale[keep] *= depth_scale[depth] * gates[keep]
-
-Итог: logits += bias * 0.1
-```
-
-#### 2.2.8 Параметры (полная таблица)
-
-| Подкомпонент | Формула | Параметров | Ops/forward |
-|-------------|---------|-----------|-------------|
-| base_tpf.P | [160,160,160] | 4,096,000 | 0 (lookup) |
-| decomp_proj.weight | [768, 128] | 98,304 | 128×768 MAC |
-| compose_proj.weight | [128, 768] | 98,304 | 768×128 MAC |
-| gate_net[0].weight | [6, 128] | 768 | 128×6 MAC |
-| gate_net[0].bias | [6] | 6 | 6 add |
-| depth_scale | [8] | 1 (вектор 8) | 8 mul |
-| sym_coords | [160, 128] (buffer) | 0 | cdist: N×160×128 |
-| **Итого** | | **4,293,383** | |
-
-#### 2.2.9 Типичные значения при обучении (step 6500-7000)
-
-| Параметр | Значение |
-|----------|----------|
-| depth_scale[0] | 0.500 (инициализация) |
-| depth_scale[1] | 0.500 |
-| depth_scale[7] | 0.500 |
-| Gate entropy H | ~1.79 nats (ln 6) |
-| Composition loss | ~−0.0178 (MSE≈0 + 0.1×0 − 0.01×1.79) |
-| Bias paths | ~6^d до max_cap=4096 |
-| quantize вызовов на шаг | ~два-три (BFS levels до cap) |
-
-### 2.3 TensorPotentialField — базовый слой (4,096,000 params)
-
-**Инновация #14**. Базовый тензор [V×V×V], общий для всех уровней рекурсии.
-
-Инициализация (affinity chain rule):
-```python
-P[i][j][k] = affinity[i][j] × affinity[j][k]
-```
-Где `affinity[i][j]` — частота биграммы i→j (из co-occurrence 500 семплов × 128 токенов).
-
-Обновление (attention capture):
-```python
-P[sym, :S, :S] += lr × attn_weights.mean(dim=1)  # [B, H, S, S] → [B, S, S]
-```
-
-Модуляция качеством:
-```python
-quality = confidence / (1 + curvature) / (1 + contradictions)
-lr_eff = base_lr × quality
-```
-
-Хранит счётчик `count[sym]` — сколько раз символ участвовал в обновлении.
-
-### 2.4 WordValenceField — словесная валентность (74,305 params)
-
-**Инновация #15**. Отображение координаты слова → матрица валентности [V, V].
-
-```
-word_coord [128] → left_net → left [V]
-                 → right_net → right [V]
-valence = left outer right  → [V, V]
-bias = mean(valence[valid_idxs, :])
-```
-
-Outer-product декомпозиция: вместо матрицы V×V (25,600) — два MLP 128→128→V (2 × 37,120 = 74,240 + bias 65 = 74,305).
-
-Генерация: `logits += WVF.bias × 0.05`.
-
-### 2.5 SentenceContextField — RBF-поле предложения (3 params)
-
-**Инновация #16**. Поле активации от attention весов и connection-векторов.
-
-```
-centers = top-K attention_centroids  [B, K, D]
-gamma = learnable [K]
-phi_centers = Σ gamma · exp(-||coord - center||² / 2σ²)
-edge_field = Σ exp(-||coord - mid_word||² / 2(σ/2)²)
-activation = phi_centers + edge_field
-```
-
-Всего 3 обучаемых параметра: gamma_0, gamma_1, gamma_2 (для K=3 центров).
-
-### 2.6 StaticTopologyLayer — статическая топология (~500 params)
-
-**Инновация #6**. Тензор [160, 160, 3] + Fast Path cache (10K).
-
-- **Канал 0: affinity** — сила связи i→j (из co-occurrence)
-- **Канал 1: potential barrier** — высота барьера: `1 - cos(coord_i, coord_j)`
-- **Канал 2: forbidden** — 0/1 (запрет на генерацию PAD/UNK/BOS/EOS)
-
-**Fast Path cache**: FIFO-очередь на 10K.  
-Хранит: `(centroid [128], path [list_of_ids])`.  
-При генерации: поиск ближайшего `centroid` → если `cosine > 0.9` → bias из кэшированного пути.
-
-`build_from_store(store)`: консолидирует траектории из TrajectoryStore → Fast Path.
-
-### 2.7 TrajectoryStore — иерархическая память (6,529 params + 0 внешняя)
-
-**Инновация #12**. 4 уровня хранения:
-
-| Уровень | Формат | Размер элемента | Назначение |
-|---------|--------|----------------|-----------|
-| Symbol | [L, 128] | слово × 512 bytes | Полная траектория токенов в слове |
-| Word | [N, 128] | 512 bytes | Центроиды слов |
-| Connection | [N-1, 128] | 512 bytes | Векторы между центроидами |
-| Sentence | [128] | 512 bytes | Центроид предложения |
-
-`consolidate(trajectory)`: взвешенное усреднение через ConsolidationTransformer (Conv1d + gate).
-
-`total_stored`: текущее число сохранённых траекторий (макс 50,000).
-
-### 2.8 MultiSubspaceEmbedding — мультиподпространственный эмбеддинг
-
-**Параметров**: 5,280. Часть ядра.
-
-Структурирует 128 измерений в подпространства:
-- dims 0-31: **symbol** — идентификация символа
-- dims 32-127: **context** — контекстная информация
-
-Проекция: `base_embed [128] + symbol_sub [32]` = 128.
-
-`WordWeightEncoder`: дополнительный MLP 128→128→1 — оценивает важность каждого токена в слове.
-
-### 2.9 AdaptiveFractalAttention — адаптивное фрактальное внимание
-
-**Инновации #3, #4**. Часть HybridFractalBlock.
-
-**LevelController**: `x.mean(dim=1) → Linear(128→32) → SiLU → Linear(32→32) → softmax → head_allocation`.  
-Динамически распределяет 32 головы по 6 слоям и dilation-уровням (1, 2, 4, 8).
-
-**Manifold bias**: `exp(-||proj_2D(x_i) - proj_2D(x_j)||² / (2·scale²))`.  
-Вычисляется ОДИН раз per level (не per-head). Смещает attention к точкам, близким на многообразии.
-
-**CoordBias**: `-||coord_i - coord_j||₂` — L2-distance bias в attention scores.
-
-**FractalConv2D**: causal свёртка по L × Dim с dilation 1, 2, 4, 8.  
-Параллельные ветви dilations → concat → выход. Обеспечивает multi-scale иерархию без внимания.
-
-### 2.10 SGF — Subspace-Gated FFN (3,072 params)
-
-**Инновация #10**. 4 gate-вектора (128d) + роутер 128→4 → softmax.
-
-```
-gates = softmax(router(x))          # [4] — какой gate активен
-output = Σ gate_k · (x ⊙ gate_vec_k)  # element-wise blend
-```
-
-Разные токены обрабатываются разными gate-векторами. Аналог MoE, но в одном FFN.
-
-### 2.11 Coordinate Residual Stream (1,536 params)
-
-**Инновация #9**. Сквозной поток координат через все 6 слоёв.
-
-```
-coord_residual = x (вход)
-for layer in layers:
-    hidden = layer(coord_residual)
-    gate = sigmoid(Linear(128→128)(coord_residual))
-    coord_residual = gate ⊙ hidden + (1 - gate) ⊙ coord_residual
-```
-
-Информация не замывается — поток координат проходит через все слои без потери.
-
-### 2.12 SubHSM — Subspace Hierarchical Softmax (516 params)
-
-**Инновация #7**. 4 группы по ~40 токенов.
-
-```
-group_logits = Linear(128→4)(hidden)           # 128×4 + 4 = 516 params
-group_probs = softmax(group_logits)
-group_id = argmax(group_probs)
-bias = group_bias[group_id]  # прибавляется к logits
-```
-
-Group CE loss × 0.05 — вспомогательная loss для обучения классификатора групп.
-
-### 2.13 TrajLoss — траекторная Auxiliary Loss (16,576 params)
-
-**Инновация #11**. `MLP 128→64→128` предсказывает Δ-вектор следующей позиции.
-
-```
-target = embed(token_next) + pad(subspace(token_next))  # [128]
-current = hiddens[:, -1, :]                              # [128]
-delta_pred = TrajPredictor(current)                      # [128]
-next_pred = current + delta_pred
-loss = MSE(next_pred, target)
-```
-
-Weight: 0.1 × total loss. Обучает внутреннее представление предсказывать следующую координату.
-
-### 2.14 Validation Suite
-
-**Инновация — автоматическая валидация**. Каждые 5000 шагов:
-
-1. **Генерация 7 seed'ов**: "что", "почему", "как", "где", "когда", "зачем", "кто"
-2. **Тест на Анне Карениной**: первые 100 предложений, Perplexity + Trajectory curvature
-3. **SelfReflection**: кривизна траекторий, confidence, пространственная эффективность (ratio активных измерений)
-4. **Best checkpoint**: сохраняется при улучшении avg_curvature
-
----
-
-## 3. Архитектура трансформера (ядро, ~1.14M params)
-
-```
-Input [B, L] → CoordinateEmbedding [B, L, 128] → RoPE
-  → MultiSubspaceEmbedding [B, L, 128]
-  → HybridFractalBlock × 6 [B, L, 128]  (CoordResidualStream сквозной)
-  → RMSNorm [B, L, 128]
-  → CoordinateDecoder [B, L, 160]
-  → SubHSM bias → Logits [B, L, 160]
-```
-
-### 3.1 CoordinateEmbedding
-
-**Параметров**: 160 × 128 = 20,480.
-
-`nn.Parameter`, не `nn.Embedding`. Прямое обращение по индексу: `coords[token_ids]`.
-
-Координаты на единичной сфере: `coord = coord / ||coord||₂`.
-
-### 3.2 RoPE
-
-Поворот в 2D-подпространствах: 128/2 = 64 поворота. `θ = 10000.0`.
-
-### 3.3 HybridFractalBlock (×6)
-
-**Параметров на блок**: ~190K. **Инновация #5**.
-
-```
-Input → LayerNorm
-  → FractalConv2D (dilations 1,2,4,8) → AdaptiveFractalAttention (32 heads)
-  → GateMerge (sigmoid blend)
-  → LayerNorm → SGF (4-gate FFN)
-  → CoordResidualStream gate update
-  → Output
-```
-
-### 3.4 CoordinateDecoder
-
-`Linear(128→160)` + `nearest-neighbour_bonus` + `SubHSM_group_bias`.
-
-Nearest-neighbour: `cosine(hidden, coord[sym])` — бонус к токенам, чьи координаты близки к hidden.
-
-### 3.5 Dilated KV-Cache
-
-Для каждого dilation-уровня d: K/V каждого d-го токена.  
-Не реализовано в полной мере (зарезервировано).
-
----
-
-## 4. Обучение
-
-### 4.1 Данные
-
-| Параметр | Значение |
-|----------|----------|
-| Источник | full_corpus_ru.txt (172 MB, русская литература XIX-XX вв.) |
-| Формат кодирования | CharacterVocab с boundary-разметкой (`<W></W><S></S>`) |
-| Размер после кодирования | 106,520,000 токенов |
-| Структура | 680,318 предложений (блоки, разделённые `</S>`) |
-| Уникальных токенов | 113 (из 160 — остальные boundary и служебные) |
-| Упаковка | `mmap_mode='r'`, int32, полная загрузка в virtual memory |
-
-### 4.2 Гиперпараметры
-
-| Параметр | Значение | Обоснование |
-|----------|---------|------------|
-| B (batch) | **12** | VRAM 0.7/2.1 GB → запас 1.4 GB позволяет B=12 |
-| ML (seq) | **192** | Предложений обычно 10-30 токенов; 192 ≈ 2-3 предложения |
-| STEPS | 100,000 | ~10 часов на MX550 |
-| LR | 5e-3 | Cosine до 0; типично для small transformers |
-| Optimizer | AdamW | weight_decay=0.01 |
-| TrajLoss weight | 0.1 | Эмпирически |
-| GroupLoss weight | 0.05 | Эмпирически |
-| CompLoss weight | 0.01 | Начальное значение ~−0.0179, не доминирует |
-| Diversity weight | 0.1 | Внутри comp_loss; penalty на cos(i≠j) |
-| Entropy bonus | −0.01 | Внутри comp_loss; предотвращает коллапс гейтов |
-
-### 4.3 Loss (полная)
-
-| Компонент | Функция | Вес | Типичное значение |
-|-----------|---------|-----|-------------------|
-| CE | `CE(pred, target)` | 1.0 | 1.2-1.9 |
-| SubHSM group | `CE(group_logits, group_target)` | 0.05 | 0.06-0.16 |
-| TrajLoss | `MSE(pred_delta, actual_delta)` | 0.1 | 0.005-0.007 |
-| Composition | `MSE(recon, x) + 0.1·diversity − 0.01·H(gates)` | 0.01 | −0.0178 |
-
-### 4.4 Цикл обучения
-
-```
-for s in 1..100000:
-    1. Собрать батч: 12 блоков × обрезка до </S>→</W> → [12, L≤192]
-    2. Forward: hiddens, scores = transformer(bt)
-    3. CE loss + Group loss + TrajLoss + CompLoss → backward
-    4. Clip grad norm 1.0 → opt.step() → sch.step()
-    
-    Каждые 50:  print loss, acc, traj, group, comp
-    Каждые 500: save checkpoint → thinking_phase()
-    Каждые 2500: random generation (3 prompts)
-    Каждые 5000: full validation → best checkpoint by curvature
-```
-
-### 4.5 Thinking Phase (каждые 500 шагов)
-
-Цель: обновить потенциалы и топологию на основе накопленного опыта.
-
-```
-1. Co-occurrence affinity:
-   for 500 samples of 128 tokens:
-       for each pair (ids[k], ids[k+1]):
-           aff[ids[k], ids[k+1]] += 1
-   aff = aff / aff.max()
-
-2. Init RecursiveTPF:
-   base_tpf.init_from_affinity(aff)
-   topology[:, :, 0] = aff.cpu()
-
-3. Capture → update RecursiveTPF (10 blocks):
-   for each random block:
-       forward(block, capture_attn=True)
-       tensor_potential.update(sym_idx, attn_4d, lr=0.01)
-
-4. Extract → consolidate → store (5 blocks):
-   for each random block:
-       ht = extract_hierarchical(model, ids, text)
-       ht = store.consolidate(ht)
-       store.store_hierarchical(ht)
-
-5. Build topology:
-   topology.build_from_store(store)
-```
-
-### 4.6 Enhanced Generation Pipeline
-
-```python
-def enhanced_generate(prompt_ids, cv, max_new=30, temperature=0.8):
-    ids = list(prompt_ids)
-    for _ in range(max_new):
-        h, logits = forward(ids)                     # [1, L, D], [1, L, V]
-        
-        # Recursive bias (BFS quantize на K=6, max_depth=8)
-        bias_tpf = recursive_bias(x=h[0,-1], context_ids=ids)
-        logits += bias_tpf * 0.1
-        
-        # Word valence bias
-        word_coord = h[0, :].mean(dim=0)
-        bias_word = word_valence.get_valence_bias(word_coord, ids)
-        logits += bias_word * 0.05
-        
-        # Adaptive repetition penalty
-        freq = Counter(ids)                          # все сгенерированные
-        top_vals, top_idx = logits.topk(20)
-        probs = softmax(top_vals / temperature)
-        for rank, t in enumerate(top_idx.tolist()):
-            if freq.get(t, 0) > 0:                   # каждый повтор режет p вдвое
-                probs[rank] *= 0.5 ** freq[t]
-        probs /= probs.sum()
-        
-        # Sampling
-        nt = top_idx[multinomial(probs, 1)]
-        ids.append(nt)
-        if nt == SENT_CLOSE: break
-    
-    return decode(ids)
+half = D // 2  # 192
+k = torch.arange(half, dtype=torch.float32)
+theta = THETA_MIN * (THETA_MAX / THETA_MIN) ** (k / half)
+freqs = 1.0 / theta  # ω_k = 1/θ_k
+
+pos = torch.arange(max_seq_len)
+angles = pos[:, None] * freqs[None, :]  # [max_seq_len, half]
+cos = angles.cos()
+sin = angles.sin()
+
+# apply: x → [x0·cos - x1·sin, x1·cos + x0·sin]
 ```
 
 ---
 
-## 5. RecursiveTensorPotentialField — детальный дизайн
+## 2. GroupedScaleAttention
 
-### 5.1 Мотивация
+### 2.1 Принцип: разделение по масштабам
 
-Плоский TPF не различает контексты:
-- "кот" и "собака" заканчиваются на "а" → bias одинаков
-- "бежать" и "читать" заканчиваются на "ь" → bias одинаков
+В природе языка одновременно действуют процессы на разных масштабах:
+- **Микро**: какие буквы образуют морфему (char→morph)
+- **Мезо**: какие морфемы образуют слово (morph→word)  
+- **Макро**: какие слова образуют предложение (word→sentence)
+- **Глобальный**: как предложения связаны в дискурсе (sentence→discourse)
 
-Рекурсивная декомпозиция: hidden state содержит информацию о всём контексте (благодаря трансформеру).  
-Декомпозиция на K субвекторов → каждый квантизуется к символу → bias от TPF для КАЖДОГО субвектора.
+EVA выделяет 6 групп голов — по одной на каждый масштаб.
 
-Один и тот же символ "а" даст разный bias в зависимости от того, какие субвекторы активны:
-- "кот" + gate(g₁=0.9, g₂=0.01, ...) → активирует символ "о" из TPF
-- "собака" + gate(g₁=0.1, g₂=0.8, ...) → активирует символ "б" из TPF
-
-### 5.2 Поток данных (с размерами)
+### 2.2 Архитектура
 
 ```
-Level 0:
-  x [128] → quantize [1] → P[1, V, V] → mean(valid) → bias [V], scale=1.0
-  → decomp: subs [1, 6, 128], gates [1, 6]
+Q = W_Q · norm(x + r1 + r2 + r3)    # единый Q для всех групп
+K = W_K · norm(x + r1 + r2 + r3)    # единый K для всех групп  
+V = W_V · norm(x + r1 + r2 + r3)    # единый V для всех групп
+
+Q, K, V = reshape(Q, [B, L, 24, 16])  # 24 heads × 16 dim
+
+for group g in range(6):
+    heads_g = Q[:, :, g*4:(g+1)*4]    # 4 heads for this group
+    
+    for head h in heads_g:
+        score = head_Q · head_K^T / √16 + causal_mask
+        attn = softmax(score)         # [B, L, L]
+        out = attn · head_V           # [B, L, 16]
+    
+    group_out = concat(heads_out)     # [B, L, 64]
+    group_out = W_O_g(group_out)      # [B, L, 384] — своя W_O на группу
+    
+out = Σ softmax(gate_l)_g · group_out_g
+```
+
+### 2.3 Per-layer gating
+
+Gate-вектор каждого слоя `gate_l ∈ ℝ⁶` инициализирован по layer-specific bias:
+
+```python
+LAYER_GATE_INIT = {
+    0:  [0.70, 0.20, 0.10, 0.00, 0.00, 0.00],   # char-heavy
+    1:  [0.60, 0.25, 0.15, 0.00, 0.00, 0.00],
+    2:  [0.40, 0.30, 0.20, 0.10, 0.00, 0.00],   # mix char/morph/word
+    3:  [0.30, 0.30, 0.25, 0.15, 0.00, 0.00],
+    4:  [0.10, 0.30, 0.30, 0.20, 0.10, 0.00],   # word/phrase-heavy
+    5:  [0.05, 0.25, 0.30, 0.25, 0.15, 0.00],
+    6:  [0.00, 0.15, 0.25, 0.30, 0.25, 0.05],   # phrase/sentence
+    7:  [0.00, 0.10, 0.20, 0.30, 0.30, 0.10],
+    8:  [0.00, 0.00, 0.10, 0.25, 0.40, 0.25],   # sentence/discourse
+    9:  [0.00, 0.00, 0.05, 0.20, 0.40, 0.35],
+    10: [0.00, 0.00, 0.00, 0.10, 0.35, 0.55],
+    11: [0.00, 0.00, 0.00, 0.05, 0.30, 0.65],   # discourse-heavy
+}
+```
+
+---
+
+## 3. Residual Streams
+
+### 3.1 Зачем?
+
+В обычном трансформере:
+
+```
+x_l = x_{l-1} + Attention(LayerNorm(x_{l-1}))
+x_l = x_l + FFN(LayerNorm(x_l))
+```
+
+Информация "смешивается" в одном векторе. Проблема: на слое 10 всё ещё нужно помнить, какой символ был на позиции 3, но вектор уже перезаписан discourse-информацией.
+
+### 3.2 Три потока
+
+```python
+# Инициализация
+residual1 = zeros(B, L, D)   # char/morph — локальная структура
+residual2 = zeros(B, L, D)   # word/phrase — синтаксис
+residual3 = zeros(B, L, D)   # sentence/discourse — глобальная структура
+
+# Каждый слой
+for l in range(12):
+    attn_out = Attention(Norm(x + residual1 + residual2 + residual3))
+    x = x + attn_out + FFN(Norm(x))
+    
+    # Обновление с layer-specific α
+    residual1 += attn_out * α1(l)   # α1: 0.30 → 0.10 → 0.05
+    residual2 += attn_out * α2(l)   # α2: 0.10 → 0.30 → 0.15
+    residual3 += attn_out * α3(l)   # α3: 0.05 → 0.15 → 0.30
+```
+
+### 3.3 Динамика α
+
+```
+Layer 0-3:  char/morph learning  (α1=0.30, α2=0.10, α3=0.05)
+Layer 4-7:  word/phrase learning (α1=0.10, α2=0.30, α3=0.15)
+Layer 8-11: global structure     (α1=0.05, α2=0.15, α3=0.30)
+```
+
+---
+
+## 4. AttractorField
+
+### 4.1 Формальное определение
+
+Поле аттракторов — это набор точек в ℝ³⁸⁴ с весами:
+
+```
+A = {(μ_a, w_a, r_a) | a = 0..N_attr}
+```
+
+Потенциал поля:
+
+```
+P(z) = Σ_a w_a · exp(-||z - μ_a||² / 2σ²)
+```
+
+### 4.2 Hebbian update
+
+Алгоритм обновления при получении новой точки z ∈ ℝ³⁸⁴:
+
+```
+def hebbian_update(z, z_next=None):
+    # 1. Find closest attractor
+    c = argmin_a ||z - μ_a||
+    
+    # 2. Increment
+    w_c += 1
+    n = w_c  # total visits
+    
+    # 3. Count-normalized center EMA
+    μ_c += (lr_center / n) · (z - μ_c)
+    
+    # 4. Refractory vector EMA
+    if z_next is not None:
+        r_c += lr_refract · ((z_next - z) - r_c)
+    
+    # 5. Global decay (once per forward)
+    w_a *= decay
+```
+
+### 4.3 Свойства count-normalized update
+
+Стандартная EMA: `μ += lr · (z - μ)` — каждый новый sample двигает центр одинаково.
+
+Count-normalized: `μ += (lr/n) · (z - μ)` — ранние samples двигают сильно, поздние — слабо. Это даёт **сходимость**: μ_a → истинное среднее всех точек в кластере.
+
+### 4.4 nxt_direction — направление генерации
+
+```
+nxt(z) = η · (μ* - z)_norm + (1-η) · r*_norm
+
+где:
+- μ* = центр ближайшего к z аттрактора
+- r* = рефрактер этого аттрактора
+- η = learnable (default 0.7)
+- (·)_norm = normalize to unit vector
+```
+
+Компоненты:
+- η·(μ*-z): **консервативное** притяжение — оставаться в области известного
+- (1-η)·r*: **инновационное** продолжение — двигаться в типичном направлении выхода
+
+### 4.5 gradient — градиент поля
+
+```
+∇P(z) = -Σ_a (w_a/σ²) · exp(-||z-μ_a||²/2σ²) · (z - μ_a)
+```
+
+Используется для gradient ascent генерации (Phase 4):
+
+```
+for step in range(n_steps):
+    z += η · ∇P(z) + noise  # Langevin dynamics
+```
+
+---
+
+## 5. Boundary Detection
+
+### 5.1 Задача
+
+Для последовательности BPE-токенов определить границы слов (начало/середина/конец).
+
+### 5.2 BoundaryDetectionHead
+
+```python
+class BoundaryDetectionHead(nn.Module):
+    def __init__(self, d_model=384):
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 64),   # проекция
+            nn.SiLU(),                 # нелинейность
+            nn.Linear(64, 3),         # [word_start, inside, word_end]
+        )
+    
+    def forward(self, h):
+        return self.mlp(h)  # [B, L, 3]
+```
+
+### 5.3 Boundary corpus
+
+Создаётся скриптом `create_boundary_labels.py`:
+
+```
+Input: full_corpus_ru.txt (русский текст)
+
+Для каждой строки:
+  Разбить на предложения (по .!?… + заглавная)
   
-Level 1:
-  frontier [N=6, 128]
-  → quantize [N] → P[N, V, V] → mean(valid) → level_biases [N, V], scale=[0.5, ..., 0.5]
-  → gate filter (keep gates > 0.05) → M ≤ 6 survivors
-  → decomp: subs [M, 6, 128], gates [M, 6]
-  → scale = [0.5² × gate₁, 0.5² × gate₂, ...]
-
-Level 2:
-  frontier [M×K, 128]
-  ...
-
-Combine:
-  bias = Σ[depth] Σ[paths] P[sym_path, valid, :].mean(dim=0) × scale_path
-  bias = bias / Σ[paths] scale_path  (нормировка)
-```
-
-### 5.3 Quantize — детали
-
-```python
-def quantize(self, vectors):
-    """vectors: [N, D] → ids: [N]"""
-    # ОДИН cdist на все векторы
-    dists = torch.cdist(vectors, self.sym_coords, p=2)  # [N, 160]
-    return dists.argmin(dim=-1)                          # [N]
-```
-
-Сложность: `O(N × 160 × 128)`. Для N=4096 (max_cap) и D=128: 4096 × 160 × 128 = 83.9M FLOPS.  
-На MX550 (~2 TFLOPS): ~0.04ms. Ничтожно.
-
-### 5.4 Decompose — детали
-
-```python
-def decompose(self, vectors):
-    """vectors: [N, D] → sub: [N, K, D], gates: [N, K]"""
-    N = vectors.shape[0]
-    sub = self.decomp_proj(vectors).view(N, self.K, self.coord_dim)
-    # decom_proj: Linear(128→768), N × 128 × 768 = 98,304N MAC
-    gates = self.gate_net(vectors)  # Linear(128→6), N × 128 × 6 = 768N MAC
-    return sub, gates
-```
-
-### 5.5 Composition Loss — детали
-
-```python
-def composition_loss(self, vectors):
-    B, L, D = vectors.shape
-    flat = vectors.reshape(-1, D)     # [B*L, 128]
+  Для каждого предложения:
+    Разбить на слова (по пробелам)
     
-    # Decompose
-    subs, gates = self.decompose(flat)  # [BL, 6, 128], [BL, 6]
-    
-    # Reconstruct
-    recon = self.compose(subs)         # [BL, 128]
-    
-    # MSE: обратная связь decomp→compose
-    loss_mse = F.mse_loss(recon, flat)  # scalar
-    
-    # Diversity: penalty на косинусное сходство субвекторов
-    subs_norm = F.normalize(subs, dim=-1)
-    cos_mat = torch.bmm(subs_norm, subs_norm.transpose(1, 2))  # [BL, 6, 6]
-    mask = 1.0 - torch.eye(self.K, device=cos_mat.device).unsqueeze(0)
-    diversity = (cos_mat * mask).sum(dim=(1,2)) / (self.K * (self.K - 1))
-    diversity = diversity.mean()
-    # При случайных субвекторах: cos ~ 0, diversity ~ 0
-    # При коллапсе (все v_k = x/K): cos = 1, diversity = 1
-    
-    # Gate entropy: предотвратить коллапс к одному gate
-    entropy = -(gates * torch.log(gates + 1e-10)).sum(dim=-1).mean()
-    # При равномерных gate: entropy = ln(6) ≈ 1.79
-    # При коллапсе (один gate=1): entropy = 0
-    
-    return loss_mse + 0.1 * diversity - 0.01 * entropy
+    Для каждого слова:
+      Извлечь alpha-части (русские буквы) и punctuation
+      
+      Для alpha-части:
+        BPE-encode → word_ids
+        label: 
+          - каждый id: start(0) если первый, inside(1) если середина, end(2) если последний
+          - если 1 токен → end(2) (одновременно start и end)
+      
+      Для punctuation:
+        BPE-encode → punct_id
+        label: end(2)
 ```
 
-**Схема градиентов**:
-- `loss_mse` → compose_proj ← decomp_proj (сквозная связь: учим оба)
-- `diversity` → decomp_proj (субвекторы должны быть разные)
-- `entropy` → gate_net (гейты не должны коллапсить)
+### 5.4 Ограничения
 
-**Динамика обучения**:
-1. **Фаза 1 (0-10K steps)**: MSE доминирует. Состав учится быть identity. Diversity ~0, entropy ~1.79.
-2. **Фаза 2 (10K-50K steps)**: MSE мал. Diversity начинает расти (субвекторы специализируются). Entropy снижается до ~1.0.
-3. **Фаза 3 (50K+ steps)**: Установившийся баланс. Diversity ~0.5-0.7, entropy ~0.8-1.2, MSE ~0.
-
-### 5.6 Depth Scale — per-level веса
-
-```python
-self.depth_scale = nn.Parameter(torch.ones(max_depth) * 0.5)
-# shape: [8], все 0.5
-```
-
-Градиент: `∂loss/∂depth_scale[d] = Σ_paths scale_before_depth_d × g_k × bias_path`
-
-Динамика: если глубокая рекурсия полезна → `depth_scale[d]` растёт. Если вредна → падает к 0.
-
-### 5.7 BFS Tree — масштабирование
-
-```
-Gate threshold = 0.05
-Max cap = 4096
-
-При равномерных gates (H=1.79, все g_k ≈ 1/6 ≈ 0.17 > 0.05):
-  Level 0: 1 path  (keep все 6)
-  Level 1: 6 paths (keep все 6 × 6 = 36)
-  Level 2: 36 paths
-  Level 3: 216 paths
-  Level 4: 1296 paths
-  Level 5: 7776 paths → превышение max_cap=4096, обрезаем
-
-После специализации gates (1-2 активных):
-  Level 0: 1 path (keep 2)
-  Level 1: 2 paths
-  Level 2: 4 paths
-  Level 3: 8 paths
-  ...
-  Level 8: 256 paths → все 8 уровней вмещаются
-```
+- Не учитывает составные слова через дефис (разбиваются на части)
+- Не различает SENT_OPEN/SENT_CLOSE (только WORD level)
+- Все позиции имеют label (0, 1, или 2) — нет ignore_index
 
 ---
 
-## 6. Resume из чекпоинта — миграция
+## 6. L_align — Cross-level Consistency
 
-### 6.1 Старый → Новый чекпоинт
+### 6.1 Принцип
 
-| Старый ключ | Новый ключ | Действие |
-|------------|-----------|----------|
-| `tensor_potential.P` | `tensor_potential.base_tpf.P` | Копирование вручную |
-| `tensor_potential.count` | `tensor_potential.base_tpf.count` | strict=False (игнорируется) |
-| `tensor_potential.depth_scale` (scalar) | `tensor_potential.depth_scale` (vector[8]) | Отбрасывается (shape mismatch) |
-| Все остальные ключи | Совпадают | Автоматическая загрузка |
+Информация о границах слов должна быть согласована между:
+- **char-level**: BoundaryDetectionHead — per-token "inside" probability
+- **word-level**: WordWeightEncoder — per-word importance score
 
-### 6.2 Code
+### 6.2 Loss
 
-```python
-if os.path.exists(ckpt_path):
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
-    old_sd = ckpt['ut']
-    
-    # Remove shape-mismatched keys
-    for k in list(old_sd.keys()):
-        if k in model.state_dict() and old_sd[k].shape != model.state_dict()[k].shape:
-            del old_sd[k]  # depth_scale scalar→vector, etc.
-    
-    model.load_state_dict(old_sd, strict=False)
-    
-    # Migrate old TPF.P → base_tpf.P
-    if 'tensor_potential.P' in old_sd:
-        model.tensor_potential.base_tpf.P.copy_(old_sd['tensor_potential.P'])
+```
+L_align = MSE(char_inside, word_importance_sigmoid)
+
+где:
+- char_inside = boundary_probs[..., 1]  — вероятность "внутри слова" для каждого токена  
+  shape: [B, L]
+- word_importance = Sigmoid(Linear(word_vec)).sigmoid()  — важность каждого слова
+  shape: [B, L] — broadcast от word-level к token-level по word_id
 ```
 
----
+### 6.3 Зачем?
 
-## 7. Метрики и производительность
-
-### 7.1 Текущие метрики (step 6500)
-
-| Метрика | Значение |
-|---------|---------|
-| CE Loss | 1.24-1.89 |
-| Accuracy | 49-64% |
-| TrajLoss | 0.005-0.007 |
-| GroupLoss | 0.06-0.16 |
-| Composition Loss | ~−0.0178 |
-| Topology connections | ~1250 |
-| Trajectories in store | ~35 |
-| Steps/min | ~160 |
-| VRAM | 0.7 GB / 2.1 GB |
-
-### 7.2 Производительность
-
-| Операция | Время | Frequency |
-|----------|-------|-----------|
-| Forward + loss (B=12, ML=192) | ~375ms | Каждый шаг |
-| Thinking phase (500 samples + update) | ~30s | Каждые 500 шагов |
-| Validation (7 seeds + Anna Karenina) | ~60s | Каждые 5000 шагов |
-| Checkpoint save (22 MB) | ~2s | Каждые 500 шагов |
-
-### 7.3 VRAM Breakdown
-
-| Компонент | VRAM | Доля |
-|-----------|------|------|
-| Model params (5.5M × 4 bytes) | 22 MB | 3% |
-| Optimizer states (AdamW × 2) | 44 MB | 6% |
-| Activations (B=12, L=192, 6 layers) | ~300 MB | 42% |
-| CUDA context + allocator overhead | ~335 MB | 48% |
-| **Total** | **~700 MB** | **100%** |
+- BoundaryHead учится на labelled данных (supervised)
+- WordWeightEncoder учится на attention (unsupervised)
+- L_align — bridge между ними: заставляет attention WordWeightEncoder согласовываться с supervised boundaries
 
 ---
 
-## 8. Отличия от LLM
+## 7. Composite Loss
 
-| | LLM (GPT, LLaMA) | EVA |
-|---|---|---|
-| **Параметры** | 1B–1.7T | **5.49M** |
-| **VRAM** | 8-80 GB | **0.7 GB** |
-| **Знания** | В весах (неотделимы) | Потенциалы + топология + траектории |
-| **Ретенция** | Context window (4K-128K) | Внешняя память (50K+ траекторий) |
-| **Масштабирование** | Больше параметров | Больше траекторий |
-| **Bias** | Нет (raw CE) | RecursiveTPF (K=6, BFS) + WVF + SubHSM |
-| **Внимание** | MHSA | FractalConv2D + CoordBias + Adaptive |
-| **Иерархия** | Flat tokens | Character + Word + Sentence (boundary) |
-| **Интерпретируемость** | Black box | Траектория + рекурсивный bias |
-| **Обучение** | Weeks, 8-256 GPUs | Hours, 1 GPU (MX550) |
+```
+L = W_CE · L_CE 
+  + W_NXT · L_nxt 
+  + W_BOUNDARY · L_boundary 
+  + W_ALIGN · L_align
+  + W_ATTRACTOR · (L_ac + L_dv)
+  + W_HAF · L_haf
+
+Где:
+W_CE = 1.0
+W_NXT = 0.05
+W_BOUNDARY = 0.1  
+W_ALIGN = 0.05
+W_ATTRACTOR = 0.01
+W_HAF = 0.001
+```
+
+### 7.1 Gradients
+
+```
+∂L/∂θ_model = ∂L_CE/∂θ + 0.05·∂L_nxt/∂θ + 0.1·∂L_boundary/∂θ 
+              + 0.05·∂L_align/∂θ + 0.01·∂L_AF/∂θ + 0.001·∂L_HAF/∂θ
+```
+
+L_boundary влияет только на BoundaryDetectionHead + скрытые состояния.
+L_nxt влияет на TrajectoryBoundaryPredictor + скрытые состояния.
+L_align влияет на оба — согласует их.
+L_CE влияет на всю модель — основной сигнал.
+L_HAF влияет на HierarchicalAdditiveField (slot_net, stop_head) + скрытые состояния.
+
+### 7.2 Regularization
+
+- Weight decay: 0.01 (AdamW)
+- Gradient clipping: 1.0
+- Temperature clamp: [0.1, 10.0]
+- AttractorField decay: 0.999 per step
+
+---
+
+## 8. Generation Mechanics
+
+### 8.1 Полный процесс
+
+```
+1. Вход: prompt_ids = [BOS, t1, t2, ..., tn]
+2. h, logits, heads = model(prompt_ids, return_heads=True)
+3. z_curr = h[0, -1]  — последняя координата
+
+4. Если use_attractors и attractors > 0:
+     nxt = attractor_field.nxt_direction(z_curr.unsqueeze(0))[0]
+   Иначе:
+     _, nxt, _ = boundary_predictor(h[:, -1:])  # [1, 1, D]
+     nxt = nxt[0, 0]  # [D]
+
+5. z_pred = z_curr + nxt  # [D]
+
+6. logits_know = decoder(z_pred.unsqueeze(0).unsqueeze(0))[0, 0]
+
+7. sym_coords = embed.weight  # [4101, 384]
+   dists = -cdist(z_pred.unsqueeze(0), sym_coords, p=2)[0]
+   
+8. concept_score = heads['concept'][0, -1].item()
+   contra_score = heads['contradiction'][0, -1].item()
+   
+   logits_conc = dists * (1.0 + concept_score)
+   logits_contr = dists * (1.0 - contra_score * 0.5)
+
+9. meta_w = heads['meta_weights'][0]  # [3]
+   final = (meta_w[0]·logits_know + meta_w[1]·logits_conc + meta_w[2]·logits_contr) / temp
+
+10. mask special tokens [0,1,2,3,GAP,157,158,159,160]
+11. repetition penalty: final[t] -= count[t] * 0.5
+12. top-20 → softmax → multinomial → next_token
+13. append → repeat from step 2
+```
+
+### 8.2 Режимы generation
+
+| Режим | nxt source | Когда |
+|-------|-----------|-------|
+| Standard | boundary_predictor | По умолчанию |
+| Attractor | attractor.nxt_direction | Если накоплено >0 аттракторов |
+| Hierarchical | haf.nxt_direction | Декомпозиция + аттракторы компонентов (Phase 3+) |
+| Gradient | ∇P(z) ascent | Phase 4 |
+
+### 8.3 HAF в генерации (перспектива)
+
+```
+1. z_curr — текущий вектор
+2. decompose(z_curr) → [v₀, v₁, ..., v_K]  — разложить на компоненты
+3. Для каждого vₖ: найти ближайший аттрактор → nxt_k
+4. z_next = Σ(vₖ + nxt_k) / K  — собрать обратно
+5. token_next = argmin ||z_next - E||
+```
+
+Преимущество: генерация учитывает иерархию концепта. Если z_curr = "пришёл",
+decompose найдёт ["при-", "-шёл-", "-л"], каждый компонент двигается к своему
+аттрактору, сумма даёт направление к семантически связанному следующему слову.
+
+---
+
+## 9. Parameter Schema
+
+### 9.1 Embedding (1,574,784 params)
+
+```
+E ∈ ℝ^{4101 × 384}
+init: Normal(0, 0.02)
+```
+
+### 9.2 Attention per layer (589,824 params per layer × 12 = 7,077,888)
+
+```
+Q: Linear(384, 384)      = 147,456
+K: Linear(384, 384)      = 147,456
+V: Linear(384, 384)      = 147,456
+W_O × 6: 6 × Linear(64, 384) = 147,456
+Total: 589,824
+```
+
+### 9.3 FFN per layer (589,824 params per layer × 12 = 7,077,888)
+
+```
+W_gate: Linear(384, 512) = 196,608
+W_up:   Linear(384, 512) = 196,608
+W_down: Linear(512, 384) = 196,608
+Total: 589,824
+```
+
+### 9.4 Heads
+
+| Head | Params | Formula |
+|------|--------|---------|
+| BoundaryDetection | 24,771 | 384·64 + 64·3 + biases |
+| TrajectoryPredictor | 394,240 | 384·256 + 256 + 256·1152 + 1152 |
+| ConceptHead | 26,689 | 384·64 + 64 + 64·32 + 32 + 32·1 + 1 |
+| ContradictionHead | 26,689 | (same as Concept) |
+| UncertaintyHead | 49,472 | 384·64 + 64 + 64·384 + 384 |
+| ResidualHead | 484,608 | 3·384·384 + 384 + 384·64 + 64 + 64·384 + 384 |
+| MetaWeighter | 24,771 | 384·64 + 64 + 64·3 + 3 |
+| WordValence | 1,099,520 | 2 × (384·128 + 128 + 128·4101 + 4101) |
+| BoundaryValidator | 49,408 | 2·384·64 + 64 + 64·2 + 2 |
+| AttractorField | 0 | Buffers only |
+
+### 9.5 Total: 20,473,064 (≈20.5M)
+
+---
+
+## 10. Training Config
+
+### 10.1 Current (Phase 2)
+
+```python
+N_STEPS = 200000
+B = 8
+L = 64
+LR = 3e-4
+WARMUP = 4000
+OPTIMIZER = AdamW(weight_decay=0.01)
+SCHEDULER = SequentialLR([
+    LinearLR(start_factor=1e-4, total_iters=4000),
+    CosineAnnealingLR(T_max=196000),
+], milestones=[4000])
+CLIP_NORM = 1.0
+```
+
+### 10.2 Data flow
+
+```
+# per step:
+idx = randint(0, N - L - 1, size=B)        # random offsets
+batch_ids = stack([data[i:i+L] for i in idx])     # [B, L]
+batch_labels = stack([labels[i:i+L] for i in idx]) # [B, L]
+targets = stack([data[i+1:i+L+1] for i in idx])    # [B, L]
+
+x = tensor(batch_ids)
+y_labels = tensor(batch_labels)
+targets = tensor(targets)
+
+h, scores, weights, heads = model(x, return_heads=True)
+ce_loss = CE(scores, targets)            # masked for specials
+nxt_loss = MSE(nxt_pred, h_diff)          # trajectory
+boundary_loss = CE(boundary_logits, y_labels)  # boundary
+align_loss = MSE(char_inside, word_pooled)     # consistency
+```
+
+### 10.3 Metrics per step
+
+```
+ce=2.34 nxt=0.31 bc=0.13 align=0.0004 ac=0.002 dv=0.14
+hf=0.003 hk=3 hr=0.001 acc=0.51 b_acc=0.95 att=2100 haf_att=85
+```
+
+- ce: CE loss (ожидаем 1.0-2.0 в начале)
+- nxt: trajectory MSE (должен снижаться к ~0.01)
+- bc: boundary loss (0.0 если нет WO/WC в данных, ∼0.1 если есть)
+- align: L_align MSE (согласование char/word)
+- ac: attractor consistency loss (MSE h→nearest center)
+- dv: attractor diversity loss (ортогональность центров)
+- hf: HAF multi-path loss (разложение + реконструкция)
+- hk: HAF K — число компонент декомпозиции на шаге
+- hr: HAF residual — норма остатка после декомпозиции
+- acc: token prediction accuracy (∼50-60% на char, ∼30-40% на BPE)
+- b_acc: boundary accuracy (80-95% с labelled corpus)
+- att: количество аттракторов в AttractorField
+- haf_att: количество аттракторов в HAF
+
+---
+
+## 11. HierarchicalAdditiveField
+
+### 11.1 Мотивация
+
+Стандартный AttractorField хранит точки в ℝ³⁸⁴, но не знает их внутренней
+структуры. Концепт "пришёл" — это одновременно целое и сумма частей
+("при-" + "-шёл-" + "-л"). HAF реализует **иерархическое аддитивное хранение**:
+
+```
+z ∈ ℝᴰ → decompose → [v₀, v₁, ..., v_K], K ∈ [0, max_arity], z ≈ Σ vₖ
+```
+
+Каждый vₖ — самостоятельный концепт, который тоже раскладывается. Нулевые
+векторы — разделители между уровнями (аналог "0" в вашем примере 5 = 1+4 = 2+3).
+
+### 11.2 Sequential Decomposition
+
+В отличие от параллельного подхода (все компоненты из одного выстрела), HAF
+использует **последовательное разложение** — каждый шаг объясняет остаток:
+
+```
+r₀ = z                              # residual = исходный вектор
+for k = 0..max_arity:
+    stopₖ = σ(W_stop · rₖ + b_stop)  # вероятность остановки
+    vₖ  = MLP_slot(rₖ + posₖ) + rₖ   # skip-connection: vₖ ≈ rₖ на старте
+    rₖ₊₁ = rₖ - vₖ                   # новый residual
+    if stopₖ > 0.5: break            # STOP
+return [v₀, v₁, ..., v_K]           # z = Σ vₖ (с точностью до r_K ≈ 0)
+```
+
+**Skip-connection** (MLP + r) — ключевое техническое решение:
+- На инициализации MLP≈0 → v₀≈z → r₁≈0 → perfect reconstruction за 1 шаг
+- Модель не тратит capacity на реконструкцию, сразу учится дробить осмысленно
+- Гарантия: ||z - Σvₖ|| ≈ ||r_K|| < 0.001 после обучения
+
+### 11.3 Variable Arity (STOP head)
+
+Количество компонент K определяется контекстом через sigmoid-врата:
+
+```python
+stop_logit = W · r + b              # один Linear(384 → 1)
+stop_prob = sigmoid(stop_logit)      # [0, 1]
+# STOP когда stop_prob > 0.5
+```
+
+Во время обучения — **Gumbel-Sigmoid** для дифференцируемого дискретного выбора:
+
+```python
+gumbel = -log(-log(U + ε) + ε)
+stop_noisy = sigmoid((stop_logit + gumbel) / τ)
+stop_hard = (stop_noisy > 0.5).float()
+stop = stop_hard + stop_soft - stop_soft.detach()  # straight-through
+```
+
+На первом шаге (k=0) STOP всегда заблокирован — нужен минимум 1 компонент.
+
+### 11.4 Multi-Path Loss
+
+Один концепт может быть разложен по-разному (как 5 = 1+4 = 2+3).
+Разные dropout seeds → разные decomposition paths:
+
+```
+Path A (dropout=0.05): z → [v₀, v₁]    (2 компонента)
+Path B (dropout=0.50): z → [w₀, w₁, w₂] (3 компонента)
+Оба: Σ ≈ z
+```
+
+Loss:
+```
+L_haf = W_recon · (||z - Σvₖ||² + ||z - Σwₖ||²)    # реконструкция (≈0)
+      + W_cross · ||Σvₖ - Σwₖ||²                     # согласованность путей
+      + W_sparsity · (K_A + K_B) / max_arity          # мало компонент
+      + W_diversity · cos(mean(v), mean(w))            # разные паттерны
+```
+
+### 11.5 Иерархия
+
+Каждый vₖ — вектор в ℝ³⁸⁴ → рекурсивно раскладывается:
+
+```
+z (путь)
+├── v₀ (глагольный корень)
+│   ├── w₀ (приставка "при-")
+│   ├── w₁ (корень "-шёл-")
+│   └── w₂ (окончание "-л")
+└── v₁ (вспомогательный смысл)
+    ├── x₀
+    └── x₁
+```
+
+Хранение: каждый узел → AttractorField (Hebbian update).
+
+```
+store_hierarchical(z, depth=2):
+    1. hebbian_update(z)                    — сохранить z
+    2. parts = decompose(z)                  — разложить
+    3. for each p in parts:
+         a. hebbian_update(p)               — сохранить компонент
+         b. if depth > 0: recurse(p)        — рекурсия
+```
+
+### 11.6 Параметры
+
+| Параметр | Значение | Смысл |
+|----------|----------|-------|
+| coord_dim | 384 | Размерность = d_model |
+| max_arity | 8 | Максимум компонент в разложении |
+| max_depth | 5 | Глубина рекурсивного дерева |
+| creation_threshold | 0.1 | Порог создания нового аттрактора |
+
+**slot_net**: Linear(384→384) → SiLU → Linear(384→384), 295K params.
+**stop_head**: Linear(384→1), 385 params.
+**slot_pos**: [8, 384] learnable positional embedding, 3072 params.
+**depth_scale**: [5] learnable, 5 params.
+**gs_temp**: [1] learnable Gumbel temperature, 1 param.
+**attractors**: AttractorField(10000, 384) — 0 trainable, ~30 MB buffers.
+
+Total HAF params: ~298K (1.4% от 20.5M модели).
+
+### 11.7 Интеграция в модель
+
+```python
+# В __init__ модели:
+self.haf = HierarchicalAdditiveField(coord_dim=d_model)
+
+# В forward (update_attractors=True):
+z_pooled = h.mean(dim=1)  # [B, D]
+for b in range(min(B, 4)):
+    self.haf.store_hierarchical(z_pooled[b], depth=2)
+
+# В train loop (step > HAF_WARMUP):
+z_pooled = h.mean(dim=(0, 1))  # [D] — глобальный mean
+haf_loss = self.haf.multi_path_loss(z_pooled, n_paths=2)
+total_loss += W_HAF * haf_loss  # W_HAF = 0.001
+```
+
+### 11.8 Связь с концептами и противоречиями
+
+HAF даёт модели **явное представление** о структуре знания:
+- Вместо "угадывания" следующего токена — декомпозиция текущего концепта
+- Концепт ("понятие") = точка в пространстве с известным разложением
+- Противоречие = компоненты, чьи аттракторы указывают в разные стороны
+- Поиск = спуск по иерархии: z → decompose → sub-аттракторы → ближайшие концепты
+
+Это делает ConceptHead и ContradictionHead не эвристиками, а
+**измеримыми величинами**: density аттракторов вокруг z → concept_score,
+dispersion направлений sub-аттракторов → contradiction_score.
+
+---
+
+## 12. Key Files
+
+```
+FCF/
+├── train_phase1.py              — Phase 1: char-level (CE + nxt)
+├── train_phase2.py              — Phase 2: BPE (CE + nxt + bd + align) ← текущий
+├── eval_phase1.py               — Eval (generation + topology)
+├── create_boundary_labels.py    — Boundary corpus builder
+├── encode_bpe_corpus.py         — BPE corpus encoder
+├── test_compile.py              — Verification tests
+├── test_integrity.py            — Data integrity checks
+│
+├── eva/symbolic/
+│   ├── phase1_model.py          — UnifiedMultidimensionalTransformerV2 (вкл. HAF)
+│   ├── heads.py                 — All head modules
+│   ├── subspace_coords.py       — WordWeightEncoder
+│   ├── potential_fields.py      — AttractorField, WSentenceContextField,
+│   │                              HierarchicalAdditiveField, etc.
+│   └── bpe_tokenizer.py         — BPE wrapper (HuggingFace tokenizers)
+│
+├── real_data/
+│   ├── full_corpus_ru.txt       — Raw text (173 MB)
+│   ├── full_corpus_ids.npy      — Char-level (94.7M tokens)
+│   ├── full_corpus_bpe.npy      — BPE (29.4M tokens)
+│   ├── full_corpus_bpe_boundary.npy  — BPE + boundaries (60.2M tokens)
+│   ├── full_corpus_bpe_labels.npy    — Boundary labels (0/1/2)
+│   └── bpe_tokenizer.json       — Trained tokenizer
+│
+├── checkpoints/v4/
+│   ├── phase1_step_20000.pt     — Phase 1 checkpoints
+│   ├── phase1_step_40000.pt
+│   └── phase1_step_60000.pt
+│
+└── docs/
+    ├── ARCHITECTURE.md          — This file
+    └── architecture_v4.md       — Original spec (historical)
+```

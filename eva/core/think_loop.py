@@ -75,7 +75,7 @@ class ThinkLoop:
             'disk_usage': s['disk'],
             'rate_history': [0.0] * 100,
         })
-        log(f'DB: {s["sentences"]} sentences, {s["tokens"]} tokens, {s["disk"]}')
+        log(f'DB: {s["sentences"]} sentences (WP={self.db.n_sentences:,} + Wiki={self.db.n_wiki_sentences:,}), {s["tokens"]} tokens, {s["disk"]}')
 
         log('Loading heads...')
         self.heads = HeadsEnsemble(META, CSR)
@@ -249,17 +249,22 @@ class ThinkLoop:
         })
 
     def _sample_real_data(self, n_samples):
-        """Sample (context, next_token) pairs from real WP sentences in DB."""
+        """Sample (context, next_token) pairs from real data (WP + Wikipedia)."""
         pairs = []
-        n_sent = min(self.db.n_sentences, 5000)
-        if n_sent < 2:
+        n_wp = min(self.db.n_sentences, 5000)
+        n_wiki = min(self.db.n_wiki_sentences, 5000)
+        if n_wp + n_wiki < 2:
             return pairs
-        for _ in range(n_samples * 2):
-            sent_idx = random.randint(0, n_sent - 1)
-            sent = self.db.get_sentence(sent_idx)
-            tokens = sent['tokens']
-            if len(tokens) < 3:
+        for _ in range(n_samples * 3):
+            if n_wiki > 0 and random.random() < 0.5:
+                sent_idx = random.randint(0, n_wiki - 1)
+                sent = self.db.get_wiki_sentence(sent_idx)
+            else:
+                sent_idx = random.randint(0, n_wp - 1)
+                sent = self.db.get_sentence(sent_idx)
+            if sent is None or len(sent['tokens']) < 3:
                 continue
+            tokens = sent['tokens']
             pos = random.randint(1, len(tokens) - 2)
             ctx = self._context_from_tokens(tokens, pos)
             if ctx is not None:

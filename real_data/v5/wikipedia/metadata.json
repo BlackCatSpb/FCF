@@ -1,0 +1,11 @@
+{
+  "n_sentences": 500000,
+  "n_tokens": 43666770,
+  "n_words": 7657293,
+  "vocab_size": 4101,
+  "text_id": 2,
+  "n_transitions": 43166770,
+  "n_unique_transitions": 130181,
+  "source": "ruwiki 20231101 via HuggingFace datasets",
+  "created": "2026-06-02 01:12:48"
+}

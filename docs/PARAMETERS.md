@@ -468,6 +468,7 @@ WO (4097) и WC (4098) НЕ маскируются — модель должна
 | `temperature` | 0.8 | Температура softmax. >1 = более случайно, <1 = более детерминировано. |
 | `max_new` | 128 | Макс. число новых токенов для генерации. |
 | `use_attractors` | False | Использовать AttractorField.nxt_direction() вместо boundary_predictor. |
+| `use_haf` | False | Использовать HAF.nxt_direction() — иерархическое направление через декомпозицию. Приоритет выше use_attractors. |
 | `top_k` | 20 | Top-K sampling: из 20 самых вероятных. |
 | `repetition_penalty` | count(t) × 0.5 | Штраф: каждый уже сгенерированный токен уменьшает свой logit. |
 

@@ -87,11 +87,25 @@ class BPEVocab:
         return result
 
     def decode(self, ids: List[int], skip_special: bool = True) -> str:
-        skip = {self.PAD_IDX, self.UNK_IDX, self.BOS_IDX, self.EOS_IDX,
-                self.GAP_FILLER_IDX, self.WORD_OPEN_IDX, self.WORD_CLOSE_IDX,
-                self.SENT_OPEN_IDX, self.SENT_CLOSE_IDX}
-        bpe_ids = [i for i in ids if (not skip_special or i not in skip) and i < self.vocab_size]
-        return self.tokenizer.decode(bpe_ids)
+        result = []
+        for i in ids:
+            if i == self.WORD_OPEN_IDX:
+                if result and not result[-1].isspace():
+                    result.append(' ')
+                continue
+            if i == self.WORD_CLOSE_IDX:
+                continue
+            if skip_special and i in {self.PAD_IDX, self.UNK_IDX, self.BOS_IDX, self.EOS_IDX,
+                                       self.GAP_FILLER_IDX, self.SENT_OPEN_IDX, self.SENT_CLOSE_IDX}:
+                continue
+            if i < self.vocab_size:
+                tok = self.tokenizer.decode([i])
+                # Insert space before uppercase (word start in BPE)
+                if (tok and tok[0].isupper() and result
+                    and not result[-1].isspace() and result[-1] not in ' («'):
+                    result.append(' ')
+                result.append(tok)
+        return ''.join(result)
 
     def __len__(self) -> int:
         return self.vocab_size_with_boundaries

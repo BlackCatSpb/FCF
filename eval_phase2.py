@@ -93,14 +93,15 @@ if n_att > 1:
         print(f'  Mean inter-attractor dist: {triu[triu>0].mean().item():.4f}')
         print(f'  Min inter-attractor dist: {triu[triu>0].min().item():.4f}')
 
-# ─── 4. Generation (standard mode) ───
-print('\n=== 4. Generation (standard) ===')
+# ─── 4. Generation ───
+print('\n=== 4. Generation ===')
 prompts = [
     cv.encode('Литва'),
     cv.encode('Россия'),
     cv.encode('Квантовая'),
 ]
-def generate(model, prompt_ids, max_new=64, temp=0.8, use_attractors=False):
+def generate(model, prompt_ids, max_new=64, temp=0.8,
+             use_attractors=False, use_haf=False):
     model.eval()
     ids = list(prompt_ids)
     with torch.no_grad():
@@ -108,7 +109,10 @@ def generate(model, prompt_ids, max_new=64, temp=0.8, use_attractors=False):
             inp = torch.tensor([ids[-64:]], dtype=torch.long, device=device)
             h, _, _, heads_out = model.forward(inp, return_heads=True, capture_attn=True)
             z_curr = h[0, -1]
-            if use_attractors and model.attractor_field.n_attractors > 0:
+            if use_haf and model.haf.attractors.n_attractors > 0:
+                nxt_dir = model.haf.nxt_direction(z_curr.unsqueeze(0))[0]
+                z_pred = z_curr + nxt_dir
+            elif use_attractors and model.attractor_field.n_attractors > 0:
                 nxt_dir = model.attractor_field.nxt_direction(z_curr.unsqueeze(0))[0]
                 z_pred = z_curr + nxt_dir
             else:
@@ -139,12 +143,50 @@ def generate(model, prompt_ids, max_new=64, temp=0.8, use_attractors=False):
             if nt in {cv.EOS_IDX, cv.SENT_CLOSE_IDX}:
                 break
     return cv.decode(ids), {}
+print('  — Standard (boundary_predictor) —')
 for p in prompts:
-    text, _ = generate(model, p, max_new=64, use_attractors=False)
+    text, _ = generate(model, p, max_new=64)
     print(f'  {text[:150]}')
 
-# ─── 5. Attention analysis ───
-print('\n=== 5. Attention Pattern Analysis ===')
+if model.haf.attractors.n_attractors > 0:
+    print('  — HAF mode —')
+    for p in prompts:
+        text, _ = generate(model, p, max_new=64, use_haf=True)
+        print(f'  {text[:150]}')
+
+# ─── 5. HAF analysis ───
+print('\n=== 5. HAF Hierarchical Analysis ===')
+haf = model.haf
+n_att_haf = haf.attractors.n_attractors
+print(f'  HAF attractors: {n_att_haf}')
+if n_att_haf > 0:
+    valid = haf.attractors.valid_mask[:n_att_haf]
+    centers = haf.attractors.centers[:n_att_haf][valid]
+    counts = haf.attractors.counts[:n_att_haf][valid]
+    print(f'  Count range: {counts.min().item():.1f}..{counts.max().item():.1f}')
+    if len(centers) > 1:
+        pairwise = torch.cdist(centers, centers, p=2)
+        triu = torch.triu(pairwise, diagonal=1)
+        n_pairs = (triu > 0).sum().item()
+        if n_pairs > 0:
+            print(f'  Mean inter-attractor dist: {triu[triu>0].mean().item():.4f}')
+
+    # Decomposition analysis on sample
+    z_sample = h[0, L // 4]
+    parts, info = haf.decompose(z_sample, noise_dropout=0.0)
+    z_hat = haf.compose(parts)
+    recon_err = (z_hat - z_sample).norm().item()
+    print(f'  Sample K={info["K"]}, recon_err={recon_err:.4f}, '
+          f'residual={info["final_residual"].norm().item():.4f}')
+
+    # Concept/contra from HAF
+    concept_scores = heads_out.get('concept', torch.zeros(B, L))
+    contra_scores = heads_out.get('contradiction', torch.zeros(B, L))
+    print(f'  concept_mean={concept_scores.mean().item():.4f}, '
+          f'contra_mean={contra_scores.mean().item():.4f}')
+
+# ─── 6. Attention analysis ───
+print('\n=== 6. Attention Pattern Analysis ===')
 idx = rng.randint(0, N - L - 1, size=B)
 batch = np.stack([ids[i:i+L] for i in idx])
 x = torch.tensor(batch, dtype=torch.long, device=device)
@@ -159,8 +201,8 @@ if attn_mats:
     print(f'  Mean diagonal weight: {diagonal:.4f}')
     print(f'  Mean off-diagonal weight: {off_diag:.4f}')
 
-# ─── 6. Dimension utilization ───
-print('\n=== 6. Dimension Analysis ===')
+# ─── 7. Dimension utilization ───
+print('\n=== 7. Dimension Analysis ===')
 h_np = h.cpu().numpy()  # (B, L, 384)
 dim_var = h_np.var(axis=(0, 1))
 mean_var = dim_var.mean()

@@ -46,11 +46,13 @@ W_ATTRACTOR = 0.03       # ↑ с 0.01 — сильнее притяжение �
 W_DIVERSITY = 0.02       # отдельный вес diversity (был частью W_ATTRACTOR)
 W_META = 0.01            # KL loss для MetaWeighter
 W_FLOW = 0.001           # smoothness: MSE соседних nxt-векторов
+W_HAF = 0.001            # HAF multi-path loss (Phase 2 compatibility)
 
 # Attractor config
 UPDATE_ATTRACTORS_EVERY = 10
 ATTRACTOR_WARMUP = 1000
 ATTRACTOR_CONFIDENCE_THRESHOLD = 0.3  # мин. confidence для сохранения трека
+HAF_WARMUP = 1000
 
 VOCAB = 4101
 SPECIAL_IDS = {0, 1, 2, 3, 4096, 4099, 4100}
@@ -70,8 +72,14 @@ args = parser.parse_args()
 
 if args.resume and os.path.exists(args.resume):
     ckpt = torch.load(args.resume, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt['model_state'])
+    model.load_state_dict(ckpt['model_state'], strict=False)
     print(f'Resumed from {args.resume} (step {ckpt.get("step","?")})')
+    missing = [k for k in model.state_dict() if k not in ckpt['model_state']]
+    extra = [k for k in ckpt['model_state'] if k not in model.state_dict()]
+    if missing:
+        print(f'  Missing keys: {len(missing)} (HAF/heads mismatch — expected)')
+    if extra:
+        print(f'  Extra keys: {len(extra)} (from different checkpoint — expected)')
 else:
     print('No checkpoint, training from scratch')
 
@@ -212,11 +220,26 @@ for step in range(N_STEPS):
     else:
         flow_loss = torch.tensor(0.0, device=device)
 
+    # 8. HAF multi-path loss
+    haf = model.haf
+    if step > HAF_WARMUP:
+        z_pooled = h.mean(dim=(0, 1))
+        haf_loss_dict = haf.multi_path_loss(
+            z_pooled, n_paths=2, w_cross=0.05, w_sparsity=0.005)
+        haf_loss = haf_loss_dict['total']
+        haf_K = heads_out.get('haf_K', 0)
+        haf_res = heads_out.get('haf_residual', 0.0)
+    else:
+        haf_loss = torch.tensor(0.0, device=device)
+        haf_K = 0
+        haf_res = 0.0
+
     # ── Total loss ──
     total = (W_CE * ce_loss + W_NXT * nxt_loss +
              W_BOUNDARY * boundary_loss_val + W_ALIGN * align_loss +
              W_ATTRACTOR * attractor_loss + W_DIVERSITY * diversity_loss +
-             W_META * meta_loss + W_FLOW * flow_loss)
+             W_META * meta_loss + W_FLOW * flow_loss +
+             W_HAF * haf_loss)
     total.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
@@ -246,6 +269,7 @@ for step in range(N_STEPS):
         elapsed = time.time() - t0
         lr_now = optimizer.param_groups[0]['lr']
         n_att = model.attractor_field.n_attractors
+        haf_n_att = model.haf.attractors.n_attractors
         steps_per_sec = (step + 1) / (elapsed + 1e-8)
         eta = (N_STEPS - step) / (steps_per_sec + 1e-8) / 3600
         mw = meta_weights[0].tolist()
@@ -253,7 +277,8 @@ for step in range(N_STEPS):
                f'nxt={nxt_loss.item():.3f} bc={boundary_loss_val.item():.3f} '
                f'ac={attractor_loss.item():.3f} dv={diversity_loss.item():.3f} '
                f'meta={meta_loss.item():.4f} flow={flow_loss.item():.4f} '
-               f'acc={acc:.3f} b_acc={b_acc:.3f} att={n_att} '
+               f'hf={haf_loss.item():.4f} hk={haf_K} hr={haf_res:.3f} '
+               f'acc={acc:.3f} b_acc={b_acc:.3f} att={n_att} haf_att={haf_n_att} '
                f'mw=[{mw[0]:.2f},{mw[1]:.2f},{mw[2]:.2f}] '
                f'steps/s={steps_per_sec:.1f} ETA={eta:.1f}h'
                f' | {elapsed/60:.0f}min')

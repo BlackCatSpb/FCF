@@ -1,422 +1,209 @@
 """
-Heads — все heads для shared encoder EVA Symbolic v3.
+HeadsEnsemble — 6 data-driven heads (morph, syntax, transition, semantic, concept, contra).
 
-TrajectoryBoundaryPredictor — 3×ℝ¹²⁸: конец слова, начало следующего, вектор связи
-BoundaryValidator      — softmax(word, sentence): разрешение неоднозначности
-ConceptHead            — sigmoid: важность концепта из intrinsic density
-ContradictionHead      — sigmoid: уровень противоречия из intrinsic uncertainty
-UncertaintyHead        — log-variance per coordinate: intrinsic uncertainty signal
-MetaWeighter           — softmax(3): веса know/conc/contr с bias на знания
-WeightProjector        — проекция весов модели → ℝ¹²⁸ как токен контекста
-MoEFFN                 — Mixture-of-Experts FFN: per-token expert routing
+Все операции — numpy arrays, без Python loops per-token.
+WeightTransformer учит взвешивать heads.
 """
-import torch, torch.nn as nn, torch.nn.functional as F
-import math
+import math, pickle, os
+from typing import Optional
+import numpy as np
 
 
-class MoEFFN(nn.Module):
-    """
-    Mixture-of-Experts FFN: per-token routing между N экспертами.
+class HeadsEnsemble:
+    """Все 6 heads. Векторизовано: score_all(V) = O(V) numpy."""
 
-    Каждый эксперт — SwiGLUFFN с hidden_dim/n_experts.
-    Router: h → softmax(N).
-    Output: weighted sum.
-    """
-    def __init__(self, dim: int, hidden_dim: int, n_experts: int = 4, top_k: int = 2):
-        super().__init__()
-        self.n_experts = n_experts
-        self.top_k = top_k
-        expert_hidden = max(hidden_dim // n_experts, 16)
+    def __init__(self, meta_path: str, csr_path: Optional[str] = None,
+                 default_weights: Optional[dict] = None):
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
 
-        self.router = nn.Linear(dim, n_experts)
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(dim, expert_hidden, bias=False),
-                nn.SiLU(),
-                nn.Linear(expert_hidden, dim, bias=False),
-            ) for _ in range(n_experts)
-        ])
+        self.V = meta.get('V', 4101)
 
-    def forward(self, x):
-        route_logits = self.router(x)
-        if self.training and self.top_k < self.n_experts:
-            noise = torch.randn_like(route_logits) * 0.1
-            route_logits = route_logits + noise
-        route_weights = F.softmax(route_logits, dim=-1)
+        # Precomputed log-prob arrays from rebuild script
+        self.morph_logprob = meta.get('morph_logprob', {})
+        self.syntax_logprob = meta.get('syntax_logprob', {})
 
-        if self.top_k < self.n_experts:
-            top_w, top_idx = route_weights.topk(self.top_k, dim=-1)
-            mask = torch.zeros_like(route_weights)
-            mask.scatter_(-1, top_idx, 1.0)
-            route_weights = route_weights * mask
-            route_weights = route_weights / (route_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # Transition: load CSR log-prob matrix
+        if csr_path is None:
+            csr_path = os.path.join(os.path.dirname(meta_path), 'hierarchical')
+        log_prob_csr_file = os.path.join(csr_path, 'log_prob_csr.npz')
+        if os.path.exists(log_prob_csr_file):
+            from scipy.sparse import load_npz
+            self.log_prob_csr = load_npz(log_prob_csr_file)
+        else:
+            self.log_prob_csr = None
 
-        out = 0.0
-        for i, expert in enumerate(self.experts):
-            w = route_weights[..., i:i+1]
-            out = out + w * expert(x)
+        # Semantic similarity [V, V] sparse
+        self.semantic_sim = np.zeros((self.V, self.V), dtype=np.float32)
+        trans_sim = meta.get('trans_sim_sparse', {})
+        for tid, neighbors in trans_sim.items():
+            for neighbor_id, sim in neighbors:
+                self.semantic_sim[tid, neighbor_id] = sim
+
+        # Contradiction penalty
+        self.contra_penalty = np.zeros((self.V, self.V), dtype=np.float32)
+        for ta, tb, s in meta.get('contra_pairs', []):
+            self.contra_penalty[ta, tb] = float(s)
+            self.contra_penalty[tb, ta] = float(s)
+
+        # Concept scores
+        cs = meta.get('concept_scores', None)
+        if cs is not None:
+            self.concept_scores = np.asarray(cs, dtype=np.float32)
+        else:
+            self.concept_scores = np.ones(self.V, dtype=np.float32) * 0.5
+
+        # Token counts for rare-token detection
+        self.token_counts = np.asarray(meta.get('token_counts', np.ones(self.V)), dtype=np.int32)
+
+        self.default_weights = default_weights or {
+            'morph': 1.0, 'syntax': 1.0, 'transition': 2.0,
+            'semantic': 0.5, 'concept': 0.2, 'contra': 0.5,
+        }
+
+    def compute_weights(self, context: dict) -> dict:
+        w = dict(self.default_weights)
+        flags = context.get('flags', 0)
+        pos_in_word = context.get('pos_in_word', -1)
+        word_len = context.get('word_len', 0)
+        prev = context.get('prev_token_id', None)
+
+        is_word_start = (flags >> 0) & 1
+        is_word_end = (flags >> 1) & 1
+        is_special = (flags >> 5) & 1
+
+        if is_special:
+            w['transition'] = 5.0
+            for k in ['morph', 'syntax', 'semantic', 'concept', 'contra']:
+                w[k] = 0.0
+        elif is_word_start:
+            w['syntax'] = 3.0; w['morph'] = 0.5; w['transition'] = 1.0; w['semantic'] = 0.5
+        elif is_word_end:
+            w['morph'] = 0.5; w['transition'] = 3.0; w['semantic'] = 1.0
+        elif pos_in_word > 0 and word_len > 2:
+            frac = pos_in_word / max(word_len, 1)
+            if 0.2 < frac < 0.8:
+                w['morph'] = 4.0; w['transition'] = 0.5
+
+        if prev is not None and prev < self.V:
+            if int(self.token_counts[prev]) < 5:
+                w['semantic'] += 1.0; w['transition'] *= 0.3
+
+        return w
+
+    def individual_scores(self, context: dict) -> np.ndarray:
+        """Return (6, V) array: each row is one head's score vector."""
+        out = np.zeros((6, self.V), dtype=np.float32)
+        wl = context.get('word_len', 0)
+        piw = context.get('pos_in_word', -1)
+        wn = context.get('word_num', -1)
+        prev = context.get('prev_token_id', None)
+        ctx_toks = context.get('context_tokens', [])
+
+        # 0: morph
+        if wl in self.morph_logprob and piw in self.morph_logprob[wl]:
+            out[0] = self.morph_logprob[wl][piw]
+        else:
+            out[0] = np.full(self.V, -7.0, dtype=np.float32)
+
+        # 1: syntax
+        if wn in self.syntax_logprob:
+            out[1] = self.syntax_logprob[wn]
+        else:
+            out[1] = np.full(self.V, -7.0, dtype=np.float32)
+
+        # 2: transition
+        if prev is not None and prev < self.V and self.log_prob_csr is not None:
+            row = self.log_prob_csr[prev].tocoo()
+            for col_idx, val in zip(row.col, row.data):
+                out[2, col_idx] = val
+        out[2][out[2] == 0] = -10.0  # unseen transitions get low score
+
+        # 3: semantic
+        if ctx_toks:
+            for ct in ctx_toks[-3:]:
+                if ct < self.V:
+                    out[3] += self.semantic_sim[ct]
+
+        # 4: concept
+        out[4] = self.concept_scores
+
+        # 5: contra (penalty)
+        if ctx_toks:
+            for ct in ctx_toks[-3:]:
+                if ct < self.V:
+                    out[5] = np.maximum(out[5], self.contra_penalty[ct])
+
         return out
 
+    def score_all(self, context: dict) -> np.ndarray:
+        weights = self.compute_weights(context)
+        scores = np.zeros(self.V, dtype=np.float32)
 
-class TrajectoryBoundaryPredictor(nn.Module):
-    """
-    h → (end_coord, next_coord, conn_vector) — все в ℝ^d_model.
-    """
-    def __init__(self, d_model=128):
-        super().__init__()
-        self.d_model = d_model
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 256), nn.SiLU(),
-            nn.Linear(256, d_model * 3),
-        )
+        w = weights.get('morph', 0.0)
+        if w != 0.0:
+            wl = context.get('word_len', 0)
+            piw = context.get('pos_in_word', -1)
+            if wl in self.morph_logprob and piw in self.morph_logprob[wl]:
+                scores += w * self.morph_logprob[wl][piw]
 
-    def forward(self, h):
-        out = self.mlp(h)
-        d = self.d_model
-        end = out[..., :d]
-        nxt = out[..., d:2*d]
-        conn = out[..., 2*d:]
-        return end, nxt, conn
+        w = weights.get('syntax', 0.0)
+        if w != 0.0:
+            wn = context.get('word_num', -1)
+            if wn in self.syntax_logprob:
+                scores += w * self.syntax_logprob[wn]
 
+        w = weights.get('transition', 0.0)
+        if w != 0.0 and self.log_prob_csr is not None:
+            prev = context.get('prev_token_id', None)
+            if prev is not None and prev < self.V:
+                row = self.log_prob_csr[prev].tocoo()
+                for col_idx, val in zip(row.col, row.data):
+                    scores[col_idx] += w * val
 
-class BoundaryValidator(nn.Module):
-    """
-    h + z_current → softmax(word_boundary, sentence_boundary).
-    """
-    def __init__(self, d_model=128):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model * 2, 64), nn.SiLU(),
-            nn.Linear(64, 2), nn.Softmax(dim=-1),
-        )
+        w = weights.get('semantic', 0.0)
+        if w != 0.0:
+            ctx = context.get('context_tokens', [])
+            if ctx:
+                sem = np.zeros(self.V, dtype=np.float32)
+                for ct in ctx[-3:]:
+                    if ct < self.V:
+                        sem += self.semantic_sim[ct]
+                scores += w * sem
 
-    def forward(self, h, z_current):
-        inp = torch.cat([h, z_current], dim=-1)
-        return self.mlp(inp)
+        w = weights.get('concept', 0.0)
+        if w != 0.0:
+            scores += w * self.concept_scores
 
+        w = weights.get('contra', 0.0)
+        if w != 0.0:
+            ctx = context.get('context_tokens', [])
+            if ctx:
+                penalty = np.zeros(self.V, dtype=np.float32)
+                for ct in ctx[-3:]:
+                    if ct < self.V:
+                        penalty = np.maximum(penalty, self.contra_penalty[ct])
+                scores -= w * penalty * 2.0
 
-class ConceptHead(nn.Module):
-    """
-    h → concept_probability [0,1].
-    Учится предсказывать intrinsic cluster density траектории:
-    concept = слово, вокруг которого плотный кластер в trajectory space.
-    """
-    def __init__(self, d_model=128):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 64), nn.SiLU(),
-            nn.Linear(64, 32), nn.SiLU(),
-            nn.Linear(32, 1), nn.Sigmoid(),
-        )
+        return scores
 
-    def forward(self, h):
-        return self.mlp(h).squeeze(-1)
+    def best_token(self, context: dict) -> int:
+        return int(np.argmax(self.score_all(context)))
 
+    def top_k(self, context: dict, k: int = 5) -> list:
+        scores = self.score_all(context)
+        top_idx = np.argsort(-scores)[:k]
+        return [(int(tid), float(scores[tid])) for tid in top_idx]
 
-class ContradictionHead(nn.Module):
-    """
-    h → contradiction_probability [0,1].
-    Учится предсказывать intrinsic uncertainty траектории:
-    contradiction = позиция с высокой variance предсказания.
-    """
-    def __init__(self, d_model=128):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 64), nn.SiLU(),
-            nn.Linear(64, 32), nn.SiLU(),
-            nn.Linear(32, 1), nn.Sigmoid(),
-        )
+    def score_token(self, token_id: int, context: dict) -> float:
+        return float(self.score_all(context)[token_id])
 
-    def forward(self, h):
-        return self.mlp(h).squeeze(-1)
-
-
-class UncertaintyHead(nn.Module):
-    """
-    h → log_variance [128].
-    Предсказывает per-dimension variance trajectory prediction.
-    Обучается на реальной ошибке: MSE(z_pred, z_true).
-    
-    Это intrinsic contradiction signal:
-    - низкая variance = модель уверена = нет противоречия
-    - высокая variance = модель не уверена = противоречие
-    """
-    def __init__(self, d_model=128):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 64), nn.SiLU(),
-            nn.Linear(64, d_model),
-        )
-
-    def forward(self, h):
-        log_var = self.mlp(h)
-        return log_var.exp()  # [B, L, 128] — per-dim variance
-
-
-class ResidualHead(nn.Module):
-    """
-    Предсказывает delta_z = z_t - z_{t-1} из контекста h_t.
-
-    Концепция:
-    - Если модель может предсказать, куда в embedding space перейдёт следующий токен,
-      значит она понимает семантический сдвиг
-    - Если residual error ||delta_pred - delta_true||² велика → высокая неопределённость
-    - Используется как сигнал для thought loop (contra/uncertainty) и как auxiliary loss
-
-    Forward:
-        h: [B, L, D] — скрытые состояния
-        z_prev: [B, L, D] — координаты предыдущих токенов (z_{t-1})
-        z_curr: [B, L, D] — координаты текущих токенов (z_t)
-
-    Returns:
-        delta_pred: [B, L, D] — предсказанные дельты
-        residual_error: [B, L] — ||delta_pred - delta_true||² per position
-    """
-    def __init__(self, d_model=128):
-        super().__init__()
-        self.proj = nn.Linear(d_model * 3, d_model)  # [h_t, z_prev, z_curr] → D
-        self.res_mlp = nn.Sequential(
-            nn.Linear(d_model, 64), nn.SiLU(),
-            nn.Linear(64, d_model),  # output: delta_z
-        )
-
-    def forward(self, h, z_prev, z_curr):
-        delta_true = z_curr - z_prev  # [B, L, D]
-        inp = torch.cat([h, z_prev, z_curr], dim=-1)  # [B, L, 3D]
-        shortcut = self.proj(inp)
-        delta_pred = self.res_mlp(shortcut)  # [B, L, D]
-        residual_error = (delta_pred - delta_true).pow(2).sum(dim=-1)  # [B, L]
-        return delta_pred, residual_error
-
-    def residual_loss(self, delta_pred, delta_true):
-        """MSE дельты: per-position → mean."""
-        return (delta_pred - delta_true).pow(2).mean()
-
-
-class MetaWeighter(nn.Module):
-    """
-    context_hidden → [w_know, w_conc, w_contr] — softmax, 3 sources.
-    
-    Head-only режим: только knowledge, concept, contra (без decoder).
-    Bias по умолчанию: знания (индекс 0) в приоритете.
-    Тренировочный прогрев: temperature растёт от 0.1 до 1.0 за warmup_steps.
-    """
-    def __init__(self, d_model=128, warmup_steps=1000):
-        super().__init__()
-        n_out = 3
-        self.proj = nn.Linear(d_model, 64)
-        self.weight_net = nn.Linear(64, n_out)
-        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
-        self.warmup_steps = warmup_steps
-        self.register_buffer('_bias', torch.tensor([1.0, 0.0, 0.0]))
-        self.current_step = 0
-
-    def forward(self, context_hidden):
-        if self.training and self.current_step < self.warmup_steps:
-            progress = self.current_step / max(self.warmup_steps, 1)
-            self.temperature.data = torch.tensor([0.1 + 0.9 * progress],
-                device=self.temperature.device)
-            self.current_step += 1
-
-        h = F.silu(self.proj(context_hidden))
-        raw = self.weight_net(h)
-        bias = self._bias.to(raw.device) * self.temperature
-        return torch.softmax(raw + bias, dim=-1)
-
-    def kl_loss(self, context_hidden, prior=None):
-        w = self.forward(context_hidden)
-        if prior is None:
-            prior = torch.full_like(w, 1.0 / w.shape[-1])
-        return F.kl_div(w.log(), prior, reduction='batchmean')
-
-
-class WeightProjector(nn.Module):
-    """
-    Проекция текущего состояния весов модели в ℝ¹²⁸.
-
-    Берёт mean+std каждого parameter tensor → конкатенация → MLP → ℝ¹²⁸.
-    Кэширует результат; пересчёт только при вызове update().
-
-    Используется как токен контекста: [W_token, t1, t2, ...].
-    """
-    def __init__(self, coord_dim=128, max_stats=512):
-        super().__init__()
-        self.max_stats = max_stats
-        self.mlp = nn.Sequential(
-            nn.Linear(max_stats, 256), nn.SiLU(),
-            nn.Linear(256, coord_dim),
-        )
-        self.register_buffer('_cached_token', torch.zeros(coord_dim))
-
-    def _extract_stats(self, model):
-        stats = []
-        for name, param in model.named_parameters():
-            if param.numel() > 0:
-                stats.append(param.data.mean().view(1))
-                if param.numel() > 1:
-                    stats.append(param.data.std().view(1))
-        flat = torch.cat(stats)
-        n = flat.numel()
-        if n >= self.max_stats:
-            return flat[:self.max_stats]
-        return F.pad(flat, (0, self.max_stats - n))
-
-    def update(self, model):
-        with torch.no_grad():
-            s = self._extract_stats(model)
-            s = s.to(self._cached_token.device)
-            tok = self.mlp(s.unsqueeze(0)).squeeze(0)
-            self._cached_token.copy_(tok)
-        return self._cached_token
-
-    def forward(self):
-        return self._cached_token
-
-
-class DistillationHead(nn.Module):
-    """
-    Проекция hidden states teacher модели в ℝ¹²⁸ + MSE loss.
-
-    Teacher может быть любой PyTorch моделью (BERT, GPT, SmallTransformer, etc).
-    DistillationHead учится проецировать h_teacher → ℝ¹²⁸ так, чтобы
-    MSE(h_eva, h_teacher_proj) → 0.
-
-    WeightProjector при этом учится извлекать из весов teacher модель сигнал,
-    достаточный для предсказания его hidden states.
-    """
-    def __init__(self, teacher_hidden_dim: int, coord_dim: int = 128):
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(teacher_hidden_dim, 64),
-            nn.SiLU(),
-            nn.Linear(64, coord_dim),
-        )
-        self.mse = nn.MSELoss()
-
-    def project(self, h_teacher: torch.Tensor) -> torch.Tensor:
-        return self.proj(h_teacher)
-
-    def loss(self, h_eva: torch.Tensor, h_teacher: torch.Tensor) -> torch.Tensor:
-        """
-        h_eva: [B, L, coord_dim] — скрытые состояния EVA
-        h_teacher: [B, L, teacher_hidden_dim] — скрытые состояния teacher
-        Returns: scalar MSE loss
-        """
-        h_teacher_proj = self.project(h_teacher)
-        return self.mse(h_eva, h_teacher_proj)
-
-
-class TeacherAdapter(nn.Module):
-    """
-    Адаптер для любой teacher модели.
-
-    Оборачивает teacher, извлекает:
-    - weight_token: проекция весов teacher → ℝ¹²⁸ (через переданный WeightProjector)
-    - h_teacher: скрытые состояния teacher на том же input
-
-    Используется в EVA forward:
-    >>> teacher = SmallTransformer()
-    >>> adapter = TeacherAdapter(teacher, teacher_hidden_dim=64)
-    >>> adapter.to(device)
-    >>> w_token = adapter.get_weight_token(weight_projector)  # ℝ¹²⁸
-    >>> h_teacher = adapter.get_hidden(input_ids)             # [B, L, 64]
-    """
-    def __init__(self, teacher_model: nn.Module, teacher_hidden_dim: int):
-        super().__init__()
-        self.teacher = teacher_model
-        teacher_model.eval()
-        for p in teacher_model.parameters():
-            p.requires_grad_(False)
-        self.teacher_hidden_dim = teacher_hidden_dim
-
-    def get_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Извлекает hidden states teacher модели на input_ids."""
-        with torch.no_grad():
-            if hasattr(self.teacher, 'get_hidden'):
-                h_teacher = self.teacher.get_hidden(input_ids)
-            elif hasattr(self.teacher, 'forward'):
-                out = self.teacher(input_ids)
-                if isinstance(out, tuple):
-                    h_teacher = out[0]
-                elif hasattr(out, 'last_hidden_state'):
-                    h_teacher = out.last_hidden_state
-                else:
-                    h_teacher = out
-            else:
-                raise AttributeError('Teacher model must support forward() or get_hidden()')
-        return h_teacher
-
-    def get_weight_token(self, projector: WeightProjector) -> torch.Tensor:
-        """Обновляет и возвращает weight token из весов teacher."""
-        return projector.update(self.teacher)
-
-
-class BoundaryDetectionHead(nn.Module):
-    """
-    h → [word_start, word_inside, word_end] logits [B, L, 3].
-
-    Supervised from full_corpus_encoded.npy:
-    - Position before WORD_OPEN(157) → word_end
-    - Position at WORD_CLOSE(158) → word_end
-    - Position at WORD_OPEN(157) → word_start
-    - Regular chars → word_inside
-    - SENT_OPEN/SENT_CLOSE → ignore
-
-    Labels: 0=start, 1=inside, 2=end, -100=ignore.
-    """
-    def __init__(self, d_model=128):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 64), nn.SiLU(),
-            nn.Linear(64, 3),
-        )
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.mlp(h)  # [B, L, 3]
-
-    @staticmethod
-    def make_labels(token_ids: torch.Tensor, WORD_OPEN: int = 157,
-                    WORD_CLOSE: int = 158, SENT_OPEN: int = 159,
-                    SENT_CLOSE: int = 160) -> torch.Tensor:
-        B, L = token_ids.shape
-        labels = torch.full((B, L), -100, dtype=torch.long, device=token_ids.device)
-
-        # Position before WORD_OPEN → word_end
-        mask_end = torch.zeros_like(token_ids, dtype=torch.bool)
-        if L > 1:
-            mask_end[:, :-1] = token_ids[:, 1:] == WORD_OPEN
-        labels[mask_end] = 2
-
-        # Position at WORD_CLOSE → word_end (token is boundary, not char)
-        labels[token_ids == WORD_CLOSE] = 2
-
-        # Position at WORD_OPEN → word_start
-        labels[token_ids == WORD_OPEN] = 0
-
-        # Regular chars → word_inside (4..155, exclude special tokens)
-        is_char = (token_ids >= 4) & (token_ids <= 155) & (token_ids != 156)
-        labels[is_char] = 1
-
-        return labels
-
-    @staticmethod
-    def boundary_loss(logits: torch.Tensor, token_ids: torch.Tensor,
-                      **kwargs) -> torch.Tensor:
-        labels = BoundaryDetectionHead.make_labels(token_ids, **kwargs)
-        return F.cross_entropy(logits.reshape(-1, 3), labels.reshape(-1),
-                               ignore_index=-100)
-
-
-def potential_guided_logits(z_pred, sym_coords, bias_tpf, bias_wvf, temperature=0.8):
-    """
-    Формирование логитов через расстояния до символов (НЕ обучаемый слой).
-    
-    z_pred:  [D] — предсказанная координата
-    sym_coords: [V, D] — таблица координат символов
-    bias_tpf: [V] — bias от TensorPotentialField
-    bias_wvf: [V] — bias от WordValenceField
-    
-    Returns: logits [V]
-    """
-    dists = torch.cdist(z_pred.unsqueeze(0), sym_coords, p=2).squeeze(0)
-    return -dists / temperature + bias_tpf * 0.1 + bias_wvf * 0.05
+    def token_text(self, tid: int) -> str:
+        """Return text for a token ID. Requires BPEVocab loaded."""
+        if not hasattr(self, '_vocab'):
+            try:
+                from eva.symbolic.bpe_tokenizer import BPEVocab
+                self._vocab = BPEVocab()
+            except ImportError:
+                return str(tid)
+        return self._vocab.decode([tid]) if hasattr(self._vocab, 'decode') else str(tid)

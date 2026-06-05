@@ -361,8 +361,6 @@ class GateLogic:
         if prev_s_type is not None:
             valid = self.s_type_level.valid_to(prev_s_type)
             if valid is not None:
-                # Конвертируем type_id → набор type-2 токенов
-                # не применяем как маску V, а сохраняем как ограничение
                 context['_valid_s_types'] = valid
 
         # Paragraph gate

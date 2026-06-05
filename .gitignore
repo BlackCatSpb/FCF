@@ -1,10 +1,11 @@
 checkpoints/
 domain_rules/
+
+# Model checkpoints (not source data)
 *.pt
-*.faiss
-*.pkl
-*.bin
 *.safetensors
+
+# Ignore experiment-generated data
 __pycache__/
 *.pyc
 .venv/
@@ -17,7 +18,15 @@ tests/
 .idea/
 .vscode/
 *.lnk
-real_data/*.txt
-real_data/*.json
-real_data/*.npy
-pre_tokenize.py
+*.pyc
+*.log
+
+# Ignore training data and generated output
+real_data/v5/
+real_data/v6/
+real_data/v7/
+hierarchical_data/
+hierarchical_data_clean/
+hierarchical_data_hq/
+gen*.json
+token_demo.json

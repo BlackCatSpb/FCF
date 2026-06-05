@@ -1,237 +1,172 @@
-# EVA — Emergent Vector Architecture
+# EVA — Explainable Vector Architecture
 
-**Не next-token prediction. Навигация в 384-мерном координатном пространстве.**
+**Rule-constrained generation without frequency memorization.**
 
-EVA — иерархическая когнитивная архитектура. Символы языка — точки в ℝ³⁸⁴, текст — траектория, 6 статистических голов — компас, WeightTransformer (33K параметров) — штурман.
+Каждый выбор — пересечение бинарных gates на ВСЕХ уровнях иерархии одновременно. Никаких весов, никакого обучения. Только SVD cosine similarity для семантического выбора внутри структурных стен.
 
-Данные: Война и Мир (27K предложений) + ConceptNet Russian (478K семантических tripleтов). Общий объём: 505K предложений, 14.7M токенов. Вес на диске: 21 MB.
-
----
-
-## 1. Архитектура
-
-### 1.1 CoordinatePacker — 384-мерная перфокарта
-
-Каждый `h[t]` — 384-мерный вектор с детерминированной упаковкой:
+## Принцип
 
 ```
-┌─────────────┬──────────┬──────────────────────────┐
-│ Поле        │  Биты    │  Назначение              │
-├─────────────┼──────────┼──────────────────────────┤
-│ TOKEN       │  0-12    │  token_id (0-8191)       │
-│ POS_WORD    │  13-20   │  позиция в слове         │
-│ LEN_WORD    │  21-28   │  длина слова             │
-│ NUM_WORD    │  29-36   │  номер слова             │
-│ POS_SENT    │  37-45   │  позиция в предложении   │
-│ LEN_SENT    │  46-54   │  длина предложения       │
-│ FLAGS       │  55-72   │  18 бинарных флагов      │
-│ META        │  73-80   │  тип BPE-токена          │
-│ CONTEXT     │  81-88   │  n-gram fingerprint      │
-│ ID_MISC     │  89-96   │  text_id (8 бит, 0=WP, 1=ConceptNet)│
-│ RESERVED    │ 97-383   │  для трансформера (287)  │
-└─────────────┴──────────┴──────────────────────────┘
+Данные (текст) → BPE токены → Иерархия (глава/абзац/предложение/слово)
+  → AssociationGraph (48 концептов, 12 мета-концептов, SVD 32-dim)
+  → Gates (бинарные правила на всех уровнях)
+  → INTERSECTION gates = valid_mask → SVD scores внутри стен → выбор
 ```
 
-Значения: `+1.0` = бит установлен, `-1.0` = бит сброшен, `0.0` = зарезервировано.
-Полная обратимость: `pack(unpack(h)) == h`.
+- **Никакой частотности**: все структурно возможные transitions равны (score=1.0)
+- **Каждый выход объясним**: что повлияло (semantic, s_type, cross_sent, gates)
+- **Gates только добавляются**: новое наблюдение → новый gate. Старые gates не изменяются.
 
-### 1.2 HeadsEnsemble — 6 статистических голов
+## Архитектура
 
-Детерминированные, data-driven, без обучения. Каждая голова — предвычисленный массив (V,) или (V, V) sparse:
+### 1. Иерархический парсер (`text_hierarchy.py`)
 
-| Голова       | Размерность          | Источник данных              | Смысл                                          |
-|-------------|----------------------|------------------------------|------------------------------------------------|
-| Morph       | morph_logprob[wl][pos] → array(V) | Морфология слов            | P(token | позиция в слове, длина слова)        |
-| Syntax      | syntax_logprob[wn] → array(V)    | Синтаксис                   | P(token | номер слова в предложении)          |
-| Transition  | log_prob_csr (VxV sparse)        | Биграммы токенов            | log P(token | prev_token)                     |
-| Semantic    | semantic_sim (VxV sparse)        | Cosine similarity transitions| Семантическая близость токенов               |
-| Concept     | concept_scores (V,)              | Частота × контекстное разнообразие | Важность токена как концепта         |
-| Contra      | contra_penalty (VxV sparse)      | Взаимоисключающие пары       | Штраф за противоречие                       |
+Война и Мир → 4 тома → 17 частей → 355 глав → 10,853 предложений.
+Каждое предложение: BPE-токены, тип (statement/dialogue/question/exclamation/french),
+позиция в иерархии.
 
-Все 6 голов за один векторизованный вызов: `score_all(context)` → weighted sum.
+### 2. AssociationGraph (`association_graph.py`)
 
-### 1.3 WeightTransformer
+Двухуровневая кластеризация type-2 токенов через SVD + K-means:
 
-Учится взвешивать 6 голов динамически, в зависимости от контекста:
+| Уровень | Размер | Описание |
+|---------|--------|----------|
+| Meta | 12 кластеров | Верхний уровень абстракции |
+| Concept | 48 кластеров | Семантические группы слов |
 
-```
-token_embed(8) + [word_len, pos_in_word, word_num, pos_in_sent, sent_len, flags]
-  → Linear(14, 32) → ReLU → Linear(32, 6) → Softplus
-```
+Каждый type-2 токен (2442 шт.) имеет SVD-вектор (32-dim) и принадлежит
+концепту и мета-концепту. None-frequency: все векторы равноправны.
 
-- **33,486 параметров** — в 1000× меньше, чем embedding-слой LLM
-- Self-training: генерирует текст → heads оценивают → трансформер учится предсказывать следующий токен по 6-D weighted score
-- Best val_acc: 15.8% (rule-based baseline: 9.0%, +76% relative)
+### 3. Structural Rules (`structural_rules.py`)
 
-### 1.4 GenerationLoop
+Бинарные правила (0/1, без частот):
 
-Детерминированный конвейер:
+- **Sentence type transitions**: 5 типов × 5 = 21 переход
+- **Cross-sentence concept transitions**: 47 source → reachable concepts, 1216/2304 (52.8% density)
 
-```
-SENT_OPEN → WORD_OPEN → [heads score] → select → ... → WORD_CLOSE
-  → [choose next word or SENT_CLOSE] → WORD_OPEN → ...
-```
+### 4. Gate System (`gate_logic.py`)
 
-Ключевые механики:
-- После WORD_CLOSE: выбор между WORD_OPEN (продолжить) и SENT_CLOSE (закончить)
-- Sigmoid ramp на WORD_CLOSE (поз. 2-6): бонус растёт с длиной слова
-- Температурная выборка (0.0 = argmax, 1.0 = uniform)
-- Маски на SPECIAL-токенах (SENT_OPEN/CLOSE не генерируются как контент)
-
-### 1.5 Multi-Text (text_id)
-
-Dims 89-96 = 8 бит, до 255 различных текстов:
-- `text_id = 0` — Война и Мир (27K предложений)
-- `text_id = 1` — ConceptNet Russian (478K предложений)
-
-Morph/syntax распределения — взвешенное среднее (WP × 2, CN × 1). Transition — суммарный CSR.
-
----
-
-## 2. Data-Driven, не Neural
-
-Вся семантика извлечена из данных, не из весов:
+Многоуровневая система gates:
 
 ```
-Данные (текст) → BPE → Сбор статистик → 6 предвычисленных head-массивов
-  → HeadsEnsemble (numpy, 11.6K calls/s) → WeightTransformer (33K params)
+Meta (12) → Concept (48) → Word (2442) → BPE (4101) → S_type (5)
 ```
 
-**Никакого backpropagation на heads.** Никаких embedding-слоёв на 50M+ параметров.
-WeightTransformer учится только взвешивать heads — это задача с 6-d выходом, не next-token prediction над 4101 токенами.
+- 4 уровня иерархии + sentence type
+- `observe(text)` → парсит текст, добавляет gates на ВСЕХ уровнях
+- `valid_mask(context)` → INTERSECTION всех gates = единая бинарная маска над V=4101
+- `observe_sentence(tokens, s_type)` → self-play learning
+- Предвычисленные expansions: level_id → set[BPE tokens] для быстрой конвертации
 
----
+**Текущие gates** (из Войны и Мира):
+| Level | Gates |
+|-------|-------|
+| meta | 142 |
+| concept | 2,230 |
+| word | 192,365 |
+| bpe | 208,865 |
+| s_type | 21 |
 
-## 3. Autonomous Think Loop
+### 5. VectorGenerator (`vector_space.py`)
 
-4 фазы, бесконечный цикл:
+Основной генератор:
 
 ```
-┌─ THINK ──────────────────────┐
-│  Generate ~45K токенов (15s) │
-│  Наполнить train_buffer (10K)│
-└──────────┬───────────────────┘
-           ▼
-┌─ ANALYZE ────────────────────┐
-│  Concept clustering          │
-│  Contradiction audit         │
-└──────────┬───────────────────┘
-           ▼
-┌─ LEARN ──────────────────────┐
-│  Self-train WeightTransformer│
-│  на реальных + сгенерированных│
-└──────────┬───────────────────┘
-           ▼
-┌─ OPTIMIZE ───────────────────┐
-│  Save concept clusters to DB │
-│  Save model checkpoint       │
-└──────────────────────────────┘
+generate_step(ctx, prev_token, content_token) → next_token
 ```
 
-Запуск: `python eva/core/think_loop.py --port 8383`
-Веб-дашборд: `http://localhost:8383`
+1. **Стены** (valid_mask): правила + стены
+2. **Структурные scores**: INTERSECTION gates → valid set (все равны 1.0)
+3. **Семантические scores**: SVD cosine similarity к последнему content word (top-5, weight 5.0)
+4. **Sentence-type boost**: после диалога/вопроса boost глаголов речи
+5. **Continuation**: type-2 при piw=0, type-3 при piw>=1
+6. **EOS**: вероятностное завершение (1% × word_num, max 25%, min 4 слова)
+7. **Anti-repetition**: текстовая (0 повторов) + концептуальная (≥2 cid → блок)
+8. **Self-play**: каждое предложение → observe_sentence → gates учатся
 
----
+### 6. Anti-Frequency Design
 
-## 4. ConceptNet Integration
+| Механизм | Что заменяет |
+|----------|-------------|
+| Бинарные gates | Frequency-based transition probabilities |
+| Все scores равны (1.0) | Weighted/likelihood scores |
+| SVD cosine similarity | Frequency-based word similarity |
+| Top-5 content boost | All-token boosting |
+| Probabilistic EOS (1% ramp) | Learned EOS prediction |
+| Intersection of constraints | Neural network softmax |
 
-- Источник: `conceptnet.db` (10.25 GB, 34M assertions, 50 relations)
-- Фильтр: Russian→Russian edges (480K / 34M)
-- Шаблоны: `form_of`→«— форма слова», `is_a`→«— это», `related_to`→«связан с», и т.д.
-- Результат: 478K естественных русских предложений, 29 MB текста
-- Токенизация: BPE (boundary tokens 157-160 совместимы с WP)
-- Хранилище: `real_data/v5/conceptnet/` (3.7 MB)
+## Данные
 
----
+| Файл | Содержание |
+|------|-----------|
+| `real_data/full_corpus_ru.txt` | Война и Мир (10,853 предложений) |
+| `real_data/v8/` | Heads ensemble (structural matrix) |
+| `real_data/gates/` | Предвычисленные gates (5 JSON) |
+| `real_data/structural_rules.json` | Бинарные правила переходов |
+| `hierarchical_data*/` | Обработанные иерархические данные |
 
-## 5. Сжатие данных (уникальное)
+## Ключевые метрики
 
-| Компонент          | До сжатия   | После сжатия | Коэффициент |
-|-------------------|-------------|-------------|------------|
-| Trajectory Store  | 10.6 GB     | — (удалён)  | ∞          |
-| Heads metadata    | сырые счётчики| 7.7 MB     | ~1000×     |
-| Transitions       | dense matrix| CSR sparse  | ~400×      |
-| Morph/syntax      | full arrays | sparse V-dim | ~200×      |
-| Concept clusters  | —           | 10 bins     | —          |
+| Метрика | Значение |
+|---------|----------|
+| Размерность BPE | 4,101 |
+| Type-2 токенов | 2,442 |
+| Концептов | 48 |
+| Мета-концептов | 12 |
+| Предложений в корпусе | 10,853 |
+| BPE gates | 208,865 |
+| Concept transitions (rules) | 1,216 |
+| Семантическая размерность | 32 (SVD) |
+| Параметров | 0 (все правила data-driven, без обучения) |
 
-Подробно: см. [COMPRESSION.md](COMPRESSION.md).
+## Запуск
 
----
+```python
+from eva.symbolic.bpe_tokenizer import HierarchicalVocab
+from eva.symbolic.association_graph import AssociationGraph
+from eva.symbolic.heads import HeadsEnsemble
+from eva.symbolic.vector_space import VectorGenerator
 
-## 6. Ключевые цифры
+hv = HierarchicalVocab()
+heads = HeadsEnsemble('real_data/v8/heads_meta.pkl', 'real_data/v8')
+ag = AssociationGraph(n_clusters=48, n_metas=12)
+ag.build(heads.log_prob_csr, hv.token_type, decode_fn=hv.decode)
 
-| Метрика                  | Значение                     |
-|-------------------------|------------------------------|
-| Размерность             | 384                          |
-| Размер словаря          | 4101 (BPE)                   |
-| Всего параметров        | 33,486 (WeightTransformer)   |
-| Скорость heads          | 11,600 calls/s               |
-| Скорость генерации      | ~2,600 tok/s                 |
-| Всего предложений       | 504,804 (27K WP + 478K CN)   |
-| Всего токенов           | 14,700,456                   |
-| Всего слов              | 2,280,414                    |
-| Уникальных переходов    | 80,149                       |
-| Противоречий            | 9,012                        |
-| Вес на диске            | 21 MB                        |
-| VRAM                    | 0 MB (CPU-only, numpy)       |
-| Запуск                  | `.\run_eva.ps1`              |
+vg = VectorGenerator(heads_obj=heads, assoc_graph=ag, hv=hv)
+vg.load_gates('real_data/gates')
+result = vg.generate(max_tokens=80, seed_word='сказал')
+print(result['text'])
+```
 
----
-
-## 7. Интеграция с dashboard
-
-Два источника данных:
-- `/api/state` — JSON: фаза, счётчики, веса heads, история точности/скорости
-- `/api/log` — JSON: последние события
-
-UI: 9 карточек, 3 графика (heads distribution, accuracy trend, gen rate trend), лог событий.
-Автообновление каждые 2.5 сек.
-
----
-
-## 8. Файловая структура
+## Структура проекта
 
 ```
 FCF/
-├── eva/
-│   ├── core/
-│   │   ├── think_loop.py      # Автономный цикл (4 фазы)
-│   │   ├── dashboard.py        # Веб-дашборд (localhost:8383)
-│   │   └── database.py         # Хранилище ("Хранилище")
-│   └── symbolic/
-│       ├── heads.py            # HeadsEnsemble (6 голов)
-│       ├── weight_transformer.py # 33K-параметровый взвешиватель
-│       ├── generation_loop.py  # Авторегрессивная генерация
-│       ├── coordinate_packer.py # 384-мерная упаковка
-│       ├── reserved_dims.py    # Заполнение dims 97-383
-│       ├── bpe_tokenizer.py    # BPE-токенизатор (4101)
-│       └── char_vocab.py       # Символьный словарь (legacy)
-├── real_data/v5/
-│   ├── hierarchical/           # WP-only (sentences, CSR, caches)
-│   ├── conceptnet/             # CN-only (sentences, CSR, caches)
-│   └── heads_meta.pkl          # Merged (7.7 MB)
-├── models/
-│   └── weight_transformer_best.pt # Checkpoint трансформера
-├── build_conceptnet_text.py    # Извлечение CN→текст
-├── build_conceptnet_trajectories.py # Токенизация CN + merge heads
-├── build_hierarchical.py       # Построение hierarchical (legacy)
-├── run_eva.ps1                 # Лаунчер
-└── README.md                   # Этот файл
+├── eva/symbolic/           # Core modules
+│   ├── bpe_tokenizer.py    # BPE токенизатор (V=4101)
+│   ├── text_hierarchy.py   # Иерархический парсер
+│   ├── association_graph.py# 2-level concept clustering + SVD
+│   ├── structural_rules.py # Бинарные transition rules
+│   ├── gate_logic.py       # Multi-level gate system
+│   ├── vector_space.py     # VectorGenerator (основной генератор)
+│   ├── generation_loop.py  # Утилиты генерации
+│   ├── heads.py            # Heads ensemble
+│   ├── concept_transformer.py   # Concept predictor (blocked)
+│   ├── linguistic_rules.py      # Морфологические правила
+│   ├── potential_field.py       # Potential field gen (legacy)
+│   └── ...                      # Прочие модули
+├── real_data/
+│   ├── full_corpus_ru.txt  # Война и Мир
+│   ├── gates/              # Предвычисленные gates
+│   ├── v8/                 # Heads model data
+│   └── structural_rules.json
+├── experiments/            # Test/build/debug/analysis scripts
+│   ├── tests/
+│   ├── build/
+│   ├── analysis/
+│   ├── train/
+│   ├── eval/
+│   └── legacy/
+├── hierarchical_data*/     # Processed data
+└── README.md
 ```
-
----
-
-## 9. Запуск
-
-```powershell
-# Прямой запуск
-python -X utf8 eva/core/think_loop.py --port 8383
-
-# Через PowerShell (с дашбордом)
-.\run_eva.ps1
-
-# Открыть дашборд
-start http://localhost:8383
-```
-
-Для остановки: `Ctrl+C`.

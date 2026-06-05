@@ -1,8 +1,8 @@
 """
 EVA — TrajectoryStore: база всех траекторий декодирования.
-Хранит каждую траекторию (координаты + метаданные) при encode→decode.
+Хранит каждую траекторию в сжатом формате (TRACK_DTYPE, ~16 байт/шаг).
 При генерации — извлекает похожие траектории как контекст (RAG).
-Knowledge = trajectories in ℝ²⁴, not weights.
+Knowledge = trajectories in 16 bytes/step, not 1536.
 """
 
 import torch, torch.nn as nn, torch.nn.functional as F, numpy as np, pickle, os, time
@@ -10,11 +10,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
+from coordinate_packer import CoordinatePacker, TRACK_DTYPE
+
 
 @dataclass
 class HierarchicalTrajectory:
     """Multi-level trajectory — agent's proposed structure."""
-    symbol_trajectory: np.ndarray       # [L, D] — raw coords
+    compact_track: np.ndarray         # [L] TRACK_DTYPE — сжатый трек
     word_boundaries: List[Tuple[int,int]]  # [(start,end),...]
     word_centroids: np.ndarray          # [num_words, D]
     word_weights: np.ndarray            # [num_words]
@@ -27,6 +29,11 @@ class HierarchicalTrajectory:
     def __post_init__(self):
         self.length = len(self.ids)
 
+    def decompress(self) -> np.ndarray:
+        """Развернуть сжатый трек в [L, 384]."""
+        cp = CoordinatePacker()
+        return cp.decompress_track(self.compact_track)
+
 
 class ConsolidationTransformer(nn.Module):
     """
@@ -37,21 +44,16 @@ class ConsolidationTransformer(nn.Module):
     def __init__(self, d_model=128):
         super().__init__()
         self.d_model = d_model
-        # Conv1d с groups=8 для лёгкости
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=8)
-        # Element-wise gate (128 params вместо full Linear)
         self.gate = nn.Parameter(torch.zeros(d_model))
         self.importance_head = nn.Linear(d_model, 1)
     
     def forward(self, traj: torch.Tensor) -> torch.Tensor:
         L, D = traj.shape
-        conv_in = traj.unsqueeze(0).transpose(1, 2)  # [1, D, L]
-        conv_out = self.conv(conv_in).transpose(1, 2)  # [1, L, D]
-        
-        # Element-wise gate
-        gate = torch.sigmoid(self.gate)  # [D]
+        conv_in = traj.unsqueeze(0).transpose(1, 2)
+        conv_out = self.conv(conv_in).transpose(1, 2)
+        gate = torch.sigmoid(self.gate)
         combined = gate * conv_out + (1 - gate) * traj.unsqueeze(0)
-        
         weights = self.importance_head(combined).squeeze(-1)
         weights = F.softmax(weights, dim=-1)
         return weights.squeeze(0)
@@ -59,16 +61,17 @@ class ConsolidationTransformer(nn.Module):
 
 class TrajectoryStore:
     """
-    Хранилище траекторий: flat + hierarchical.
+    Хранилище траекторий: сжатый компакт-формат (TRACK_DTYPE).
     """
     
     def __init__(self, max_trajectories=1000000):
         self.max_trajectories = max_trajectories
+        self.packer = CoordinatePacker()
         
-        self.trajectories = []      # [L, D] flat
+        self.compact_tracks = []    # List[TRACK_DTYPE] — сжатые треки
         self.ids_list = []          # [L]
         self.texts = []             # str
-        self.centroids = []         # [D]
+        self.centroids = []         # [D] — для быстрого поиска
         self.first_coords = []      # [D]
         self.lengths = []           # int
         self.total_stored = 0
@@ -77,32 +80,31 @@ class TrajectoryStore:
         self.hierarchical = []      # List[HierarchicalTrajectory]
         
         # Learnable Consolidation
-        self.consolidation_net = None  # Lazy init on first use
+        self.consolidation_net = None
+
+    def _centroid_from_compact(self, compact: np.ndarray) -> np.ndarray:
+        """Вычислить центроид [384] из сжатого трека."""
+        return self.packer.decompress_track(compact).mean(axis=0)
+
+    def _first_from_compact(self, compact: np.ndarray) -> np.ndarray:
+        """Первый шаг [384] из сжатого трека."""
+        return self.packer.decompress_track(compact[:1])[0]
     
     def _lazy_init_consolidation(self, device='cpu'):
         if self.consolidation_net is None:
             self.consolidation_net = ConsolidationTransformer(d_model=128).to(device)
     
     def consolidate(self, htraj: HierarchicalTrajectory, device='cpu') -> HierarchicalTrajectory:
-        """
-        Learnable consolidation: взвесить шаги траектории через Transformer-encoder.
-        Возвращает новую HierarchicalTrajectory с взвешенным centroid.
-        """
-        if len(htraj.symbol_trajectory) < 3:
+        if len(htraj.compact_track) < 3:
             return htraj
-        
         self._lazy_init_consolidation(device)
-        
-        traj_t = torch.tensor(htraj.symbol_trajectory, dtype=torch.float32, device=device)
+        traj = htraj.decompress()
+        traj_t = torch.tensor(traj, dtype=torch.float32, device=device)
         with torch.no_grad():
-            weights = self.consolidation_net.forward(traj_t).cpu().numpy()  # [L]
-        
-        # Weighted centroid вместо простого среднего
-        weighted_centroid = (htraj.symbol_trajectory * weights[:, np.newaxis]).sum(axis=0)
-        
-        # Возвращаем новый объект с улучшенными метриками
+            weights = self.consolidation_net.forward(traj_t).cpu().numpy()
+        weighted_centroid = (traj * weights[:, np.newaxis]).sum(axis=0)
         return HierarchicalTrajectory(
-            symbol_trajectory=htraj.symbol_trajectory,
+            compact_track=htraj.compact_track,
             word_boundaries=htraj.word_boundaries,
             word_centroids=htraj.word_centroids,
             word_weights=htraj.word_weights,
@@ -116,183 +118,145 @@ class TrajectoryStore:
         """Store multi-level trajectory (agent's proposed method)."""
         if self.total_stored >= self.max_trajectories:
             cutoff = self.max_trajectories // 10
-            self.trajectories = self.trajectories[cutoff:]
+            self.compact_tracks = self.compact_tracks[cutoff:]
             self.ids_list = self.ids_list[cutoff:]
             self.texts = self.texts[cutoff:]
             self.centroids = self.centroids[cutoff:]
             self.first_coords = self.first_coords[cutoff:]
             self.lengths = self.lengths[cutoff:]
             self.hierarchical = self.hierarchical[cutoff:]
-            self.total_stored = len(self.trajectories)
+            self.total_stored = len(self.compact_tracks)
         
         self.hierarchical.append(htraj)
-        # Also store flat for backward compat
-        self.trajectories.append(htraj.symbol_trajectory)
+        self.compact_tracks.append(htraj.compact_track)
         self.ids_list.append(htraj.ids)
         self.texts.append(htraj.text)
         self.centroids.append(htraj.sentence_centroid)
-        self.first_coords.append(htraj.symbol_trajectory[0] if len(htraj.symbol_trajectory) > 0 else np.zeros(htraj.sentence_centroid.shape))
+        first = htraj.decompress()[0] if len(htraj.compact_track) > 0 else np.zeros(384)
+        self.first_coords.append(first)
         self.lengths.append(htraj.length)
         self.total_stored += 1
     
     def find_similar_hierarchical(self, query_htraj, level_weights=None, top_k=10):
-        """Multi-level similarity search (agent's proposed method)."""
         if level_weights is None:
             level_weights = {1: 0.4, 2: 0.3, 3: 0.2, 4: 0.1}
-        
         if not self.hierarchical:
             return []
-        
+        q_traj = query_htraj.decompress()
         scores = []
         for i, h in enumerate(self.hierarchical):
             s = 0.0
-            
-            # Level 1: Symbol trajectory similarity
-            q_sym = query_htraj.symbol_trajectory
-            h_sym = h.symbol_trajectory
-            min_len = min(len(q_sym), len(h_sym))
+            h_traj = h.decompress()
+            min_len = min(len(q_traj), len(h_traj))
             if min_len > 0:
-                sym_dist = np.linalg.norm(q_sym[:min_len] - h_sym[:min_len], axis=1).mean()
+                sym_dist = np.linalg.norm(q_traj[:min_len] - h_traj[:min_len], axis=1).mean()
                 s += level_weights.get(1, 0) * (1.0 / (1.0 + sym_dist))
-            
-            # Level 2: Word centroid similarity
             if len(query_htraj.word_centroids) > 0 and len(h.word_centroids) > 0:
                 q_wc = query_htraj.word_centroids.mean(axis=0)
                 h_wc = h.word_centroids.mean(axis=0)
                 w_sim = np.dot(q_wc, h_wc) / (np.linalg.norm(q_wc) * np.linalg.norm(h_wc) + 1e-8)
                 s += level_weights.get(2, 0) * max(0, w_sim)
-            
-            # Level 3: Connection pattern similarity
             if len(query_htraj.connection_coords) > 0 and len(h.connection_coords) > 0:
                 q_cc = query_htraj.connection_coords.mean(axis=0)
                 h_cc = h.connection_coords.mean(axis=0)
                 c_sim = np.dot(q_cc, h_cc) / (np.linalg.norm(q_cc) * np.linalg.norm(h_cc) + 1e-8)
                 s += level_weights.get(3, 0) * max(0, c_sim)
-            
-            # Level 4: Sentence centroid distance
             sc_dist = np.linalg.norm(query_htraj.sentence_centroid - h.sentence_centroid)
             s += level_weights.get(4, 0) * (1.0 / (1.0 + sc_dist))
-            
             scores.append((s, i))
-        
         scores.sort(key=lambda x: x[0], reverse=True)
         return [self.hierarchical[i] for _, i in scores[:top_k]]
 
     def store(self, text, ids, trajectory):
-        """
-        Сохранить траекторию декодирования.
-        
-        Args:
-            text: исходный текст
-            ids: список ID символов
-            trajectory: numpy массив [L, 24] координат
-        """
+        """Сохранить траекторию (автоматически сжимает [L, 384] → TRACK_DTYPE)."""
+        compact = self.packer.compress_track(trajectory)
+        self.store_compact(text, ids, compact)
+
+    def store_compact(self, text, ids, compact, text_id=0):
+        """Сохранить сжатый трек (7- или 10-польный). Авто-конвертация в TRACK_DTYPE."""
         if self.total_stored >= self.max_trajectories:
-            # Remove oldest 10%
             cutoff = self.max_trajectories // 10
-            self.trajectories = self.trajectories[cutoff:]
+            self.compact_tracks = self.compact_tracks[cutoff:]
             self.ids_list = self.ids_list[cutoff:]
             self.texts = self.texts[cutoff:]
             self.centroids = self.centroids[cutoff:]
             self.first_coords = self.first_coords[cutoff:]
             self.lengths = self.lengths[cutoff:]
-            self.total_stored = len(self.trajectories)
+            self.total_stored = len(self.compact_tracks)
         
-        self.trajectories.append(trajectory.astype(np.float32))
+        if compact.dtype.names is not None and compact.dtype.names != TRACK_DTYPE.names:
+            compact = self.packer.convert_generation_compact(compact, text_id)
+        elif compact.dtype != TRACK_DTYPE:
+            compact = compact.astype(TRACK_DTYPE)
+        
+        self.compact_tracks.append(compact)
         self.ids_list.append(ids)
         self.texts.append(text)
-        self.centroids.append(trajectory.mean(axis=0).astype(np.float32))
-        self.first_coords.append(trajectory[0].astype(np.float32))
+        self.centroids.append(self._centroid_from_compact(compact))
+        self.first_coords.append(self._first_from_compact(compact))
         self.lengths.append(len(ids))
         self.total_stored += 1
     
+    def get_trajectory(self, idx: int) -> np.ndarray:
+        """Развернуть сжатый трек в [L, 384]."""
+        return self.packer.decompress_track(self.compact_tracks[idx])
+
     def find_similar(self, query_traj, top_k=10, max_len_diff=5):
-        """
-        Найти траектории, похожие на query.
-        
-        Uses centroid distance + first-point similarity for fast filtering.
-        """
         if self.total_stored == 0:
             return []
-        
         query_centroid = query_traj.mean(axis=0)
         query_first = query_traj[0]
         query_len = len(query_traj)
-        
         scores = []
         for i in range(self.total_stored):
-            # Fast filter: length similarity
             len_diff = abs(self.lengths[i] - query_len)
             if len_diff > max_len_diff:
                 continue
-            
-            # Centroid distance (fast)
             c_dist = np.linalg.norm(self.centroids[i] - query_centroid)
-            
-            # First-point similarity
             f_sim = np.dot(self.first_coords[i], query_first) / (
-                np.linalg.norm(self.first_coords[i]) * np.linalg.norm(query_first) + 1e-8
-            )
-            
-            # Combined score
+                np.linalg.norm(self.first_coords[i]) * np.linalg.norm(query_first) + 1e-8)
             score = -c_dist + f_sim * 2.0 - len_diff * 0.1
             scores.append((score, i))
-        
         scores.sort(key=lambda x: x[0], reverse=True)
         results = []
         for _, idx in scores[:top_k]:
             results.append({
                 'text': self.texts[idx],
                 'ids': self.ids_list[idx],
-                'trajectory': self.trajectories[idx],
+                'compact': self.compact_tracks[idx],
+                'trajectory': self.get_trajectory(idx),
                 'distance': np.linalg.norm(self.centroids[idx] - query_centroid),
             })
-        
         return results
     
     def find_by_prefix(self, prefix_ids, top_k=10):
-        """Найти траектории, начинающиеся с prefix_ids."""
         if self.total_stored == 0:
             return []
-        
         prefix_len = len(prefix_ids)
         scores = []
-        
         for i in range(self.total_stored):
             if self.lengths[i] <= prefix_len:
                 continue
-            
-            # Check if first N IDs match
             match = 0
             for j in range(min(prefix_len, len(self.ids_list[i]))):
                 if self.ids_list[i][j] == prefix_ids[j]:
                     match += 1
                 else:
                     break
-            
-            if match >= prefix_len - 1:  # at most 1 mismatch
-                # Score by trajectory similarity
-                traj_prefix = self.trajectories[i][:prefix_len]
-                # Simple: use centroid distance
+            if match >= prefix_len - 1:
                 dist = np.linalg.norm(self.centroids[i])
                 scores.append((-dist, i))
-        
         scores.sort(key=lambda x: x[0], reverse=True)
         return [{
             'text': self.texts[idx],
             'ids': self.ids_list[idx],
-            'trajectory': self.trajectories[idx],
+            'compact': self.compact_tracks[idx],
+            'trajectory': self.get_trajectory(idx),
         } for _, idx in scores[:top_k]]
     
     def get_context_for_generation(self, current_ids, trajectory, top_k=5):
-        """
-        Получить контекст для генерации: похожие траектории.
-        Используется при RAG (retrieval-augmented generation).
-        """
         similar = self.find_similar(trajectory, top_k=top_k)
         prefix_matches = self.find_by_prefix(current_ids, top_k=3)
-        
-        # Merge and deduplicate
         seen = set()
         context = []
         for item in similar + prefix_matches:
@@ -301,7 +265,6 @@ class TrajectoryStore:
                 context.append(item)
                 if len(context) >= top_k:
                     break
-        
         return context
     
     def stats(self):
@@ -313,7 +276,7 @@ class TrajectoryStore:
     
     def save(self, path):
         data = {
-            'trajectories': self.trajectories,
+            'compact_tracks': self.compact_tracks,
             'ids_list': self.ids_list,
             'texts': self.texts,
             'centroids': self.centroids,
@@ -328,7 +291,8 @@ class TrajectoryStore:
     def load(self, path):
         with open(path, 'rb') as f:
             data = pickle.load(f)
-        self.trajectories = data['trajectories']
+        self.compact_tracks = data.get('compact_tracks',
+            [self.packer.compress_track(t) for t in data.get('trajectories', [])])
         self.ids_list = data['ids_list']
         self.texts = data['texts']
         self.centroids = data['centroids']

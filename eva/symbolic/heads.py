@@ -101,8 +101,8 @@ class HeadsEnsemble:
         ctx_toks = context.get('context_tokens', [])
 
         # 0: morph
-        if wl in self.morph_logprob and piw in self.morph_logprob[wl]:
-            out[0] = self.morph_logprob[wl][piw]
+        if piw in self.morph_logprob:
+            out[0] = self.morph_logprob[piw]
         else:
             out[0] = np.full(self.V, -7.0, dtype=np.float32)
 
@@ -142,10 +142,9 @@ class HeadsEnsemble:
 
         w = weights.get('morph', 0.0)
         if w != 0.0:
-            wl = context.get('word_len', 0)
             piw = context.get('pos_in_word', -1)
-            if wl in self.morph_logprob and piw in self.morph_logprob[wl]:
-                scores += w * self.morph_logprob[wl][piw]
+            if piw in self.morph_logprob:
+                scores += w * self.morph_logprob[piw]
 
         w = weights.get('syntax', 0.0)
         if w != 0.0:

@@ -25,6 +25,7 @@ tests/
 real_data/v5/
 real_data/v6/
 real_data/v7/
+real_data/bpe_tokenizer.json
 hierarchical_data/
 hierarchical_data_clean/
 hierarchical_data_hq/

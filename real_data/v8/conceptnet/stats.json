@@ -1,0 +1,8 @@
+{
+  "name": "conceptnet",
+  "source": "C:\\Users\\black\\OneDrive\\Desktop\\FCF\\real_data\\conceptnet\\conceptnet_ru.txt",
+  "n_sentences": 477743,
+  "n_tokens": 7045183,
+  "n_unique_transitions": 114156,
+  "created": "2026-06-05 11:11:53"
+}

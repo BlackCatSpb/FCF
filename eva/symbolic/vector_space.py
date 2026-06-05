@@ -195,10 +195,12 @@ class VectorGenerator:
         self._current_word_tokens = []  # tokens of current in-progress word
         self._full_word_anchor = None   # (type2_tid, word_text) last complete word
         
+        # ---- ConceptNet-refined vectors ----
+        self._refined_vectors_path = None
+        
         # ---- Word completion prefix map (type-2→type-3 semantic continuation) ----
-        self._prefix_map = {}      # (start_tid,) -> [(type3_tid, completed_type2_tid)]
-        self._prefix_map_full = {} # (start_tid, type3_tid) -> set of completed_type2_tids
-        self._prefix_type2 = set() # type-2 tokens that are prefixes (have type-3 continuations)
+        self._prefix_type3_set = {} # prefix_tid -> set[type3_tid]
+        self._prefix_type2 = set()  # type-2 tokens that are prefixes (have type-3 continuations)
         self._build_word_prefix_map()
     
     def _build_structural_matrix(self):
@@ -268,96 +270,89 @@ class VectorGenerator:
     
     def _build_word_prefix_map(self):
         """
-        Build prefix map for semantic word continuation at piw>=1.
-        For each type-2 word starter, encode the full word with space prefix,
-        map type-3 continuations to completed type-2 tokens.
+        Build prefix data for semantic word continuation at piw>=1.
+        Uses structural matrix to identify which type-3 tokens follow each prefix.
         """
-        self._prefix_map = {}
-        self._prefix_map_full = {}
-        self._word_trie = {'_words_': set()}  # root of word BPE trie
+        self._prefix_type3_set = {}  # prefix_tid -> set[type3_tid]
+        for tid in range(self.V):
+            if tid >= len(self.tt) or not self._is_content_token(tid):
+                continue
+            follow = self.structural.get(tid, set())
+            type3 = {t for t in follow if t < len(self.tt) and self.tt[t] == 3}
+            if type3:
+                self._prefix_type3_set[tid] = type3
         
-        for tid2 in range(self.V):
-            if tid2 >= len(self.tt) or not self._is_content_token(tid2):
-                continue
-            word_text = self.hv.decode([tid2]).strip()
-            if not word_text:
-                continue
-            # Encode full word with space prefix
-            full = self.hv.encode(' ' + word_text)
-            if not full or full[0] != tid2:
-                continue
-            continuations = full[1:]  # type-3 tokens
-            if not continuations:
-                continue
-            
-            # First continuation
-            first_cont = continuations[0]
-            key = (tid2,)
-            self._prefix_map.setdefault(key, []).append((first_cont, tid2))
-            
-            # Full path map
-            full_key = tuple(continuations)
-            self._prefix_map_full.setdefault(tid2, {})[full_key] = tid2
-            
-            # Build trie for multi-step continuations
-            node = self._word_trie
-            node['_words_'].add(tid2)  # all words under root
-            # Add type-2 starter
-            if tid2 not in node:
-                node[tid2] = {'_words_': set()}
-            node = node[tid2]
-            node['_words_'].add(tid2)
-            # Add type-3 continuations
-            for ct in continuations:
-                if ct not in node:
-                    node[ct] = {'_words_': set()}
-                node = node[ct]
-                node['_words_'].add(tid2)
-        
-        n_types = sum(len(v) for v in self._prefix_map.values())
-        n_words = sum(len(w) for v in self._prefix_map_full.values() for w in v.values())
-        print(f"  Word prefix map: {n_types} type-3 paths, {n_words} completed words")
+        n_prefixes = len(self._prefix_type3_set)
+        n_paths = sum(len(v) for v in self._prefix_type3_set.values())
+        print(f"  Prefix type-3 map: {n_prefixes} prefixes, {n_paths} type-3 continuations")
     
-    def _max_sim_in_trie_node(self, node, anchor_tid):
-        """Max SVD similarity from anchor_tid to any word in a trie node's subtree."""
-        best = 0.0
-        for word_tid in node.get('_words_', set()):
-            if self.vs.has_vector(word_tid) and self.vs.has_vector(anchor_tid):
-                sim = self.vs.similarity(anchor_tid, word_tid)
-                if sim > best:
-                    best = sim
-        return best
-    
+    def _prefix_boost_scores(self, ctx, valid_mask, content_token=-1):
+        """
+        Boost prefix type-2 tokens at piw=0 based on SVD similarity between
+        the prefix and the last content word. This lets the model generate
+        morphologically complex words via prefix+continuation instead of
+        only atomic type-2 tokens.
+        """
+        scores = np.zeros(self.V, dtype=np.float32)
+        pos_in_word = ctx.get('pos_in_word', -1)
+        if pos_in_word != 0 or content_token < 0:
+            return scores
+        if not self.vs.has_vector(content_token):
+            return scores
+
+        # Check if the PREVIOUS generated token is a prefix
+        # If so, also boost its type-3 continuations as alternatives to new words
+        prev_tid = ctx.get('token_id', -1)
+        if prev_tid >= 0 and prev_tid in self._prefix_type3_set:
+            # We're at piw=0 AFTER generating a prefix.
+            # The prefix _is_ the current token. Boost type-3 continuations
+            # so that completing the word is competitive with starting a new one.
+            prefix_tid = prev_tid
+            if self.vs.has_vector(prefix_tid):
+                sim = self.vs.similarity(prefix_tid, content_token)
+                if sim > 0:
+                    for tid3 in self._prefix_type3_set[prefix_tid]:
+                        if valid_mask[tid3]:
+                            scores[tid3] = sim * 4.0
+
+        for prefix_tid in self._prefix_type3_set:
+            if not valid_mask[prefix_tid]:
+                continue
+            if self.vs.has_vector(prefix_tid):
+                sim = self.vs.similarity(prefix_tid, content_token)
+                if sim > 0:
+                    scores[prefix_tid] = sim * 4.0
+
+        return scores
+
     def _continuation_semantic_scores(self, ctx, content_token, valid_mask):
         """
         Semantic scores for type-3 continuations (piw>=1).
-        For each valid type-3 continuation, score by max SVD similarity
-        between the anchor and any complete word reachable via this continuation.
+        At piw>=1, the prefix token has already been selected.
+        Score each valid type-3 continuation of this prefix by SVD similarity
+        between the prefix and the last content word.
         """
         scores = np.zeros(self.V, dtype=np.float32)
         pos_in_word = ctx.get('pos_in_word', -1)
         if pos_in_word < 1 or content_token < 0:
             return scores
-        if not self.vs.has_vector(content_token) or not self._current_word_tokens:
+        if not self._current_word_tokens:
             return scores
         
-        # Walk the trie with current word tokens
-        node = self._word_trie
-        for tid in self._current_word_tokens:
-            if tid in node:
-                node = node[tid]
-            else:
-                return scores
+        prefix_tid = self._current_word_tokens[0]
+        if not self._is_content_token(prefix_tid):
+            return scores
+        if not self.vs.has_vector(prefix_tid) or not self.vs.has_vector(content_token):
+            return scores
         
-        # Score each valid continuation by max SVD sim in its subtree
-        for tid3, subtree in node.items():
-            if tid3 == '_words_':
-                continue
-            if not valid_mask[tid3]:
-                continue
-            best = self._max_sim_in_trie_node(subtree, content_token)
-            if best > 0:
-                scores[tid3] = best * 0.3  # weight for continuation
+        sim = self.vs.similarity(prefix_tid, content_token)
+        if sim <= 0:
+            return scores
+        
+        valid_type3 = self._prefix_type3_set.get(prefix_tid, set())
+        for tid3 in valid_type3:
+            if valid_mask[tid3]:
+                scores[tid3] = sim * 1.0
         
         return scores
     
@@ -367,7 +362,23 @@ class VectorGenerator:
             return
         self.structural_rules = StructuralRules()
         self.structural_rules.load(path)
-    
+
+    def load_refined_vectors(self, path):
+        """Load ConceptNet-refined SVD vectors. Overrides per-token vectors in vs."""
+        import pickle, os
+        if not path or not os.path.exists(path):
+            print(f'WARNING: refined vectors not found at {path}')
+            return
+        with open(path, 'rb') as f:
+            refined = pickle.load(f)
+        n_overridden = 0
+        for tid, vec in refined.items():
+            if tid in self.vs.token_vectors:
+                self.vs.token_vectors[tid] = vec.astype(np.float32)
+                n_overridden += 1
+        self._refined_vectors_path = path
+        print(f'Refined vectors loaded: {n_overridden}/{len(refined)} overridden')
+
     def _concepts_for_prev(self, prev_concept_cluster):
         """Get valid next concept clusters for cross-sentence transition."""
         if self.structural_rules is None or prev_concept_cluster < 0:
@@ -481,13 +492,22 @@ class VectorGenerator:
                     if len(text) < 3:
                         mask[tid] = False
         
-        # piw>=1: только WORD_CONT
+        # piw≥1: WORD_CONT — allow type-2 (new word), type-3 (structural cont), EOS
         if pos_in_word >= 1:
             for tid in range(self.V):
                 if tid < len(self.tt):
-                    if self.tt[tid] == 2 or self.tt[tid] == 0:
+                    if self.tt[tid] == 0:
                         mask[tid] = False
-            mask[3] = False
+            mask[3] = True if word_num >= 2 else False
+
+        # На piw=0 после префикса: разрешить также type-3 продолжения этого префикса
+        # Позволяет: префикс (type-2) → продолжение (type-3) → полное слово
+        if pos_in_word == 0:
+            prev_tid = ctx.get('token_id', -1)
+            if prev_tid >= 0 and prev_tid in self._prefix_type3_set:
+                for tid3 in self._prefix_type3_set[prev_tid]:
+                    if tid3 < self.V:
+                        mask[tid3] = True
         
         # EOS разрешён в конце слова
         if is_word_end and word_num >= 2:
@@ -634,10 +654,14 @@ class VectorGenerator:
                         if cluster not in paragraph_topic:
                             scores[tid] = -np.inf
         else:
-            # Continuation: all type-3 tokens equally possible
-            for tid in range(self.V):
-                if tid < len(self.tt) and self.tt[tid] == 3 and valid_mask[tid]:
+            # Continuation: only structurally valid type-3 tokens
+            allowed = self.structural.get(prev_token, set())
+            for tid in allowed:
+                if tid < self.V and valid_mask[tid]:
                     scores[tid] = 1.0
+            # EOS also valid at word boundary
+            if valid_mask[3] and ctx.get('flags', 0) >> 1 & 1:
+                scores[3] = 1.0
         
         return scores
     
@@ -798,10 +822,13 @@ class VectorGenerator:
             words_in_sentence=getattr(self, '_words_in_current_sentence', 0)
         )
         
-        # 6. Continuation semantic scores: на piw>=1 бустить type-3 по SVD законченного слова
+        # 6. Prefix boost: на piw=0 бустить префиксы, чьи продолжения семантически подходят
+        prefix_boost = self._prefix_boost_scores(ctx, valid, content_token)
+        
+        # 7. Continuation semantic scores: на piw>=1 бустить type-3 по SVD законченного слова
         cont_sem = self._continuation_semantic_scores(ctx, content_token, valid)
         
-        # 7. Комбинируем: structural + semantic + concept + s_type + cont_sem
+        # 8. Комбинируем: structural + semantic + concept + s_type + prefix + cont_sem
         scores = structural.copy()
         for tid in range(self.V):
             if not valid[tid]:
@@ -815,14 +842,16 @@ class VectorGenerator:
                 base += concept_pmi[tid]
             if s_type_boost[tid] != 0.0:
                 base += s_type_boost[tid]
+            if prefix_boost[tid] != 0.0:
+                base += prefix_boost[tid]
             if cont_sem[tid] != 0.0:
                 base += cont_sem[tid]
             scores[tid] = base
         
-        # 8. Стена
+        # 9. Стена
         scores[~valid] = -np.inf
         
-        # 9. EOS decision: at word boundaries, probabilistically end sentence
+        # 10. EOS decision: at word boundaries, probabilistically end sentence
         pos_in_word = ctx.get('pos_in_word', -1)
         flags = ctx.get('flags', 0)
         is_word_end = (flags >> 1) & 1

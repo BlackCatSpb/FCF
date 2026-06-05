@@ -36,19 +36,16 @@ class PotentialField:
     generate_step(ctx, rules, heads, assoc_graph):
       1. rules.filter(ctx) → valid_tokens (булева маска)
       2. heads.scores(ctx) → raw_scores
-      3. assoc_graph.activate(ctx.prev_token) → concept_boost_1
-      4. concept_transformer.predict(ctx.concept_seq) → concept_boost_2
-      5. raw_scores + concept_boost = potential
-      6. potential[~valid] = -inf  (стены!)
-      7. select from potential
+      3. assoc_graph.activate(ctx.prev_token) → concept_boost
+      4. raw_scores + concept_boost = potential
+      5. potential[~valid] = -inf  (стены!)
+      6. select from potential
     """
     
-    def __init__(self, heads_obj, rules, assoc_graph=None, tokenizer=None,
-                 concept_transformer=None):
+    def __init__(self, heads_obj, rules, assoc_graph=None, tokenizer=None):
         self.heads = heads_obj
         self.rules = rules  # list of AffixRule
         self.ag = assoc_graph
-        self.ct = concept_transformer  # ConceptTransformer instance
         self.hv = tokenizer or HierarchicalVocab()
         self.tt = self.hv.token_type
         self.V = min(4101, max(len(self.tt) + 1, 4101))
@@ -193,28 +190,6 @@ class PotentialField:
                 elif node_id < 4096:
                     scores[node_id] += energy * 0.5
         
-        # 4. Concept Transformer prediction — дискриминативные токены
-        if self.ct is not None and concept_history is not None and len(concept_history) >= 1:
-            try:
-                c_seq = concept_history[-8:]
-                cid, ct_logits = self.ct.predict_next(c_seq, temperature=0.5)
-                import torch.nn.functional as F
-                probs = F.softmax(ct_logits, dim=-1).cpu().numpy()
-                
-                for ci in range(self.ag.n_clusters):
-                    boost = float(probs[ci]) * 10.0
-                    essence = self._concept_tokens(4096 + ci)
-                    if essence:
-                        for tid in essence:
-                            if tid < self.V:
-                                scores[tid] += boost
-                    else:
-                        for tid in self.ag.cid_to_tids.get(4096 + ci, []):
-                            if tid < self.V:
-                                scores[tid] += boost
-            except:
-                pass
-        
         # 5. Concept repetition penalty
         if concept_history is not None and len(concept_history) >= 2:
             recent = set(concept_history[-self.repeat_window:])
@@ -281,14 +256,11 @@ class PotentialGenerator:
     Каждый шаг: правила → стена, heads + концепты → потенциал, выбор.
     """
     
-    def __init__(self, heads_obj, rule_extractor, assoc_graph=None,
-                 concept_transformer=None):
+    def __init__(self, heads_obj, rule_extractor, assoc_graph=None):
         rules = getattr(rule_extractor, 'affixation_rules', []) + \
                 getattr(rule_extractor, 'syntax_rules', [])
-        self.field = PotentialField(heads_obj, rules, assoc_graph,
-                                    concept_transformer=concept_transformer)
+        self.field = PotentialField(heads_obj, rules, assoc_graph)
         self.ag = assoc_graph
-        self.ct = concept_transformer
         self.hv = HierarchicalVocab()
         self.history = []
     

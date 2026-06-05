@@ -11,12 +11,7 @@ from eva.symbolic.generation_loop import select_token
 from eva.symbolic.structural_rules import StructuralRules
 from eva.symbolic.gate_logic import GateLogic
 
-try:
-    import torch
-    import torch.nn.functional as F
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
+
 
 
 class VectorSpace:
@@ -142,8 +137,7 @@ class VectorGenerator:
     на piw>=1 — head-продолжение слова (как обычно).
     """
     
-    def __init__(self, heads_obj, assoc_graph, hv, rule_extractor=None,
-                 ct_model_path=None):
+    def __init__(self, heads_obj, assoc_graph, hv, rule_extractor=None):
         self.heads = heads_obj
         self.ag = assoc_graph
         self.hv = hv
@@ -206,34 +200,6 @@ class VectorGenerator:
         self._prefix_map_full = {} # (start_tid, type3_tid) -> set of completed_type2_tids
         self._prefix_type2 = set() # type-2 tokens that are prefixes (have type-3 continuations)
         self._build_word_prefix_map()
-        
-        # ---- ConceptTransformer ----
-        self.ct_model = None
-        self._concept_history = []  # concept IDs (for CT prediction)
-        if ct_model_path and HAS_TORCH:
-            self._load_concept_transformer(ct_model_path)
-    
-    def _load_concept_transformer(self, model_path):
-        """Load ConceptTransformer for concept-level guidance."""
-        import os
-        if not os.path.exists(model_path):
-            print(f"CT model not found: {model_path}")
-            return
-        try:
-            from eva.symbolic.concept_transformer import ConceptTransformer
-            n_concepts = self.ag.n_clusters
-            self.ct_model = ConceptTransformer(
-                n_concepts=n_concepts + 1,
-                d_model=64, n_layers=3, n_heads=4
-            )
-            state = torch.load(model_path, map_location='cpu', weights_only=True)
-            self.ct_model.load_state_dict(state, strict=False)
-            self.ct_model.eval()
-            self.ct_weight = 3.0  # CT boost weight
-            print(f"  CT loaded: {model_path}")
-        except Exception as e:
-            print(f"  CT load failed: {e}")
-            self.ct_model = None
     
     def _build_structural_matrix(self):
         """Строит структурную матрицу: возможные transitions между type-2 токенами.
@@ -754,41 +720,46 @@ class VectorGenerator:
                     scores[tid] = sim * max(weight, 0.5)
         return scores
     
-    def _concept_ct_scores(self, ctx, valid_mask):
+    def _concept_pmi_scores(self, ctx, valid_mask, content_token=-1,
+                            prev_sent_concept=-1):
         """
-        ConceptTransformer-based concept scores.
-        CT predicts P(next_concept | concept_history), boosts tokens in top-K concepts.
+        PMI-based concept transition scores.
+        Uses AssociationGraph.transition_ci: P(concept_j | concept_i) from corpus.
+        At word boundaries, boost tokens in top-K most likely next concepts
+        based on the LAST content token's concept.
         """
         scores = np.zeros(self.V, dtype=np.float32)
-        if self.ct_model is None or len(self._concept_history) < 2:
-            return scores
-        
         pos_in_word = ctx.get('pos_in_word', -1)
         if pos_in_word != 0:
             return scores
-        
-        try:
-            seq = self._concept_history[-48:]  # last 48 concepts
-            x = torch.tensor([seq], dtype=torch.long)
-            with torch.no_grad():
-                logits = self.ct_model(x)
-                next_logits = logits[0, -1, :]
-                probs = F.softmax(next_logits / 0.5, dim=-1).numpy()
-            
-            top_k = 5
-            top_indices = np.argsort(probs)[-top_k:][::-1]
-            
-            for ct_idx in top_indices:
-                p = probs[ct_idx]
-                concept_id = self.ag.L1_OFFSET + ct_idx  # CT index -> concept_id
-                members = self.ag.cid_to_tids.get(concept_id, [])
-                for tid in members:
-                    if tid < self.V and valid_mask[tid]:
-                        scores[tid] += p * self.ct_weight
-            
+
+        # Use content_token's concept for within-sentence transitions
+        # Fall back to prev_sent_concept for cross-sentence transitions
+        last_concept_id = -1
+        if content_token >= 0 and self._is_content_token(content_token):
+            last_concept_id = self.ag.get_concept(content_token)
+        if last_concept_id is None or last_concept_id < 0:
+            if prev_sent_concept >= 0 and prev_sent_concept < self.ag.n_clusters:
+                last_concept_id = self.ag.L1_OFFSET + prev_sent_concept
+        if last_concept_id is None or last_concept_id < 0:
             return scores
-        except Exception:
+
+        outgoing = self.ag.transition_ci.get(last_concept_id, [])
+        if not outgoing:
             return scores
+
+        top_k = min(5, len(outgoing))
+        top_transitions = sorted(outgoing, key=lambda x: -x[1])[:top_k]
+        for cj_id, log_prob in top_transitions:
+            members = self.ag.cid_to_tids.get(cj_id, [])
+            boost = float(np.exp(log_prob))
+            if boost < 0.01:
+                continue
+            for tid in members:
+                if tid < self.V and valid_mask[tid]:
+                    scores[tid] += boost * 3.0
+
+        return scores
     
     def generate_step(self, ctx, prev_token, content_token=-1, temperature=0.5,
                       prev_sentence_concept=-1, prev_sentence_type=None,
@@ -817,8 +788,9 @@ class VectorGenerator:
         # 3. Семантические scores (SVD-близость к последнему content word)
         semantic = self._semantic_scores(ctx, prev_token, content_token, valid)
         
-        # 4. Concept scores (CT-guided concept prediction)
-        concept_ct = self._concept_ct_scores(ctx, valid)
+        # 4. Concept scores (PMI-based concept transition)
+        concept_pmi = self._concept_pmi_scores(ctx, valid, content_token,
+                                               prev_sentence_concept)
         
         # 5. Sentence-type boost: после диалога/вопроса boost глаголов речи
         s_type_boost = self._sentence_type_boost(
@@ -839,8 +811,8 @@ class VectorGenerator:
                 base = scores[tid]
             if semantic[tid] != 0.0:
                 base += semantic[tid]
-            if concept_ct[tid] != 0.0:
-                base += concept_ct[tid]
+            if concept_pmi[tid] != 0.0:
+                base += concept_pmi[tid]
             if s_type_boost[tid] != 0.0:
                 base += s_type_boost[tid]
             if cont_sem[tid] != 0.0:
@@ -870,7 +842,7 @@ class VectorGenerator:
         
         # 10. Fallback если всё -inf
         if not np.any(np.isfinite(scores)):
-            scores = semantic.copy() + concept_ct.copy() + s_type_boost.copy()
+            scores = semantic.copy() + concept_pmi.copy() + s_type_boost.copy()
             scores[~valid] = -np.inf
         
         # 11. Выбор
@@ -886,8 +858,8 @@ class VectorGenerator:
         # Что повлияло?
         if self._is_content_token(next_tok):
             explanation["reasons"].append("content")
-        if concept_ct[next_tok] != 0.0 and self.ct_model is not None:
-            explanation["reasons"].append("concept_ct")
+        if concept_pmi[next_tok] != 0.0:
+            explanation["reasons"].append("concept_pmi")
         if content_token >= 0 and self.vs.has_vector(content_token) and self.vs.has_vector(next_tok):
             sim = self.vs.similarity(content_token, next_tok)
             if sim > 0.2:
@@ -916,7 +888,6 @@ class VectorGenerator:
         tokens = [2]  # BOS
         explanations = []
         content_token = -1  # последний content word (для семантического контекста)
-        self._concept_history = []  # reset CT history
         self._current_word_tokens = []  # reset word accumulation
         self._full_word_anchor = None
         
@@ -958,13 +929,7 @@ class VectorGenerator:
                 if self._is_content_token(seed_type2):
                     content_token = seed_type2
                     self._current_word_tokens = [seed_type2]
-                # Track concept for CT
-                if self.ct_model is not None:
-                    cid = self.ag.get_concept(seed_type2)
-                    if cid is not None:
-                        ct_idx = cid - self.ag.L1_OFFSET
-                        if 0 <= ct_idx < self.ag.n_clusters:
-                            self._concept_history.append(ct_idx)
+
         
         # Initial BOS: BOS is token 2, which is not in the structural matrix
         # First token is always from heads (no structural context yet)
@@ -1000,12 +965,6 @@ class VectorGenerator:
                         if self.vs.has_vector(ft):
                             content_token = ft
                             break
-                if self.ct_model is not None:
-                    cid = self.ag.get_concept(next_tok)
-                    if cid is not None:
-                        ct_idx = cid - self.ag.L1_OFFSET
-                        if 0 <= ct_idx < self.ag.n_clusters:
-                            self._concept_history.append(ct_idx)
             exp = {"valid_tokens": int(valid.sum()), "chosen": int(next_tok),
                    "chosen_text": chosen_text, "reasons": ["first"]}
             explanations.append(exp)
@@ -1062,13 +1021,7 @@ class VectorGenerator:
                     self._current_word_tokens = []
                 self._current_word_tokens.append(next_tok)  # include punct in next word
             
-            # Track concept for CT (at word boundaries)
-            if cur_token_type == 2 and self.ct_model is not None:
-                cid = self.ag.get_concept(next_tok)
-                if cid is not None:
-                    ct_idx = cid - self.ag.L1_OFFSET
-                    if 0 <= ct_idx < self.ag.n_clusters:
-                        self._concept_history.append(ct_idx)
+
             
             # Target composition guidance
             if target_composition and ctx.get('word_num', 0) >= 2:

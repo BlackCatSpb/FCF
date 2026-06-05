@@ -196,6 +196,9 @@ class GateLogic:
         if not self._expansions_built:
             self._build_expansions()
 
+        if not text_hierarchy.sentences and hasattr(text_hierarchy, 'parse'):
+            text_hierarchy.parse()
+
         for sent in text_hierarchy.sentences:
             # BPE level: все пары соседних токенов
             toks = sent.tokens

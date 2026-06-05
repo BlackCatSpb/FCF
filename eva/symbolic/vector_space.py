@@ -1,7 +1,3 @@
-"""
-VectorSpaceGenerator — генерация через непрерывное SVD-пространство.
-Никаких жёстких кластеров. Концепт = вектор + порог активации.
-"""
 import sys, math, numpy as np
 from collections import defaultdict
 
@@ -10,6 +6,7 @@ from eva.symbolic.bpe_tokenizer import HierarchicalVocab
 from eva.symbolic.generation_loop import select_token
 from eva.symbolic.structural_rules import StructuralRules
 from eva.symbolic.gate_logic import GateLogic
+from eva.symbolic.pattern_learner import PatternLearner
 
 
 
@@ -167,6 +164,9 @@ class VectorGenerator:
         self.IGNORED = {0, 1, 2, 4, 5}
         self.BANNED = {3}
         
+        # Pattern Learner (самоорганизация шаблонов)
+        self._pattern_learner = None
+        self._pattern_learner_trained = False
         # Semantic coherence weight
         self.sem_weight = 5.0
         self.sem_boost_count = 5  # only boost top-5 SVD-nearest tokens
@@ -202,6 +202,10 @@ class VectorGenerator:
         self._prefix_type3_set = {} # prefix_tid -> set[type3_tid]
         self._prefix_type2 = set()  # type-2 tokens that are prefixes (have type-3 continuations)
         self._build_word_prefix_map()
+
+        # ---- Word completion state ----
+        self._word_prefix = -1        # type-2 prefix of current in-progress word
+        self._current_word_type3s = set()  # type-3 tokens already emitted for current word
     
     def _build_structural_matrix(self):
         """Строит структурную матрицу: возможные transitions между type-2 токенами.
@@ -278,7 +282,13 @@ class VectorGenerator:
             if tid >= len(self.tt) or not self._is_content_token(tid):
                 continue
             follow = self.structural.get(tid, set())
-            type3 = {t for t in follow if t < len(self.tt) and self.tt[t] == 3}
+            # Only type-3 that decode to pure letters (no punctuation, numbers)
+            type3 = set()
+            for t in follow:
+                if t < len(self.tt) and self.tt[t] == 3:
+                    txt = self.hv.decode([t]).strip()
+                    if txt and txt[0].isalpha():
+                        type3.add(t)
             if type3:
                 self._prefix_type3_set[tid] = type3
         
@@ -313,7 +323,7 @@ class VectorGenerator:
                 if sim > 0:
                     for tid3 in self._prefix_type3_set[prefix_tid]:
                         if valid_mask[tid3]:
-                            scores[tid3] = sim * 4.0
+                            scores[tid3] = sim * 8.0
 
         for prefix_tid in self._prefix_type3_set:
             if not valid_mask[prefix_tid]:
@@ -500,11 +510,25 @@ class VectorGenerator:
                         mask[tid] = False
             mask[3] = True if word_num >= 2 else False
 
-        # На piw=0 после префикса: разрешить также type-3 продолжения этого префикса
-        # Позволяет: префикс (type-2) → продолжение (type-3) → полное слово
+            # Если у текущего префикса есть непотраченные type-3 продолжения —
+            # блокируем ВСЕ type-2. Слово должно быть завершено через type-3.
+            word_prefix = ctx.get('word_prefix', -1)
+            used_type3s = ctx.get('used_type3s', set())
+            if word_prefix >= 0 and word_prefix in self._prefix_type3_set:
+                remaining = self._prefix_type3_set[word_prefix] - used_type3s
+                if remaining:
+                    for tid in range(self.V):
+                        if tid < len(self.tt) and self.tt[tid] == 2:
+                            mask[tid] = False
+
+        # На piw=0 после префикса: разрешить только type-3 продолжения,
+        # блокировать все type-2 (слово должно быть завершено через type-3)
         if pos_in_word == 0:
             prev_tid = ctx.get('token_id', -1)
             if prev_tid >= 0 and prev_tid in self._prefix_type3_set:
+                for tid in range(self.V):
+                    if tid < len(self.tt) and self.tt[tid] == 2:
+                        mask[tid] = False
                 for tid3 in self._prefix_type3_set[prev_tid]:
                     if tid3 < self.V:
                         mask[tid3] = True
@@ -596,7 +620,234 @@ class VectorGenerator:
         if text[0].isascii() and text[0].isalpha():
             return False
         return True
-    
+
+    # ─── Example Path (образ-скелет) ──────────────────────────────────
+
+    def _extract_example_path(self, text):
+        hv = self.hv
+        ag = self.ag
+        tokens = hv.encode(' ' + text)
+        concept_sequence = []
+        token_sequence = []
+        word_count = 0
+        prev_cluster = None
+        for t in tokens:
+            if t >= 4096:
+                continue
+            if self.tt[t] != 2:
+                continue
+            decoded = hv.decode([t]).strip()
+            # Фильтруем мусор: пустые строки, латиница, одиночные символы
+            if not decoded:
+                continue
+            if decoded[0].isascii() and decoded[0].isalpha():
+                continue
+            if len(decoded) <= 1:
+                continue
+            c = ag.get_concept(t)
+            if c is not None:
+                cluster = c - ag.L1_OFFSET
+                if 0 <= cluster < ag.n_clusters:
+                    if prev_cluster is None or cluster != prev_cluster:
+                        concept_sequence.append(cluster)
+                        token_sequence.append(t)
+                        word_count += 1
+                        prev_cluster = cluster
+        if not concept_sequence:
+            return None
+        concept_sequence.append(-1)  # EOS
+        token_sequence.append(-1)    # EOS
+        # Определяем тип предложения
+        s_type = 'statement'
+        first_word_text = text.strip().split()[0].lower().strip('—–-«».,!?;:()"')
+        if text.strip().endswith('?'):
+            s_type = 'question'
+        elif text.strip().endswith('!'):
+            s_type = 'exclamation'
+        elif text.strip().startswith('—') or first_word_text in ('—', '-'):
+            s_type = 'dialogue'
+        else:
+            # Если есть PatternLearner со статистикой — используем его
+            pl = getattr(self, '_pattern_learner', None)
+            if pl and (pl.token_s_type_dist or pl.concept_s_type_dist) and token_sequence:
+                first_tid = token_sequence[0]
+                first_c = concept_sequence[0] if concept_sequence else -1
+                s_type = pl.detect_s_type(first_concept=first_c, first_tid=first_tid)
+        return {
+            's_type': s_type,
+            'concept_sequence': concept_sequence,
+            'token_sequence': token_sequence,
+            'word_count': word_count,
+            'text': text,
+        }
+
+    def _example_path_scores(self, ctx, valid, forced_path):
+        scores = np.zeros(self.V, dtype=np.float32)
+        pos_in_word = ctx.get('pos_in_word', -1)
+        if pos_in_word != 0:
+            return scores
+        word_num = ctx.get('word_num', -1)
+        if word_num < 0:
+            return scores
+        seq = forced_path.get('concept_sequence', [])
+        tokens_seq = forced_path.get('token_sequence')
+        if tokens_seq is None:
+            tokens_seq = []
+        if word_num >= len(seq):
+            return scores
+        expected_cluster = seq[word_num]
+        expected_tid = tokens_seq[word_num] if word_num < len(tokens_seq) else -1
+        
+        # В конце пути — форсируем EOS
+        if expected_cluster == -1:
+            if 3 < self.V and valid[3]:
+                scores[3] = 10.0
+            return scores
+        
+        # Буст конкретного токена из примера
+        if expected_tid >= 0 and expected_tid < self.V and valid[expected_tid]:
+            scores[expected_tid] = 12.0
+        
+        # Буст остальных токенов из концепта
+        if 0 <= expected_cluster < self.ag.n_clusters:
+            cid_full = self.ag.L1_OFFSET + expected_cluster
+            members = self.ag.cid_to_tids.get(cid_full, [])
+            for tid in members:
+                if tid < self.V and valid[tid] and scores[tid] == 0.0:
+                    scores[tid] = 6.0
+        return scores
+        word_num = ctx.get('word_num', -1)
+        if word_num < 0:
+            return scores
+        seq = forced_path.get('concept_sequence', [])
+        tokens_seq = forced_path.get('token_sequence')
+        if tokens_seq is None:
+            tokens_seq = []
+        if word_num >= len(seq):
+            return scores
+        expected_cluster = seq[word_num]
+        expected_tid = tokens_seq[word_num] if word_num < len(tokens_seq) else -1
+        
+        # Буст конкретного токена из примера
+        if expected_tid >= 0 and expected_tid < self.V and valid[expected_tid]:
+            scores[expected_tid] = 12.0
+        
+        # Буст остальных токенов из концепта
+        if 0 <= expected_cluster < self.ag.n_clusters:
+            cid_full = self.ag.L1_OFFSET + expected_cluster
+            members = self.ag.cid_to_tids.get(cid_full, [])
+            for tid in members:
+                if tid < self.V and valid[tid] and scores[tid] == 0.0:
+                    scores[tid] = 6.0
+        return scores
+
+    def _word_importance(self, tid):
+        if tid >= len(self.tt) or self.tt[tid] != 2:
+            return 0.0
+        text = self.hv.decode([tid]).strip()
+        if not text or len(text) <= 2:
+            return 0.0
+        if text[0].isascii() and text[0].isalpha():
+            return 0.0
+        l = len(text)
+        if l >= 6:
+            return 1.0
+        if l >= 4:
+            cid = self.ag.get_concept(tid)
+            if cid is not None:
+                cluster = cid - self.ag.L1_OFFSET
+                members = self.ag.get_members(cluster)
+                if len(members) >= 10:
+                    return 1.0
+            return 0.7
+        return 0.3
+
+    def _select_spine(self, ctx, prev_sent_concept=-1, seed_word=None):
+        spine = []
+        hv = self.hv
+        ag = self.ag
+        cur_cid = None
+        if seed_word:
+            seed_tokens = hv.encode(' ' + seed_word)
+            for t in seed_tokens:
+                if t < 4096 and self.tt[t] == 2:
+                    c = ag.get_concept(t)
+                    if c is not None:
+                        cur_cid = c - ag.L1_OFFSET
+                        break
+        if cur_cid is None and prev_sent_concept >= 0:
+            cur_cid = prev_sent_concept
+        if cur_cid is None:
+            return []
+        roles = ['subject', 'verb', 'object']
+        for pos in range(3):
+            if cur_cid is None or cur_cid >= ag.n_clusters:
+                break
+            cid_full = ag.L1_OFFSET + cur_cid
+            outgoing = ag.transition_ci.get(cid_full, [])
+            if not outgoing:
+                break
+            best_cj = None
+            # Try all outgoing transitions to find one with usable members
+            outgoing_sorted = sorted(outgoing, key=lambda x: -x[1])
+            for cj_id, lp in outgoing_sorted:
+                if cj_id < ag.L1_OFFSET:
+                    continue
+                cj = cj_id - ag.L1_OFFSET
+                if not (0 <= cj < ag.n_clusters) or cj == cur_cid:
+                    continue
+                members = ag.cid_to_tids.get(cj_id, [])
+                if not members:
+                    continue
+                for tid in members:
+                    if not self._is_content_token(tid) or tid >= 4096:
+                        continue
+                    if self._word_importance(tid) >= 0.7 and len(hv.decode([tid]).strip()) >= 3:
+                        best_cj = cj
+                        break
+                if best_cj is not None:
+                    break
+            if best_cj is None:
+                break
+            members = ag.cid_to_tids.get(ag.L1_OFFSET + best_cj, [])
+            if not members:
+                break
+            best_tid = None
+            best_score = -1.0
+            for tid in members:
+                if not self._is_content_token(tid) or tid >= 4096:
+                    continue
+                imp = self._word_importance(tid)
+                if imp < 0.7:
+                    continue
+                txt = hv.decode([tid]).strip()
+                if len(txt) < 3:
+                    continue
+                score = imp * (1.0 if best_tid is None else 0.9)
+                if score > best_score:
+                    best_score = score
+                    best_tid = tid
+            if best_tid is not None:
+                spine.append((best_tid, best_cj, roles[pos]))
+                cur_cid = best_cj
+            else:
+                break
+        return spine
+
+    def _spine_scores(self, ctx, valid_mask, spine):
+        scores = np.zeros(self.V, dtype=np.float32)
+        pos_in_word = ctx.get('pos_in_word', -1)
+        if pos_in_word != 0:
+            return scores
+        word_num = ctx.get('word_num', -1)
+        if word_num < 0:
+            return scores
+        for sp_idx, (tid, cid, role) in enumerate(spine):
+            if sp_idx <= word_num <= sp_idx + 1:
+                if tid < self.V and valid_mask[tid]:
+                    scores[tid] = 3.0
+        return scores
+
     def _structural_scores(self, ctx, prev_token, valid_mask, prev_sentence_concept=-1,
                            paragraph_topic=None):
         """
@@ -787,7 +1038,7 @@ class VectorGenerator:
     
     def generate_step(self, ctx, prev_token, content_token=-1, temperature=0.5,
                       prev_sentence_concept=-1, prev_sentence_type=None,
-                      paragraph_topic=None):
+                      paragraph_topic=None, spine=None, forced_path=None):
         """
         Один шаг генерации.
         prev_token: последний токен (может быть type-2 или type-3)
@@ -795,6 +1046,8 @@ class VectorGenerator:
         prev_sentence_concept: cluster idx последнего концепта предыдущего предложения
         prev_sentence_type: тип предыдущего предложения (для sentence-type контекста)
         paragraph_topic: set of concept cluster IDs for current paragraph
+        spine: [(tid, concept_id, role), ...] — стержневые слова предложения
+        forced_path: dict from _extract_example_path — концепт-скелет для подражания
         """
         # 1. Стены
         valid = self._valid_mask(ctx)
@@ -828,7 +1081,13 @@ class VectorGenerator:
         # 7. Continuation semantic scores: на piw>=1 бустить type-3 по SVD законченного слова
         cont_sem = self._continuation_semantic_scores(ctx, content_token, valid)
         
-        # 8. Комбинируем: structural + semantic + concept + s_type + prefix + cont_sem
+        # 8. Spine boost: стержневые слова предложения
+        spine_boost = self._spine_scores(ctx, valid, spine or [])
+        
+        # 9. Example path boost: концепт-скелет из примера
+        example_boost = self._example_path_scores(ctx, valid, forced_path) if forced_path else np.zeros(self.V, dtype=np.float32)
+        
+        # 10. Комбинируем: structural + semantic + concept + s_type + prefix + cont_sem + spine + example
         scores = structural.copy()
         for tid in range(self.V):
             if not valid[tid]:
@@ -846,12 +1105,16 @@ class VectorGenerator:
                 base += prefix_boost[tid]
             if cont_sem[tid] != 0.0:
                 base += cont_sem[tid]
+            if spine_boost[tid] != 0.0:
+                base += spine_boost[tid]
+            if example_boost[tid] != 0.0:
+                base += example_boost[tid]
             scores[tid] = base
         
-        # 9. Стена
+        # 11. Стена
         scores[~valid] = -np.inf
         
-        # 10. EOS decision: at word boundaries, probabilistically end sentence
+        # 12. EOS decision: at word boundaries, probabilistically end sentence
         pos_in_word = ctx.get('pos_in_word', -1)
         flags = ctx.get('flags', 0)
         is_word_end = (flags >> 1) & 1
@@ -869,12 +1132,12 @@ class VectorGenerator:
                     "reasons": ["EOS(%.2f)" % p_eos]
                 }
         
-        # 10. Fallback если всё -inf
+        # 13. Fallback если всё -inf
         if not np.any(np.isfinite(scores)):
             scores = semantic.copy() + concept_pmi.copy() + s_type_boost.copy()
             scores[~valid] = -np.inf
         
-        # 11. Выбор
+        # 14. Выбор
         next_tok = select_token(scores, temperature=temperature)
         
         explanation = {
@@ -898,6 +1161,14 @@ class VectorGenerator:
         if s_type_boost[next_tok] != 0.0 and prev_sentence_type in ('dialogue', 'question'):
             explanation["reasons"].append("s_type_%s" % prev_sentence_type[:4])
         
+        # Report example path boost
+        if forced_path and example_boost[next_tok] != 0.0:
+            word_num = ctx.get('word_num', -1)
+            seq = forced_path.get('concept_sequence', [])
+            if 0 <= word_num < len(seq):
+                expected_cluster = seq[word_num]
+                explanation["reasons"].append("example_C%d" % expected_cluster)
+        
         # Report cross-sentence constraint if active
         if prev_sentence_concept >= 0 and prev_token == 3:
             explanation["prev_sent_concept"] = int(prev_sentence_concept)
@@ -907,18 +1178,50 @@ class VectorGenerator:
         
         return next_tok, explanation
     
-    def generate(self, max_tokens=40, seed_word=None, target_composition=None, temperature=0.5):
+    def generate(self, max_tokens=40, seed_word=None, target_composition=None, temperature=0.5,
+                 example=None, auto_pattern=False, text_hierarchy=None):
         """
         Генерация: structural + semantic, без frequency bias.
         
         seed_word: начальное слово (опционально)
         target_composition: [(word, weight), ...] — целевая композиция (опционально)
+        example: строка-пример для подражания (опционально)
         """
         tokens = [2]  # BOS
         explanations = []
         content_token = -1  # последний content word (для семантического контекста)
         self._current_word_tokens = []  # reset word accumulation
         self._full_word_anchor = None
+        self._active_spine = []  # sentence spine for current sentence
+        
+        # Example path: извлечь концепт-скелет из примера
+        self._example_path = None
+        if example:
+            self._example_path = self._extract_example_path(example)
+            if self._example_path:
+                print("Example path: s_type=%s concepts=%s" % (
+                    self._example_path['s_type'],
+                    self._example_path['concept_sequence']))
+                self._prev_sentence_type = self._example_path['s_type']
+        
+        # Auto pattern: самоорганизация шаблонов из корпуса
+        self._active_pattern_seq = None
+        if auto_pattern and self._example_path is None:
+            if not self._pattern_learner_trained and text_hierarchy is not None:
+                self._pattern_learner = PatternLearner(self.hv, self.ag, self.gates)
+                self._pattern_learner.learn(text_hierarchy)
+                self._pattern_learner_trained = True
+            
+            if self._pattern_learner and self._pattern_learner.patterns:
+                matched = self._pattern_learner.match(seed_word=seed_word)
+                if matched:
+                    self._active_pattern_seq = matched
+                    self._example_path = self._pattern_learner.to_forced_path(matched)
+                    desc = self._pattern_learner.describe(matched)
+                    if desc:
+                        print("Pattern match: concepts=%s freq=%d meta=%s" % (
+                            desc['concepts'], desc['freq'], desc['meta']))
+                    self._prev_sentence_type = self._example_path['s_type']
         
         # Sentence tracking for cross-sentence constraints
         self._prev_sentence_last_concept = -1
@@ -935,17 +1238,16 @@ class VectorGenerator:
         
         # Seed word: encode " word" to get proper type-2 token
         if seed_word:
-            # Infer sentence type from seed word
-            speech_verbs = {'сказал','спросил','отвечал','проговорил','закричал',
-                            'говорил','продолжал','обратился','прибавил','вскричал',
-                            'заметил','возразил','перебил','произнес','пробормотал',
-                            'прошептал','крикнул'}
-            question_words = {'почему','зачем','кто','что','как','где','когда','отчего'}
-            sw = seed_word.lower()
-            if sw in speech_verbs:
-                self._prev_sentence_type = 'dialogue'
-            elif sw in question_words:
-                self._prev_sentence_type = 'question'
+            # Infer sentence type from seed word via token/concept statistics
+            if self._pattern_learner and (self._pattern_learner.token_s_type_dist or self._pattern_learner.concept_s_type_dist):
+                seed_tokens_for_type = self.hv.encode(' ' + seed_word)
+                for t in seed_tokens_for_type:
+                    if t < 4096 and self.tt[t] == 2:
+                        c = self.ag.get_concept(t)
+                        cluster = (c - self.ag.L1_OFFSET) if c is not None else -1
+                        s_t = self._pattern_learner.detect_s_type(first_concept=cluster if cluster >= 0 else None, first_tid=t)
+                        self._prev_sentence_type = s_t
+                        break
             
             seed_tokens = self.hv.encode(' ' + seed_word)
             seed_type2 = None
@@ -958,6 +1260,8 @@ class VectorGenerator:
                 if self._is_content_token(seed_type2):
                     content_token = seed_type2
                     self._current_word_tokens = [seed_type2]
+                    self._word_prefix = seed_type2
+                    self._current_word_type3s = set()
 
         
         # Initial BOS: BOS is token 2, which is not in the structural matrix
@@ -966,6 +1270,19 @@ class VectorGenerator:
             meta = self.hv.metadata_from_ids(tokens)
             ctx = dict(meta[-1])
             ctx['context_tokens'] = []
+            valid = self._valid_mask(ctx)
+            
+            # Если есть example_path — форсируем первый концепт из пути,
+            # разрешая ожидаемый токен даже если _valid_mask его блокирует
+            if self._example_path:
+                seq = self._example_path.get('concept_sequence', [])
+                tok_seq = self._example_path.get('token_sequence', [])
+                if seq and seq[0] >= 0:
+                    expected_cluster = seq[0]
+                    expected_tok = tok_seq[0] if tok_seq else -1
+                    if expected_tok >= 0 and expected_tok < self.V:
+                        valid[expected_tok] = True  # обход _valid_mask для токена из примера
+            
             # Use heads for very first token
             try:
                 hs = self.heads.individual_scores(ctx)
@@ -974,7 +1291,25 @@ class VectorGenerator:
             except:
                 scores = np.full(self.V, -np.inf, dtype=np.float32)
             
-            valid = self._valid_mask(ctx)
+            # Если есть example_path — форсируем первый концепт из пути
+            if self._example_path:
+                seq = self._example_path.get('concept_sequence', [])
+                tok_seq = self._example_path.get('token_sequence', [])
+                if seq and seq[0] >= 0:
+                    expected_cluster = seq[0]
+                    expected_tok = tok_seq[0] if tok_seq else -1
+                    if 0 <= expected_cluster < self.ag.n_clusters:
+                        cid_full = self.ag.L1_OFFSET + expected_cluster
+                        members = self.ag.cid_to_tids.get(cid_full, [])
+                        for tid in range(self.V):
+                            if valid[tid]:
+                                if tid == expected_tok:
+                                    scores[tid] = 20.0
+                                elif tid in members:
+                                    scores[tid] = 10.0
+                                else:
+                                    scores[tid] = -np.inf
+            
             # Suppress all single-letter tokens at first position
             for t in range(self.V):
                 if t < len(self.tt) and self.tt[t] == 2:
@@ -1003,6 +1338,8 @@ class VectorGenerator:
             meta = self.hv.metadata_from_ids(tokens)
             ctx = dict(meta[-1])
             ctx['context_tokens'] = tokens[-15:] if len(tokens) > 5 else tokens
+            ctx['word_prefix'] = self._word_prefix
+            ctx['used_type3s'] = self._current_word_type3s.copy()
             
             prev = tokens[-1] if len(tokens) > 1 else 2
             
@@ -1018,11 +1355,20 @@ class VectorGenerator:
                 prev == 3 and self._sentences_in_paragraph > 0
             ) else None
             
+            # Sentence spine: pre-select 3 core words at sentence start
+            if prev == 3 or len(tokens) <= 2:
+                spine = self._select_spine(ctx, prev_sent_concept=psc, seed_word=seed_word if len(tokens) <= 2 else None)
+                self._active_spine = spine
+            else:
+                spine = self._active_spine
+            
             next_tok, exp = self.generate_step(
                 ctx, prev, content_token, temperature,
                 prev_sentence_concept=psc,
                 prev_sentence_type=self._prev_sentence_type if prev == 3 else None,
-                paragraph_topic=para_topic
+                paragraph_topic=para_topic,
+                spine=spine,
+                forced_path=self._example_path
             )
             
             # Word accumulation: track tokens to decode full word later
@@ -1031,6 +1377,8 @@ class VectorGenerator:
             
             if cur_token_type == 2:
                 # New word starting — previous word is complete
+                self._word_prefix = next_tok
+                self._current_word_type3s = set()
                 if self._current_word_tokens:
                     anchor = self._compute_full_word_anchor(self._current_word_tokens)
                     if anchor >= 0 and self._is_content_token(anchor):
@@ -1041,8 +1389,11 @@ class VectorGenerator:
                 self._words_in_current_sentence += 1
             elif cur_token_type == 3:
                 self._current_word_tokens.append(next_tok)
+                self._current_word_type3s.add(next_tok)
             else:
                 # Punctuation/special — word is done
+                self._word_prefix = -1
+                self._current_word_type3s = set()
                 if self._current_word_tokens:
                     anchor = self._compute_full_word_anchor(self._current_word_tokens)
                     if anchor >= 0 and self._is_content_token(anchor):
@@ -1089,6 +1440,33 @@ class VectorGenerator:
             explanations.append(exp)
             
             if next_tok == 3:
+                # Word tracking reset at sentence boundary
+                self._word_prefix = -1
+                self._current_word_type3s = set()
+                # Clear example path for next sentence
+                self._example_path = None
+                
+                # Отчёт успеха для авто-шаблона
+                if self._active_pattern_seq is not None and self._pattern_learner is not None:
+                    type2_tokens = [t for t in tokens[self._sentence_start_pos:] if t < 4096 and self.tt[t] == 2]
+                    path = self._pattern_learner.to_forced_path(self._active_pattern_seq)
+                    expected = path.get('concept_sequence', []) if path else []
+                    matches = 0
+                    total = min(len(type2_tokens), len(expected) - 1)
+                    for i in range(total):
+                        if i < len(expected) - 1:
+                            c = self.ag.get_concept(type2_tokens[i])
+                            if c is not None and (c - self.ag.L1_OFFSET) == expected[i]:
+                                matches += 1
+                    match_ratio = matches / max(1, total)
+                    self._pattern_learner.report_outcome(
+                        self._active_pattern_seq,
+                        success=True,
+                        word_count=len(type2_tokens),
+                        match_ratio=match_ratio
+                    )
+                    self._active_pattern_seq = None
+                
                 # Sentence complete: save last concept for cross-sentence constraint
                 if content_token >= 0:
                     cid = self.ag.get_concept(content_token)
@@ -1099,16 +1477,9 @@ class VectorGenerator:
                 else:
                     self._prev_sentence_last_concept = -1
                 
-                # Detect sentence type from content + punctuation
+                # Detect sentence type from punctuation + concept statistics
                 sent_tokens = tokens[self._sentence_start_pos:]
                 sent_text = self.hv.decode(sent_tokens).strip()
-                speech_verbs = {'сказал','спросил','отвечал','проговорил','закричал',
-                                'говорил','продолжал','обратился','прибавил','вскричал',
-                                'заметил','возразил','перебил','произнес','пробормотал',
-                                'прошептал','крикнул','молвил'}
-                sent_words = sent_text.lower().split()
-                speech_count = sum(1 for w in sent_words if w in speech_verbs)
-                
                 prev_type_before = self._prev_sentence_type
                 
                 if '?' in sent_text:
@@ -1117,8 +1488,14 @@ class VectorGenerator:
                     self._prev_sentence_type = 'exclamation'
                 elif any(m in sent_text for m in ['—', '–', '«', '"']):
                     self._prev_sentence_type = 'dialogue'
-                elif speech_count >= 1:
-                    self._prev_sentence_type = 'dialogue'
+                elif sent_tokens and self._pattern_learner and (self._pattern_learner.token_s_type_dist or self._pattern_learner.concept_s_type_dist):
+                    first_tid = sent_tokens[0]
+                    if first_tid < 4096 and self.tt[first_tid] == 2:
+                        c = self.ag.get_concept(first_tid)
+                        cluster = (c - self.ag.L1_OFFSET) if c is not None else -1
+                        self._prev_sentence_type = self._pattern_learner.detect_s_type(
+                            first_concept=cluster if cluster >= 0 else None,
+                            first_tid=first_tid)
                 else:
                     self._prev_sentence_type = 'statement'
                 
@@ -1158,11 +1535,31 @@ class VectorGenerator:
                 
                 # Check if paragraph should end
                 if self._sentences_in_paragraph >= self._max_paragraph_sentences:
-                    # Paragraph complete: last sentence's concepts seed next paragraph
                     self._paragraph_topic = sent_concepts
-                    self._sentences_in_paragraph = 0  # marks "fresh paragraph" on next sentence
+                    self._sentences_in_paragraph = 0
                     import random as _rnd
                     self._max_paragraph_sentences = _rnd.randint(3, 5)
+        
+        # Отчёт: результат авто-шаблона
+        if self._active_pattern_seq is not None and self._pattern_learner is not None:
+            reached_eos = next_tok == 3 if len(tokens) > 1 else False
+            type2_tokens = [t for t in tokens if t < 4096 and self.tt[t] == 2]
+            path = self._pattern_learner.to_forced_path(self._active_pattern_seq)
+            expected = path.get('concept_sequence', []) if path else []
+            matches = 0
+            total = min(len(type2_tokens), len(expected) - 1)
+            for i in range(total):
+                if i < len(expected) - 1:
+                    c = self.ag.get_concept(type2_tokens[i])
+                    if c is not None and (c - self.ag.L1_OFFSET) == expected[i]:
+                        matches += 1
+            match_ratio = matches / max(1, total)
+            self._pattern_learner.report_outcome(
+                self._active_pattern_seq,
+                success=reached_eos,
+                word_count=len(type2_tokens),
+                match_ratio=match_ratio
+            )
         
         return {
             'tokens': tokens,

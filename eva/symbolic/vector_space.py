@@ -1659,9 +1659,45 @@ class VectorGenerator:
         if not is_match:
             noise = self._population.estimate_noise(word_tid, v_ctx)
             self._population.maybe_branch(word_tid, idx, noise)
+            # Create a targeted correction hypothesis if right word is known
+            if target_tid >= 0 and self.vs.has_vector(target_tid):
+                self._corrective_branch(word_tid, target_tid, ctx_anchor)
         self._population.sync_best(word_tid)
         if target_tid >= 0 and not is_match and self.vs.has_vector(target_tid):
             self._population.sync_best(target_tid)
+
+    def _corrective_branch(self, wrong_tid, right_tid, ctx_anchor):
+        """Create a targeted correction hypothesis at the right hierarchical level.
+
+        When a word or sub-word unit is wrong, instead of random exploration,
+        branch a version specifically pulled toward the right answer.
+        This hypothesis competes with the original — if it leads to matches,
+        its fitness rises; if not, it atrophies.
+
+        If the type-2 prefix was correct but type-3 continuation is wrong,
+        create a hypothesis for the type-3 tokens only (not the prefix).
+        If the whole word is wrong, correct at word level.
+        """
+        v_right = self.vs.token_vectors[right_tid]
+        idx = self._population.select(wrong_tid)
+        v_hyp = self._population.versions[wrong_tid][idx].copy()
+
+        y = float(np.dot(v_hyp, v_right))
+        y = max(y, 0.05)
+        shift = (v_right - v_hyp) * 0.5 * y
+        v_hyp += shift
+        nrm = float(np.linalg.norm(v_hyp))
+        if nrm > 0:
+            v_hyp /= nrm
+
+        if wrong_tid not in self._population.versions:
+            return
+        self._population.versions[wrong_tid].append(v_hyp)
+        self._population.fitness[wrong_tid].append(0.5)
+        self._population.n_calls[wrong_tid].append(0)
+
+        while len(self._population.versions[wrong_tid]) > self._population.max_size(wrong_tid):
+            self._population._prune(wrong_tid)
 
     def generate(self, max_tokens=40, seed_word=None, target_composition=None, temperature=0.5,
                  example=None, auto_pattern=False, text_hierarchy=None, target_text=None,

@@ -13,11 +13,16 @@ class HeadsEnsemble:
     """Все 6 heads. Векторизовано: score_all(V) = O(V) numpy."""
 
     def __init__(self, meta_path: str, csr_path: Optional[str] = None,
-                 default_weights: Optional[dict] = None):
+                 default_weights: Optional[dict] = None,
+                 config: Optional['AutoConfig'] = None):
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)
 
-        self.V = meta.get('V', 4101)
+        self.V = meta.get('V', getattr(config, 'vocab_size', 4101))
+        if config is None:
+            from eva.symbolic.auto_config import AutoConfig
+            config = AutoConfig()
+        self.config = config
 
         # Precomputed log-prob arrays from rebuild script
         self.morph_logprob = meta.get('morph_logprob', {})
@@ -56,10 +61,7 @@ class HeadsEnsemble:
         # Token counts for rare-token detection
         self.token_counts = np.asarray(meta.get('token_counts', np.ones(self.V)), dtype=np.int32)
 
-        self.default_weights = default_weights or {
-            'morph': 1.0, 'syntax': 1.0, 'transition': 2.0,
-            'semantic': 0.5, 'concept': 0.2, 'contra': 0.5,
-        }
+        self.default_weights = default_weights or dict(self.config.head_default_weights)
 
     def compute_weights(self, context: dict) -> dict:
         w = dict(self.default_weights)
@@ -73,21 +75,22 @@ class HeadsEnsemble:
         is_special = (flags >> 5) & 1
 
         if is_special:
-            w['transition'] = 5.0
-            for k in ['morph', 'syntax', 'semantic', 'concept', 'contra']:
+            w['transition'] = self.config.head_special_transition
+            for k in self.config.head_special_zero_heads:
                 w[k] = 0.0
         elif is_word_start:
-            w['syntax'] = 3.0; w['morph'] = 0.5; w['transition'] = 1.0; w['semantic'] = 0.5
+            w.update(self.config.head_word_start)
         elif is_word_end:
-            w['morph'] = 0.5; w['transition'] = 3.0; w['semantic'] = 1.0
+            w.update(self.config.head_word_end)
         elif pos_in_word > 0 and word_len > 2:
             frac = pos_in_word / max(word_len, 1)
             if 0.2 < frac < 0.8:
-                w['morph'] = 4.0; w['transition'] = 0.5
+                w.update(self.config.head_mid_word)
 
         if prev is not None and prev < self.V:
-            if int(self.token_counts[prev]) < 5:
-                w['semantic'] += 1.0; w['transition'] *= 0.3
+            if int(self.token_counts[prev]) < self.config.head_rare_token_threshold:
+                w['semantic'] += self.config.head_rare_semantic_boost
+                w['transition'] *= self.config.head_rare_transition_factor
 
         return w
 
@@ -104,20 +107,20 @@ class HeadsEnsemble:
         if piw in self.morph_logprob:
             out[0] = self.morph_logprob[piw]
         else:
-            out[0] = np.full(self.V, -7.0, dtype=np.float32)
+            out[0] = np.full(self.V, self.config.head_fallback_logprob, dtype=np.float32)
 
         # 1: syntax
         if wn in self.syntax_logprob:
             out[1] = self.syntax_logprob[wn]
         else:
-            out[1] = np.full(self.V, -7.0, dtype=np.float32)
+            out[1] = np.full(self.V, self.config.head_fallback_logprob, dtype=np.float32)
 
         # 2: transition
         if prev is not None and prev < self.V and self.log_prob_csr is not None:
             row = self.log_prob_csr[prev].tocoo()
             for col_idx, val in zip(row.col, row.data):
                 out[2, col_idx] = val
-        out[2][out[2] == 0] = -10.0  # unseen transitions get low score
+        out[2][out[2] == 0] = self.config.head_unseen_penalty  # unseen transitions get low score
 
         # 3: semantic
         if ctx_toks:
@@ -182,7 +185,7 @@ class HeadsEnsemble:
                 for ct in ctx[-3:]:
                     if ct < self.V:
                         penalty = np.maximum(penalty, self.contra_penalty[ct])
-                scores -= w * penalty * 2.0
+                scores -= w * penalty * self.config.head_contra_penalty_multiplier
 
         return scores
 

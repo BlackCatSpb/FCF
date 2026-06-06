@@ -8,7 +8,11 @@ from collections import defaultdict
 
 
 class PatternLearner:
-    def __init__(self, hv, ag, gates=None):
+    def __init__(self, hv, ag, gates=None, config=None):
+        if config is None:
+            from eva.symbolic.auto_config import AutoConfig
+            config = AutoConfig()
+        self.config = config
         self.hv = hv
         self.ag = ag
         self.gates = gates
@@ -44,12 +48,12 @@ class PatternLearner:
             seen_tids = []
             prev_c = None
             for t in tokens:
-                if t >= 4096:
+                if t >= self.config.bpe_limit:
                     continue
                 if self._tt[t] != 2:
                     continue
                 text = self.hv.decode([t]).strip()
-                if not text or len(text) <= 1:
+                if not text or len(text) < self.config.min_word_length:
                     continue
                 if text[0].isascii() and text[0].isalpha():
                     continue
@@ -71,7 +75,7 @@ class PatternLearner:
             s_type = sent.s_type if hasattr(sent, 's_type') and sent.s_type else 'statement'
             seq_counter[seq_key]['freq'] += 1
             seq_counter[seq_key]['s_type'] = s_type
-            if len(seq_counter[seq_key]['samples']) < 5:
+            if len(seq_counter[seq_key]['samples']) < self.config.pl_sample_cap:
                 sample_words = [self.hv.decode([t]).strip() for t in seen_tids]
                 seq_counter[seq_key]['samples'].append(' '.join(sample_words[:6]))
             
@@ -87,8 +91,8 @@ class PatternLearner:
         
         self.total_sentences = total
         
-        # Фильтр: только частые (>=3 повторов) и длиной 2-5 концептов
-        min_freq = 3
+        # Фильтр: только частые и допустимой длины
+        min_freq = self.config.pl_min_freq
         
         self.patterns = {}
         self.patterns_by_s_type = defaultdict(list)
@@ -98,16 +102,18 @@ class PatternLearner:
             if info['freq'] < min_freq:
                 continue
             n_concepts = sum(1 for c in seq_key if c >= 0)
-            if n_concepts < 2 or n_concepts > 5:
+            if n_concepts < self.config.pl_pattern_min_concepts or n_concepts > self.config.pl_pattern_max_concepts:
                 continue
             
+            weight = min(self.config.pl_weight_upper_bound,
+                         info['freq'] / self.config.pl_weight_norm_divisor)
             self.patterns[seq_key] = {
                 'freq': info['freq'],
                 's_type': info['s_type'],
                 'samples': info['samples'],
                 'n_words': n_concepts,
-                'weight': min(1.0, info['freq'] / 20.0),
-                'effective_freq': info['freq'] * min(1.0, info['freq'] / 20.0),
+                'weight': weight,
+                'effective_freq': info['freq'] * weight,
                 'success_count': 0,
                 'fail_count': 0,
                 'consecutive': 0,
@@ -159,7 +165,7 @@ class PatternLearner:
             eff = info.get('effective_freq', info['freq'])
             bonus = 0.0
             if s_type and info['s_type'] == s_type:
-                bonus = 0.5
+                bonus = self.config.pl_s_type_match_bonus
             return eff + bonus * eff
         
         candidates.sort(key=sort_key, reverse=True)
@@ -180,19 +186,21 @@ class PatternLearner:
         
         # Успех: усиливаем
         if success and match_ratio >= 0.5:
-            delta = 0.1 * (0.5 + 0.5 * match_ratio)
-            info['weight'] = min(1.0, info['weight'] + delta)
+            delta = self.config.pl_reinforcement_lr * (self.config.pl_reinforcement_offset +
+                                                        self.config.pl_reinforcement_offset * match_ratio)
+            info['weight'] = min(self.config.pl_weight_upper_bound, info['weight'] + delta)
             info['success_count'] = info.get('success_count', 0) + 1
             info['consecutive'] = info.get('consecutive', 0) + 1
             # Цепная реакция: после 3+ успехов подряд усиливаем ещё больше
             if info['consecutive'] >= 3:
-                info['weight'] = min(1.0, info['weight'] + 0.05)
+                info['weight'] = min(self.config.pl_weight_upper_bound,
+                                     info['weight'] + self.config.pl_chain_reaction_bonus)
         else:
             # Неудача: затухание
-            decay = 0.05
+            decay = self.config.pl_base_decay
             if not success:
-                decay = 0.1  # сильнее если не дошли до EOS
-            info['weight'] = max(0.1, info['weight'] - decay)
+                decay = self.config.pl_failure_decay  # сильнее если не дошли до EOS
+            info['weight'] = max(self.config.pl_weight_lower_bound, info['weight'] - decay)
             info['fail_count'] = info.get('fail_count', 0) + 1
             info['consecutive'] = 0
         
@@ -261,6 +269,63 @@ class PatternLearner:
             if dist:
                 return max(dist, key=dist.get)
         return 'statement'
+    
+    def save(self, path):
+        """Сохраняет паттерны в JSON с полной разметкой."""
+        import json
+        def tuple_key(k):
+            if isinstance(k, tuple):
+                return str(k)
+            return str(k)
+        data = {
+            'total_sentences': self.total_sentences,
+            'patterns': {tuple_key(k): v for k, v in self.patterns.items()},
+            'patterns_by_s_type': {k: [tuple_key(sk) for sk in v]
+                                   for k, v in self.patterns_by_s_type.items()},
+            'patterns_by_first': {tuple_key(k): [tuple_key(sk) for sk in v]
+                                  for k, v in self.patterns_by_first.items()},
+            'concept_s_type_dist': {str(k): dict(v)
+                                    for k, v in self.concept_s_type_dist.items()},
+            'token_s_type_dist': {str(k): dict(v)
+                                  for k, v in self.token_s_type_dist.items()},
+        }
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    
+    @classmethod
+    def load(cls, path, hv, ag, gates=None):
+        """Загружает паттерны из JSON."""
+        import json, ast
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        pl = cls(hv, ag, gates)
+        pl.total_sentences = data['total_sentences']
+        
+        def parse_key(k):
+            parsed = ast.literal_eval(k)
+            return tuple(parsed) if isinstance(parsed, (list, tuple)) else parsed
+        
+        pl.patterns = {}
+        for k, v in data['patterns'].items():
+            pl.patterns[parse_key(k)] = v
+        
+        pl.patterns_by_s_type = defaultdict(list)
+        for k, v in data['patterns_by_s_type'].items():
+            pl.patterns_by_s_type[k] = [parse_key(sk) for sk in v]
+        
+        pl.patterns_by_first = defaultdict(list)
+        for k, v in data['patterns_by_first'].items():
+            pl.patterns_by_first[int(k)] = [parse_key(sk) for sk in v]
+        
+        pl.concept_s_type_dist = defaultdict(lambda: defaultdict(int))
+        for k, v in data.get('concept_s_type_dist', {}).items():
+            pl.concept_s_type_dist[int(k)] = defaultdict(int, v)
+        
+        pl.token_s_type_dist = defaultdict(lambda: defaultdict(int))
+        for k, v in data.get('token_s_type_dist', {}).items():
+            pl.token_s_type_dist[int(k)] = defaultdict(int, v)
+        
+        return pl
     
     def get_s_type_distribution(self, level='concept'):
         """

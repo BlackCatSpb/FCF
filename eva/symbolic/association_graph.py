@@ -29,9 +29,13 @@ class AssociationGraph:
       members(c) → tokens — токены, входящие в концепт
     """
 
-    def __init__(self, n_clusters=48, n_metas=12):
-        self.n_clusters = n_clusters
-        self.n_metas = n_metas
+    def __init__(self, n_clusters=48, n_metas=12, config=None):
+        if config is None:
+            from eva.symbolic.auto_config import AutoConfig
+            config = AutoConfig()
+        self.config = config
+        self.n_clusters = n_clusters if n_clusters is not None else config.n_clusters
+        self.n_metas = n_metas if n_metas is not None else config.n_metas
         
         self.tid_to_cid = {}        # token_id -> concept_id (level 1)
         self.cid_to_tids = {}       # concept_id -> list[token_id]
@@ -58,12 +62,72 @@ class AssociationGraph:
         self.pmi = {}               # (ci, cj) -> PMI (log ratio over background)
         self.pmi_ci = {}            # ci -> [(cj, pmi)] sorted by PMI desc
         
-        # Offsets
-        self.L1_OFFSET = 4096
-        self.L2_OFFSET = 4096 + n_clusters
+        self.L1_OFFSET = self.config.bpe_limit
+        self.L2_OFFSET = self.config.bpe_limit + self.n_clusters
+
+    def _cluster_l1_hdbscan(self, emb_norm, starters):
+        """L1 concept clustering via HDBSCAN (density-based, auto cluster count)."""
+        import hdbscan
+        min_size = max(3, int(len(starters) * self.config.hdbscan_min_cluster_ratio))
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_size,
+            min_samples=1,
+            metric='euclidean',
+            cluster_selection_epsilon=0.3,
+            gen_min_span_tree=True,
+        )
+        labels = clusterer.fit_predict(emb_norm)
+        n_clusters = len(set(l for l in labels if l >= 0))
+        n_noise = sum(1 for l in labels if l < 0)
+        print(f"  HDBSCAN: {n_clusters} clusters, {n_noise} noise tokens")
+        return labels, clusterer
+
+    def _cluster_l1_kmeans(self, emb_norm, starters):
+        """L1 concept clustering via KMeans (fallback)."""
+        from sklearn.cluster import KMeans
+        k = min(self.n_clusters, len(starters)//2)
+        km = KMeans(n_clusters=k, random_state=self.config.random_state, n_init='auto')
+        labels = km.fit_predict(emb_norm)
+        print(f"  KMeans: {k} clusters")
+        return labels, km
+
+    def _cluster_l2_louvain(self):
+        """L2 meta-concept clustering via Louvain community detection on transition graph."""
+        import networkx as nx
+        from community import community_louvain
+        G = nx.Graph()
+        for (ci, cj), lp in self.transition.items():
+            w = math.exp(lp)
+            if w > 1e-6:
+                G.add_edge(ci, cj, weight=w)
+        partition = community_louvain.best_partition(G, weight='weight')
+        meta_labels = {}
+        for node, community_id in partition.items():
+            meta_labels[node] = community_id
+        n_metas = len(set(meta_labels.values()))
+        print(f"  Louvain: {n_metas} meta-communities")
+        return meta_labels, n_metas
+
+    def _cluster_l2_kmeans(self, cid_list):
+        """L2 meta-concept clustering via KMeans (fallback)."""
+        from sklearn.cluster import KMeans
+        nC = len(cid_list)
+        cid_to_row = {c: i for i, c in enumerate(cid_list)}
+        cmat = np.zeros((nC, nC), dtype=np.float32)
+        for (ci, cj), lp in self.transition.items():
+            ri, rj = cid_to_row.get(ci), cid_to_row.get(cj)
+            if ri is not None and rj is not None:
+                cmat[ri, rj] = math.exp(lp)
+        km2 = min(self.n_metas, max(2, nC//2))
+        km_meta = KMeans(n_clusters=km2, random_state=42, n_init='auto')
+        km_labels = km_meta.fit_predict(cmat)
+        meta_labels = {cid: km_labels[i] for i, cid in enumerate(cid_list)}
+        n_metas = km2
+        print(f"  KMeans: {n_metas} meta-clusters")
+        return meta_labels, n_metas
 
     def build(self, log_prob_csr, token_type, decode_fn=None):
-        V = min(4096, log_prob_csr.shape[0], len(token_type))
+        V = min(self.config.bpe_limit, log_prob_csr.shape[0], len(token_type))
         starters = [t for t in range(V) if token_type[t] == 2]
         print(f"Building AssociationGraph: {len(starters)} word starters")
         
@@ -72,20 +136,48 @@ class AssociationGraph:
         # Это семантически богаче, чем incoming (что предшествует токену)
         from scipy.sparse import vstack
         from sklearn.decomposition import TruncatedSVD
-        from sklearn.cluster import KMeans
         
         blocks = []
         for tid in starters:
             blocks.append(log_prob_csr[tid] if tid < log_prob_csr.shape[0] else csr_matrix((1, log_prob_csr.shape[1])))
         mat = vstack(blocks, format='csr')
         
-        ndim = min(32, len(starters)-1, mat.shape[1]-1)
-        svd = TruncatedSVD(n_components=ndim, random_state=42)
+        ndim = min(self.config.svd_dim, len(starters)-1, mat.shape[1]-1)
+        svd = TruncatedSVD(n_components=ndim, random_state=self.config.random_state)
         emb = svd.fit_transform(mat)
         
-        k = min(self.n_clusters, len(starters)//2)
-        km = KMeans(n_clusters=k, random_state=42, n_init='auto')
-        labels = km.fit_predict(emb)
+        # Normalize embeddings to unit length for angular clustering
+        emb_norm = emb.copy()
+        norms = np.linalg.norm(emb_norm, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        emb_norm /= norms
+
+        # L1 clustering: HDBSCAN (default) or KMeans (fallback)
+        method_l1 = self.config.cluster_method_l1
+        if method_l1 == 'hdbscan':
+            labels, clusterer = self._cluster_l1_hdbscan(emb_norm, starters)
+        else:
+            labels, clusterer = self._cluster_l1_kmeans(emb_norm, starters)
+
+        # Handle noise tokens from HDBSCAN: assign to nearest cluster
+        if method_l1 == 'hdbscan' and -1 in labels:
+            unique_labels = sorted(set(l for l in labels if l >= 0))
+            if unique_labels:
+                centroids = {}
+                for ul in unique_labels:
+                    mask = labels == ul
+                    centroids[ul] = emb_norm[mask].mean(axis=0)
+                for i in range(len(labels)):
+                    if labels[i] < 0:
+                        best_clust = min(unique_labels,
+                            key=lambda ul: np.linalg.norm(emb_norm[i] - centroids[ul]))
+                        labels[i] = best_clust
+
+        # Remap labels to contiguous 0..K-1
+        unique_labels = sorted(set(labels))
+        label_map = {old: new for new, old in enumerate(unique_labels)}
+        labels = np.array([label_map[l] for l in labels])
+        n_clusters_found = len(unique_labels)
         
         self.cid_to_tids = defaultdict(list)
         self.cid_profiles = {}
@@ -94,6 +186,7 @@ class AssociationGraph:
         self.starter_list = starters
         self.starter_embeddings = emb  # (n_starters, ndim)
         self.starter_token_to_idx = {tid: i for i, tid in enumerate(starters)}
+        self.n_clusters = n_clusters_found  # update actual cluster count
         
         for i, tid in enumerate(starters):
             cid = self.L1_OFFSET + int(labels[i])
@@ -102,10 +195,10 @@ class AssociationGraph:
         print(f"  Level 1: {len(self.cid_to_tids)} concept clusters")
         
         # Concept names + profiles: distance from centroid
-        for c in range(k):
+        for c in range(n_clusters_found):
             cid = self.L1_OFFSET + c
-            centroid = km.cluster_centers_[c]
             members = self.cid_to_tids[cid]
+            centroid = emb_norm[labels == c].mean(axis=0) if method_l1 == 'hdbscan' else clusterer.cluster_centers_[c]
             self.centroid_vectors[cid] = centroid
             
             best = min(members, key=lambda t: np.linalg.norm(
@@ -161,26 +254,24 @@ class AssociationGraph:
         nz = sum(len(v) for v in self.transition_ci.values())
         print(f"  Concept transitions: {nz}")
         
-        # --- Level 2: Meta-concepts (cluster concept transition vectors) ---
+        # --- Level 2: Meta-concepts ---
+        # Louvain community detection on transition graph (default)
+        # or KMeans on transition matrix (fallback)
         cid_list = sorted(self.cid_to_tids.keys())
-        cid_to_row = {c: i for i, c in enumerate(cid_list)}
-        nC = len(cid_list)
-        cmat = np.zeros((nC, nC), dtype=np.float32)
-        for (ci, cj), lp in self.transition.items():
-            ri, rj = cid_to_row.get(ci), cid_to_row.get(cj)
-            if ri is not None and rj is not None:
-                cmat[ri, rj] = math.exp(lp)
-        
-        km2 = min(self.n_metas, max(2, nC//2))
-        km_meta = KMeans(n_clusters=km2, random_state=42, n_init='auto')
-        meta_labels = km_meta.fit_predict(cmat)
+
+        method_l2 = self.config.cluster_method_l2
+        if method_l2 == 'louvain':
+            meta_labels_raw, n_metas_found = self._cluster_l2_louvain()
+        else:
+            meta_labels_raw, n_metas_found = self._cluster_l2_kmeans(cid_list)
         
         self.mid_to_cids = defaultdict(list)
-        for i, cid in enumerate(cid_list):
-            mid = self.L2_OFFSET + int(meta_labels[i])
+        for cid in cid_list:
+            raw_mid = meta_labels_raw.get(cid, 0)
+            mid = self.L2_OFFSET + int(raw_mid)
             self.cid_to_mid[cid] = mid
             self.mid_to_cids[mid].append(cid)
-            self.mid_label[mid] = f'M{meta_labels[i]}'
+            self.mid_label[mid] = f'M{raw_mid}'
         
         print(f"  Level 2: {len(self.mid_to_cids)} meta-concepts")
         
@@ -206,6 +297,8 @@ class AssociationGraph:
         for ci in self.pmi_ci:
             self.pmi_ci[ci].sort(key=lambda x: -x[1])  # sort by PMI desc
         
+        self._decode_fn = decode_fn  # keep for save/load
+        self._heads_csr = log_prob_csr  # keep for transition rebuilding
         self._print_summary(decode_fn)
         return self
 
@@ -222,6 +315,229 @@ class AssociationGraph:
             print(f"    C{cid - self.L1_OFFSET} ({name:10s}) [{len(members):3d}] "
                   f"meta={mname}: {txt}")
 
+    def online_update(self, new_embeddings=None, starter_tids=None):
+        """
+        Online concept update via BIRCH.
+        Called after SVD training to incrementally adjust concepts
+        without full recomputation.
+        
+        Args:
+            new_embeddings: (n, ndim) array of updated SVD vectors
+            starter_tids: list of token IDs corresponding to new_embeddings rows
+        """
+        from sklearn.cluster import Birch
+        emb = self.starter_embeddings
+        if new_embeddings is not None and starter_tids is not None:
+            emb = new_embeddings
+
+        emb_norm = emb.copy()
+        norms = np.linalg.norm(emb_norm, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        emb_norm /= norms
+
+        birch = Birch(
+            threshold=self.config.birch_threshold,
+            n_clusters=None,
+            compute_labels=True,
+        )
+        birch_labels = birch.fit_predict(emb_norm)
+
+        # Remap BIRCH labels to contiguous L1_OFFSET+c
+        unique = sorted(set(birch_labels))
+        label_map = {old: new for new, old in enumerate(unique)}
+        remapped = np.array([label_map[l] for l in birch_labels])
+        n_new = len(unique)
+
+        # Update concept structures
+        old_cids = set(self.cid_to_tids.keys())
+        self.cid_to_tids = defaultdict(list)
+        self.tid_to_cid = {}
+        self.centroid_vectors = {}
+        self.cid_profiles = {}
+        self.cid_top_tokens = {}
+        self.cid_label = {}
+
+        tids = starter_tids if starter_tids is not None else self.starter_list
+        for i, tid in enumerate(tids):
+            cid = self.L1_OFFSET + int(remapped[i])
+            self.tid_to_cid[tid] = cid
+            self.cid_to_tids[cid].append(tid)
+
+        for c in range(n_new):
+            cid = self.L1_OFFSET + c
+            members = self.cid_to_tids[cid]
+            mask = remapped == c
+            centroid = emb_norm[mask].mean(axis=0)
+            self.centroid_vectors[cid] = centroid
+            best = min(members, key=lambda t: np.linalg.norm(
+                emb[tids.index(t)] - centroid))
+            self.cid_label[cid] = 'B' + str(c)
+
+            profile = {}
+            dists = []
+            for t in members:
+                idx = tids.index(t)
+                dist = float(np.linalg.norm(emb[idx] - centroid))
+                w = math.exp(-dist * 2.0)
+                profile[t] = w
+                dists.append((t, w))
+            max_w = max(w for _, w in dists) if dists else 1.0
+            profile = {t: w / max_w for t, w in profile.items()}
+            self.cid_profiles[cid] = profile
+            self.cid_top_tokens[cid] = sorted(profile.items(), key=lambda x: -x[1])
+
+        # Rebuild transition matrix with new concept IDs
+        self._rebuild_transitions()
+        print(f"  BIRCH online update: {n_new} new concepts ({len(old_cids)} old)")
+
+    def _rebuild_transitions(self):
+        """Rebuild concept transition/PPMI after reclustering."""
+        self.transition = {}
+        self.transition_ci = defaultdict(list)
+        self.transition_cj = defaultdict(list)
+        self.pmi = {}
+        self.pmi_ci = defaultdict(list)
+
+        # Collect raw transitions from token-level log_prob_csr
+        if not hasattr(self, '_decode_fn'):
+            return
+        V = self.L1_OFFSET
+        trans_count = defaultdict(lambda: defaultdict(float))
+        src_total = defaultdict(float)
+        for tid in range(V):
+            ci = self.tid_to_cid.get(tid)
+            if ci is None:
+                continue
+            # Use stored CSR from heads if available
+            if hasattr(self, '_heads_csr'):
+                trans = _aggregate_row(self._heads_csr, tid, V)
+                for col, prob in trans.items():
+                    cj = self.tid_to_cid.get(col)
+                    if cj is None:
+                        continue
+                    trans_count[ci][cj] += math.exp(prob)
+                    src_total[ci] += math.exp(prob)
+
+        for ci in trans_count:
+            total = max(src_total.get(ci, 1e-10), 1e-10)
+            for cj, cnt in trans_count[ci].items():
+                prob = cnt / total
+                lp = math.log(max(prob, 1e-10))
+                self.transition[(ci, cj)] = lp
+                self.transition_ci[ci].append((cj, lp))
+                self.transition_cj[cj].append((ci, lp))
+
+        for ci in self.transition_ci:
+            self.transition_ci[ci].sort(key=lambda x: -x[1])
+        for cj in self.transition_cj:
+            self.transition_cj[cj].sort(key=lambda x: -x[1])
+
+    def save(self, path_prefix):
+        """Сохраняет AssociationGraph: pickle (данные) + JSON (разметка).
+        path_prefix: без расширения, создаст .pkl и .json
+        """
+        import pickle, json, os
+        decode_fn = getattr(self, '_decode_fn', None)
+        pkl_path = path_prefix + '.pkl'
+        json_path = path_prefix + '.json'
+        
+        data = {
+            'n_clusters': self.n_clusters,
+            'n_metas': self.n_metas,
+            'L1_OFFSET': self.L1_OFFSET,
+            'L2_OFFSET': self.L2_OFFSET,
+            'cluster_method_l1': self.config.cluster_method_l1,
+            'cluster_method_l2': self.config.cluster_method_l2,
+            'starter_list': self.starter_list,
+            'starter_embeddings': self.starter_embeddings,
+            'starter_token_to_idx': self.starter_token_to_idx,
+            'tid_to_cid': self.tid_to_cid,
+            'cid_to_tids': dict(self.cid_to_tids),
+            'cid_to_mid': self.cid_to_mid,
+            'mid_to_cids': dict(self.mid_to_cids),
+            'cid_label': self.cid_label,
+            'mid_label': self.mid_label,
+            'cid_profiles': self.cid_profiles,
+            'cid_top_tokens': self.cid_top_tokens,
+            'centroid_vectors': self.centroid_vectors,
+            'transition': self.transition,
+            'transition_ci': dict(self.transition_ci),
+            'transition_cj': dict(self.transition_cj),
+            'pmi': self.pmi,
+            'pmi_ci': dict(self.pmi_ci),
+        }
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(data, f, protocol=5)
+        
+        # Human-readable JSON markup
+        markup = {
+            'n_clusters': self.n_clusters,
+            'n_metas': self.n_metas,
+            'concepts': {},
+            'metas': {},
+            'transitions': {},
+        }
+        for cid in sorted(self.cid_to_tids.keys()):
+            c = cid - self.L1_OFFSET
+            name = self.cid_label.get(cid, f'C{c}')
+            mid = self.cid_to_mid.get(cid)
+            mname = self.mid_label.get(mid, '?') if mid else '?'
+            members = []
+            for t in self.cid_to_tids[cid][:10]:
+                txt = decode_fn([t]).strip() if decode_fn else str(t)
+                members.append({'tid': t, 'text': txt})
+            top_trans = []
+            for cj, lp in self.transition_ci.get(cid, [])[:5]:
+                cj_name = self.cid_label.get(cj, f'C{cj-self.L1_OFFSET}')
+                top_trans.append({'to': cj_name, 'prob': f'{math.exp(lp):.4f}'})
+            markup['concepts'][name] = {
+                'cluster': c,
+                'size': len(self.cid_to_tids[cid]),
+                'meta': mname,
+                'top_members': members,
+                'top_transitions': top_trans,
+            }
+        for mid in sorted(self.mid_to_cids.keys()):
+            mname = self.mid_label.get(mid, f'M{mid-self.L2_OFFSET}')
+            members = []
+            for cid in self.mid_to_cids[mid]:
+                cname = self.cid_label.get(cid, f'C{cid-self.L1_OFFSET}')
+                members.append(cname)
+            markup['metas'][mname] = {
+                'size': len(self.mid_to_cids[mid]),
+                'concepts': members,
+            }
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(markup, f, ensure_ascii=False, indent=2)
+        
+        print(f"AssociationGraph saved: {pkl_path} + {json_path}")
+    
+    @classmethod
+    def load(cls, path_prefix, n_clusters=48, n_metas=12):
+        """Загружает AssociationGraph из pickle."""
+        import pickle
+        pkl_path = path_prefix + '.pkl'
+        with open(pkl_path, 'rb') as f:
+            data = pickle.load(f)
+        ag = cls(n_clusters=data.get('n_clusters', n_clusters),
+                 n_metas=data.get('n_metas', n_metas))
+        for key, val in data.items():
+            if key in ('n_clusters', 'n_metas'):
+                continue
+            setattr(ag, key, val)
+        # Restore defaultdicts
+        if not isinstance(ag.cid_to_tids, defaultdict):
+            ag.cid_to_tids = defaultdict(list, ag.cid_to_tids)
+        if not isinstance(ag.mid_to_cids, defaultdict):
+            ag.mid_to_cids = defaultdict(list, ag.mid_to_cids)
+        if not isinstance(ag.transition_ci, defaultdict):
+            ag.transition_ci = defaultdict(list, ag.transition_ci)
+        if not isinstance(ag.transition_cj, defaultdict):
+            ag.transition_cj = defaultdict(list, ag.transition_cj)
+        if not isinstance(ag.pmi_ci, defaultdict):
+            ag.pmi_ci = defaultdict(list, ag.pmi_ci)
+        return ag
+    
     # ---- Query API ----
     def get_concept(self, tid):
         return self.tid_to_cid.get(tid)

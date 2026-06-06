@@ -7,6 +7,7 @@ from eva.symbolic.generation_loop import select_token
 from eva.symbolic.structural_rules import StructuralRules
 from eva.symbolic.gate_logic import GateLogic
 from eva.symbolic.pattern_learner import PatternLearner
+from eva.symbolic.auto_config import AutoConfig
 
 
 
@@ -134,10 +135,11 @@ class VectorGenerator:
     на piw>=1 — head-продолжение слова (как обычно).
     """
     
-    def __init__(self, heads_obj, assoc_graph, hv, rule_extractor=None):
+    def __init__(self, heads_obj, assoc_graph, hv, rule_extractor=None, config=None):
         self.heads = heads_obj
         self.ag = assoc_graph
         self.hv = hv
+        self.config = config or AutoConfig()
         self.vs = VectorSpace(assoc_graph, hv)
         
         # Rules
@@ -146,33 +148,23 @@ class VectorGenerator:
             self.rules = getattr(rule_extractor, 'affixation_rules', []) + \
                          getattr(rule_extractor, 'syntax_rules', [])
         
-        self.V = 4101
+        self.V = self.config.vocab_size
         self.tt = hv.token_type
         
         # Blocked tokens
-        self.REPLACEMENT_TOKENS = {100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114, 115, 116, 117, 118, 119,
-            120, 121, 122, 123, 124, 125, 126, 127, 128, 129,
-            130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
-            140, 141, 142, 143, 144, 145, 146, 147, 148, 149,
-            150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
-            160, 228, 229, 230, 231, 232, 233, 234, 235, 236,
-            237, 238, 239, 240, 241, 242, 243, 244, 245, 246,
-            247, 248, 249, 250, 251, 252, 253, 254, 255, 256,
-            257, 258, 259, 260, 261, 262, 272, 274, 277, 298,
-            299, 334, 1498}
-        self.IGNORED = {0, 1, 2, 4, 5}
-        self.BANNED = {3}
+        self.REPLACEMENT_TOKENS = self.config.replacement_tokens
+        self.IGNORED = self.config.ignored_tokens
+        self.BANNED = self.config.banned_tokens
         
         # Pattern Learner (самоорганизация шаблонов)
         self._pattern_learner = None
         self._pattern_learner_trained = False
         # Semantic coherence weight
-        self.sem_weight = 5.0
-        self.sem_boost_count = 5  # only boost top-5 SVD-nearest tokens
+        self.sem_weight = self.config.sem_weight
+        self.sem_boost_count = self.config.sem_boost_count
         
         # Binary structural matrix: heads → 1/0 (возможно/невозможно)
-        self._build_structural_matrix()
+        self._build_structural_matrix(min_prob=self.config.structural_min_prob)
         
         # StructuralRules for multi-level constraints
         self.structural_rules = None
@@ -181,63 +173,82 @@ class VectorGenerator:
         self.gates = None
         
         # Cross-sentence context tracking
-        self._prev_sentence_last_concept = -1   # cluster idx (0-47)
+        self._prev_sentence_last_concept = -1
         self._prev_sentence_type = 'start'
         
         # Precomputed: concept -> token_ids for fast lookup
-        self._concept_to_tids = {}  # cluster_idx -> set[tid]
+        self._concept_to_tids = {}
         self._build_concept_to_tids()
         
-        # Last content word tracking (for semantic context at word boundaries)
+        # Last content word tracking
         self._last_content_tid = -1
         
-        # ---- Word accumulation (for full-word semantic anchoring) ----
-        self._current_word_tokens = []  # tokens of current in-progress word
-        self._full_word_anchor = None   # (type2_tid, word_text) last complete word
+        # ---- Word accumulation ----
+        self._current_word_tokens = []
+        self._full_word_anchor = None
         
         # ---- ConceptNet-refined vectors ----
         self._refined_vectors_path = None
         
-        # ---- Word completion prefix map (type-2→type-3 semantic continuation) ----
-        self._prefix_type3_set = {} # prefix_tid -> set[type3_tid]
-        self._prefix_type2 = set()  # type-2 tokens that are prefixes (have type-3 continuations)
+        # ---- Word completion prefix map ----
+        self._prefix_type3_set = {}
+        self._prefix_type2 = set()
         self._build_word_prefix_map()
 
         # ---- Word completion state ----
-        self._word_prefix = -1        # type-2 prefix of current in-progress word
-        self._current_word_type3s = set()  # type-3 tokens already emitted for current word
+        self._word_prefix = -1
+        self._current_word_type3s = set()
 
-        # ---- Target tracking for repeat-after-me learning ----
-        self._target_tokens = None   # list of expected type-2 token IDs
-        self._target_pos = 0         # current position in target
-        self._target_matches = 0     # count of correctly matched words
+        # ---- Target tracking ----
+        self._target_tokens = None
+        self._target_pos = 0
+        self._target_matches = 0
         self._got_target_match = False
-        self._word_tabu = set()      # set of (prev_concept, wrong_concept) tuples for current pos
-        self._svd_lr = 0.03          # learning rate for SVD vector shifts
-    
-    def _build_structural_matrix(self):
+        self._word_tabu = set()
+        self._svd_lr = self.config.svd_lr
+        self._trained_vectors = None  # persistent training state
+
+        # ---- Combined learning state ----
+        self._token_freq = defaultdict(int)
+        self._token_momentum = {}
+        self._current_epoch = 0
+        
+    def _build_structural_matrix(self, min_prob=0.001):
         """Строит структурную матрицу: возможные transitions между type-2 токенами.
         Heads = не частоты, а факт существования перехода в данных.
         Каждый переход, который хоть раз встретился — структурно возможен.
+        Храним также log-prob веса для взвешенных structural scores.
+        min_prob: минимальная вероятность для включения перехода (pruning шума).
         """
         self.structural = {}  # tid_in -> set of tid_out that can follow
+        self.structural_weights = {}  # tid_in -> {tid_out: weight}
+        self.structural_min_prob = min_prob
         
         csr = self.heads.log_prob_csr
-        n_structural = 0
+        log_min = math.log(max(min_prob, 1e-10))
+        n_total = 0
+        n_pruned = 0
         for src in range(self.V):
             if src >= csr.shape[0]:
                 continue
             row = csr[src].tocoo()
             targets = set()
-            for col in row.col:
+            weights = {}
+            for col, val in zip(row.col, row.data):
                 if col < self.V:
-                    targets.add(int(col))
+                    n_total += 1
+                    if val >= log_min:  # keep if prob >= min_prob
+                        targets.add(int(col))
+                        weights[int(col)] = float(val)
+                    else:
+                        n_pruned += 1
             if targets:
                 self.structural[src] = targets
-                n_structural += len(targets)
+                self.structural_weights[src] = weights
+                n_structural = sum(len(v) for v in self.structural.values())
         
-        print("Structural matrix: %d transitions, %.1f avg per token" % (
-            n_structural, n_structural / max(len(self.structural), 1)))
+        print("Structural matrix: %d transitions (%d pruned below prob=%.3f), %.1f avg per token" % (
+            n_structural, n_pruned, min_prob, n_structural / max(len(self.structural), 1)))
         
         # Detect prefix type-2 tokens: those that have type-3 continuations
         self._prefix_type2 = set()
@@ -331,7 +342,7 @@ class VectorGenerator:
                 if sim > 0:
                     for tid3 in self._prefix_type3_set[prefix_tid]:
                         if valid_mask[tid3]:
-                            scores[tid3] = sim * 8.0
+                            scores[tid3] = sim * self.config.prefix_type3_boost
 
         for prefix_tid in self._prefix_type3_set:
             if not valid_mask[prefix_tid]:
@@ -339,7 +350,7 @@ class VectorGenerator:
             if self.vs.has_vector(prefix_tid):
                 sim = self.vs.similarity(prefix_tid, content_token)
                 if sim > 0:
-                    scores[prefix_tid] = sim * 4.0
+                    scores[prefix_tid] = sim * self.config.prefix_boost_weight
 
         return scores
 
@@ -370,7 +381,7 @@ class VectorGenerator:
         valid_type3 = self._prefix_type3_set.get(prefix_tid, set())
         for tid3 in valid_type3:
             if valid_mask[tid3]:
-                scores[tid3] = sim * 1.0
+                scores[tid3] = sim * self.config.cont_sem_weight
         
         return scores
     
@@ -381,21 +392,67 @@ class VectorGenerator:
         self.structural_rules = StructuralRules()
         self.structural_rules.load(path)
 
+    def save_refined_vectors(self, path, metadata=None):
+        """Save SVD vectors with metadata markup."""
+        import pickle, json, os
+        data = {
+            'vectors': dict(self.vs.token_vectors),
+            'metadata': metadata or {},
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(data, f, protocol=5)
+        # Also save human-readable JSON
+        json_path = path.replace('.pkl', '.json')
+        markup = {
+            'dim': self.vs.dim,
+            'n_tokens': len(self.vs.token_vectors),
+            'tokens': {},
+            'metadata': metadata or {},
+        }
+        for tid, vec in self.vs.token_vectors.items():
+            if tid >= len(self.tt) or self.tt[tid] != 2:
+                continue
+            text = self.hv.decode([tid]).strip() if hasattr(self, 'hv') and self.hv else str(tid)
+            cid = self.ag.get_concept(tid) if hasattr(self, 'ag') and self.ag else None
+            cluster = (cid - self.ag.L1_OFFSET) if cid is not None else None
+            cname = self.ag.cid_label.get(cid, f'C{cluster}') if (cid is not None and hasattr(self.ag, 'cid_label')) else None
+            markup['tokens'][text] = {
+                'tid': tid,
+                'concept': cluster,
+                'concept_name': cname,
+                'norm': float(np.linalg.norm(vec)),
+            }
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(markup, f, ensure_ascii=False, indent=2)
+        print(f'Refined vectors saved: {len(data["vectors"])} tokens ({self.vs.dim}d) + markup')
+    
     def load_refined_vectors(self, path):
-        """Load ConceptNet-refined SVD vectors. Overrides per-token vectors in vs."""
-        import pickle, os
+        """Load ConceptNet-refined SVD vectors. Overrides per-token vectors in vs.
+        Supports both old format ({tid: vec}) and new format ({'vectors': ..., 'metadata': ...})."""
+        import pickle, os, json
         if not path or not os.path.exists(path):
             print(f'WARNING: refined vectors not found at {path}')
             return
         with open(path, 'rb') as f:
             refined = pickle.load(f)
+        if isinstance(refined, dict) and 'vectors' in refined:
+            vectors = refined['vectors']
+            meta = refined.get('metadata', {})
+        else:
+            vectors = refined
+            meta = {}
         n_overridden = 0
-        for tid, vec in refined.items():
+        for tid, vec in vectors.items():
             if tid in self.vs.token_vectors:
-                self.vs.token_vectors[tid] = vec.astype(np.float32)
+                self.vs.token_vectors[tid] = np.array(vec, dtype=np.float32)
                 n_overridden += 1
         self._refined_vectors_path = path
-        print(f'Refined vectors loaded: {n_overridden}/{len(refined)} overridden')
+        self._refined_metadata = meta
+        # Initialize training state from refined vectors
+        self._trained_vectors = {tid: v.copy() for tid, v in self.vs.token_vectors.items()}
+        print(f'Refined vectors loaded: {n_overridden}/{len(vectors)} overridden')
+        if meta:
+            print(f'  Metadata: {json.dumps(meta, ensure_ascii=False)[:200]}')
 
     def _concepts_for_prev(self, prev_concept_cluster):
         """Get valid next concept clusters for cross-sentence transition."""
@@ -455,7 +512,7 @@ class VectorGenerator:
         for t in self.IGNORED | self.BANNED | self.REPLACEMENT_TOKENS:
             if t < self.V:
                 mask[t] = False
-        for t in range(4096, self.V):
+        for t in range(self.config.bpe_limit, self.V):
             mask[t] = False
         
         pos_in_word = ctx.get('pos_in_word', -1)
@@ -477,16 +534,15 @@ class VectorGenerator:
                 for tid in range(self.V):
                     if tid < len(self.tt) and self.tt[tid] == 2:
                         text = self.hv.decode([tid]).strip()
-                        if len(text) <= 1:
+                        if len(text) < self.config.first_word_min_length:
                             mask[tid] = False
-            
+
             # ПРАВИЛО: на wn >= 2 блокировать function words
             if word_num >= 2:
-                function_words = {'в', 'с', 'к', 'у', 'о', 'и', 'а', '–', '—', '1', '0'}
                 for tid in range(self.V):
                     if tid < len(self.tt) and self.tt[tid] == 2:
                         text = self.hv.decode([tid]).strip().lower()
-                        if text in function_words:
+                        if text in self.config.function_words:
                             mask[tid] = False
             
             # Блокировать латинские буквы (не русский контент)
@@ -497,11 +553,18 @@ class VectorGenerator:
                         mask[tid] = False
             
             # Блокировать любые type-2 короче 3 букв (обрубки вроде "пр", "См", "пл")
+            # Но: если есть активный target, разрешаем ожидаемый токен даже если короткий
+            expected_tid = -1
+            if (hasattr(self, '_target_tokens') and self._target_tokens is not None
+                and hasattr(self, '_target_pos') and self._target_pos >= 0
+                and self._target_pos < len(self._target_tokens)):
+                expected_tid = self._target_tokens[self._target_pos]
             for tid in range(self.V):
                 if tid < len(self.tt) and self.tt[tid] == 2:
                     text = self.hv.decode([tid]).strip()
-                    if len(text) < 3:
-                        mask[tid] = False
+                    if len(text) < self.config.min_word_length:
+                        if tid != expected_tid:
+                            mask[tid] = False
         
         # piw≥1: WORD_CONT — allow type-2 (new word), type-3 (structural cont), EOS
         if pos_in_word >= 1:
@@ -523,9 +586,14 @@ class VectorGenerator:
 
         # На piw=0 после префикса: разрешить только type-3 продолжения,
         # блокировать все type-2 (слово должно быть завершено через type-3)
+        # НО: если слово не было продлено type-3 (в _current_word_tokens только 1 токен
+        # и used_type3s пуст), значит слово уже полное — разрешаем type-2
         if pos_in_word == 0:
             prev_tid = ctx.get('token_id', -1)
-            if prev_tid >= 0 and prev_tid in self._prefix_type3_set:
+            word_in_progress = hasattr(self, '_current_word_tokens') and self._current_word_tokens
+            used_type3s = ctx.get('used_type3s', set())
+            word_was_extended = len(used_type3s) > 0 or (word_in_progress and hasattr(self, '_current_word_tokens') and len(self._current_word_tokens) > 1)
+            if prev_tid >= 0 and prev_tid in self._prefix_type3_set and word_was_extended:
                 for tid in range(self.V):
                     if tid < len(self.tt) and self.tt[tid] == 2:
                         mask[tid] = False
@@ -533,9 +601,18 @@ class VectorGenerator:
                     if tid3 < self.V:
                         mask[tid3] = True
         
-        # EOS разрешён в конце слова
+        # EOS разрешён в конце слова, НО: не если текущий префикс имеет
+        # непотраченные type-3 продолжения (слово не закончено)
         if is_word_end and word_num >= 2:
-            mask[3] = True
+            allow_eos = True
+            word_prefix = ctx.get('word_prefix', -1)
+            used_type3s = ctx.get('used_type3s', set())
+            if word_prefix >= 0 and word_prefix in self._prefix_type3_set:
+                remaining = self._prefix_type3_set[word_prefix] - used_type3s
+                if remaining:
+                    allow_eos = False  # prefix incomplete
+            if allow_eos:
+                mask[3] = True
         
         # Антиповтор: блокировать слово, уже появившееся в последних 15 токенах
         if pos_in_word == 0:
@@ -569,10 +646,8 @@ class VectorGenerator:
             pl = getattr(self, '_pattern_learner', None)
             if pl is not None and pl.token_s_type_dist:
                 s_type_names = []
-                type_map_rev = {0: 'statement', 1: 'question', 2: 'exclamation',
-                                3: 'dialogue', 4: 'start'}
                 for sid in valid_s_types:
-                    name = type_map_rev.get(sid)
+                    name = self.config.s_type_map_rev.get(sid)
                     if name:
                         s_type_names.append(name)
                 for tid in range(self.V):
@@ -602,7 +677,7 @@ class VectorGenerator:
             key = ' ' + word_text
             encoded = self.hv.encode(key)
             for t in encoded:
-                if t < 4096 and self.tt[t] == 2:
+                if t < self.config.bpe_limit and self.tt[t] == 2:
                     decoded = self.hv.decode([t]).strip()
                     if decoded == word_text:
                         return t
@@ -610,13 +685,13 @@ class VectorGenerator:
                         return t
             
             # Fallback: shorter prefixes
-            for p_len in range(min(len(word_text)-1, 10), 0, -1):
+            for p_len in range(min(len(word_text)-1, self.config.prefix_fallback_max_len), 0, -1):
                 if p_len < 2:
                     break
                 prefix = word_text[:p_len]
                 encoded = self.hv.encode(' ' + prefix)
                 for t in encoded:
-                    if t < 4096 and self.tt[t] == 2:
+                    if t < self.config.bpe_limit and self.tt[t] == 2:
                         decoded = self.hv.decode([t]).strip()
                         if word_text.startswith(decoded) and len(decoded) > 1:
                             return t
@@ -627,7 +702,7 @@ class VectorGenerator:
     
     def _is_content_token(self, tid):
         """Проверяет, что токен — content word (многобуквенный type-2)."""
-        if tid >= 4096 or tid < 0:
+        if tid >= self.config.bpe_limit or tid < 0:
             return False
         if tid >= len(self.tt) or self.tt[tid] != 2:
             return False
@@ -653,7 +728,7 @@ class VectorGenerator:
         word_count = 0
         prev_cluster = None
         for t in tokens:
-            if t >= 4096:
+            if t >= self.config.bpe_limit:
                 continue
             if self.tt[t] != 2:
                 continue
@@ -721,13 +796,14 @@ class VectorGenerator:
         
         # В конце пути — форсируем EOS
         if expected_cluster == -1:
-            if 3 < self.V and valid[3]:
-                scores[3] = 10.0
+            eos_id = self.config.eos_token_id
+            if eos_id < self.V and valid[eos_id]:
+                scores[eos_id] = self.config.example_eos_boost
             return scores
         
         # Буст конкретного токена из примера
         if expected_tid >= 0 and expected_tid < self.V and valid[expected_tid]:
-            scores[expected_tid] = 12.0
+            scores[expected_tid] = self.config.example_token_boost
         
         # Буст остальных токенов из концепта
         if 0 <= expected_cluster < self.ag.n_clusters:
@@ -735,29 +811,28 @@ class VectorGenerator:
             members = self.ag.cid_to_tids.get(cid_full, [])
             for tid in members:
                 if tid < self.V and valid[tid] and scores[tid] == 0.0:
-                    scores[tid] = 6.0
+                    scores[tid] = self.config.example_concept_boost
 
 
     def _word_importance(self, tid):
         if tid >= len(self.tt) or self.tt[tid] != 2:
             return 0.0
         text = self.hv.decode([tid]).strip()
-        if not text or len(text) <= 2:
+        if not text or len(text) <= self.config.min_word_length:
             return 0.0
         if text[0].isascii() and text[0].isalpha():
             return 0.0
         l = len(text)
-        if l >= 6:
-            return 1.0
-        if l >= 4:
-            cid = self.ag.get_concept(tid)
-            if cid is not None:
-                cluster = cid - self.ag.L1_OFFSET
-                members = self.ag.get_members(cluster)
-                if len(members) >= 10:
-                    return 1.0
-            return 0.7
-        return 0.3
+        for threshold, score in sorted(self.config.word_importance_tiers, reverse=True):
+            if l >= threshold:
+                cid = self.ag.get_concept(tid)
+                if cid is not None and threshold >= 4:
+                    cluster = cid - self.ag.L1_OFFSET
+                    members = self.ag.get_members(cluster)
+                    if len(members) >= self.config.concept_member_count_threshold:
+                        return 1.0
+                return score
+        return self.config.word_importance_tiers[-1][1]
 
     def _select_spine(self, ctx, prev_sent_concept=-1, seed_word=None):
         spine = []
@@ -767,7 +842,7 @@ class VectorGenerator:
         if seed_word:
             seed_tokens = hv.encode(' ' + seed_word)
             for t in seed_tokens:
-                if t < 4096 and self.tt[t] == 2:
+                if t < self.config.bpe_limit and self.tt[t] == 2:
                     c = ag.get_concept(t)
                     if c is not None:
                         cur_cid = c - ag.L1_OFFSET
@@ -797,7 +872,7 @@ class VectorGenerator:
                 if not members:
                     continue
                 for tid in members:
-                    if not self._is_content_token(tid) or tid >= 4096:
+                    if not self._is_content_token(tid) or tid >= self.config.bpe_limit:
                         continue
                     if self._word_importance(tid) >= 0.7 and len(hv.decode([tid]).strip()) >= 3:
                         best_cj = cj
@@ -812,7 +887,7 @@ class VectorGenerator:
             best_tid = None
             best_score = -1.0
             for tid in members:
-                if not self._is_content_token(tid) or tid >= 4096:
+                if not self._is_content_token(tid) or tid >= self.config.bpe_limit:
                     continue
                 imp = self._word_importance(tid)
                 if imp < 0.7:
@@ -820,7 +895,7 @@ class VectorGenerator:
                 txt = hv.decode([tid]).strip()
                 if len(txt) < 3:
                     continue
-                score = imp * (1.0 if best_tid is None else 0.9)
+                score = imp * (1.0 if best_tid is None else self.config.spine_tie_break_decay)
                 if score > best_score:
                     best_score = score
                     best_tid = tid
@@ -842,14 +917,14 @@ class VectorGenerator:
         for sp_idx, (tid, cid, role) in enumerate(spine):
             if sp_idx <= word_num <= sp_idx + 1:
                 if tid < self.V and valid_mask[tid]:
-                    scores[tid] = 3.0
+                    scores[tid] = self.config.spine_boost
         return scores
 
     def _structural_scores(self, ctx, prev_token, valid_mask, prev_sentence_concept=-1,
                            paragraph_topic=None):
         """
-        Структурные scores (БЕЗ частотного bias).
-        На piw=0: все transitions из structural matrix равны (1.0).
+        Структурные scores (взвешенные по log-prob).
+        На piw=0: все transitions из structural matrix взвешены по prob.
           Если это первое слово после EOS, дополнительно фильтруем
           по cross-sentence concept rules + paragraph topic.
         На piw>=1: все type-3 токены равны.
@@ -862,16 +937,19 @@ class VectorGenerator:
             is_word_end = (flags >> 1) & 1
             word_num = ctx.get('word_num', -1)
             
-            # Structural: any observed transition = equally valid
+            # Structural: weighted by log-prob from heads
             allowed = self.structural.get(prev_token, set())
+            weights = self.structural_weights.get(prev_token, {})
             for tid in allowed:
                 if tid < self.V and valid_mask[tid]:
-                    scores[tid] = 1.0
+                    w = weights.get(tid, 0.0)
+                    prob = np.exp(min(w, 0.0))  # log-prob -> prob
+                    scores[tid] = max(prob, self.config.structural_score_floor)
             
-            # EOS: mark structurally valid (score = structural base 1.0)
-            # Actual EOS selection is handled in generate_step via separate probability
+            # EOS: weighted by transition from prev_token to EOS
             if valid_mask[3]:
-                scores[3] = 1.0
+                eos_w = self.structural_weights.get(prev_token, {}).get(3, 0.0)
+                scores[3] = max(np.exp(min(eos_w, 0.0)), 0.01)
             
             # Cross-sentence concept constraint: at sentence start
             if prev_sentence_concept >= 0 and prev_token == 3:
@@ -904,12 +982,15 @@ class VectorGenerator:
         else:
             # Continuation: only structurally valid type-3 tokens
             allowed = self.structural.get(prev_token, set())
+            weights = self.structural_weights.get(prev_token, {})
             for tid in allowed:
                 if tid < self.V and valid_mask[tid]:
-                    scores[tid] = 1.0
+                    w = weights.get(tid, 0.0)
+                    prob = np.exp(min(w, 0.0))
+                    scores[tid] = max(prob, self.config.structural_score_floor)
             # EOS also valid at word boundary
-            if valid_mask[3] and ctx.get('flags', 0) >> 1 & 1:
-                scores[3] = 1.0
+            if valid_mask[self.config.eos_token_id] and ctx.get('flags', 0) >> 1 & 1:
+                scores[self.config.eos_token_id] = self.config.eos_structural_baseline
         
         return scores
     
@@ -942,7 +1023,7 @@ class VectorGenerator:
             return scores
         
         # Semantic boost: топ-50 SVD-ближайших, boosting только content-токены
-        similar = self.vs.topk_similar(anchor, k=50)
+        similar = self.vs.topk_similar(anchor, k=self.config.semantic_topk)
         content_boosted = 0
         for tid, sim in similar:
             if content_boosted >= self.sem_boost_count:
@@ -960,8 +1041,42 @@ class VectorGenerator:
     def _find_speech_anchor(self, s_type):
         """Choose response verb anchor for sentence-type semantic boost."""
         if s_type in ('dialogue', 'question'):
-            return 475  # сказал — universal speech verb
+            return self.config.speech_verb_anchor  # сказал — universal speech verb
         return -1
+    
+    def _anti_chain_penalty(self, context_tokens, scores, valid_mask, window=None,
+                             multiplier=None):
+        """
+        Anti-chain: если концепт кандидата уже был в последних N словах (content words),
+        умножаем его score на multiplier (по умолчанию из config).
+        window — количество content words, не BPE-токенов.
+        """
+        if window is None:
+            window = self.config.anti_chain_window
+        if multiplier is None:
+            multiplier = self.config.anti_chain_multiplier
+        if not context_tokens or len(context_tokens) < 3:
+            return scores
+        # Scan backward through BPE tokens, counting content words (type-2)
+        recent_concepts = set()
+        content_found = 0
+        for tid in reversed(context_tokens):
+            if tid < len(self.tt) and self.tt[tid] == 2:
+                cid = self.ag.get_concept(tid)
+                if cid is not None:
+                    recent_concepts.add(cid)
+                content_found += 1
+                if content_found >= window:
+                    break
+        if not recent_concepts:
+            return scores
+        for tid in range(self.V):
+            if not valid_mask[tid] or not np.isfinite(scores[tid]):
+                continue
+            cid = self.ag.get_concept(tid)
+            if cid is not None and cid in recent_concepts:
+                scores[tid] *= multiplier
+        return scores
     
     def _sentence_type_boost(self, ctx, valid_mask, prev_sentence_type=None,
                              words_in_sentence=0):
@@ -1022,22 +1137,21 @@ class VectorGenerator:
         if not outgoing:
             return scores
 
-        top_k = min(5, len(outgoing))
+        top_k = min(self.config.pmi_topk, len(outgoing))
         top_transitions = sorted(outgoing, key=lambda x: -x[1])[:top_k]
         for cj_id, log_prob in top_transitions:
             members = self.ag.cid_to_tids.get(cj_id, [])
             boost = float(np.exp(log_prob))
-            if boost < 0.01:
+            if boost < self.config.pmi_boost_floor:
                 continue
-            # Tabu: если этот концепт уже был неправильно выбран на этой позиции — штраф
             penalty = 0.0
             for c_exp, c_wrong in self._word_tabu:
                 if cj_id == c_wrong:
-                    penalty = -10.0
+                    penalty = self.config.concept_pmi_tabu
                     break
             for tid in members:
                 if tid < self.V and valid_mask[tid]:
-                    scores[tid] += boost * 3.0 + penalty
+                    scores[tid] += boost * self.config.concept_pmi_weight + penalty
 
         return scores
     
@@ -1066,6 +1180,16 @@ class VectorGenerator:
         else:
             structural = self._structural_scores(ctx, prev_token, valid, prev_sentence_concept,
                                                  paragraph_topic)
+        
+        # 2a. Target override: если есть активный target, форсируем ожидаемый токен
+        if (hasattr(self, '_target_tokens') and self._target_tokens is not None
+            and hasattr(self, '_target_pos') and self._target_pos >= 0
+            and self._target_pos < len(self._target_tokens)
+            and ctx.get('pos_in_word', -1) == 0):
+            expected_tid = self._target_tokens[self._target_pos]
+            if expected_tid < self.V:
+                structural[expected_tid] = self.config.target_override  # high structural score
+                valid[expected_tid] = True       # force-valid
         
         # 3. Семантические scores (SVD-близость к последнему content word)
         semantic = self._semantic_scores(ctx, prev_token, content_token, valid)
@@ -1097,15 +1221,25 @@ class VectorGenerator:
         if hasattr(self.heads, 'individual_scores'):
             try:
                 hs = self.heads.individual_scores(ctx)
-                hw = np.array([0.5, 0.5, 0.3, 0.3, 0.2, 0.1], dtype=np.float32)
+                hw = np.array(self.config.heads_integrated_weights, dtype=np.float32)
                 scores6 = np.dot(hw, hs)
                 for tid in range(self.V):
                     if valid[tid] and np.isfinite(scores6[tid]):
-                        head_scores[tid] = scores6[tid] * 0.2
+                        head_scores[tid] = scores6[tid] * self.config.heads_integrated_scale
             except:
                 pass
         
-        # 11. Комбинируем: structural + semantic + concept + s_type + prefix + cont_sem + spine + example + heads
+        # 10a. Target boost: если есть target, на piw=0 бустим ожидаемый токен
+        target_boost = np.zeros(self.V, dtype=np.float32)
+        if (hasattr(self, '_target_tokens') and self._target_tokens is not None
+            and hasattr(self, '_target_pos') and self._target_pos >= 0
+            and self._target_pos < len(self._target_tokens)):
+            if ctx.get('pos_in_word', -1) == 0:
+                expected_tid = self._target_tokens[self._target_pos]
+                if expected_tid < self.V and valid[expected_tid]:
+                    target_boost[expected_tid] = self.config.target_boost  # strong direct boost
+        
+        # 11. Комбинируем: structural + semantic + concept + s_type + prefix + cont_sem + spine + example + heads + target
         scores = structural.copy()
         for tid in range(self.V):
             if not valid[tid]:
@@ -1129,7 +1263,13 @@ class VectorGenerator:
                 base += example_boost[tid]
             if head_scores[tid] != 0.0:
                 base += head_scores[tid]
+            if target_boost[tid] != 0.0:
+                base += target_boost[tid]
             scores[tid] = base
+        
+        # 11a. Anti-chain penalty: штрафуем повтор концепта в последних 15 токенах
+        context_tokens = ctx.get('context_tokens', [])
+        scores = self._anti_chain_penalty(context_tokens, scores, valid)
         
         # 11. Стена
         scores[~valid] = -np.inf
@@ -1140,17 +1280,20 @@ class VectorGenerator:
         is_word_end = (flags >> 1) & 1
         word_num = ctx.get('word_num', -1)
         
-        if is_word_end and word_num >= 4:
+        if is_word_end and word_num >= self.config.eos_min_words:
             import random as _random
-            # Slower EOS curve: 1% × word_num, max 0.25
-            p_eos = min(0.25, 0.01 * (word_num - 3))
-            if _random.random() < p_eos:
-                return 3, {
-                    "valid_tokens": int(valid.sum()),
-                    "chosen": 3,
-                    "chosen_text": "<<$>>",
-                    "reasons": ["EOS(%.2f)" % p_eos]
-                }
+            target_active = (hasattr(self, '_target_tokens') and self._target_tokens is not None
+                            and hasattr(self, '_target_pos') and self._target_pos >= 0
+                            and self._target_pos < len(self._target_tokens))
+            if not target_active:
+                p_eos = self.config.eos_probability(word_num)
+                if _random.random() < p_eos:
+                    return 3, {
+                        "valid_tokens": int(valid.sum()),
+                        "chosen": 3,
+                        "chosen_text": "<<$>>",
+                        "reasons": ["EOS(%.2f)" % p_eos]
+                    }
         
         # 13. Fallback если всё -inf
         if not np.any(np.isfinite(scores)):
@@ -1200,42 +1343,103 @@ class VectorGenerator:
         
         return next_tok, explanation
     
-    def _check_target_match(self, word_anchor, content_token):
-        """Сравнить сгенерированное слово с target. При совпадении — SVD-усиление."""
-        self._got_target_match = False
+    def _check_target_match(self, word_anchor, context_tokens):
+        """Сравнить сгенерированное слово с target. SVD shift на sequential connectedness."""
         if self._target_tokens is None or word_anchor < 0:
             return
         if self._target_pos >= len(self._target_tokens):
             return
         
         expected = self._target_tokens[self._target_pos]
+        # Find context anchor that is NOT word_anchor itself
+        ctx_anchor = -1
+        for tid in reversed(context_tokens):
+            if tid != word_anchor and tid < self.config.bpe_limit and self.tt[tid] == 2 and self.vs.has_vector(tid):
+                ctx_anchor = tid
+                break
+        if ctx_anchor < 0:
+            return
+        
         if word_anchor == expected:
-            # Совпало! Усилить семантическую связь
+            # Совпало! Усилить семантическую связь + sequential connectedness
             self._target_matches += 1
             self._target_pos += 1
             self._word_tabu.clear()
             self._got_target_match = True
-            
-            # SVD shift: pull correct word vector toward context
-            if content_token >= 0 and self.vs.has_vector(word_anchor) and self.vs.has_vector(content_token):
-                v_word = self.vs.token_vectors[word_anchor]
-                v_ctx = self.vs.token_vectors[content_token]
-                shift = (v_ctx - v_word) * self._svd_lr
-                self.vs.token_vectors[word_anchor] += shift
-                norm = np.linalg.norm(self.vs.token_vectors[word_anchor])
-                if norm > 0:
-                    self.vs.token_vectors[word_anchor] /= norm
-            # Don't call observe_online here — it's already called in the main loop
+            self._token_freq[word_anchor] += 1
+            self._svd_shift(word_anchor, ctx_anchor, is_match=True)
         else:
+            self._got_target_match = False
             # Не совпало: запомнить неправильный концепт для блокировки
             c_wrong = self.ag.get_concept(word_anchor)
             c_expected = self.ag.get_concept(expected)
             if c_wrong is not None and c_expected is not None:
                 self._word_tabu.add((c_expected, c_wrong))
-            # Не продвигаем target_pos — остаёмся на позиции для следующей попытки
-    
+            
+            # Sequential connectedness: even wrong words learn position
+            self._svd_shift(word_anchor, ctx_anchor, is_match=False)
+
+    def _context_anchor(self, context_tokens):
+        """Find last type-2 token with a vector in context for SVD shift."""
+        for tid in reversed(context_tokens):
+            if tid < self.config.bpe_limit and self.tt[tid] == 2 and self.vs.has_vector(tid):
+                return tid
+        return -1
+
+
+    def _svd_shift(self, word_tid, ctx_anchor, is_match=False):
+        """
+        Sequential connectedness SVD shift.
+        
+        Focus on UNSUCCESSFUL words: non-matched words get full learning signal,
+        already-correct words get minimal shift to preserve their position.
+        
+        Every word learns sequential structure (what follows what in sentence),
+        but non-matches get 5x more update than matches.
+        """
+        if word_tid < 0 or ctx_anchor < 0:
+            return
+        if not self.vs.has_vector(word_tid) or not self.vs.has_vector(ctx_anchor):
+            return
+        
+        v_word = self.vs.token_vectors[word_tid]
+        v_ctx = self.vs.token_vectors[ctx_anchor]
+        
+        # Frequency-based adaptive LR
+        freq = self._token_freq.get(word_tid, 1)
+        adaptive_lr = self._svd_lr / (1.0 + 0.1 * math.sqrt(freq))
+        
+        # Non-match: full learning signal (needs to learn)
+        # Match: minimal shift (already correct, preserve it)
+        total_scale = 0.2 if is_match else 1.0
+        effective_lr = adaptive_lr * total_scale
+        
+        # Oja scaling: cosine similarity determines update strength
+        y = self.vs.similarity(word_tid, ctx_anchor)
+        y = max(y, 0.05)
+        
+        # Positive shift: pull word toward its context
+        shift = (v_ctx - v_word) * effective_lr * y
+        
+        # Momentum buffer
+        beta = self.config.svd_momentum_beta
+        if word_tid not in self._token_momentum:
+            self._token_momentum[word_tid] = np.zeros_like(v_word)
+        self._token_momentum[word_tid] = (
+            beta * self._token_momentum[word_tid] + (1.0 - beta) * shift
+        )
+        
+        # Apply momentum update
+        self.vs.token_vectors[word_tid] += self._token_momentum[word_tid]
+        
+        # Normalize
+        norm = np.linalg.norm(self.vs.token_vectors[word_tid])
+        if norm > 0:
+            self.vs.token_vectors[word_tid] /= norm
+
     def generate(self, max_tokens=40, seed_word=None, target_composition=None, temperature=0.5,
-                 example=None, auto_pattern=False, text_hierarchy=None, target_text=None):
+                 example=None, auto_pattern=False, text_hierarchy=None, target_text=None,
+                 training_mode=False):
         """
         Генерация: structural + semantic, без frequency bias.
         
@@ -1243,6 +1447,7 @@ class VectorGenerator:
         target_composition: [(word, weight), ...] — целевая композиция (опционально)
         example: строка-пример для подражания (опционально)
         target_text: строка-цель для имитационного обучения (опционально)
+        training_mode: если True, SVD-сдвиги накапливаются в _trained_vectors
         """
         tokens = [2]  # BOS
         explanations = []
@@ -1250,6 +1455,11 @@ class VectorGenerator:
         self._current_word_tokens = []  # reset word accumulation
         self._full_word_anchor = None
         self._active_spine = []  # sentence spine for current sentence
+        
+        # Load trained vectors as starting point, save current for restore
+        _saved_vectors = self.vs.token_vectors
+        if self._trained_vectors is not None:
+            self.vs.token_vectors = {tid: v.copy() for tid, v in self._trained_vectors.items()}
         
         # Target tracking for repeat-after-me
         self._target_tokens = None
@@ -1259,7 +1469,7 @@ class VectorGenerator:
         self._word_tabu = set()
         if target_text:
             enc = self.hv.encode(' ' + target_text.strip())
-            target_tids = [t for t in enc if t < 4096 and self.tt[t] == 2 and self._is_content_token(t)]
+            target_tids = [t for t in enc if t < self.config.bpe_limit and self.tt[t] == 2 and self._is_content_token(t)]
             self._target_tokens = target_tids
         
         # Example path: извлечь концепт-скелет из примера
@@ -1310,7 +1520,7 @@ class VectorGenerator:
             if self._pattern_learner and (self._pattern_learner.token_s_type_dist or self._pattern_learner.concept_s_type_dist):
                 seed_tokens_for_type = self.hv.encode(' ' + seed_word)
                 for t in seed_tokens_for_type:
-                    if t < 4096 and self.tt[t] == 2:
+                    if t < self.config.bpe_limit and self.tt[t] == 2:
                         c = self.ag.get_concept(t)
                         cluster = (c - self.ag.L1_OFFSET) if c is not None else -1
                         s_t = self._pattern_learner.detect_s_type(first_concept=cluster if cluster >= 0 else None, first_tid=t)
@@ -1320,7 +1530,7 @@ class VectorGenerator:
             seed_tokens = self.hv.encode(' ' + seed_word)
             seed_type2 = None
             for t in seed_tokens:
-                if t < 4096 and self.tt[t] == 2:
+                if t < self.config.bpe_limit and self.tt[t] == 2:
                     seed_type2 = t
                     break
             if seed_type2 is not None:
@@ -1330,6 +1540,16 @@ class VectorGenerator:
                     self._current_word_tokens = [seed_type2]
                     self._word_prefix = seed_type2
                     self._current_word_type3s = set()
+                    self._words_in_current_sentence += 1
+                    # Check seed against target immediately
+                    if self._target_tokens is not None and self._target_pos < len(self._target_tokens):
+                        expected = self._target_tokens[self._target_pos]
+                        if seed_type2 == expected:
+                            self._target_matches += 1
+                            self._target_pos += 1
+                            self._word_tabu.clear()
+                # Seed word is complete: keep _current_word_tokens so word boundary
+                # detection works when next type-2 is generated
 
         
         # Initial BOS: BOS is token 2, which is not in the structural matrix
@@ -1354,7 +1574,7 @@ class VectorGenerator:
             # Use heads for very first token
             try:
                 hs = self.heads.individual_scores(ctx)
-                w = np.array([1.0, 1.0, 3.0, 0.5, 0.2, 0.5], dtype=np.float32)
+                w = np.array(self.config.gl_initial_weights, dtype=np.float32)
                 scores = np.dot(w, hs)
             except:
                 scores = np.full(self.V, -np.inf, dtype=np.float32)
@@ -1385,7 +1605,7 @@ class VectorGenerator:
                     if len(text) <= 1:
                         scores[t] = -np.inf
             scores[~valid] = -np.inf
-            next_tok = select_token(scores, temperature=min(temperature, 0.5))
+            next_tok = select_token(scores, temperature=min(temperature, self.config.initial_token_temperature_cap))
             tokens.append(next_tok)
             chosen_text = self.hv.decode([next_tok]).strip()
             if self._is_content_token(next_tok):
@@ -1393,7 +1613,7 @@ class VectorGenerator:
                 # Compute full-word anchor for first word
                 full_enc = self.hv.encode(' ' + chosen_text)
                 for ft in full_enc:
-                    if ft < 4096 and self.tt[ft] == 2 and self._is_content_token(ft):
+                    if ft < self.config.bpe_limit and self.tt[ft] == 2 and self._is_content_token(ft):
                         if self.vs.has_vector(ft):
                             content_token = ft
                             break
@@ -1405,9 +1625,26 @@ class VectorGenerator:
         while len(tokens) < max_tokens:
             meta = self.hv.metadata_from_ids(tokens)
             ctx = dict(meta[-1])
-            ctx['context_tokens'] = tokens[-15:] if len(tokens) > 5 else tokens
+            ctx['context_tokens'] = tokens[-self.config.context_window:] if len(tokens) > 5 else tokens
             ctx['word_prefix'] = self._word_prefix
             ctx['used_type3s'] = self._current_word_type3s.copy()
+            
+            # Upper word limit: force EOS beyond corpus-estimated max
+            max_words = self.config.max_words_per_sentence
+            if self._words_in_current_sentence >= max_words and ctx.get('pos_in_word', 0) == 0:
+                next_tok = 3
+                exp = {"valid_tokens": 0, "chosen": 3, "chosen_text": "<<$>>",
+                       "reasons": ["word_limit"]}
+                # Handle word accumulation before EOS
+                if self._current_word_tokens and self._target_tokens is not None:
+                    anchor = self._compute_full_word_anchor(self._current_word_tokens)
+                    self._check_target_match(anchor, tokens)
+                self._word_prefix = -1
+                self._current_word_type3s = set()
+                self._current_word_tokens = []
+                tokens.append(next_tok)
+                explanations.append(exp)
+                break
             
             prev = tokens[-1] if len(tokens) > 1 else 2
             
@@ -1439,31 +1676,49 @@ class VectorGenerator:
                 forced_path=self._example_path
             )
             
+            pos_in_word = ctx.get('pos_in_word', 0)
+            cur_token_type = self.tt[next_tok] if next_tok < len(self.tt) else 0
+            
+            # === Universal sequential connectedness training ===
+            # Full hierarchy:
+            #   type-3 (char) → word prefix (intra-word)
+            #   type-2 (word) → context anchor (intra-sentence)
+            #   type-2 after EOS → prev sentence last concept (cross-sentence/paragraph)
+            # Non-matches get full shift, matches get minimal preservation
+            if training_mode and self._target_tokens is not None:
+                if cur_token_type == 2 and pos_in_word == 0:
+                    # Paragraph level: first word after EOS → prev sentence concept
+                    if prev == 3 and self._prev_sentence_last_concept >= 0:
+                        psc = self._prev_sentence_last_concept
+                        if self.vs.has_vector(psc) and self.vs.has_vector(next_tok):
+                            self._svd_shift(next_tok, psc, is_match=False)
+                    # Word level: all type-2 → context anchor from same sentence
+                    # Note: match tracking is handled by _check_target_match
+                    # at word completion. Here we only do the SVD shift.
+                    ctx_anchor = self._context_anchor(ctx.get('context_tokens', []))
+                    if ctx_anchor >= 0 and self.vs.has_vector(next_tok):
+                        is_match = (self._target_pos < len(self._target_tokens) and
+                                    next_tok == self._target_tokens[self._target_pos])
+                        self._svd_shift(next_tok, ctx_anchor, is_match=is_match)
+                elif cur_token_type == 3 and self._word_prefix >= 0:
+                    # Character-level: shift type-3 toward word prefix
+                    word_prefix_tid = self._word_prefix
+                    if self.vs.has_vector(word_prefix_tid) and self.vs.has_vector(next_tok):
+                        self._svd_shift(next_tok, word_prefix_tid, is_match=False)
+            
             # Online gate learning: observe chosen token
             if self.gates is not None and hasattr(self.gates, 'observe_online'):
                 observe = True
                 if self._target_tokens is not None:
-                    pos_in_word = ctx.get('pos_in_word', 0)
-                    cur_token_type = self.tt[next_tok] if next_tok < len(self.tt) else 0
                     if cur_token_type == 2 and pos_in_word == 0:
-                        # Word boundary: only observe if previous word matched
                         prev_was_good = (self._got_target_match or self._target_pos == 0)
                         if not prev_was_good:
                             observe = False
                 if observe:
                     self.gates.observe_online(ctx, next_tok, content_token)
             
-            # Word accumulation: track tokens to decode full word later
-            pos_in_word = ctx.get('pos_in_word', 0)
-            cur_token_type = self.tt[next_tok] if next_tok < len(self.tt) else 0
-            
             if cur_token_type == 2:
-                # New word starting — previous word is complete
-                # Compare completed word to target
-                if self._current_word_tokens and self._target_tokens is not None:
-                    anchor = self._compute_full_word_anchor(self._current_word_tokens)
-                    self._check_target_match(anchor, content_token)
-                
+                # New word starting — previous word is complete.
                 self._word_prefix = next_tok
                 self._current_word_type3s = set()
                 if self._current_word_tokens:
@@ -1507,7 +1762,7 @@ class VectorGenerator:
                         scores2 = np.full(self.V, -np.inf, dtype=np.float32)
                         for tid, sim in near:
                             if tid < self.V and valid[tid] and sim > 0:
-                                scores2[tid] = sim * 5.0
+                                scores2[tid] = sim * self.config.composition_sem_weight
                         scores2[~valid] = -np.inf
                         if np.any(np.isfinite(scores2)):
                             next_tok = select_token(scores2, temperature=temperature)
@@ -1517,7 +1772,7 @@ class VectorGenerator:
                             if self._is_content_token(next_tok):
                                 full_enc = self.hv.encode(' ' + exp['chosen_text'])
                                 for ft in full_enc:
-                                    if ft < 4096 and self.tt[ft] == 2 and self._is_content_token(ft):
+                                    if ft < self.config.bpe_limit and self.tt[ft] == 2 and self._is_content_token(ft):
                                         content_token = ft
                                         break
                                 content_token = next_tok
@@ -1529,7 +1784,7 @@ class VectorGenerator:
                 # Compare last completed word to target
                 if self._current_word_tokens and self._target_tokens is not None:
                     anchor = self._compute_full_word_anchor(self._current_word_tokens)
-                    self._check_target_match(anchor, content_token)
+                    self._check_target_match(anchor, tokens)
                 # Word tracking reset at sentence boundary
                 self._word_prefix = -1
                 self._current_word_type3s = set()
@@ -1539,7 +1794,7 @@ class VectorGenerator:
                 
                 # Отчёт успеха для авто-шаблона
                 if self._active_pattern_seq is not None and self._pattern_learner is not None:
-                    type2_tokens = [t for t in tokens[self._sentence_start_pos:] if t < 4096 and self.tt[t] == 2]
+                    type2_tokens = [t for t in tokens[self._sentence_start_pos:] if t < self.config.bpe_limit and self.tt[t] == 2]
                     path = self._pattern_learner.to_forced_path(self._active_pattern_seq)
                     expected = path.get('concept_sequence', []) if path else []
                     matches = 0
@@ -1629,12 +1884,13 @@ class VectorGenerator:
                     self._paragraph_topic = sent_concepts
                     self._sentences_in_paragraph = 0
                     import random as _rnd
-                    self._max_paragraph_sentences = _rnd.randint(3, 5)
+        self._max_paragraph_sentences = _rnd.randint(self.config.max_paragraph_sentences_min,
+                                                      self.config.max_paragraph_sentences_max)
         
         # Отчёт: результат авто-шаблона
         if self._active_pattern_seq is not None and self._pattern_learner is not None:
             reached_eos = next_tok == 3 if len(tokens) > 1 else False
-            type2_tokens = [t for t in tokens if t < 4096 and self.tt[t] == 2]
+            type2_tokens = [t for t in tokens if t < self.config.bpe_limit and self.tt[t] == 2]
             path = self._pattern_learner.to_forced_path(self._active_pattern_seq)
             expected = path.get('concept_sequence', []) if path else []
             matches = 0
@@ -1658,6 +1914,12 @@ class VectorGenerator:
             pct = self._target_matches / max(1, n_target) * 100
             print("Target: %d/%d words matched (%.0f%%)" % (self._target_matches, n_target, pct))
         
+        # Save training state: accumulate SVD shifts across calls
+        if training_mode and self._trained_vectors is not None:
+            self._trained_vectors = {tid: v.copy() for tid, v in self.vs.token_vectors.items()}
+        # Restore previous vector state
+        self.vs.token_vectors = _saved_vectors
+        
         return {
             'tokens': tokens,
             'text': self.hv.decode(tokens),
@@ -1666,6 +1928,16 @@ class VectorGenerator:
             'target_total': len(self._target_tokens) if self._target_tokens is not None else 0,
         }
     
+    def set_epoch(self, epoch):
+        """Set current epoch and decay learning rate."""
+        self._current_epoch = epoch
+        self._svd_lr = self.config.svd_lr * (self.config.svd_lr_decay ** epoch)
+        print(f"  Epoch {epoch}: SVD lr = {self._svd_lr:.6f}")
+
+    def reset_momentum(self):
+        """Reset momentum buffer between epochs."""
+        self._token_momentum.clear()
+
     def print_trace(self, result):
         print("\n=== ВЕКТОРНАЯ ГЕНЕРАЦИЯ ===")
         print("Text: %s\n" % result['text'])

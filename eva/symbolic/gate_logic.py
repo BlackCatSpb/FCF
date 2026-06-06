@@ -72,14 +72,17 @@ class GateLogic:
       para(topic_set) → paragraph topic membership
     """
 
-    V = 4101
-
-    def __init__(self, hv=None, ag=None):
+    def __init__(self, hv=None, ag=None, config=None):
+        if config is None:
+            from eva.symbolic.auto_config import AutoConfig
+            config = AutoConfig()
+        self.config = config
         self.hv = hv
         self.ag = ag
-        self.l1_offset = 48
-        self.n_clusters = 48
-        self.n_metas = 12
+        self.V = config.vocab_size
+        self.l1_offset = config.n_clusters
+        self.n_clusters = config.n_clusters
+        self.n_metas = config.n_metas
 
         self.levels = {
             'meta':    GateLevel('meta',    self.n_metas,    self.n_metas),
@@ -87,7 +90,7 @@ class GateLogic:
             'word':    GateLevel('word',    self.V, self.V),
             'bpe':     GateLevel('bpe',     self.V, self.V),
         }
-        self.s_type_level = GateLevel('s_type', 5, 5)
+        self.s_type_level = GateLevel('s_type', config.gate_s_type_count, config.gate_s_type_count)
 
         # Para topic: set of concept IDs for current paragraph
         self.para_concepts = set()
@@ -222,9 +225,7 @@ class GateLogic:
 
         # Sentence type transitions
         s_types = [s.s_type for s in text_hierarchy.sentences if s.s_type]
-        type_map = {'statement': 0, 'question': 1, 'exclamation': 2,
-                    'dialogue': 3, 'french': 4}
-        type_ids = [type_map.get(t, 0) for t in s_types]
+        type_ids = [self.config.s_type_map.get(t, 0) for t in s_types]
         self.s_type_level.observe_sequence(type_ids)
 
         print(f"GateLogic observed {len(text_hierarchy.sentences)} sentences:")
@@ -282,10 +283,8 @@ class GateLogic:
 
         # Sentence type transition
         if prev_s_type is not None and cur_s_type is not None:
-            type_map = {'statement': 0, 'question': 1, 'exclamation': 2,
-                        'dialogue': 3, 'french': 4}
-            pid = type_map.get(prev_s_type, 0)
-            cid = type_map.get(cur_s_type, 0)
+            pid = self.config.s_type_map.get(prev_s_type, 0)
+            cid = self.config.s_type_map.get(cur_s_type, 0)
             self.s_type_level.observe(pid, cid)
 
         # Mark expansions stale
@@ -381,11 +380,64 @@ class GateLogic:
         return result
 
     def save(self, dir_path):
-        import os
+        import os, json
         os.makedirs(dir_path, exist_ok=True)
         for name, level in self.levels.items():
             level.save(os.path.join(dir_path, f'{name}.json'))
         self.s_type_level.save(os.path.join(dir_path, 's_type.json'))
+        
+        # Write annotation JSON with labels
+        ag = self.ag
+        hv = self.hv
+        annot = {
+            'levels': {},
+            'concept_labels': {},
+            'meta_labels': {},
+            'token_labels': {},
+        }
+        if ag:
+            for cid in sorted(ag.cid_to_tids.keys()):
+                c = cid - ag.L1_OFFSET
+                name = ag.cid_label.get(cid, f'C{c}')
+                mid = ag.cid_to_mid.get(cid)
+                mname = ag.mid_label.get(mid, '?') if mid else '?'
+                annot['concept_labels'][c] = {'name': name, 'meta': mname}
+            for mid in sorted(ag.mid_to_cids.keys()):
+                m = mid - ag.L2_OFFSET
+                annot['meta_labels'][m] = ag.mid_label.get(mid, f'M{m}')
+        if hv:
+            for level_name, level in self.levels.items():
+                labels = {}
+                for from_id in sorted(level.gates.keys()):
+                    if level_name == 'meta':
+                        labels[from_id] = annot.get('meta_labels', {}).get(from_id, str(from_id))
+                    elif level_name == 'concept':
+                        labels[from_id] = annot.get('concept_labels', {}).get(from_id, str(from_id))
+                    elif level_name == 'word':
+                        tid_text = hv.decode([from_id]).strip() if hv else str(from_id)
+                        labels[from_id] = tid_text
+                    elif level_name == 'bpe':
+                        tid_text = hv.decode([from_id]).strip() if hv else str(from_id)
+                        labels[from_id] = tid_text
+                annot['levels'][level_name] = {
+                    'n_from': level.n_from,
+                    'n_to': level.n_to,
+                    'gate_count': level.size(),
+                    'from_labels': labels,
+                }
+        # s_type labels
+        s_label = {}
+        for from_id in sorted(self.s_type_level.gates.keys()):
+            name = self.config.s_type_map_rev.get(from_id, str(from_id))
+            s_label[from_id] = name
+        annot['levels']['s_type'] = {
+            'n_from': self.s_type_level.n_from,
+            'n_to': self.s_type_level.n_to,
+            'gate_count': self.s_type_level.size(),
+            'from_labels': s_label,
+        }
+        with open(os.path.join(dir_path, 'annotation.json'), 'w', encoding='utf-8') as f:
+            json.dump(annot, f, ensure_ascii=False, indent=2)
 
     def load(self, dir_path):
         import os

@@ -1650,7 +1650,10 @@ class VectorGenerator:
         freq = self._token_freq.get(word_tid, 1)
         adaptive_lr = self._svd_lr / (1.0 + 0.1 * math.sqrt(freq))
 
-        # --- Context shift (LTP/LTD based on match) ---
+        # --- Context shift: Riemannian gradient of -cos(v_w, v_ctx) on sphere ---
+        # ∇_R = v_ctx - (v_w·v_ctx) × v_w
+        # When y→0 (far from context): strong pull toward v_ctx ✓
+        # When y→1 (already close): gentle refinement ✓
         total_scale = 1.0 if is_match else 0.05
         pred_err = self._concept_prediction_error(ctx_anchor, word_tid)
         total_scale *= (1.0 + pred_err)
@@ -1658,12 +1661,11 @@ class VectorGenerator:
         y = float(np.dot(v_word, v_ctx))
         y = max(y, 0.05)
 
-        shift = (v_ctx - v_word) * adaptive_lr * total_scale * y
+        shift = (v_ctx - y * v_word) * adaptive_lr * total_scale
 
-        # --- Correction shift: wrong word pulled toward right word ---
+        # --- Correction shift: wrong word pulled toward right word (also gradient) ---
         if target_tid >= 0 and not is_match and self.vs.has_vector(target_tid):
             v_right = self.vs.token_vectors[target_tid]
-            # Error count: how many times this (context, wrong) pair occurred
             err_key = (ctx_anchor, word_tid)
             if not hasattr(self, '_error_pairs'):
                 self._error_pairs = defaultdict(int)
@@ -1673,9 +1675,9 @@ class VectorGenerator:
             y_right = float(np.dot(v_word, v_right))
             y_right = max(y_right, 0.05)
 
-            corr_scale = 1.0  # full correction LR
-            corr_scale *= error_boost  # amplify on repeat errors
-            corr_shift = (v_right - v_word) * adaptive_lr * corr_scale * y_right
+            corr_scale = 1.0 * error_boost
+            # ∇_R for -cos(v_w, v_right) = v_right - (v_w·v_right) × v_w
+            corr_shift = (v_right - y_right * v_word) * adaptive_lr * corr_scale
             shift += corr_shift
 
         # --- Momentum ---

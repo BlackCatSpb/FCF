@@ -348,6 +348,7 @@ class VectorGenerator:
         self._token_momentum = {}
         self._current_epoch = 0
         self._population = VectorPopulation(self.vs, self.config, self._token_freq)
+        self._error_pairs = defaultdict(int)  # (ctx_anchor, wrong_tid) → count
         
     def _build_structural_matrix(self, min_prob=0.001):
         """Строит структурную матрицу: возможные transitions между type-2 токенами.
@@ -1531,8 +1532,9 @@ class VectorGenerator:
             if c_wrong is not None and c_expected is not None:
                 self._word_tabu.add((c_expected, c_wrong))
             
-            # Sequential connectedness: even wrong words learn position
-            self._svd_shift(word_anchor, ctx_anchor, is_match=False)
+            # Sequential connectedness: wrong word learns position AND gets
+            # corrective pull toward the right word
+            self._svd_shift(word_anchor, ctx_anchor, is_match=False, target_tid=expected)
 
     def _context_anchor(self, context_tokens):
         """Find last type-2 token with a vector in context for SVD shift."""
@@ -1587,13 +1589,17 @@ class VectorGenerator:
                 return tid
         return -1
 
-    def _svd_shift(self, word_tid, ctx_anchor, is_match=False):
+    def _svd_shift(self, word_tid, ctx_anchor, is_match=False, target_tid=-1):
         """
         Sequential connectedness SVD shift via evolutionary population.
-        
-        Selects a version via fitness-proportional selection, applies Oja+momentum
-        update, rewards/penalizes fitness, branches on mismatch for exploration,
-        and syncs the best version back to vs.token_vectors.
+
+        When target_tid >= 0 and not is_match (wrong word generated):
+        - Normal LTD shift toward context (×0.05)
+        - PLUS correction shift: pull wrong→right (stronger)
+        - Repeated errors amplify correction (boosting)
+
+        When is_match (correct word):
+        - LTP shift toward context (×1.0)
         """
         if word_tid < 0 or ctx_anchor < 0:
             return
@@ -1607,17 +1613,35 @@ class VectorGenerator:
         freq = self._token_freq.get(word_tid, 1)
         adaptive_lr = self._svd_lr / (1.0 + 0.1 * math.sqrt(freq))
 
-        total_scale = 1.0 if is_match else 0.05  # LTP vs LTD: match=full, non-match=near-zero
+        # --- Context shift (LTP/LTD based on match) ---
+        total_scale = 1.0 if is_match else 0.05
         pred_err = self._concept_prediction_error(ctx_anchor, word_tid)
-        total_scale *= (1.0 + pred_err)  # surprise amplifies learning
-        effective_lr = adaptive_lr * total_scale
+        total_scale *= (1.0 + pred_err)
 
         y = float(np.dot(v_word, v_ctx))
         y = max(y, 0.05)
 
-        shift = (v_ctx - v_word) * effective_lr * y
+        shift = (v_ctx - v_word) * adaptive_lr * total_scale * y
 
-        # Per-version momentum
+        # --- Correction shift: wrong word pulled toward right word ---
+        if target_tid >= 0 and not is_match and self.vs.has_vector(target_tid):
+            v_right = self.vs.token_vectors[target_tid]
+            # Error count: how many times this (context, wrong) pair occurred
+            err_key = (ctx_anchor, word_tid)
+            if not hasattr(self, '_error_pairs'):
+                self._error_pairs = defaultdict(int)
+            self._error_pairs[err_key] += 1
+            error_boost = 1.0 + min(3.0, 0.5 * (self._error_pairs[err_key] - 1))
+
+            y_right = float(np.dot(v_word, v_right))
+            y_right = max(y_right, 0.05)
+
+            corr_scale = 1.0  # full correction LR
+            corr_scale *= error_boost  # amplify on repeat errors
+            corr_shift = (v_right - v_word) * adaptive_lr * corr_scale * y_right
+            shift += corr_shift
+
+        # --- Momentum ---
         beta = self.config.svd_momentum_beta
         if word_tid not in self._token_momentum:
             self._token_momentum[word_tid] = {}
@@ -1636,6 +1660,8 @@ class VectorGenerator:
             noise = self._population.estimate_noise(word_tid, v_ctx)
             self._population.maybe_branch(word_tid, idx, noise)
         self._population.sync_best(word_tid)
+        if target_tid >= 0 and not is_match and self.vs.has_vector(target_tid):
+            self._population.sync_best(target_tid)
 
     def generate(self, max_tokens=40, seed_word=None, target_composition=None, temperature=0.5,
                  example=None, auto_pattern=False, text_hierarchy=None, target_text=None,
@@ -1910,7 +1936,11 @@ class VectorGenerator:
                     if ctx_anchor >= 0 and self.vs.has_vector(next_tok):
                         is_match = (self._target_pos < len(self._target_tokens) and
                                     next_tok == self._target_tokens[self._target_pos])
-                        self._svd_shift(next_tok, ctx_anchor, is_match=is_match)
+                        ttid = self._target_tokens[self._target_pos] if self._target_pos < len(self._target_tokens) else -1
+                        if not is_match and ttid >= 0 and ttid != next_tok:
+                            self._svd_shift(next_tok, ctx_anchor, is_match=False, target_tid=ttid)
+                        else:
+                            self._svd_shift(next_tok, ctx_anchor, is_match=is_match)
                 elif cur_token_type == 3 and self._word_prefix >= 0:
                     # Character-level: shift type-3 toward word prefix
                     word_prefix_tid = self._word_prefix
@@ -2149,6 +2179,7 @@ class VectorGenerator:
         if not hasattr(self, '_token_momentum') or self._token_momentum is None:
             self._token_momentum = {}
         self._token_momentum.clear()
+        self._error_pairs.clear()
 
     def print_trace(self, result):
         print("\n=== ВЕКТОРНАЯ ГЕНЕРАЦИЯ ===")

@@ -208,8 +208,13 @@ class VectorPopulation:
             self._prune(tid)
             if len(self.versions[tid]) >= self.max_size(tid):
                 return
+        # noise_level is desired angular deviation (radians ≈ fraction of unit sphere).
+        # Scale per-dim: σ_dim = angle / √dim so that |noise| ≈ angle.
+        dim = self.vs.dim
+        angle = max(0.003, min(noise_level, 0.2))
+        per_dim = angle / math.sqrt(dim)
         v = self.versions[tid][idx].copy()
-        v += np.random.randn(*v.shape).astype(np.float32) * noise_level
+        v += np.random.randn(*v.shape).astype(np.float32) * per_dim
         norm = float(np.linalg.norm(v))
         if norm > 0:
             v /= norm

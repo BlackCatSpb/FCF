@@ -327,8 +327,13 @@ class AssociationGraph:
         """
         from sklearn.cluster import Birch
         emb = self.starter_embeddings
+        tids = self.starter_list
         if new_embeddings is not None and starter_tids is not None:
             emb = new_embeddings
+            tids = starter_tids
+            self.starter_embeddings = new_embeddings
+            self.starter_list = starter_tids
+            self.starter_token_to_idx = {tid: i for i, tid in enumerate(starter_tids)}
 
         emb_norm = emb.copy()
         norms = np.linalg.norm(emb_norm, axis=1, keepdims=True)
@@ -347,8 +352,12 @@ class AssociationGraph:
         label_map = {old: new for new, old in enumerate(unique)}
         remapped = np.array([label_map[l] for l in birch_labels])
         n_new = len(unique)
+        self.n_clusters = n_new
 
-        # Update concept structures
+        # Precompute tid→index lookup to avoid O(n²) list.index()
+        tid_to_idx = {tid: i for i, tid in enumerate(tids)}
+
+        # Update concept structures (clear ALL including L2 meta)
         old_cids = set(self.cid_to_tids.keys())
         self.cid_to_tids = defaultdict(list)
         self.tid_to_cid = {}
@@ -356,8 +365,9 @@ class AssociationGraph:
         self.cid_profiles = {}
         self.cid_top_tokens = {}
         self.cid_label = {}
+        self.cid_to_mid = {}
+        self.mid_to_cids = defaultdict(set)
 
-        tids = starter_tids if starter_tids is not None else self.starter_list
         for i, tid in enumerate(tids):
             cid = self.L1_OFFSET + int(remapped[i])
             self.tid_to_cid[tid] = cid
@@ -369,14 +379,15 @@ class AssociationGraph:
             mask = remapped == c
             centroid = emb_norm[mask].mean(axis=0)
             self.centroid_vectors[cid] = centroid
+            # Use precomputed tid_to_idx instead of O(n) list.index()
             best = min(members, key=lambda t: np.linalg.norm(
-                emb[tids.index(t)] - centroid))
+                emb[tid_to_idx[t]] - centroid))
             self.cid_label[cid] = 'B' + str(c)
 
             profile = {}
             dists = []
             for t in members:
-                idx = tids.index(t)
+                idx = tid_to_idx[t]
                 dist = float(np.linalg.norm(emb[idx] - centroid))
                 w = math.exp(-dist * 2.0)
                 profile[t] = w

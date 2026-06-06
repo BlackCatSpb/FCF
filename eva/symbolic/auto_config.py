@@ -322,8 +322,8 @@ class AutoConfig:
 
         rng = np.random.RandomState(self.random_state)
         for _ in range(min(5000, len(collocated) * 2)):
-            a = rng.randint(0, len(all_tids))
-            b = rng.randint(0, len(all_tids))
+            a = all_tids[rng.randint(0, len(all_tids))]
+            b = all_tids[rng.randint(0, len(all_tids))]
             if a != b and vg.vs.has_vector(a) and vg.vs.has_vector(b):
                 random_pairs.append(vg.vs.similarity(a, b))
 

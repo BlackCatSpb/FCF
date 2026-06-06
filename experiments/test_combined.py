@@ -74,5 +74,5 @@ for epoch in range(n_epochs):
     print(f'>>> Epoch {epoch}: eval {total_matches}/{total_target} ({eval_pct:.1f}%) lr={vg._svd_lr:.6f}')
     print()
 
-config.target_boost = original_target_boost
+    config.target_boost = original_target_boost  # restore before next training epoch
 print(f'Done. Trained vectors: {len(vg._trained_vectors)}, momentum buffer: {len(vg._token_momentum)}')

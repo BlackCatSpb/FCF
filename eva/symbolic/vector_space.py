@@ -1,4 +1,4 @@
-import sys, math, numpy as np
+import sys, math, random, numpy as np
 from collections import defaultdict
 
 sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
@@ -1386,6 +1386,17 @@ class VectorGenerator:
                 return tid
         return -1
 
+    def _cluster_to_tid(self, cluster_idx):
+        """Convert a cluster index (0..n_clusters-1) to a representative token ID for SVD."""
+        if cluster_idx < 0:
+            return -1
+        cid_full = cluster_idx + self.ag.L1_OFFSET
+        members = self.ag.cid_to_tids.get(cid_full, [])
+        # Pick first member that has a vector
+        for tid in members:
+            if tid < self.config.bpe_limit and self.vs.has_vector(tid):
+                return tid
+        return -1
 
     def _svd_shift(self, word_tid, ctx_anchor, is_match=False):
         """
@@ -1455,11 +1466,15 @@ class VectorGenerator:
         self._current_word_tokens = []  # reset word accumulation
         self._full_word_anchor = None
         self._active_spine = []  # sentence spine for current sentence
+        self._max_paragraph_sentences = random.randint(self.config.max_paragraph_sentences_min,
+                                                       self.config.max_paragraph_sentences_max)
         
-        # Load trained vectors as starting point, save current for restore
+        # Load trained vectors as starting point, save current for restore.
+        # MUST deep-copy: _saved_vectors must remain a reference to the UNMODIFIED
+        # original dict, while vs.token_vectors becomes a NEW dict.
         _saved_vectors = self.vs.token_vectors
-        if self._trained_vectors is not None:
-            self.vs.token_vectors = {tid: v.copy() for tid, v in self._trained_vectors.items()}
+        start_vectors = self._trained_vectors if self._trained_vectors is not None else _saved_vectors
+        self.vs.token_vectors = {tid: v.copy() for tid, v in start_vectors.items()}
         
         # Target tracking for repeat-after-me
         self._target_tokens = None
@@ -1688,10 +1703,12 @@ class VectorGenerator:
             if training_mode and self._target_tokens is not None:
                 if cur_token_type == 2 and pos_in_word == 0:
                     # Paragraph level: first word after EOS → prev sentence concept
+                    # _prev_sentence_last_concept is a cluster index (0..n_clusters-1),
+                    # convert to a representative token ID before use.
                     if prev == 3 and self._prev_sentence_last_concept >= 0:
-                        psc = self._prev_sentence_last_concept
-                        if self.vs.has_vector(psc) and self.vs.has_vector(next_tok):
-                            self._svd_shift(next_tok, psc, is_match=False)
+                        psc_tid = self._cluster_to_tid(self._prev_sentence_last_concept)
+                        if psc_tid >= 0 and self.vs.has_vector(next_tok):
+                            self._svd_shift(next_tok, psc_tid, is_match=False)
                     # Word level: all type-2 → context anchor from same sentence
                     # Note: match tracking is handled by _check_target_match
                     # at word completion. Here we only do the SVD shift.
@@ -1883,9 +1900,8 @@ class VectorGenerator:
                 if self._sentences_in_paragraph >= self._max_paragraph_sentences:
                     self._paragraph_topic = sent_concepts
                     self._sentences_in_paragraph = 0
-                    import random as _rnd
-        self._max_paragraph_sentences = _rnd.randint(self.config.max_paragraph_sentences_min,
-                                                      self.config.max_paragraph_sentences_max)
+                    self._max_paragraph_sentences = random.randint(self.config.max_paragraph_sentences_min,
+                                                                    self.config.max_paragraph_sentences_max)
         
         # Отчёт: результат авто-шаблона
         if self._active_pattern_seq is not None and self._pattern_learner is not None:
@@ -1936,6 +1952,8 @@ class VectorGenerator:
 
     def reset_momentum(self):
         """Reset momentum buffer between epochs."""
+        if not hasattr(self, '_token_momentum') or self._token_momentum is None:
+            self._token_momentum = {}
         self._token_momentum.clear()
 
     def print_trace(self, result):

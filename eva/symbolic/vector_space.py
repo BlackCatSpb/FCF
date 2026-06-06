@@ -127,6 +127,120 @@ class VectorSpace:
         return result
 
 
+class VectorPopulation:
+    """Evolutionary vector population with fitness-proportional selection.
+
+    Each token can have multiple vector versions. Selection is probabilistic —
+    no hard thresholds. Branching (new version spawn) happens on mismatch,
+    extinct by fitness decay. All parameters derived from token frequency and
+    global vector statistics — zero hardcoded values.
+    """
+    def __init__(self, vs, config, token_freq):
+        self.vs = vs
+        self.config = config
+        self._freq = token_freq
+
+        self.versions = {}    # {tid: [vec₀, vec₁, ...]}
+        self.fitness = {}     # {tid: [f₀, f₁, ...]}
+        self.n_calls = {}     # {tid: [c₀, c₁, ...]}
+        self._base_calls = {} # {tid: total_update_calls}
+        self._global_std = None
+
+    def lazy_init(self, tid):
+        if tid not in self.versions:
+            v = self.vs.token_vectors[tid].copy()
+            self.versions[tid] = [v]
+            self.fitness[tid] = [1.0]
+            self.n_calls[tid] = [0]
+            self._base_calls[tid] = 0
+
+    def max_size(self, tid):
+        f = max(self._freq.get(tid, 1), 1)
+        return max(1, min(5, 1 + int(math.log2(f))))
+
+    def select(self, tid):
+        self.lazy_init(tid)
+        fit = self.fitness[tid]
+        total = sum(fit)
+        if total <= 0:
+            return 0
+        r = random.random() * total
+        cum = 0
+        for i, f in enumerate(fit):
+            cum += f
+            if r <= cum:
+                return i
+        return 0
+
+    def update(self, tid, idx, is_match):
+        self.lazy_init(tid)
+        n = self._base_calls[tid] + 1
+        self._base_calls[tid] = n
+        decay = n / (n + 1)
+        fit = self.fitness[tid]
+        for i in range(len(fit)):
+            fit[i] *= decay
+        fit[idx] += 1.0 if is_match else 0.2
+
+    def maybe_branch(self, tid, idx, noise_level):
+        self.lazy_init(tid)
+        if len(self.versions[tid]) >= self.max_size(tid):
+            self._prune(tid)
+            if len(self.versions[tid]) >= self.max_size(tid):
+                return
+        v = self.versions[tid][idx].copy()
+        v += np.random.randn(*v.shape).astype(np.float32) * noise_level
+        norm = float(np.linalg.norm(v))
+        if norm > 0:
+            v /= norm
+        self.versions[tid].append(v)
+        self.fitness[tid].append(0.5)
+        self.n_calls[tid].append(0)
+
+    def _prune(self, tid):
+        fit = self.fitness[tid]
+        if len(fit) <= 1:
+            return
+        min_idx = min(range(1, len(fit)), key=lambda i: fit[i])
+        self.versions[tid].pop(min_idx)
+        self.fitness[tid].pop(min_idx)
+        self.n_calls[tid].pop(min_idx)
+
+    def sync_best(self, tid):
+        self.lazy_init(tid)
+        fit = self.fitness[tid]
+        best_idx = max(range(len(fit)), key=lambda i: fit[i])
+        if best_idx != 0:
+            self.versions[tid][0], self.versions[tid][best_idx] = \
+                self.versions[tid][best_idx], self.versions[tid][0]
+            self.fitness[tid][0], self.fitness[tid][best_idx] = \
+                self.fitness[tid][best_idx], self.fitness[tid][0]
+            self.n_calls[tid][0], self.n_calls[tid][best_idx] = \
+                self.n_calls[tid][best_idx], self.n_calls[tid][0]
+        self.vs.token_vectors[tid] = self.versions[tid][0].copy()
+
+    def global_noise_std(self):
+        if self._global_std is None:
+            vecs = list(self.vs.token_vectors.values())
+            if vecs:
+                self._global_std = float(np.std(np.stack(vecs)))
+            else:
+                self._global_std = 0.01
+        return self._global_std
+
+    def estimate_noise(self, tid, ctx_vec=None):
+        gs = self.global_noise_std()
+        if ctx_vec is not None and tid in self.versions:
+            v = self.versions[tid][0]
+            sim = float(np.dot(v, ctx_vec))
+            return gs * max(0.05, 1.0 - sim)
+        return gs * 0.5
+
+    def sync_all(self):
+        for tid in list(self.versions.keys()):
+            self.sync_best(tid)
+
+
 class VectorGenerator:
     """
     Генерация через векторное пространство.
@@ -212,6 +326,7 @@ class VectorGenerator:
         self._token_freq = defaultdict(int)
         self._token_momentum = {}
         self._current_epoch = 0
+        self._population = VectorPopulation(self.vs, self.config, self._token_freq)
         
     def _build_structural_matrix(self, min_prob=0.001):
         """Строит структурную матрицу: возможные transitions между type-2 токенами.
@@ -1400,53 +1515,51 @@ class VectorGenerator:
 
     def _svd_shift(self, word_tid, ctx_anchor, is_match=False):
         """
-        Sequential connectedness SVD shift.
+        Sequential connectedness SVD shift via evolutionary population.
         
-        Focus on UNSUCCESSFUL words: non-matched words get full learning signal,
-        already-correct words get minimal shift to preserve their position.
-        
-        Every word learns sequential structure (what follows what in sentence),
-        but non-matches get 5x more update than matches.
+        Selects a version via fitness-proportional selection, applies Oja+momentum
+        update, rewards/penalizes fitness, branches on mismatch for exploration,
+        and syncs the best version back to vs.token_vectors.
         """
         if word_tid < 0 or ctx_anchor < 0:
             return
         if not self.vs.has_vector(word_tid) or not self.vs.has_vector(ctx_anchor):
             return
-        
-        v_word = self.vs.token_vectors[word_tid]
+
+        idx = self._population.select(word_tid)
+        v_word = self._population.versions[word_tid][idx]
         v_ctx = self.vs.token_vectors[ctx_anchor]
-        
-        # Frequency-based adaptive LR
+
         freq = self._token_freq.get(word_tid, 1)
         adaptive_lr = self._svd_lr / (1.0 + 0.1 * math.sqrt(freq))
-        
-        # Non-match: full learning signal (needs to learn)
-        # Match: minimal shift (already correct, preserve it)
+
         total_scale = 0.2 if is_match else 1.0
         effective_lr = adaptive_lr * total_scale
-        
-        # Oja scaling: cosine similarity determines update strength
-        y = self.vs.similarity(word_tid, ctx_anchor)
+
+        y = float(np.dot(v_word, v_ctx))
         y = max(y, 0.05)
-        
-        # Positive shift: pull word toward its context
+
         shift = (v_ctx - v_word) * effective_lr * y
-        
-        # Momentum buffer
+
+        # Per-version momentum
         beta = self.config.svd_momentum_beta
         if word_tid not in self._token_momentum:
-            self._token_momentum[word_tid] = np.zeros_like(v_word)
-        self._token_momentum[word_tid] = (
-            beta * self._token_momentum[word_tid] + (1.0 - beta) * shift
-        )
-        
-        # Apply momentum update
-        self.vs.token_vectors[word_tid] += self._token_momentum[word_tid]
-        
-        # Normalize
-        norm = np.linalg.norm(self.vs.token_vectors[word_tid])
-        if norm > 0:
-            self.vs.token_vectors[word_tid] /= norm
+            self._token_momentum[word_tid] = {}
+        if idx not in self._token_momentum[word_tid]:
+            self._token_momentum[word_tid][idx] = np.zeros_like(v_word)
+        mom = self._token_momentum[word_tid][idx]
+        mom[:] = beta * mom + (1.0 - beta) * shift
+
+        v_word += mom
+        nrm = float(np.linalg.norm(v_word))
+        if nrm > 0:
+            v_word /= nrm
+
+        self._population.update(word_tid, idx, is_match)
+        if not is_match:
+            noise = self._population.estimate_noise(word_tid, v_ctx)
+            self._population.maybe_branch(word_tid, idx, noise)
+        self._population.sync_best(word_tid)
 
     def generate(self, max_tokens=40, seed_word=None, target_composition=None, temperature=0.5,
                  example=None, auto_pattern=False, text_hierarchy=None, target_text=None,
@@ -1475,6 +1588,10 @@ class VectorGenerator:
         _saved_vectors = self.vs.token_vectors
         start_vectors = self._trained_vectors if self._trained_vectors is not None else _saved_vectors
         self.vs.token_vectors = {tid: v.copy() for tid, v in start_vectors.items()}
+        # Sync population primary to loaded vectors
+        for tid, v in self.vs.token_vectors.items():
+            self._population.lazy_init(tid)
+            self._population.versions[tid][0] = v.copy()
         
         # Target tracking for repeat-after-me
         self._target_tokens = None

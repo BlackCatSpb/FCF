@@ -48,6 +48,7 @@ class AutoConfig:
         self.svd_lr_decay = 0.9
         self.svd_epochs = 10
         self.svd_neg_samples = 5
+        self.population_mode = True
 
         # Generation limits
         self.max_words_per_sentence = 12

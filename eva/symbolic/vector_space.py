@@ -181,6 +181,26 @@ class VectorPopulation:
         for i in range(len(fit)):
             fit[i] *= decay
         fit[idx] += 1.0 if is_match else 0.2
+        self._homeostatic(tid)
+
+    def _homeostatic(self, tid):
+        """Homeostatic plasticity: weak versions boosted, strong suppressed.
+        Maintains population diversity without hard thresholds.
+        If one version dominates >50% of total fitness, it is gently dampened.
+        If a version has <10% share, it gets a small excitatory boost.
+        """
+        fit = self.fitness[tid]
+        if len(fit) <= 1:
+            return
+        tot = sum(fit)
+        if tot <= 0:
+            return
+        for i in range(len(fit)):
+            share = fit[i] / tot
+            if share > 0.5:
+                fit[i] *= 0.95
+            elif share < 0.1 and fit[i] > 0:
+                fit[i] *= 1.05
 
     def maybe_branch(self, tid, idx, noise_level):
         self.lazy_init(tid)
@@ -289,6 +309,7 @@ class VectorGenerator:
         # Cross-sentence context tracking
         self._prev_sentence_last_concept = -1
         self._prev_sentence_type = 'start'
+        self._last_concept_cid = -1  # lateral inhibition target
         
         # Precomputed: concept -> token_ids for fast lookup
         self._concept_to_tids = {}
@@ -1193,6 +1214,18 @@ class VectorGenerator:
                 scores[tid] *= multiplier
         return scores
     
+    def _lateral_inhibition(self, scores, valid_mask, last_cid, multiplier=0.3):
+        """Lateral inhibition: suppress other tokens in the same concept as
+        the last-selected content token. Prevents immediate co-activation of
+        redundant tokens — analogous to cortical lateral inhibition."""
+        if last_cid < 0:
+            return scores
+        members = self.ag.cid_to_tids.get(last_cid, [])
+        for tid in members:
+            if tid < self.V and valid_mask[tid] and np.isfinite(scores[tid]):
+                scores[tid] *= multiplier
+        return scores
+    
     def _sentence_type_boost(self, ctx, valid_mask, prev_sentence_type=None,
                              words_in_sentence=0):
         """
@@ -1386,6 +1419,10 @@ class VectorGenerator:
         context_tokens = ctx.get('context_tokens', [])
         scores = self._anti_chain_penalty(context_tokens, scores, valid)
         
+        # 11b. Lateral inhibition: подавляем другие токены того же концепта,
+        # что был выбран на предыдущем content-шаге (кортикальное торможение)
+        scores = self._lateral_inhibition(scores, valid, self._last_concept_cid)
+        
         # 11. Стена
         scores[~valid] = -np.inf
         
@@ -1430,6 +1467,9 @@ class VectorGenerator:
         # Что повлияло?
         if self._is_content_token(next_tok):
             explanation["reasons"].append("content")
+            # Lateral inhibition: запомнить концепт выбранного токена
+            cid = self.ag.get_concept(next_tok)
+            self._last_concept_cid = cid if cid is not None else -1
         if concept_pmi[next_tok] != 0.0:
             explanation["reasons"].append("concept_pmi")
         if content_token >= 0 and self.vs.has_vector(content_token) and self.vs.has_vector(next_tok):
@@ -1507,6 +1547,40 @@ class VectorGenerator:
             return -1
         cid_full = cluster_idx + self.ag.L1_OFFSET
         members = self.ag.cid_to_tids.get(cid_full, [])
+        for tid in members:
+            if tid < self.config.bpe_limit and self.vs.has_vector(tid):
+                return tid
+        return -1
+
+    def _concept_prediction_error(self, prev_tid, actual_tid):
+        """Predictive coding: PMI-based concept surprise.
+
+        Returns 0.0 if actual concept matches the PMI-predicted next concept
+        from prev_tid. Returns 1.0 if unexpected. Error ∈ [0, 1] scales the
+        SVD learning signal — the brain learns more from surprising events.
+        """
+        actual_c = self.ag.get_concept(actual_tid)
+        if actual_c is None:
+            return 0.5
+        actual_cluster = actual_c - self.ag.L1_OFFSET
+        pmi_next = self.ag.pmi.get(prev_tid, {})
+        if not pmi_next:
+            return 0.5
+        # Best predicted concept: PMI-argmax over successors
+        best_cj = max(pmi_next, key=pmi_next.get)
+        if best_cj == actual_cluster:
+            return 0.0
+        # Surprise magnitude = 1 - exp(log_prob_diff) ≈ how much more
+        # surprising than the best prediction
+        diff = pmi_next.get(actual_cluster, -20.0) - pmi_next.get(best_cj, 0.0)
+        return float(np.clip(1.0 - np.exp(diff), 0.0, 1.0))
+
+    def _cluster_to_tid(self, cluster_idx):
+        """Convert a cluster index (0..n_clusters-1) to a representative token ID for SVD."""
+        if cluster_idx < 0:
+            return -1
+        cid_full = cluster_idx + self.ag.L1_OFFSET
+        members = self.ag.cid_to_tids.get(cid_full, [])
         # Pick first member that has a vector
         for tid in members:
             if tid < self.config.bpe_limit and self.vs.has_vector(tid):
@@ -1534,6 +1608,8 @@ class VectorGenerator:
         adaptive_lr = self._svd_lr / (1.0 + 0.1 * math.sqrt(freq))
 
         total_scale = 0.2 if is_match else 1.0
+        pred_err = self._concept_prediction_error(ctx_anchor, word_tid)
+        total_scale *= (1.0 + pred_err)  # surprise amplifies learning
         effective_lr = adaptive_lr * total_scale
 
         y = float(np.dot(v_word, v_ctx))
@@ -1636,6 +1712,7 @@ class VectorGenerator:
         # Sentence tracking for cross-sentence constraints
         self._prev_sentence_last_concept = -1
         self._prev_sentence_type = 'start'
+        self._last_concept_cid = -1
         self._sentence_start_pos = len(tokens)  # where current sentence started
         self._generated_sentence_count = 0
         self._words_in_current_sentence = 0

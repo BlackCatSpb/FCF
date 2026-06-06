@@ -42,6 +42,7 @@ class AutoConfig:
         self.sem_boost_count = 5
 
         # Learning
+        self.svd_dim = 256
         self.svd_lr = 0.1
         self.svd_momentum_beta = 0.9
         self.svd_neg_feedback_scale = 0.3

@@ -44,6 +44,25 @@ class VectorSpace:
         """SVD-вектор токена (32-dim)."""
         return self.token_vectors.get(tid)
     
+    def project_to_dim(self, target_dim, seed=42):
+        """Project all vectors to target_dim preserving pairwise dot products.
+        
+        Uses a random orthogonal matrix Q ∈ R^{target_dim × current_dim} with
+        orthonormal columns, so Q^T Q = I and v·w ≈ (Qv)·(Qw). Up-projection
+        adds extra dimensions initialized from the original space; down-projection
+        truncates via the leading singular vectors of the random projection.
+        """
+        cur = self.dim
+        if cur is None or cur == target_dim:
+            return
+        rng = np.random.RandomState(seed)
+        R = rng.randn(target_dim, cur).astype(np.float32)
+        Q, _ = np.linalg.qr(R)
+        for tid in list(self.token_vectors.keys()):
+            v = self.token_vectors[tid]
+            self.token_vectors[tid] = (Q @ v).astype(np.float32)
+        self.dim = target_dim
+
     def normalize(self, v):
         """L2-normalize vector."""
         n = np.linalg.norm(v)
@@ -590,6 +609,19 @@ class VectorGenerator:
                 n_overridden += 1
         self._refined_vectors_path = path
         self._refined_metadata = meta
+
+        # Project to target dimension if different from loaded
+        loaded_dim = self.vs.dim
+        target_dim = self.config.svd_dim
+        if target_dim != loaded_dim:
+            self.vs.project_to_dim(target_dim)
+            # Also project starter_embeddings to keep alignment
+            if self.ag.starter_embeddings is not None and self.ag.starter_embeddings.shape[1] != target_dim:
+                R = np.random.RandomState(42).randn(target_dim, loaded_dim).astype(np.float32)
+                Q, _ = np.linalg.qr(R)
+                self.ag.starter_embeddings = (self.ag.starter_embeddings @ Q.T).astype(np.float32)
+            print(f'  Projected: {loaded_dim}D → {target_dim}D')
+
         # Initialize training state from refined vectors
         self._trained_vectors = {tid: v.copy() for tid, v in self.vs.token_vectors.items()}
         print(f'Refined vectors loaded: {n_overridden}/{len(vectors)} overridden')

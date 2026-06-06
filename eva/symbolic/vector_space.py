@@ -1607,7 +1607,7 @@ class VectorGenerator:
         freq = self._token_freq.get(word_tid, 1)
         adaptive_lr = self._svd_lr / (1.0 + 0.1 * math.sqrt(freq))
 
-        total_scale = 0.2 if is_match else 1.0
+        total_scale = 1.0 if is_match else 0.05  # LTP vs LTD: match=full, non-match=near-zero
         pred_err = self._concept_prediction_error(ctx_anchor, word_tid)
         total_scale *= (1.0 + pred_err)  # surprise amplifies learning
         effective_lr = adaptive_lr * total_scale

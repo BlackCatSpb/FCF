@@ -106,7 +106,7 @@ class CrystalGenerator:
         if cid is not None:
             return cid
 
-        # 2. Orthographic (edit distance to known words, threshold > 0.4)
+        # 2. Orthographic (Dice bigram similarity, threshold > 0.4)
         best_cid, best_score = None, 0.0
         for known_w, known_cid in self.cs.word_to_cid.items():
             if abs(len(known_w) - len(w)) > 3:
@@ -118,21 +118,27 @@ class CrystalGenerator:
         if best_cid is not None:
             return best_cid
 
-        # 3. Vector projection: BPE-encode unknown word,
-        #    find concept vector with closest embedding
-        bpe_ids = self.tok.bpe.encode(w).ids
+        # 3. BPE token overlap (Jaccard similarity, not raw count).
+        #    Only consider matches with >10% Jaccard overlap.
+        #    Weighted centroid of overlapping words -> closest concept.
+        bpe_ids = set(self.tok.bpe.encode(w).ids) if self.tok.bpe.encode(w).ids else set()
         if bpe_ids:
-            # Average the vectors of known words that share BPE tokens
             candidate_vectors = []
-            for known_w, known_cid in self.cs.word_to_cid.items():
-                known_ids = self.tok.bpe.encode(known_w).ids
-                overlap = len(set(bpe_ids) & set(known_ids))
-                if overlap > 0:
+            # Speed: limit scan to first 8000 known words (most frequent)
+            # Full scan is too slow for 37k words on each unknown input
+            scan_limit = min(8000, len(self.cs.word_to_cid))
+            for known_w, known_cid in list(self.cs.word_to_cid.items())[:scan_limit]:
+                known_ids = set(self.tok.bpe.encode(known_w).ids)
+                if not known_ids:
+                    continue
+                jaccard = len(bpe_ids & known_ids) / len(bpe_ids | known_ids)
+                if jaccard > 0.1:  # at least 10% token set overlap
                     v = self.cs.concept_vector(known_cid)
                     if v is not None:
-                        candidate_vectors.append((known_cid, v, overlap))
+                        candidate_vectors.append((known_cid, v, jaccard))
+
             if candidate_vectors:
-                # Weight by token overlap
+                # Weight by Jaccard similarity
                 total_w = sum(o for _, _, o in candidate_vectors)
                 weights = np.array([o / total_w for _, _, o in candidate_vectors], dtype=np.float64)
                 avg_v = np.average(

@@ -58,20 +58,19 @@ print("=" * 60)
 
 # Known words
 for w in ["князь", "война", "человек", "сказать", "быть", "и", "не"]:
-    cid = gen.resolve_anchor(w)
-    check(f"resolve_anchor('{w}') -> {cid}", cid is not None, f"got None")
+    cid, conf = gen.resolve_anchor(w)
+    check(f"resolve_anchor('{w}') -> ({cid}, {conf})", cid is not None, f"got None")
 
 # Unknown but plausible Russian words
 unknown_words = ["Пьер", "Наташа", "Андрей", "Болконский", "Ростов"]
 for w in unknown_words:
-    cid = gen.resolve_anchor(w)
-    check(f"resolve_anchor('{w}') -> {cid}", cid is not None, f"got None")
+    cid, conf = gen.resolve_anchor(w)
+    check(f"resolve_anchor('{w}') -> ({cid}, {conf})", cid is not None, f"got None")
     if cid is not None:
-        # Should resolve to SOMETHING reasonable
         anchor = cs.concept_info.get(cid, {}).get('anchor', '?')
         print(f"    -> anchor='{anchor}'")
 
-# Random character strings (complete noise)
+# Random character strings (complete noise) — must return low confidence
 import string
 random.seed(42)
 noise_words = []
@@ -81,13 +80,21 @@ for _ in range(20):
                 for _ in range(length))
     noise_words.append(w)
 
+noise_confidences = []
 for w in noise_words:
-    cid = gen.resolve_anchor(w)
-    check(f"resolve_anchor('{w[:10]}...') -> {cid}", cid is not None, f"got None")
+    cid, conf = gen.resolve_anchor(w)
+    noise_confidences.append(conf)
+    check(f"resolve_anchor('{w[:10]}...') -> ({cid}, {conf:.3f})", cid is not None, f"got None")
 
-# Empty/edge cases
-check("resolve_anchor('')", gen.resolve_anchor("") is not None)
-check("resolve_anchor(' ') ", gen.resolve_anchor(" ") is not None)
+# Verify most noise gets near-zero confidence
+low_conf = sum(1 for c in noise_confidences if c < 0.1)
+check(f"noise: {low_conf}/{len(noise_confidences)} have confidence < 0.1", low_conf >= len(noise_confidences) * 0.5)
+
+# Empty/edge cases — zero confidence
+cid, conf = gen.resolve_anchor("")
+check("resolve_anchor('')", cid is not None and conf == 0.0)
+cid, conf = gen.resolve_anchor(" ")
+check("resolve_anchor(' ') ", cid is not None and conf == 0.0)
 
 print(f"\n  Anchor resolution: {passed}/{passed + failed}")
 anchor_pass = passed

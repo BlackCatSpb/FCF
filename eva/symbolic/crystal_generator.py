@@ -76,6 +76,7 @@ class CrystalGenerator:
         # --- Intent & Distance tracking ---
         self._query_anchors = []    # concept IDs from query
         self._query_centroid = None # mean vector of query concepts
+        self._query_confidence = 1.0  # how well we understood the query
         self._response_centroid = None # mean vector of response so far
 
     def _theta_temp(self, word_num):
@@ -91,74 +92,104 @@ class CrystalGenerator:
     # ── Anchor resolution (no fallbacks) ──────────────────────────
 
     def resolve_anchor(self, word):
-        """Resolve ANY word to a concept anchor. Never returns None.
+        """Resolve word to concept anchor with confidence.
 
-        Strategy (cascading):
-        1. Direct lookup: word -> cid
-        2. Orthographic: closest known word by edit distance
-        3. Vector projection: encode via BPE, find closest concept vector
-        4. Semantic centroid: if all fails, return most connected concept
+        Returns:
+            (cid, confidence):
+                cid: concept ID (always)
+                confidence: 0..1 how sure we are this is the right anchor.
+                0.0 = pure noise/unknown, 1.0 = exact dictionary match.
+
+        Low-confidence anchors mean: "this input has no clear meaning
+        in my knowledge space." The caller should NOT generate confidently
+        from such anchors — they signal uncertainty, not knowledge.
         """
         w = word.lower().strip()
+        if not w:
+            # Empty input: return neutral anchor at semantic origin
+            return self._neutral_anchor(), 0.0
 
-        # 1. Direct lookup
+        # 1. Direct lookup (exact dictionary match)
         cid = self.cs.word_to_cid.get(w)
         if cid is not None:
-            return cid
+            return cid, 1.0
 
-        # 2. Orthographic (Dice bigram similarity, threshold > 0.4)
+        # 2. Orthographic (Dice bigram similarity > 0.4)
         best_cid, best_score = None, 0.0
         for known_w, known_cid in self.cs.word_to_cid.items():
             if abs(len(known_w) - len(w)) > 3:
                 continue
             score = self._edit_similarity(w, known_w)
-            if score > best_score and score > 0.4:
+            if score > best_score:
                 best_score, best_cid = score, known_cid
 
-        if best_cid is not None:
-            return best_cid
+        if best_score > 0.5:
+            return best_cid, best_score
 
-        # 3. BPE token overlap (Jaccard similarity, not raw count).
-        #    Only consider matches with >10% Jaccard overlap.
-        #    Weighted centroid of overlapping words -> closest concept.
+        # 3. BPE token overlap (Jaccard similarity)
         bpe_ids = set(self.tok.bpe.encode(w).ids) if self.tok.bpe.encode(w).ids else set()
+        best_confidence = 0.0
         if bpe_ids:
             candidate_vectors = []
-            # Speed: limit scan to first 8000 known words (most frequent)
-            # Full scan is too slow for 37k words on each unknown input
             scan_limit = min(8000, len(self.cs.word_to_cid))
             for known_w, known_cid in list(self.cs.word_to_cid.items())[:scan_limit]:
                 known_ids = set(self.tok.bpe.encode(known_w).ids)
                 if not known_ids:
                     continue
                 jaccard = len(bpe_ids & known_ids) / len(bpe_ids | known_ids)
-                if jaccard > 0.1:  # at least 10% token set overlap
+                if jaccard > 0.1:
                     v = self.cs.concept_vector(known_cid)
                     if v is not None:
                         candidate_vectors.append((known_cid, v, jaccard))
 
             if candidate_vectors:
-                # Weight by Jaccard similarity
+                # Best individual Jaccard = confidence upper bound
+                best_jaccard = max(o for _, _, o in candidate_vectors)
+                best_confidence = best_jaccard * 0.8  # discount: BPE is weaker than orthographic
+
+                # Confidence too low: don't pretend to know this input
+                if best_confidence < 0.15:
+                    return self._neutral_anchor(), 0.0
+
                 total_w = sum(o for _, _, o in candidate_vectors)
                 weights = np.array([o / total_w for _, _, o in candidate_vectors], dtype=np.float64)
                 avg_v = np.average(
                     [v for _, v, _ in candidate_vectors],
                     axis=0, weights=weights
                 )
-                # Find closest concept to this averaged vector
                 best_cid = self._closest_concept(avg_v, k=1)[0][0]
-                return best_cid
+                return best_cid, best_confidence
 
-        # 4. Ultimate anchor: most connected concept in the lattice
-        if self.cs.cid_list:
-            # Find concept with highest merge potential (most connected)
-            if self._merge_cache is None:
-                self._precompute_merge_potential()
-            best_cid = max(self._merge_cache, key=self._merge_cache.get)
-            return best_cid
+        # 4. No meaningful overlap → this is noise/unknown input.
+        #    Return NEUTRAL anchor at semantic origin with zero confidence.
+        #    This is NOT a fallback — it's a signal: "I don't know this."
+        return self._neutral_anchor(), 0.0
 
-        # 5. Absolute last resort: first concept
-        return self.cs.cid_list[0] if self.cs.cid_list else 0
+    def _neutral_anchor(self):
+        """The semantic 'center of mass' — represents complete uncertainty.
+        
+        This concept sits at the normalized centroid of all concept vectors.
+        It means: "this input doesn't match any specific knowledge."
+        The model should not generate confidently from this anchor.
+        """
+        if hasattr(self, '_neutral_anchor_cid'):
+            return self._neutral_anchor_cid
+
+        # Compute centroid of all concept vectors (semantic origin)
+        all_vs = list(self.cs.concept_vectors.values())
+        if not all_vs:
+            return self.cs.cid_list[0] if self.cs.cid_list else 0
+
+        centroid = np.mean(all_vs, axis=0).astype(np.float32)
+        norm = np.linalg.norm(centroid)
+        if norm > 1e-10:
+            centroid /= norm
+
+        # Find closest existing concept to centroid
+        self._neutral_anchor_cid = self._closest_concept(centroid, k=1)[0][0]
+
+        # Ensure it's stored
+        return self._neutral_anchor_cid
 
     def _edit_similarity(self, a, b):
         """Normalized edit similarity (Dice coefficient on bigrams)."""
@@ -202,14 +233,17 @@ class CrystalGenerator:
         """
         anchors = []
         vectors = []
+        query_confidence = []
         for w in query_words:
-            cid = self.resolve_anchor(w)
+            cid, conf = self.resolve_anchor(w)
             v = self.cs.concept_vector(cid)
             if v is not None:
                 anchors.append(cid)
                 vectors.append(v)
+                query_confidence.append(conf)
 
         self._query_anchors = anchors
+        self._query_confidence = np.mean(query_confidence) if query_confidence else 0.0
 
         if not vectors:
             # Should never happen since resolve_anchor always returns
@@ -291,7 +325,14 @@ class CrystalGenerator:
         if seed_cid is None and seed_word is None:
             seed_cid = intent_cid
         elif seed_cid is None and seed_word is not None:
-            seed_cid = self.resolve_anchor(seed_word)
+            seed_cid, seed_conf = self.resolve_anchor(seed_word)
+            self._query_confidence = min(self._query_confidence, seed_conf)
+
+        # Feed query confidence into hormonal system
+        # Low confidence -> NA up, 5HT up, ACh down (cautious mode)
+        if self._query_confidence < 0.3:
+            self.hormones.noradrenaline = min(1.0, self.hormones.noradrenaline + 0.2)
+            self.hormones.serotonin = min(1.0, self.hormones.serotonin + 0.1)
 
         target_concepts = self._target_concepts(target_text)
         effective_max = max_words if max_words is not None else self.max_words

@@ -38,18 +38,25 @@ class HeadsEnsemble:
         else:
             self.log_prob_csr = None
 
-        # Semantic similarity [V, V] sparse
-        self.semantic_sim = np.zeros((self.V, self.V), dtype=np.float32)
+        # Semantic similarity — sparse, only allocate if data exists
         trans_sim = meta.get('trans_sim_sparse', {})
-        for tid, neighbors in trans_sim.items():
-            for neighbor_id, sim in neighbors:
-                self.semantic_sim[tid, neighbor_id] = sim
+        if trans_sim:
+            self.semantic_sim = np.zeros((self.V, self.V), dtype=np.float32)
+            for tid, neighbors in trans_sim.items():
+                for neighbor_id, sim in neighbors:
+                    self.semantic_sim[tid, neighbor_id] = sim
+        else:
+            self.semantic_sim = None
 
-        # Contradiction penalty
-        self.contra_penalty = np.zeros((self.V, self.V), dtype=np.float32)
-        for ta, tb, s in meta.get('contra_pairs', []):
-            self.contra_penalty[ta, tb] = float(s)
-            self.contra_penalty[tb, ta] = float(s)
+        # Contradiction penalty — sparse
+        contra = meta.get('contra_pairs', [])
+        if contra:
+            self.contra_penalty = np.zeros((self.V, self.V), dtype=np.float32)
+            for ta, tb, s in contra:
+                self.contra_penalty[ta, tb] = float(s)
+                self.contra_penalty[tb, ta] = float(s)
+        else:
+            self.contra_penalty = None
 
         # Concept scores
         cs = meta.get('concept_scores', None)
@@ -123,7 +130,7 @@ class HeadsEnsemble:
         out[2][out[2] == 0] = self.config.head_unseen_penalty  # unseen transitions get low score
 
         # 3: semantic
-        if ctx_toks:
+        if ctx_toks and self.semantic_sim is not None:
             for ct in ctx_toks[-3:]:
                 if ct < self.V:
                     out[3] += self.semantic_sim[ct]
@@ -132,7 +139,7 @@ class HeadsEnsemble:
         out[4] = self.concept_scores
 
         # 5: contra (penalty)
-        if ctx_toks:
+        if ctx_toks and self.contra_penalty is not None:
             for ct in ctx_toks[-3:]:
                 if ct < self.V:
                     out[5] = np.maximum(out[5], self.contra_penalty[ct])
@@ -164,7 +171,7 @@ class HeadsEnsemble:
                     scores[col_idx] += w * val
 
         w = weights.get('semantic', 0.0)
-        if w != 0.0:
+        if w != 0.0 and self.semantic_sim is not None:
             ctx = context.get('context_tokens', [])
             if ctx:
                 sem = np.zeros(self.V, dtype=np.float32)
@@ -178,7 +185,7 @@ class HeadsEnsemble:
             scores += w * self.concept_scores
 
         w = weights.get('contra', 0.0)
-        if w != 0.0:
+        if w != 0.0 and self.contra_penalty is not None:
             ctx = context.get('context_tokens', [])
             if ctx:
                 penalty = np.zeros(self.V, dtype=np.float32)

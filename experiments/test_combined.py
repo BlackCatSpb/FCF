@@ -31,8 +31,9 @@ for sent in sents[:10]:
         continue
     train_sents.append({'text': text, 'tids': tids, 'fw': hv.decode([tids[0]]).strip()})
 
+config.svd_lr = 0.1  # override stale saved config
 print(f'Training on {len(train_sents)} sentences')
-print(f'Config: lr={config.svd_lr}, decay={config.svd_lr_decay}, momentum={config.svd_momentum_beta}, neg_scale={config.svd_neg_feedback_scale}')
+print(f'Config: lr={config.svd_lr}, decay={config.svd_lr_decay}, momentum={config.svd_momentum_beta}, neg_samples={config.svd_neg_samples}')
 print()
 
 original_target_boost = config.target_boost

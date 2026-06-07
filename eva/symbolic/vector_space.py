@@ -1544,19 +1544,24 @@ class VectorGenerator:
             return
         
         expected = self._target_tokens[self._target_pos]
-        # Find context anchor that is NOT word_anchor itself
+        # Use target context (previous target word) instead of generated context
+        # This avoids corrupting training when the generated previous word is wrong
         ctx_anchor = -1
-        for tid in reversed(context_tokens):
-            if tid != word_anchor and tid < self.config.bpe_limit and self.tt[tid] == 2 and self.vs.has_vector(tid):
-                ctx_anchor = tid
-                break
+        if self._target_pos > 0:
+            prev_target = self._target_tokens[self._target_pos - 1]
+            if self.vs.has_vector(prev_target):
+                ctx_anchor = prev_target
+        if ctx_anchor < 0:
+            for tid in reversed(context_tokens):
+                if tid != word_anchor and tid < self.config.bpe_limit and self.tt[tid] == 2 and self.vs.has_vector(tid):
+                    ctx_anchor = tid
+                    break
         if ctx_anchor < 0:
             return
         
         if word_anchor == expected:
             # Совпало! Усилить семантическую связь + sequential connectedness
             self._target_matches += 1
-            self._target_pos += 1
             self._word_tabu.clear()
             self._got_target_match = True
             self._token_freq[word_anchor] += 1
@@ -1572,6 +1577,12 @@ class VectorGenerator:
             # Sequential connectedness: wrong word learns position AND gets
             # corrective pull toward the right word
             self._svd_shift(word_anchor, ctx_anchor, is_match=False, target_tid=expected)
+            # Positive reinforcement: always train the correct word toward context
+            if self.vs.has_vector(expected) and ctx_anchor != expected:
+                self._svd_shift(expected, ctx_anchor, is_match=True)
+
+        # Advance position regardless of match
+        self._target_pos += 1
 
     def _context_anchor(self, context_tokens):
         """Find last type-2 token with a vector in context for SVD shift."""
@@ -2007,7 +2018,14 @@ class VectorGenerator:
                     # Word level: all type-2 → context anchor from same sentence
                     # Note: match tracking is handled by _check_target_match
                     # at word completion. Here we only do the SVD shift.
-                    ctx_anchor = self._context_anchor(ctx.get('context_tokens', []))
+                    # Use target context when available (avoid corrupted generated context)
+                    ctx_anchor = -1
+                    if self._target_pos > 0:
+                        prev_target = self._target_tokens[self._target_pos - 1]
+                        if self.vs.has_vector(prev_target):
+                            ctx_anchor = prev_target
+                    if ctx_anchor < 0:
+                        ctx_anchor = self._context_anchor(ctx.get('context_tokens', []))
                     if ctx_anchor >= 0 and self.vs.has_vector(next_tok):
                         is_match = (self._target_pos < len(self._target_tokens) and
                                     next_tok == self._target_tokens[self._target_pos])

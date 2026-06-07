@@ -12,13 +12,11 @@ from scipy.sparse import csr_matrix, save_npz, load_npz
 
 from eva.symbolic.bpe_tokenizer import HierarchicalVocab
 
-V = 4101
-UNIFORM_LP = math.log(1.0 / V)
-
-
 class CorpusBuilder:
-    def __init__(self):
+    def __init__(self, vocab_size=None):
         self.hv = HierarchicalVocab()
+        self.V = self.hv.vocab_size if vocab_size is None else vocab_size
+        self.UNIFORM_LP = math.log(1.0 / self.V)
 
     def tokenize_file(self, path, skip_empty=True):
         """Tokenize a text file (one or many sentences). Returns list of token ID lists."""
@@ -45,7 +43,7 @@ class CorpusBuilder:
         print('Building transitions...')
         t0 = time.time()
         trans = defaultdict(int)
-        tok_cnt = np.zeros(V, dtype=np.int32)
+        tok_cnt = np.zeros(self.V, dtype=np.int32)
         for ids in all_ids:
             for t in range(len(ids) - 1):
                 trans[(ids[t], ids[t+1])] += 1
@@ -61,24 +59,24 @@ class CorpusBuilder:
         si = np.argsort(rows, kind='stable')
         rows, cols, data = rows[si], cols[si], data[si]
 
-        indptr = np.zeros(V + 1, dtype=np.int32)
+        indptr = np.zeros(self.V + 1, dtype=np.int32)
         for r in rows:
             indptr[r + 1] += 1
         indptr = np.cumsum(indptr, dtype=np.int32)
 
-        for i in range(V):
+        for i in range(self.V):
             s, e = indptr[i], indptr[i+1]
             if s < e:
                 o = np.argsort(cols[s:e])
                 cols[s:e] = cols[s:e][o]
                 data[s:e] = data[s:e][o]
 
-        count_csr = csr_matrix((data, cols, indptr.copy()), shape=(V, V), dtype=np.int32)
+        count_csr = csr_matrix((data, cols, indptr.copy()), shape=(self.V, self.V), dtype=np.int32)
         rs = np.maximum(np.array(count_csr.sum(axis=1)).flatten(), 1)
         lp_data = np.zeros(len(data), dtype=np.float32)
         for i in range(len(data)):
             lp_data[i] = math.log(data[i] / rs[rows[i]]) if data[i] > 0 else -23.0
-        lp_csr = csr_matrix((lp_data, cols.copy(), indptr.copy()), shape=(V, V), dtype=np.float32)
+        lp_csr = csr_matrix((lp_data, cols.copy(), indptr.copy()), shape=(self.V, self.V), dtype=np.float32)
 
         print(f'  {len(pairs):,} unique transitions, {int(tok_cnt.sum()):,} total tokens ({time.time()-t0:.1f}s)')
         return count_csr, lp_csr, tok_cnt
@@ -133,7 +131,7 @@ class CorpusBuilder:
                 total = sum(morph[wl][pos].values())
                 if total == 0:
                     continue
-                arr = np.full(V, UNIFORM_LP, dtype=np.float32)
+                arr = np.full(self.V, self.UNIFORM_LP, dtype=np.float32)
                 for tid, cnt in morph[wl][pos].items():
                     arr[int(tid)] = math.log(cnt / total)
                 morph_lp[wl][pos] = arr
@@ -144,22 +142,22 @@ class CorpusBuilder:
             total = sum(syntax[wn].values())
             if total == 0:
                 continue
-            arr = np.full(V, UNIFORM_LP, dtype=np.float32)
+            arr = np.full(self.V, self.UNIFORM_LP, dtype=np.float32)
             for tid, cnt in syntax[wn].items():
                 arr[int(tid)] = math.log(cnt / total)
             syn_lp[wn] = arr
 
         # Concept scores: sqrt(count × n_neighbors)
         mc = float(max(1, int(tok_cnt.max())))
-        cs = np.zeros(V, dtype=np.float32)
-        for tid in range(V):
+        cs = np.zeros(self.V, dtype=np.float32)
+        for tid in range(self.V):
             c = int(tok_cnt[tid])
             if c > 0:
                 nn = int(count_csr.indptr[tid + 1] - count_csr.indptr[tid])
                 cs[tid] = min(1.0, math.sqrt(float(c) * float(max(1, nn))) / math.sqrt(mc))
 
         meta = {
-            'V': int(V),
+            'V': int(self.V),
             'morph_logprob': morph_lp,
             'syntax_logprob': syn_lp,
             'trans_sim_sparse': {},
@@ -202,13 +200,15 @@ class CorpusBuilder:
         return meta
 
     @staticmethod
-    def merge(metas, output_path, count_csrs=None, weights=None):
+    def merge(metas, output_path, V=4101, count_csrs=None, weights=None):
         """
         Merge multiple heads_meta dicts with optional weights.
         metas: list of heads_meta dicts
+        V: vocabulary size (default 4101 for backward compat)
         weights: list of floats (default: equal)
         count_csrs: list of count CSR matrices (for combined concept_scores)
         """
+        unif_lp = math.log(1.0 / V)
         n = len(metas)
         weights = weights or [1.0] * n
         w = np.array(weights, dtype=np.float32)
@@ -233,7 +233,7 @@ class CorpusBuilder:
                     if wl in m['morph_logprob'] and pos in m['morph_logprob'][wl]:
                         arr += w[mi] * m['morph_logprob'][wl][pos]
                     else:
-                        arr += w[mi] * UNIFORM_LP
+                        arr += w[mi] * unif_lp
                 merged_morph[wl][pos] = arr
 
         # Syntax merge
@@ -247,7 +247,7 @@ class CorpusBuilder:
                 if wn in m['syntax_logprob']:
                     arr += w[mi] * m['syntax_logprob'][wn]
                 else:
-                    arr += w[mi] * UNIFORM_LP
+                    arr += w[mi] * unif_lp
             merged_syn[wn] = arr
 
         # Token counts

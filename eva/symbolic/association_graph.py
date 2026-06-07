@@ -675,7 +675,7 @@ class AssociationGraph:
 
     def concept_scores(self, cid, V_size=4101):
         """Boost scores for tokens in a concept (like ConceptGraph.concept_scores)."""
-        boost = np.zeros(min(V_size, 4096), dtype=np.float32)
+        boost = np.zeros(V_size, dtype=np.float32)
         members = self.cid_to_tids.get(cid, [])
         for tid in members:
             if tid < len(boost):

@@ -1,0 +1,15 @@
+File size: 30586011
+First 100 bytes hex: d090d0b1d0b0d0bad182d0b8d0bdd0b0d0bbd18cd0bdd18bd0b920d0bfd180d0bed182d0b8d0b2d0bed0bfd0bed0bbd0bed0b6d0bdd0be20d0b0d0bad182d0b8d0bdd0b0d0bbd18cd0bdd18bd0b92e0d0ad090d0b1d0b0d0bad182d0b8d0bdd0b0d0bbd1
+Found at byte 1142438
+Context: ходит от доить.
+Далматская собака происходит от далматский.
+Далматская собака — то же, что далматский дог.
+Далматский происходит от да�
+Total form_of occurrences: 343855
+Total lines: 477744
+Line 0: Абактинальный противоположно актинальный.
+Line 1: Абактинальный — то же, что аборальный.
+Line 2: Аберрация противоположно норма.
+  собака: 64 occurrences
+  слабый: 18 occurrences
+  комиссия: 55 occurrences

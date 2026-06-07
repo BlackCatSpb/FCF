@@ -1,12 +1,12 @@
 """
-Rebuild from corpus — new architecture (ConceptNet + concept navigation).
-
+Full rebuild with Wikipedia corpus — new architecture.
 Pipeline:
-  1. Clean old data (all files)
-  2. Train character-level BPE (Whitespace pre-tokenizer, no ByteLevel)
-  3. Build ConceptNet skeleton (from conceptnet_ru.txt)
-  4. Build ConceptSpace (SVD on concept transitions from corpus)
-  5. Test generation
+  1. Clean old data
+  2. Train character-level BPE on Wikipedia
+  3. Build ConceptNet skeleton (filters long anchors >30 chars)
+  4. Build ConceptSpace (concept transitions from Wikipedia)
+  5. Build SyntaxLattice (n-grams from Wikipedia)
+  6. Test generation
 """
 import sys, os, json, time
 sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
@@ -16,10 +16,11 @@ CORPUS_PATH = os.path.join(DATA_DIR, 'full_corpus_ru.txt')
 BPE_PATH = os.path.join(DATA_DIR, 'bpe_tokenizer.json')
 SKELETON_PATH = os.path.join(DATA_DIR, 'concept_skeleton.json')
 SPACE_PATH = os.path.join(DATA_DIR, 'concept_space.json')
+LATTICE_PATH = os.path.join(DATA_DIR, 'syntax_lattice.json')
 
 t_start = time.time()
 
-# ── Step 1: Clean old data ──
+# ── Step 1: Clean old data (keep corpus, skeleton, conceptnet) ──
 print("=" * 60)
 print("STEP 1: Cleaning old databases")
 print("=" * 60)
@@ -31,30 +32,26 @@ if os.path.exists(DATA_DIR):
         if os.path.isfile(fp):
             os.remove(fp)
             print(f"  deleted {f}")
-    # Remove the archived version directories too
-    for d in ['v5', 'v6', 'v7', 'v8', 'v9']:
-        dp = os.path.join(DATA_DIR, d)
-        if os.path.isdir(dp):
-            import shutil
-            shutil.rmtree(dp)
-            print(f"  removed {d}")
 
 # ── Step 2: Train character-level BPE ──
 print("\n" + "=" * 60)
 print("STEP 2: Training character-level BPE (vocab_size=8192)")
 print("=" * 60)
 from eva.symbolic.concept_tokenizer import train_character_bpe
+t = time.time()
 train_character_bpe(CORPUS_PATH, vocab_size=8192, save_path=BPE_PATH)
+print(f"  BPE training: {time.time()-t:.1f}s")
 
 # ── Step 3: Build ConceptNet skeleton ──
 print("\n" + "=" * 60)
-print("STEP 3: Building ConceptNet concept skeleton")
+print("STEP 3: Building ConceptNet concept skeleton (filter >30 chars)")
 print("=" * 60)
 from eva.symbolic.concept_net import ConceptSkeleton
+t = time.time()
 sk = ConceptSkeleton()
 sk.build()
 sk.save(SKELETON_PATH)
-print(f"  {sk.n_concepts} concepts, {len(sk.relations)} relations")
+print(f"  {sk.n_concepts} concepts, {len(sk.relations)} relations ({time.time()-t:.1f}s)")
 
 # ── Step 4: Initialize tokenizer ──
 print("\n" + "=" * 60)
@@ -67,30 +64,50 @@ print(f"  Vocab: {len(tok)}, BPE: {tok.bpe_vocab_size}, Concepts: {tok.skeleton.
 
 # ── Step 5: Build ConceptSpace ──
 print("\n" + "=" * 60)
-print("STEP 5: Building ConceptSpace")
+print("STEP 5: Building ConceptSpace (concept transitions from Wikipedia)")
 print("=" * 60)
 from eva.symbolic.concept_space import ConceptSpace
+t = time.time()
 cs = ConceptSpace(sk, dim=128)
 cs.build(corpus_path=CORPUS_PATH, tok=tok)
 cs.save(SPACE_PATH)
-print(f"  {len(cs.cid_list)} concepts @ {cs.dim}D")
+print(f"  {len(cs.cid_list)} concepts @ {cs.dim}D ({time.time()-t:.1f}s)")
 
-# ── Step 6: Test generation ──
+# ── Step 6: Build SyntaxLattice ──
 print("\n" + "=" * 60)
-print("STEP 6: Test generation")
+print("STEP 6: Building SyntaxLattice")
 print("=" * 60)
-from eva.symbolic.concept_generator import ConceptGenerator
-gen = ConceptGenerator(cs, tok, {
-    'temperature': 0.5,
-    'concept_temp': 0.3,
-    'word_temp': 0.2,
-    'max_words': 15,
+from eva.symbolic.syntax_lattice import SyntaxLattice
+t = time.time()
+lattice = SyntaxLattice()
+lattice.build(corpus_path=CORPUS_PATH, tok=tok)
+lattice.save(LATTICE_PATH)
+print(f"  {[len(lattice.bigram_prefixes), len(lattice.trigram_prefixes), len(lattice.fourgram_prefixes)]} prefixes ({time.time()-t:.1f}s)")
+
+# ── Step 7: Quick test ──
+print("\n" + "=" * 60)
+print("STEP 7: Quick generation test")
+print("=" * 60)
+from eva.symbolic.crystal_generator import CrystalGenerator
+from eva.symbolic.hormonal_system import HormonalSystem
+
+hormones = HormonalSystem()
+gen = CrystalGenerator(cs, tok, lattice, hormones, {
+    'max_words': 12,
     'min_words': 3,
+    'temperature': 0.5,
 })
 
-for seed in ['князь', 'война', 'сказал', 'человек', 'собака']:
+for seed in ['князь', 'война', 'человек', 'Россия', 'Москва']:
     result = gen.generate(seed_word=seed)
     print(f"  [{seed}] {result['text']}")
+
+# Check anchors
+print("\n  Anchor samples:")
+for w in ['князь', 'война', 'Пьер', 'xrqjz']:
+    cid, conf = gen.resolve_anchor(w)
+    anchor = cs.concept_info.get(cid, {}).get('anchor', '?')
+    print(f"    {w} → cid={cid}, conf={conf:.3f}, anchor='{anchor}'")
 
 elapsed = time.time() - t_start
 print(f"\nTotal time: {elapsed:.1f}s")

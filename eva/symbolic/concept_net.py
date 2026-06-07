@@ -159,6 +159,12 @@ class ConceptSkeleton:
         # Create concepts
         next_cid = 0
         for lemma, words in lemma_to_words.items():
+            # Skip compound entries (anchor > 30 chars)
+            # These are phrases like "национальное управление сша по аэронавтике..."
+            # too long to be useful for concept navigation; constituent words
+            # will be mapped via _add_orphan_word if they appear in the corpus.
+            if len(lemma) > 30:
+                continue
             words_list = sorted(words)
             cid = next_cid
             next_cid += 1
@@ -177,7 +183,16 @@ class ConceptSkeleton:
         self.n_concepts = next_cid
 
     def _add_orphan_word(self, word):
-        """Create a singleton concept for a word with no form_of entry."""
+        """Create a singleton concept for a word with no form_of entry.
+        Skips words longer than 30 chars (compound expressions).
+        """
+        if len(word) > 30:
+            # Map to the closest existing short word's concept if possible
+            prefix = word.split()[0] if ' ' in word else word[:20]
+            existing_cid = self.word_to_cid.get(prefix)
+            if existing_cid is not None:
+                return existing_cid
+            return None  # caller should handle
         cid = self.n_concepts
         self.n_concepts += 1
         self.concepts[cid] = {
@@ -195,8 +210,14 @@ class ConceptSkeleton:
     def _ensure_word_has_concept(self, word):
         """Ensure word has a concept (add orphan if needed)."""
         if word not in self.word_to_cid:
-            self._add_orphan_word(word)
-        return self.word_to_cid[word]
+            cid = self._add_orphan_word(word)
+            if cid is None:
+                # Word too long, use short prefix instead
+                prefix = word.split()[0] if ' ' in word else word[:20]
+                cid = self._add_orphan_word(prefix)
+            if cid is not None:
+                self.word_to_cid[word] = cid
+        return self.word_to_cid.get(word)
 
     def _build_concept_graph(self, triples):
         """Build relations between concepts from all triples.

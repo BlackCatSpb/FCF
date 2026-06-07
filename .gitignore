@@ -1,34 +1,12 @@
-checkpoints/
-domain_rules/
-
-# Model checkpoints (not source data)
-*.pt
-*.safetensors
-
-# Ignore experiment-generated data
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 venv/
 *.egg-info/
 dist/
 build/
-logs/
-tests/
 .idea/
 .vscode/
 *.lnk
-*.pyc
 *.log
-
-# Ignore training data and generated output
-real_data/v5/
-real_data/v6/
-real_data/v7/
-real_data/bpe_tokenizer.json
-_archive/
-hierarchical_data/
-hierarchical_data_clean/
-hierarchical_data_hq/
-gen*.json
-token_demo.json

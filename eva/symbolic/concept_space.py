@@ -439,29 +439,37 @@ class ConceptSpace:
             json.dump(data, f, ensure_ascii=False, indent=1)
         print(f"  Saved ConceptSpace to {path}")
 
-    def load(self, path):
-        """Load ConceptSpace from disk."""
+    @classmethod
+    def load(cls, path):
+        """Load ConceptSpace from disk (class method)."""
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        self.dim = data['dim']
-        self.cid_list = data['cid_list']
-        self.word_to_cid = data['word_to_cid']
-        self.cid_to_words = {int(c): ws for c, ws in data['cid_to_words'].items()}
-        self.concept_vectors = {int(c): np.array(v, dtype=np.float32)
+        obj = cls.__new__(cls)
+        obj.skeleton = None
+        obj.dim = data['dim']
+        obj.cid_list = data['cid_list']
+        obj.cid_to_idx = {c: i for i, c in enumerate(obj.cid_list)}
+        obj.word_to_cid = data['word_to_cid']
+        obj.cid_to_words = {int(c): ws for c, ws in data['cid_to_words'].items()}
+        obj.concept_vectors = {int(c): np.array(v, dtype=np.float32)
                                  for c, v in data['concept_vectors'].items()}
-        self.concept_info = {}
+        obj.cid_vectors = {}
+        obj.concept_transitions = None
+        obj.concept_info = {}
         for c_str, info in data['concept_info_keys'].items():
             c = int(c_str)
-            self.concept_info[c] = {
+            obj.concept_info[c] = {
                 'cid': c,
                 'anchor': info['anchor'],
                 'satellites': [],
                 'relations': defaultdict(list),
-                'vector': self.concept_vectors.get(c),
+                'vector': obj.concept_vectors.get(c),
                 'size': info['size'],
             }
-        print(f"  Loaded ConceptSpace: {len(self.cid_list)} concepts @ {self.dim}D")
-        return self
+        obj.rng = np.random.RandomState(42)
+        obj._concept_usage = Counter()
+        print(f"  Loaded ConceptSpace: {len(obj.cid_list)} concepts @ {obj.dim}D")
+        return obj
 
 
 # ---- Training: concept-level SVD shift ----

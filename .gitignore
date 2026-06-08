@@ -10,3 +10,10 @@ build/
 .vscode/
 *.lnk
 *.log
+
+# Large data files (generated, not tracked in git)
+real_data/concept_space.json
+real_data/morph_cache.json
+real_data/concept_skeleton.json
+checkpoints/
+*.npy

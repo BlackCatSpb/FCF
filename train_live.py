@@ -36,7 +36,8 @@ MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'real_data'
 CKPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'checkpoints')
 
 TEST_EVERY = 500          # lines between test generations
-SAVE_EVERY = 5000         # lines between model saves
+SAVE_EVERY = 5000         # lines between model saves (named checkpoints)
+SAVE_EVERY_LIVE = 50      # lines between live checkpoint overwrites
 MAX_WORDS_PER_LINE = 50   # skip lines longer than this
 
 # Fixed test queries to evaluate generation quality during training
@@ -170,7 +171,7 @@ class Dashboard:
         # Tips
         if conn_rate < 1:
             lines.append(f'  [i] Cold start: caches filling. Speed will increase.')
-        lines.append(f'  [i] Checkpoint every {SAVE_EVERY:,} lines.')
+        lines.append(f'  [i] Checkpoint every {SAVE_EVERY:,} lines, live overwrite every {SAVE_EVERY_LIVE} lines.')
         lines.append('')
 
         try:
@@ -322,11 +323,25 @@ def run_training(args):
                 test_results=test_results,
             )
 
-            # Save checkpoint
+            # Save checkpoint (named, every SAVE_EVERY)
             if line_count % SAVE_EVERY < 1 and line_count > start_from:
                 elapsed = time.time() - t0
                 save_checkpoint(cs, lattice, gen, line_count, elapsed, ckpt_dir, tag=str(line_count))
                 checkpoint_connections = len(lattice.connections)
+
+            # Live checkpoint (overwrite main files every SAVE_EVERY_LIVE)
+            if line_count % SAVE_EVERY_LIVE < 1 and line_count > start_from:
+                cs.save(os.path.join(ckpt_dir, 'concept_space.json'))
+                lattice.save(os.path.join(ckpt_dir, 'syntax_lattice.json'))
+                meta = {
+                    'lines': line_count,
+                    'connections': len(lattice.connections),
+                    'role_memory': len(gen.gate.role_memory),
+                    'concepts': len(cs.cid_list),
+                    'resolve_cache': len(gen._resolve_cache),
+                }
+                with open(os.path.join(ckpt_dir, 'meta.json'), 'w', encoding='utf-8') as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
 
     pbar.close()
 

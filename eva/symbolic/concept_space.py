@@ -44,6 +44,7 @@ class ConceptSpace:
         # Word → concept mapping
         self.word_to_cid = {}         # word → cid (from skeleton)
         self.cid_to_words = {}        # cid → [words]
+        self.word_to_morph = {}       # word → {normal_form, prefix, suffix, ending, pos}
 
         # Transition matrix (concept → concept)
         self.concept_transitions = None  # CSR matrix (n_concepts × n_concepts)
@@ -796,6 +797,7 @@ class ConceptSpace:
                 'codebooks': [cb.tolist() for cb in self.pq_codebooks],
                 'cid_list': self.cid_list,
                 'word_to_cid': self.word_to_cid,
+                'word_to_morph': self.word_to_morph,
                 'cid_to_words': {str(c): ws for c, ws in self.cid_to_words.items()},
                 'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}
                                       for c, info in self.concept_info.items()},
@@ -806,6 +808,7 @@ class ConceptSpace:
                 'pq': False,
                 'cid_list': self.cid_list,
                 'word_to_cid': self.word_to_cid,
+                'word_to_morph': self.word_to_morph,
                 'cid_to_words': {str(c): ws for c, ws in self.cid_to_words.items()},
                 'concept_vectors': {str(c): v.tolist() for c, v in self.concept_vectors.items()},
                 'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}
@@ -845,6 +848,7 @@ class ConceptSpace:
         # Always load mapping data
         obj.word_to_cid = data.get('word_to_cid') or {}
         obj.cid_to_words = {int(c): ws for c, ws in data.get('cid_to_words', {}).items()}
+        obj.word_to_morph = data.get('word_to_morph') or {}
 
         if data.get('pq'):
             # PQ-compressed format: decode back to full vectors

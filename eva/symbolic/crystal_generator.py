@@ -162,11 +162,11 @@ class CrystalGenerator:
             self._resolve_cache[w] = (cid, 1.0)
             return cid, 1.0
 
-        # 2. Morph root resolution (fast, O(1))
+        # 2. Morph root resolution (fast, O(1) with cache)
         # Root → same CID regardless of affixes.
         # Affix shifts apply to VECTORS (for gate/centroid computation),
         # not to CID resolution — same concept, different word form.
-        morph = ConceptTokenizer.morph_parse(w)
+        morph = self._lookup_morph(w)
         root = morph['normal_form'] if morph else w
         root_cid = self.cs.word_to_cid.get(root)
         if root_cid is not None:
@@ -192,6 +192,15 @@ class CrystalGenerator:
         result = (self._neutral_anchor(), 0.0)
         self._resolve_cache[w] = result
         return result
+
+    def _lookup_morph(self, word):
+        """Look up morphological parse: first from in-model cache, then live parse."""
+        cached = self.cs.word_to_morph.get(word)
+        if cached is not None:
+            return cached
+        # Fallback to live parse (for words not in corpus)
+        morph = ConceptTokenizer.morph_parse(word)
+        return morph
 
     def _neutral_anchor(self):
         """The semantic 'center of mass' — represents complete uncertainty.

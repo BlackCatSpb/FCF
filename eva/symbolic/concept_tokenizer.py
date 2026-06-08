@@ -380,9 +380,8 @@ class ConceptTokenizer:
         pos = features.get('pos', 'UNK')
 
         # Use pymorphy3 to get normal form (lemma)
-        import pymorphy3
-        morph = pymorphy3.MorphAnalyzer()
-        parsed = morph.parse(w)
+        from eva.symbolic.pos_tagger import _morph
+        parsed = _morph.parse(w)
         if not parsed:
             return None
 

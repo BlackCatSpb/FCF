@@ -18,6 +18,7 @@ import numpy as np
 from collections import defaultdict, Counter
 from scipy.sparse import csr_matrix, vstack
 from sklearn.decomposition import TruncatedSVD
+from sklearn.cluster import KMeans
 import math, json, os, pickle
 
 
@@ -62,8 +63,18 @@ class ConceptSpace:
         self._cid_order = []
         self._matrix_dirty = True
 
+        # Product Quantization (storage compression)
+        # PQ replaces full float32 vectors with compact codes:
+        #   n_subvectors × uint8 per vector instead of D × float32
+        #   typical ratio: 32 bytes vs 512 bytes (128D) → 16× compression
+        self.pq_codebooks = None    # list of (n_centroids, subdim) arrays
+        self.pq_codes = None        # (N, n_subvectors) uint8 array
+        self.pq_cid_order = []      # CID order matching pq_codes rows
+        self.pq_n_subvectors = 0
+        self.pq_n_centroids = 0
+
         # Affix shift vectors (morphological modifiers)
-        # affix → 128D shift vector, initialized as random unit vectors
+        # affix → dim-D shift vector, initialized as random unit vectors
         self.affix_shifts = {}
         self._init_affix_shifts()
 
@@ -504,6 +515,242 @@ class ConceptSpace:
                 break
         return result[:k]
 
+    # ── Product Quantization — storage compression ─────────────────
+
+    def pq_train(self, n_subvectors=32, n_centroids=256):
+        """Train PQ codebooks from current concept vectors.
+
+        Args:
+            n_subvectors: number of sub-vectors to split each D-dim vector into
+            n_centroids: centroids per subspace (256 = 8-bit index)
+
+        Splits each D-dim vector into n_subvectors subspaces of dim D/n_subvectors.
+        Performs k-means in each subspace to learn n_centroids.
+
+        PQ compression ratio:
+            before: N × D × float32 (4 bytes)
+            after:  N × n_subvectors × uint8 (1 byte) + n_subvectors × n_centroids × subdim × float32
+            typical for 128D → 32×8 = 32 bytes vs 512 bytes = 16× compression
+        """
+        vecs = list(self.concept_vectors.values())
+        if not vecs:
+            return
+        N = len(vecs)
+        D = self.dim
+        assert D % n_subvectors == 0, f'Dim {D} must be divisible by {n_subvectors}'
+        subdim = D // n_subvectors
+
+        mat = np.array(vecs, dtype=np.float32)
+        # Normalize each vector
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        mat /= norms
+
+        codebooks = []
+        for m in range(n_subvectors):
+            subvecs = mat[:, m * subdim:(m + 1) * subdim]
+            kmeans = KMeans(n_clusters=n_centroids, random_state=42 + m,
+                            n_init=1, max_iter=20)
+            kmeans.fit(subvecs)
+            codebooks.append(kmeans.cluster_centers_.astype(np.float32))
+
+        self.pq_codebooks = codebooks
+        self.pq_n_subvectors = n_subvectors
+        self.pq_n_centroids = n_centroids
+        self.pq_cid_order = list(self.concept_vectors.keys())
+        self.pq_codes = None  # not encoded yet
+        return codebooks
+
+    def pq_encode(self):
+        """Encode all concept vectors using trained codebooks.
+
+        Returns:
+            pq_codes: (N, n_subvectors) uint8 array
+        """
+        if self.pq_codebooks is None:
+            raise ValueError('Call pq_train() first')
+        vecs = [self.concept_vectors[cid] for cid in self.pq_cid_order]
+        mat = np.array(vecs, dtype=np.float32)
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        mat /= norms
+
+        N = len(mat)
+        n_sub = self.pq_n_subvectors
+        subdim = self.dim // n_sub
+        codes = np.zeros((N, n_sub), dtype=np.uint8)
+
+        for m in range(n_sub):
+            subvecs = mat[:, m * subdim:(m + 1) * subdim]
+            cb = self.pq_codebooks[m]  # (n_centroids, subdim)
+            # Compute distances from each subvec to each centroid
+            # Use argmin across centroids
+            for i in range(N):
+                diffs = subvecs[i] - cb  # (n_centroids, subdim)
+                dists = np.sum(diffs ** 2, axis=1)
+                codes[i, m] = np.argmin(dists).astype(np.uint8)
+
+        self.pq_codes = codes
+        return codes
+
+    def pq_decode_all(self):
+        """Reconstruct full vectors from PQ codes.
+
+        Updates concept_vectors in-place with decoded (approximate) vectors.
+        """
+        if self.pq_codes is None or self.pq_codebooks is None:
+            return
+        n_sub = self.pq_n_subvectors
+        subdim = self.dim // n_sub
+        N = len(self.pq_cid_order)
+        decoded = np.zeros((N, self.dim), dtype=np.float32)
+        for m in range(n_sub):
+            cb = self.pq_codebooks[m]
+            codes_m = self.pq_codes[:, m]
+            decoded[:, m * subdim:(m + 1) * subdim] = cb[codes_m]
+        # Renormalize
+        norms = np.linalg.norm(decoded, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        decoded /= norms
+        # Write back
+        for i, cid in enumerate(self.pq_cid_order):
+            self.concept_vectors[cid] = decoded[i]
+        self.mark_matrix_dirty()
+
+    def pq_decode(self, cid):
+        """Decode a single concept vector from PQ codes."""
+        if self.pq_codes is None or self.pq_codebooks is None:
+            return self.concept_vectors.get(cid)
+        try:
+            idx = self.pq_cid_order.index(cid)
+        except ValueError:
+            return self.concept_vectors.get(cid)
+        n_sub = self.pq_n_subvectors
+        subdim = self.dim // n_sub
+        v = np.zeros(self.dim, dtype=np.float32)
+        for m in range(n_sub):
+            cb = self.pq_codebooks[m]
+            v[m * subdim:(m + 1) * subdim] = cb[self.pq_codes[idx, m]]
+        norm = np.linalg.norm(v)
+        if norm > 1e-10:
+            v /= norm
+        return v
+
+    def pq_adc_search(self, query_vec, k=10):
+        """Approximate nearest neighbor via Asymmetric Distance Computation.
+
+        Query is kept in full float32 (not encoded).
+        Database distances computed by summing subspace distances
+        from pre-computed lookup tables.
+
+        Args:
+            query_vec: (D,) float32 query vector (NOT normalized — done internally)
+            k: number of nearest neighbors
+
+        Returns:
+            [(cid, similarity), ...]  (cosine similarity, higher = closer)
+        """
+        if self.pq_codes is None or self.pq_codebooks is None:
+            return []
+        vn = query_vec / max(np.linalg.norm(query_vec), 1e-10)
+        n_sub = self.pq_n_subvectors
+        subdim = self.dim // n_sub
+        N = len(self.pq_cid_order)
+
+        # Build distance table: for each subspace, distance from query to each centroid
+        dist_tables = []
+        for m in range(n_sub):
+            q_sub = vn[m * subdim:(m + 1) * subdim]
+            cb = self.pq_codebooks[m]
+            diffs = cb - q_sub  # (n_centroids, subdim)
+            dists = np.sum(diffs ** 2, axis=1)  # (n_centroids,)
+            dist_tables.append(dists)
+
+        # For each database vector, sum subspace distances via lookup
+        # Optimized: precompute full distance matrix
+        total_dists = np.zeros(N, dtype=np.float32)
+        for m in range(n_sub):
+            codes_m = self.pq_codes[:, m].astype(np.int32)
+            total_dists += dist_tables[m][codes_m]
+
+        # Convert distance to cosine similarity: sim = 1 - dist²/2
+        sims = 1.0 - total_dists / 2.0
+        sims = np.clip(sims, -1.0, 1.0)
+
+        # Top-k
+        k_actual = min(k, N)
+        idx = np.argpartition(-sims, k_actual - 1)[:k_actual]
+        idx = idx[np.argsort(-sims[idx])]
+        return [(self.pq_cid_order[i], float(sims[i])) for i in idx[:k]]
+
+    def pq_compression_ratio(self):
+        """Report storage savings from PQ compression."""
+        if self.pq_codes is None:
+            return 0
+        orig = len(self.pq_cid_order) * self.dim * 4  # float32
+        codes_size = self.pq_codes.nbytes
+        cb_size = sum(cb.nbytes for cb in self.pq_codebooks)
+        return orig / (codes_size + cb_size)
+
+    def expand_dim(self, target_dim):
+        """Expand vector space dimension (e.g. 128 → 384).
+
+        Existing vectors are kept in the first `self.dim` coordinates.
+        New dimensions are initialized from a random subspace
+        (orthogonal complement) to preserve existing relationships.
+
+        Args:
+            target_dim: new dimension (must be > current dim)
+        """
+        if target_dim <= self.dim:
+            return
+        old_dim = self.dim
+        print(f'  Expanding dimension: {old_dim} -> {target_dim}')
+        new_dim = target_dim
+
+        # Generate random orthonormal basis for new dimensions
+        rng = np.random.RandomState(42)
+        # Use QR decomposition to get orthogonal basis
+        rand_mat = rng.randn(new_dim, new_dim).astype(np.float32)
+        q, _ = np.linalg.qr(rand_mat)
+        # Take projection matrix: old_dim rows of the orthogonal matrix
+        # This preserves old vectors and adds orthogonal new dimensions
+        proj = q[:old_dim, :new_dim]  # (old_dim, new_dim)
+
+        new_vectors = {}
+        for cid, v in self.concept_vectors.items():
+            # Project old vector to new space via random orthogonal matrix
+            v_new = v @ proj  # (new_dim,) — v is (old_dim,)
+            norm = np.linalg.norm(v_new)
+            if norm > 1e-10:
+                v_new /= norm
+            new_vectors[cid] = v_new
+
+        self.concept_vectors = new_vectors
+        self.dim = new_dim
+
+        # Expand affix shifts to new dimension
+        new_affix = {}
+        for affix, shift in self.affix_shifts.items():
+            if len(shift) == old_dim:
+                new_shift = shift @ proj
+                n = np.linalg.norm(new_shift)
+                if n > 1e-10:
+                    new_shift /= n
+                new_affix[affix] = new_shift
+            else:
+                new_affix[affix] = shift
+        self.affix_shifts = new_affix
+
+        # Invalidate caches
+        self.pq_codebooks = None
+        self.pq_codes = None
+        self.pq_cid_order = []
+        self._vector_matrix = None
+        self._cid_order = []
+        self._matrix_dirty = True
+        print(f'  Done: {len(new_vectors)} concepts @ {self.dim}D')
+
     def predict_next_concept(self, prev_cid, top_k=20):
         """Predict next concept from transition matrix."""
         if self.concept_transitions is None:
@@ -529,17 +776,41 @@ class ConceptSpace:
             return self.concept_info[cid]['anchor']
         return None
 
-    def save(self, path):
-        """Save ConceptSpace to disk."""
-        data = {
-            'dim': self.dim,
-            'cid_list': self.cid_list,
-            'word_to_cid': self.word_to_cid,
-            'cid_to_words': {str(c): ws for c, ws in self.cid_to_words.items()},
-            'concept_vectors': {str(c): v.tolist() for c, v in self.concept_vectors.items()},
-            'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}
-                                  for c, info in self.concept_info.items()},
-        }
+    def save(self, path, use_pq=False):
+        """Save ConceptSpace to disk.
+
+        Args:
+            path: file path
+            use_pq: if True, save PQ-compressed format (much smaller).
+                    Requires pq_codes to be computed (call pq_encode() first).
+        """
+        if use_pq and self.pq_codes is not None:
+            # PQ format: codes + codebooks, no full vectors
+            data = {
+                'dim': self.dim,
+                'pq': True,
+                'n_subvectors': self.pq_n_subvectors,
+                'n_centroids': self.pq_n_centroids,
+                'pq_cid_order': self.pq_cid_order,
+                'pq_codes': self.pq_codes.tolist(),
+                'codebooks': [cb.tolist() for cb in self.pq_codebooks],
+                'cid_list': self.cid_list,
+                'word_to_cid': self.word_to_cid,
+                'cid_to_words': {str(c): ws for c, ws in self.cid_to_words.items()},
+                'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}
+                                      for c, info in self.concept_info.items()},
+            }
+        else:
+            data = {
+                'dim': self.dim,
+                'pq': False,
+                'cid_list': self.cid_list,
+                'word_to_cid': self.word_to_cid,
+                'cid_to_words': {str(c): ws for c, ws in self.cid_to_words.items()},
+                'concept_vectors': {str(c): v.tolist() for c, v in self.concept_vectors.items()},
+                'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}
+                                      for c, info in self.concept_info.items()},
+            }
         # Save homeostatic state if initialized
         if hasattr(self, 'concept_usage'):
             data['concept_usage'] = {str(c): u for c, u in self.concept_usage.items()}
@@ -547,11 +818,15 @@ class ConceptSpace:
 
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
-        print(f"  Saved ConceptSpace to {path}")
+        size_kb = os.path.getsize(path) / 1024
+        print(f"  Saved ConceptSpace ({'PQ ' if use_pq else ''}{size_kb:.0f}KB) to {path}")
 
     @classmethod
     def load(cls, path):
-        """Load ConceptSpace from disk (class method)."""
+        """Load ConceptSpace from disk (class method).
+
+        Handles both regular and PQ-compressed formats automatically.
+        """
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         obj = cls.__new__(cls)
@@ -559,10 +834,46 @@ class ConceptSpace:
         obj.dim = data['dim']
         obj.cid_list = data['cid_list']
         obj.cid_to_idx = {c: i for i, c in enumerate(obj.cid_list)}
-        obj.word_to_cid = data['word_to_cid']
-        obj.cid_to_words = {int(c): ws for c, ws in data['cid_to_words'].items()}
-        obj.concept_vectors = {int(c): np.array(v, dtype=np.float32)
-                                 for c, v in data['concept_vectors'].items()}
+
+        # PQ attributes (set defaults before potential override)
+        obj.pq_codebooks = None
+        obj.pq_codes = None
+        obj.pq_cid_order = []
+        obj.pq_n_subvectors = 0
+        obj.pq_n_centroids = 0
+
+        # Always load mapping data
+        obj.word_to_cid = data.get('word_to_cid') or {}
+        obj.cid_to_words = {int(c): ws for c, ws in data.get('cid_to_words', {}).items()}
+
+        if data.get('pq'):
+            # PQ-compressed format: decode back to full vectors
+            n_sub = data['n_subvectors']
+            n_cen = data['n_centroids']
+            obj.pq_n_subvectors = n_sub
+            obj.pq_n_centroids = n_cen
+            obj.pq_cid_order = data['pq_cid_order']
+            obj.pq_codebooks = [np.array(cb, dtype=np.float32) for cb in data['codebooks']]
+            obj.pq_codes = np.array(data['pq_codes'], dtype=np.uint8)
+
+            subdim = obj.dim // n_sub
+            N = len(obj.pq_cid_order)
+            decoded = np.zeros((N, obj.dim), dtype=np.float32)
+            for m in range(n_sub):
+                cb = obj.pq_codebooks[m]
+                codes_m = obj.pq_codes[:, m]
+                decoded[:, m * subdim:(m + 1) * subdim] = cb[codes_m]
+            norms = np.linalg.norm(decoded, axis=1, keepdims=True)
+            norms[norms < 1e-10] = 1.0
+            decoded /= norms
+
+            obj.concept_vectors = {}
+            for i, cid in enumerate(obj.pq_cid_order):
+                obj.concept_vectors[cid] = decoded[i]
+        else:
+            obj.concept_vectors = {int(c): np.array(v, dtype=np.float32)
+                                     for c, v in data['concept_vectors'].items()}
+
         obj.cid_vectors = {}
         obj.concept_transitions = None
         obj.concept_info = {}
@@ -584,7 +895,8 @@ class ConceptSpace:
         obj._matrix_dirty = True
         obj.affix_shifts = {}
         obj._init_affix_shifts()
-        print(f"  Loaded ConceptSpace: {len(obj.cid_list)} concepts @ {obj.dim}D")
+        pq_note = ' (PQ)' if data.get('pq') else ''
+        print(f"  Loaded ConceptSpace: {len(obj.cid_list)} concepts @ {obj.dim}D{pq_note}")
         return obj
 
 

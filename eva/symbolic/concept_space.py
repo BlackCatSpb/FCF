@@ -56,6 +56,56 @@ class ConceptSpace:
         self.rng = np.random.RandomState(42)
         self._inhibition_step = 0  # counter for lateral inhibition seed
 
+        # Affix shift vectors (morphological modifiers)
+        # affix → 128D shift vector, initialized as random unit vectors
+        self.affix_shifts = {}
+        self._init_affix_shifts()
+
+    def _init_affix_shifts(self):
+        """Initialize affix shift vectors as random unit vectors.
+
+        These represent grammatical modifications to root concepts:
+        - prefix: directional/aspectual modification
+        - suffix: derivational modification
+        - ending: grammatical role (case, number, gender, person)
+        """
+        rng = np.random.RandomState(42)
+        common_prefixes = ['по', 'за', 'на', 'вы', 'от', 'при', 'пере', 'про',
+                           'раз', 'рас', 'вз', 'воз', 'вос', 'из', 'ис',
+                           'под', 'над', 'об', 'о', 'у', 'с', 'со', 'в', 'во',
+                           'до', 'без', 'бес', 'пре', 'пред']
+        common_suffixes = ['к', 'ок', 'ек', 'ик', 'ник', 'тель', 'чик', 'щик',
+                           'ств', 'ость', 'ени', 'ани', 'изм', 'ист',
+                           'лив', 'чив', 'оват', 'ну', 'а']
+        common_endings =  ['а', 'я', 'о', 'е', 'ы', 'и', 'у', 'ю',
+                           'ой', 'ей', 'ых', 'их', 'ам', 'ям',
+                           'ого', 'его', 'ому', 'ему', 'ым', 'им',
+                           'ую', 'юю', 'ая', 'яя', 'ое', 'ее', 'ые', 'ие']
+
+        for affix in common_prefixes + common_suffixes + common_endings:
+            v = rng.randn(self.dim).astype(np.float32)
+            norm = np.linalg.norm(v)
+            if norm > 1e-10:
+                v /= norm
+            self.affix_shifts[affix] = v
+
+    def get_affix_shift(self, affix):
+        """Get shift vector for a morphological affix.
+
+        Returns 128D unit vector (or zero vector if unknown).
+        """
+        v = self.affix_shifts.get(affix)
+        if v is not None:
+            return v
+        # Create on first use
+        rng = np.random.RandomState(hash(affix) % (2**31))
+        v = rng.randn(self.dim).astype(np.float32)
+        norm = np.linalg.norm(v)
+        if norm > 1e-10:
+            v /= norm
+        self.affix_shifts[affix] = v
+        return v
+
     def build(self, corpus_path=None, tok=None):
         """Build ConceptSpace from skeleton and corpus.
 

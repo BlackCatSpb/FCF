@@ -194,6 +194,38 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
     def _reorder_cache(self, past_key_values, beam_idx):
         return past_key_values
 
+    # ── External Training Interface ──
+
+    def train_from_text(self, text: str) -> int:
+        """Train model from external text data.
+
+        Decodes text → extracts core concepts → builds connections →
+        updates role_memory → organizes semantic space.
+
+        Not gradient descent: pure structure extraction and accumulation.
+
+        Args:
+            text: input Russian text (one or more sentences)
+
+        Returns:
+            number of sentences processed
+        """
+        self._load()
+        return self._generator.train_from_text(text)
+
+    def train_from_file(self, file_path: str) -> int:
+        """Train model from a text file.
+
+        Args:
+            file_path: path to .txt file with Russian text
+
+        Returns:
+            number of sentences processed
+        """
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        return self.train_from_text(text)
+
     # ── Save / Load ──
 
     def save_pretrained(self, save_directory: str, **kwargs):

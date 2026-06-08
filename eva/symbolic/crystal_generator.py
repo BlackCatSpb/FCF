@@ -24,6 +24,7 @@ from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.hormonal_system import HormonalSystem
 from eva.symbolic.concept_inductor import ConceptInductor
 from eva.symbolic.semantic_gate import SemanticGate
+from eva.symbolic.concept_tokenizer import ConceptTokenizer
 
 
 class CrystalGenerator:
@@ -92,6 +93,7 @@ class CrystalGenerator:
         # --- Core concept & modifier field (from gate) ---
         self._core_cid = None
         self._modifier_field = {}
+        self._core_aspects = []  # decomposed aspects of current core
 
     def _theta_temp(self, word_num):
         """Theta-rhythm temperature: high early (explore), low late (exploit)."""
@@ -303,6 +305,80 @@ class CrystalGenerator:
 
         return intent_cid, intent_vec, delta
 
+    # ── Core decomposition (field exploration) ─────────────────
+
+    def decompose_core(self, core_cid, top_k=10):
+        """Decompose core concept into its semantic aspects.
+
+        Aspects are sub-concepts that can be expressed about the core:
+        - Similar concepts in vector space (semantic neighbors)
+        - Connected concepts from lattice (co-occurring modifiers)
+        - Concepts in the modifier field (adjectives, relations)
+
+        Returns:
+            list of dicts: {cid, strength, relation, type}
+        """
+        aspects = {}
+        v_core = self.cs.concept_vector(core_cid)
+
+        # 1. Vector space neighbors (semantic aspects)
+        if v_core is not None:
+            similar = self.cs.topk_similar_concepts(core_cid, k=top_k)
+            for cid, anchor, sim in similar:
+                aspects[cid] = {
+                    'cid': cid, 'strength': sim,
+                    'relation': 'similar_to', 'type': 'semantic',
+                }
+
+        # 2. Lattice connections (syntagmatic aspects)
+        connected = self.lattice.connections_of(core_cid, top_k=top_k)
+        for cid, conn in connected:
+            if cid not in aspects or conn['strength'] > aspects[cid]['strength']:
+                aspects[cid] = {
+                    'cid': cid, 'strength': conn['strength'],
+                    'relation': conn['type'], 'type': 'connection',
+                }
+
+        # 3. Modifier field (query-specific aspects)
+        for cid, mod_info in self._modifier_field.items():
+            if cid not in aspects or mod_info['strength'] > aspects[cid]['strength']:
+                aspects[cid] = {
+                    'cid': cid,
+                    'strength': mod_info.get('strength', 0.5),
+                    'relation': mod_info.get('relation', 'modifies'),
+                    'type': 'modifier',
+                }
+
+        result = sorted(aspects.values(), key=lambda x: -x['strength'])[:top_k]
+        self._core_aspects = result
+        return result
+
+    def _gate_verification(self, cid):
+        """Verify that a generated concept is connected to the core.
+
+        Returns:
+            (is_connected, connection_strength)
+        """
+        if self._core_cid is None or cid == self._core_cid:
+            return True, 1.0
+
+        # Direct connection from lattice
+        conn = self.lattice.get_connection(self._core_cid, cid)
+        if conn is not None and conn['strength'] > 0.05:
+            return True, conn['strength']
+
+        # Vector similarity
+        v_core = self.cs.concept_vector(self._core_cid)
+        v_cand = self.cs.concept_vector(cid)
+        if v_core is not None and v_cand is not None:
+            cos = float(np.dot(v_core, v_cand) / max(
+                np.linalg.norm(v_core) * np.linalg.norm(v_cand), 1e-10))
+            if cos > 0.2:
+                return True, max(cos, 0)
+
+        # No connection found
+        return False, 0.0
+
     # ── Semantic distance tracking ───────────────────────────────
 
     def _semantic_delta(self, query_vec, response_path, window=5):
@@ -360,6 +436,10 @@ class CrystalGenerator:
         # Confidence = how cleanly the gate found a core
         gate_noise_ratio = len(noise_words) / max(len(src_words), 1)
         self._query_confidence = max(0.1, 1.0 - gate_noise_ratio)
+
+        # ── Decompose core concept into aspects (field exploration) ──
+        if core_cid is not None:
+            self.decompose_core(core_cid)
 
         # Use core as seed if no explicit seed given
         if seed_cid is None and seed_word is None:
@@ -419,9 +499,21 @@ class CrystalGenerator:
 
                 for ci, (cid, cand_score) in enumerate(candidates):
                     new_seq = seq + [cid]
+
+                    # ---- Gate verification: is this candidate connected to core? ----
+                    is_verified, gate_strength = self._gate_verification(cid)
+                    if not is_verified and core_cid is not None:
+                        # Not connected to core — if confidence low, skip entirely
+                        if self._query_confidence > 0.5:
+                            continue
+
                     # Distance penalty: penalize candidates that increase drift
                     dist_penalty = drift_penalty * (1.0 if ci == 0 else 1.0 + 0.1 * ci)
                     new_score = score + cand_score - dist_penalty
+
+                    # Gate verification bonus: prefer concepts connected to core
+                    if is_verified:
+                        new_score += gate_strength * 0.1
 
                     # ---- Word form selection ----
                     word_text = self._select_word(cid, h_temp)
@@ -514,36 +606,44 @@ class CrystalGenerator:
         }
 
     def _branch(self, seq, word_num, theta_temp=0.3, target_cid=None, intent_vec=None):
-        """Generate diverse branching candidates.
+        """Generate diverse branching candidates via field exploration.
 
-        Uses Reciprocal Rank Fusion (RRF) to combine:
-        - Syntax lattice (n-gram) ~ syntactic crystal field
-        - Vector similarity (semantic) ~ semantic electron field
-        - Core modifier field ~ what aspects of core to express
-        - Content word bias ~ imagery potential
-        - Target boosting (training) ~ supervised alignment
+        Uses Reciprocal Rank Fusion (RRF) combined with core aspect
+        decomposition to generate candidates within the core's field.
 
-        Core modifier field ensures generation stays within the
-        semantic orbit of the core concept, not jumping to unrelated
-        concepts.
+        Components:
+        - Core aspects (decomposed sub-topics of core concept)
+        - Core modifier field (query-specific modifiers)
+        - Core connection strength (any concept connected to core)
+        - Syntax lattice (n-gram) ~ syntactic structure
+        - Vector similarity (semantic) ~ semantic proximity
+
+        Gate verification filters candidates not connected to core.
 
         Returns:
             [(cid, log_score), ...]
         """
         cids = seq[-3:] if len(seq) >= 3 else seq
         prev_cid = seq[-1]
-        K = 3  # RRF constant (for 20-30 candidates, K=3 gives meaningful rank discrimination)
+        K = 3  # RRF constant
+        core_cid = self._core_cid if hasattr(self, '_core_cid') else None
 
-        # POS context: get POS of previous concept's anchor
+        # POS context
         from eva.symbolic.pos_tagger import get_pos, pos_transition_score
         prev_anchor = self.cs.concept_info.get(prev_cid, {}).get('anchor', '')
         prev_pos = get_pos(prev_anchor) if prev_anchor else 'UNK'
 
-        # 1. N-gram syntax candidates with ranks
+        # 1. Core aspects (decomposed field — THE key signal)
+        aspect_cids = {}
+        if core_cid is not None and self._core_aspects:
+            for asp in self._core_aspects:
+                aspect_cids[asp['cid']] = asp['strength']
+
+        # 2. N-gram syntax candidates
         syn_preds = self.lattice.predict(cids)
         syn_ranked = {cid: i+1 for i, (cid, _) in enumerate(syn_preds[:30])}
 
-        # 2. Vector similarity candidates (semantic)
+        # 3. Vector similarity (from prev concept)
         v_prev = self.cs.concept_vector(prev_cid)
         vec_candidates = []
         if v_prev is not None:
@@ -551,45 +651,48 @@ class CrystalGenerator:
             vec_candidates = [(cid, sim) for cid, anchor, sim in similar]
         vec_ranked = {cid: i+1 for i, (cid, _) in enumerate(vec_candidates[:20])}
 
-        # 3. All candidate cids (union of syntax + vector + modifier field)
+        # 4. All candidate cids (union of all sources)
         modifier_cids = set(self._modifier_field.keys())
-        all_cids = set(syn_ranked.keys()) | set(vec_ranked.keys()) | modifier_cids
+        all_cids = (set(aspect_cids.keys()) | set(syn_ranked.keys()) |
+                    set(vec_ranked.keys()) | modifier_cids)
 
         if not all_cids:
             return []
 
-        # 4. RRF scoring
+        # 5. RRF scoring with core field dominance
         combined = {}
-        core_cid = self._core_cid if hasattr(self, '_core_cid') else None
         for cid in all_cids:
             rrf = 0.0
 
-            # Syntax component: 1/(K + rank_in_ngrams)
+            # Core aspect priority: exploring what we can say about core
+            if cid in aspect_cids:
+                rrf += 0.6 * aspect_cids[cid] / (K + 1)
+            elif core_cid is not None and cid != core_cid:
+                conn = self.lattice.connection_strength(core_cid, cid, self.cs)
+                if conn > 0.1:
+                    rrf += 0.3 * conn / (K + 1)
+
+            # Syntax component
             if cid in syn_ranked:
-                rrf += 0.5 / (K + syn_ranked[cid])
+                rrf += 0.3 / (K + syn_ranked[cid])
 
-            # Vector component: 1/(K + rank_in_vectors)
+            # Vector component
             if cid in vec_ranked:
-                rrf += 0.3 / (K + vec_ranked[cid])
+                rrf += 0.2 / (K + vec_ranked[cid])
 
-            # Modifier field boost: exploring aspects of core concept
+            # Modifier field boost
             if cid in modifier_cids:
                 mod_strength = self._modifier_field[cid].get('strength', 0.5)
-                rrf += 0.4 * mod_strength / (K + 1)
+                rrf += 0.2 * mod_strength / (K + 1)
 
-            # Core connection boost: staying relevant to core concept
-            if core_cid is not None and cid != core_cid:
-                conn = self.gate._connection_strength(core_cid, cid)
-                rrf += 0.2 * conn / (K + 1)
-
-            # Novelty prior: rare concepts get a small boost
+            # Novelty prior
             freq = self.lattice.concept_freq.get(cid, 0)
-            prior = 0.1 / (K + 1) * (1.0 - min(freq / 1000, 1.0))
+            prior = 0.05 / (K + 1) * (1.0 - min(freq / 1000, 1.0))
             rrf += prior
 
             combined[cid] = rrf
 
-        # 5. Homeostatic boost + content word bonus
+        # 6. Homeostatic boost + content word bonus
         for cid in list(combined.keys()):
             h_boost = self.cs.homeostatic_boost(cid)
             combined[cid] *= (1.0 + h_boost * 0.3)
@@ -620,7 +723,7 @@ class CrystalGenerator:
 
             # Core connection penalty: concepts unrelated to core get penalized
             if core_cid is not None and cid != core_cid and cid not in modifier_cids:
-                conn = self.gate._connection_strength(core_cid, cid)
+                conn = self.lattice.connection_strength(core_cid, cid, self.cs)
                 if conn < 0.05:
                     combined[cid] *= 0.5  # strong penalty for drifting
 
@@ -771,6 +874,81 @@ class CrystalGenerator:
         meta = self.tok.metadata_from_ids(ids)
         return [m.get('concept_id') for m in meta
                 if m['flags'] & 1 and m.get('concept_id') is not None]
+
+    # ---- External Training API ----
+
+    def train_from_text(self, text):
+        """Train model from external text (decode → metadata → organize connections).
+
+        Training principle:
+        1. Decode text to metadata: extract core concepts, modifiers, connections
+        2. Organize semantic connections: update lattice, role_memory, concept space
+        3. Accumulate structure: every text enriches the model's semantic map
+
+        This is NOT gradient descent. It's structure extraction and accumulation.
+
+        Args:
+            text: input text (any Russian text)
+        """
+        sentences = self._split_into_sentences(text)
+
+        for sentence in sentences:
+            words = sentence.strip().split()
+            if len(words) < 2:
+                continue
+
+            # 1. Extract core concept via gate
+            core_cid, modifier_field, centroid, noise = self.gate.extract_core(words)
+            if core_cid is None:
+                continue
+
+            # 2. Update role memory
+            mod_cids = set(modifier_field.keys())
+            self.gate.update_role_memory(words, core_cid, mod_cids)
+
+            # 3. Build connection graph from sentence structure
+            from eva.symbolic.pos_tagger import get_pos
+            word_data = []
+            for w in words:
+                clean = w.strip('.,!?;:()[]{}«»—–-…\'\"')
+                if not clean:
+                    continue
+                morph = ConceptTokenizer.morph_parse(clean)
+                root = morph['normal_form'] if morph else clean
+                cid = self.cs.word_to_cid.get(root) or self.cs.word_to_cid.get(clean)
+                pos = morph['pos'] if morph else get_pos(clean)
+                word_data.append({
+                    'word': clean, 'cid': cid, 'pos': pos, 'root': root,
+                })
+
+            # Core→core connections (NOUN→VERB, etc.)
+            cores = [d for d in word_data if d['pos'] in ('NOUN', 'VERB') and d['cid'] is not None]
+            for i in range(len(cores)):
+                for j in range(i + 1, len(cores)):
+                    idx_a = word_data.index(cores[i])
+                    idx_b = word_data.index(cores[j])
+                    env_words = [word_data[k]['word'] for k in range(idx_a + 1, idx_b)]
+                    relation = self.lattice.infer_relation(env_words)
+                    self.lattice.add_connection(cores[i]['cid'], cores[j]['cid'], relation)
+
+            # 4. Update lattice n-grams
+            concept_seq = [d['cid'] for d in word_data if d['cid'] is not None]
+            if len(concept_seq) >= 2:
+                self.lattice.update(concept_seq)
+
+            # 5. STDP on core→modifier transitions
+            for d in word_data:
+                if d['cid'] is not None and d['cid'] != core_cid:
+                    self.cs.svd_shift(core_cid, d['cid'],
+                                      expected_cid=core_cid, lr=0.05)
+
+        return len(sentences)
+
+    @staticmethod
+    def _split_into_sentences(text):
+        import re
+        sents = re.split(r'(?<=[.!?…])\s+(?=[А-ЯЁA-Z])', text.strip())
+        return [s.strip() for s in sents if s.strip()]
 
     # ---- Training ----
 

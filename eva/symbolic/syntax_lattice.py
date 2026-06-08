@@ -1,32 +1,61 @@
-"""SyntaxLattice — higher-order concept n-gram patterns from corpus.
+"""SyntaxLattice — connection strength graph + n-gram patterns.
 
-Captures natural syntax as concept-sequence templates:
-  2-grams: князь->сказать, война->начаться
-  3-grams: князь->выйти->на, сказать->что->весь
-  4-grams: князь->Андрей->выйти->на
+Captures semantic connections between core concepts, not just sequences:
+   connection(core_A, core_B) → {type, strength, context}
+   
+Relation types are inferred from environment words between concepts:
+   "на улице погода" → located_at
+   "хорошая погода" → has_quality
+   "погода испортилась" → state_change
 
-Not rules — probability distributions over concept chains.
-Higher n = more syntactic specificity.
-Lower n = fallback (semantic coherence).
+N-grams remain for syntactic sequence information.
+Connection graph adds semantic relation layer.
 """
 
 import numpy as np
 from collections import defaultdict, Counter
 from scipy.sparse import csr_matrix
 import json, math, os
-from typing import List
+from typing import List, Optional, Dict, Tuple
+
+
+# Relation types between concepts
+RELATION_TYPES = {
+    'has_quality': 0,       # ADJ→NOUN (хорошая погода)
+    'located_at': 1,        # PREP→NOUN (на улице)
+    'has_possession': 2,    # NOUN→NOUN genitive (дом человека)
+    'performs_action': 3,   # NOUN→VERB (человек идёт)
+    'has_manner': 4,        # ADV→VERB (быстро бежать)
+    'has_quantity': 5,      # NUM→NOUN (три дома)
+    'state_change': 6,      # VERB→state (погода испортилась)
+    'contrast': 7,          # но, а
+    'connects': 8,          # и, да
+    'time_at': 9,           # temporal (вчера, сегодня)
+    'related_to': 10,       # generic
+}
+
+# Environment words that signal relation types
+ENV_TO_RELATION = {
+    'в': 'located_at', 'на': 'located_at', 'у': 'located_at',
+    'под': 'located_at', 'над': 'located_at', 'между': 'located_at',
+    'за': 'located_at', 'перед': 'located_at', 'около': 'located_at',
+    'возле': 'located_at', 'среди': 'located_at',
+    'и': 'connects', 'да': 'connects',
+    'но': 'contrast', 'а': 'contrast', 'однако': 'contrast',
+    'вчера': 'time_at', 'сегодня': 'time_at', 'завтра': 'time_at',
+    'потом': 'time_at', 'затем': 'time_at', 'сначала': 'time_at',
+    'после': 'time_at', 'до': 'time_at', 'во время': 'time_at',
+}
 
 
 class SyntaxLattice:
-    """Higher-order concept n-gram models forming the syntactic skeleton.
+    """Higher-order concept n-gram models + connection strength graph.
 
-    The lattice is hierarchical:
-      Level 1 (bigram): concept->concept transition matrix [already in ConceptSpace]
-      Level 2 (trigram): concept->concept->concept transitions
-      Level 3 (4-gram): concept->concept->concept->concept transitions
+    The lattice has two views:
+      Sequential: n-gram concept→concept→concept transitions
+      Semantic: connection(core_A, core_B) → {type, strength}
 
-    Generation interpolates between levels: prefer higher n when data exists,
-    fall back to lower n for flexibility.
+    Generation uses both: syntax for ordering, connections for relevance.
     """
 
     def __init__(self):
@@ -41,6 +70,9 @@ class SyntaxLattice:
 
         # Max n-gram order
         self.max_n = 4
+
+        # Connection graph: (cid_a, cid_b) → {count, type_counter}
+        self.connections = defaultdict(lambda: {'count': 0, 'types': Counter()})
 
     def build(self, corpus_path, tok, max_n=4, min_count=2):
         """Build n-gram model from corpus concept sequences.
@@ -245,6 +277,194 @@ class SyntaxLattice:
                 self.ngrams[n][prefix][next_c] += 1
                 self.concept_freq[next_c] += 1
 
+    # ── Connection Strength Graph ────────────────────────────
+
+    @staticmethod
+    def infer_relation(env_words):
+        """Infer relation type from environment words between concepts.
+
+        Args:
+            env_words: list of words (prepositions, conjunctions) between cores
+
+        Returns:
+            relation type string
+        """
+        for w in env_words:
+            wl = w.lower().strip('.,!?;:()[]{}«»—–-…\'\"')
+            if wl in ENV_TO_RELATION:
+                return ENV_TO_RELATION[wl]
+        return 'related_to'
+
+    def add_connection(self, cid_a, cid_b, relation='related_to', count=1):
+        """Record a semantic connection between two concepts.
+
+        Args:
+            cid_a, cid_b: concept IDs
+            relation: relation type string
+            count: increment amount
+        """
+        key = (min(cid_a, cid_b), max(cid_a, cid_b))
+        self.connections[key]['count'] += count
+        if relation in RELATION_TYPES:
+            self.connections[key]['types'][relation] += count
+
+    def get_connection(self, cid_a, cid_b):
+        """Get connection info between two concepts.
+
+        Returns:
+            dict with: strength (0..1), type, context
+            or None if no connection recorded.
+        """
+        key = (min(cid_a, cid_b), max(cid_a, cid_b))
+        conn = self.connections.get(key)
+        if conn is None or conn['count'] == 0:
+            return None
+
+        # Connection strength: normalized co-occurrence
+        max_count = max(self.concept_freq.get(cid_a, 1),
+                        self.concept_freq.get(cid_b, 1))
+        strength = min(conn['count'] / max(max_count, 1), 1.0)
+
+        # Dominant relation type
+        types = conn['types']
+        dom_type = types.most_common(1)[0][0] if types else 'related_to'
+
+        return {
+            'strength': strength,
+            'type': dom_type,
+            'count': conn['count'],
+        }
+
+    def connection_strength(self, cid_a, cid_b, cs=None):
+        """Compute connection strength between two concepts.
+
+        Combines:
+          - co-occurrence count from connection graph
+          - cosine similarity from vector space (if cs provided)
+
+        Returns: float 0..1
+        """
+        conn = self.get_connection(cid_a, cid_b)
+        cooc_strength = conn['strength'] if conn else 0.0
+
+        cos_strength = 0.0
+        if cs is not None:
+            va = cs.concept_vector(cid_a)
+            vb = cs.concept_vector(cid_b)
+            if va is not None and vb is not None:
+                cos = float(np.dot(va, vb) / max(
+                    np.linalg.norm(va) * np.linalg.norm(vb), 1e-10))
+                cos_strength = max(cos, 0)
+
+        return 0.6 * cooc_strength + 0.4 * cos_strength
+
+    def connections_of(self, cid, top_k=20):
+        """Get all concepts connected to a given concept.
+
+        Returns:
+            [(connected_cid, {strength, type}), ...] sorted by strength
+        """
+        results = []
+        for (a, b), conn in self.connections.items():
+            if a == cid:
+                other = b
+            elif b == cid:
+                other = a
+            else:
+                continue
+            max_c = max(self.concept_freq.get(cid, 1),
+                        self.concept_freq.get(other, 1))
+            strength = min(conn['count'] / max(max_c, 1), 1.0)
+            dom_type = conn['types'].most_common(1)[0][0] if conn['types'] else 'related_to'
+            results.append((other, {'strength': strength, 'type': dom_type}))
+
+        results.sort(key=lambda x: -x[1]['strength'])
+        return results[:top_k]
+
+    def build_connections_from_corpus(self, corpus_path, tok, cs):
+        """Build connection graph from corpus using morphology.
+
+        For each sentence, extract concept pairs and infer relations
+        from environment words between them.
+        """
+        import re
+        with open(corpus_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Split into sentences
+                sents = re.split(r'(?<=[.!?…])\s+(?=[А-ЯЁA-Z])', line)
+                for sent in sents:
+                    self._build_connections_from_sentence(sent, tok, cs)
+
+    def _build_connections_from_sentence(self, sentence, tok, cs):
+        """Extract connections from a single sentence."""
+        from eva.symbolic.concept_tokenizer import ConceptTokenizer
+        from eva.symbolic.pos_tagger import get_pos
+
+        words = sentence.strip().split()
+        if len(words) < 2:
+            return
+
+        # Parse each word for morphology and concept
+        word_data = []
+        for w in words:
+            clean = w.strip('.,!?;:()[]{}«»—–-…\'\"')
+            if not clean:
+                continue
+            morph = ConceptTokenizer.morph_parse(clean)
+            root = morph['normal_form'] if morph else clean
+            cid = cs.word_to_cid.get(root) or cs.word_to_cid.get(clean)
+            if cid is None:
+                continue
+            pos = morph['pos'] if morph else get_pos(clean)
+            word_data.append({
+                'word': clean,
+                'cid': cid,
+                'pos': pos,
+                'root': root,
+            })
+
+        if len(word_data) < 2:
+            return
+
+        # Find core concepts (NOUN, VERB) and modifiers (ADJ, ADV, PREP)
+        cores = [(i, d) for i, d in enumerate(word_data) if d['pos'] in ('NOUN', 'VERB')]
+        modifiers = [(i, d) for i, d in enumerate(word_data) if d['pos'] in ('ADJ', 'ADV', 'PREP', 'NUM')]
+
+        # Core→core connections (NOUN→VERB, VERB→NOUN, etc.)
+        for i in range(len(cores)):
+            for j in range(i + 1, len(cores)):
+                idx_a, da = cores[i]
+                idx_b, db = cores[j]
+
+                # Environment words between cores
+                env_words = [word_data[k]['word'] for k in range(idx_a + 1, idx_b)]
+
+                # Infer relation
+                relation = self.infer_relation(env_words)
+                if 'PREP' in [word_data[k]['pos'] for k in range(idx_a + 1, idx_b)]:
+                    relation = 'located_at'
+
+                self.add_connection(da['cid'], db['cid'], relation)
+
+        # Core→modifier connections
+        for core_idx, core in cores:
+            for mod_idx, mod in modifiers:
+                if mod_idx == core_idx:
+                    continue
+                if core_idx < mod_idx:
+                    # Modifier after core: check if adjacent
+                    if mod_idx - core_idx <= 2:
+                        rel = 'has_quality' if mod['pos'] == 'ADJ' else \
+                              'has_manner' if mod['pos'] == 'ADV' else \
+                              'located_at' if mod['pos'] == 'PREP' else \
+                              'has_quantity' if mod['pos'] == 'NUM' else \
+                              'related_to'
+                        self.add_connection(core['cid'], mod['cid'], rel)
+
     def save(self, path):
         """Save to JSON."""
         data = {
@@ -256,6 +476,13 @@ class SyntaxLattice:
                 for n, ngrams in self.ngrams.items()
             },
             'concept_freq': dict(self.concept_freq),
+            'connections': {
+                f'{a},{b}': {
+                    'count': conn['count'],
+                    'types': dict(conn['types']),
+                }
+                for (a, b), conn in self.connections.items()
+            },
         }
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
@@ -273,7 +500,17 @@ class SyntaxLattice:
                 prefix = tuple(int(c) for c in prefix_key.split())
                 self.ngrams[n][prefix] = Counter({int(k): v for k, v in counter_data.items()})
         self.concept_freq = Counter({int(k): v for k, v in data['concept_freq'].items()})
-        print(f"  Loaded SyntaxLattice: {[len(v) for v in self.ngrams.values()]} prefixes")
+        # Load connection graph if present
+        self.connections = defaultdict(lambda: {'count': 0, 'types': Counter()})
+        if 'connections' in data:
+            for key_str, conn_data in data['connections'].items():
+                a, b = int(key_str.split(',')[0]), int(key_str.split(',')[1])
+                self.connections[(a, b)] = {
+                    'count': conn_data['count'],
+                    'types': Counter({k: v for k, v in conn_data['types'].items()}),
+                }
+        print(f"  Loaded SyntaxLattice: {[len(v) for v in self.ngrams.values()]} prefixes, "
+              f"{len(self.connections)} connections")
         return self
 
 

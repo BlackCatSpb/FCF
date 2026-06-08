@@ -1,21 +1,22 @@
-"""ConceptTokenizer — tokenizer as metadata factory for concept-based generation.
+"""ConceptTokenizer — hierarchical semantic extractor.
 
 Architecture:
-- Explicit WORD_OPEN/WORD_CLOSE/SENT_OPEN/SENT_CLOSE boundaries
-- Each word mapped to a ConceptNet concept (via ConceptSkeleton)
-- Metadata: concept_id, is_anchor, word_type, pos_in_word, word_num
-- BPE subword tokens WITHIN each word (character-level, no ByteLevel)
+- BPE tokens preserved for backward compatibility
+- Added pymorphy3 morphological layer: root + affix decomposition
+- Each word: root → core concept vector + affix shifts → word vector
+- Metadata: concept_id, is_anchor, root, prefix, suffix, ending, pos, features
+- Hierarchical: word → phrase → sentence metadata extraction
 
 Token ID layout:
-  0: PAD
-  1: UNK
-  2: BOS
-  3: EOS
-  4: WORD_OPEN    — marks word start
-  5: WORD_CLOSE   — marks word end
-  6: SENT_OPEN    — marks sentence start
-  7: SENT_CLOSE   — marks sentence end
-  8+: BPE subword tokens (from pretrained BPE model)
+   0: PAD
+   1: UNK
+   2: BOS
+   3: EOS
+   4: WORD_OPEN    — marks word start
+   5: WORD_CLOSE   — marks word end
+   6: SENT_OPEN    — marks sentence start
+   7: SENT_CLOSE   — marks sentence end
+   8+: BPE subword tokens (from pretrained BPE model)
 """
 
 import os, re, json, math
@@ -25,6 +26,7 @@ from tokenizers import Tokenizer
 from typing import List, Optional
 
 from eva.symbolic.concept_net import ConceptSkeleton
+from eva.symbolic.pos_tagger import get_morph_features, get_pos
 
 BPE_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_tokenizer.json')
 SKELETON_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'concept_skeleton.json')
@@ -359,6 +361,162 @@ class ConceptTokenizer:
 
     def __len__(self):
         return self.V
+
+    # ── Morphological parsing layer ─────────────────────────────
+
+    @staticmethod
+    def morph_parse(word):
+        """Parse word into morphological components.
+
+        Returns:
+            dict with: root, prefix, suffix, ending, pos, features, normalized
+            or None if word can't be parsed.
+        """
+        w = word.strip('.,!?;:()[]{}«»—–-…\u201d\u201c"\'').lower()
+        if not w or len(w) < 2:
+            return None
+
+        features = get_morph_features(w)
+        pos = features.get('pos', 'UNK')
+
+        # Use pymorphy3 to get normal form (lemma)
+        import pymorphy3
+        morph = pymorphy3.MorphAnalyzer()
+        parsed = morph.parse(w)
+        if not parsed:
+            return None
+
+        best = parsed[0]
+        normal_form = best.normal_form
+        tag = best.tag
+
+        # Decompose word into morphemes (heuristic for Russian)
+        # Root approximation: take normal_form as root candidate
+        # For now, root = normal_form, affixes are derived from differences
+        root = normal_form
+
+        # Detect common prefixes
+        prefix = ''
+        for p in ['пре', 'при', 'пере', 'про', 'раз', 'рас', 'вз', 'воз',
+                  'вос', 'из', 'ис', 'вы', 'от', 'о', 'об', 'обо', 'под',
+                  'над', 'за', 'на', 'по', 'до', 'с', 'со', 'в', 'во',
+                  'у', 'без', 'бес', 'через', 'чрез']:
+            if w.startswith(p) and not normal_form.startswith(p):
+                prefix = p
+                break
+
+        # Detect common suffixes
+        suffix = ''
+        remaining = w[len(prefix):] if prefix else w
+        for s in ['к', 'ок', 'ек', 'ик', 'ник', 'тель', 'чик', 'щик',
+                  'ств', 'еств', 'ость', 'ность', 'ени', 'ани',
+                  'изм', 'ист', 'атор', 'тор',
+                  'лив', 'чив', 'ист', 'оват', 'еват',
+                  'ну', 'а', 'я']:
+            if remaining.endswith(s) and len(remaining) > len(s) + 2:
+                suffix = s
+                break
+
+        # Detect ending (last 1-2 chars after removing root-suffix, heuristic)
+        ending = ''
+        base = remaining[:-len(suffix)] if suffix else remaining
+        for e in ['ого', 'его', 'ому', 'ему', 'ым', 'им', 'ой', 'ей',
+                  'ую', 'юю', 'ая', 'яя', 'ое', 'ее', 'ые', 'ие',
+                  'а', 'я', 'о', 'е', 'ы', 'и', 'у', 'ю',
+                  'ой', 'ей', 'ых', 'их', 'ам', 'ям']:
+            if base.endswith(e) and len(base) > len(e) + 1:
+                ending = e
+                break
+
+        return {
+            'word': w,
+            'root': root,
+            'prefix': prefix,
+            'suffix': suffix,
+            'ending': ending,
+            'pos': pos,
+            'normal_form': normal_form,
+            'features': features,
+        }
+
+    @staticmethod
+    def morph_root_vector(word, cs):
+        """Get root concept vector for a word's morphological root.
+
+        Returns:
+            (cid, vector) or (None, None) if root not found.
+        """
+        morph = ConceptTokenizer.morph_parse(word)
+        if morph is None:
+            return None, None
+
+        # Try root (normal form) first
+        root = morph['normal_form']
+        cid = cs.word_to_cid.get(root)
+        if cid is not None:
+            v = cs.concept_vector(cid)
+            if v is not None:
+                return cid, v
+
+        # Try original word
+        cid = cs.word_to_cid.get(morph['word'])
+        if cid is not None:
+            v = cs.concept_vector(cid)
+            if v is not None:
+                return cid, v
+
+        return None, None
+
+    @staticmethod
+    def word_morph_vector(word, cs, affix_shifts=None):
+        """Assemble word vector from root concept + affix shifts.
+
+        word_vector = root_concept_vector + prefix_shift + suffix_shift + ending_shift
+
+        Args:
+            word: input word
+            cs: ConceptSpace instance
+            affix_shifts: dict {affix: np.array(128D)} or None
+
+        Returns:
+            np.array(128D) or None if root not found
+        """
+        morph = ConceptTokenizer.morph_parse(word)
+        if morph is None:
+            return None
+
+        cid, root_v = ConceptTokenizer.morph_root_vector(word, cs)
+        if root_v is None:
+            return None
+
+        vec = root_v.copy()
+        if affix_shifts:
+            for affix_type in ('prefix', 'suffix', 'ending'):
+                affix = morph.get(affix_type, '')
+                if affix and affix in affix_shifts:
+                    vec += affix_shifts[affix] * 0.3  # affix shift is weaker than root
+
+        norm = np.linalg.norm(vec)
+        if norm > 1e-10:
+            vec /= norm
+        return vec
+
+    def morph_metadata(self, text):
+        """Extract hierarchical morphological metadata from text.
+
+        Returns:
+            list of dicts, one per word: {word, root, prefix, suffix,
+            ending, pos, features, cid, root_vector, word_vector}
+        """
+        result = []
+        words = text.strip().split()
+        for w in words:
+            entry = ConceptTokenizer.morph_parse(w)
+            if entry is None:
+                result.append({'word': w, 'pos': 'UNK'})
+                continue
+            result.append(entry)
+        return result
 
 
 def train_character_bpe(corpus_path, vocab_size=8192, save_path=None):

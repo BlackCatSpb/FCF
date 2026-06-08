@@ -820,8 +820,9 @@ class ConceptSpace:
             data['concept_usage'] = {str(c): u for c, u in self.concept_usage.items()}
             data['concept_fitness'] = {str(c): f for c, f in self.concept_fitness.items()}
 
-        with open(path, 'w', encoding='utf-8') as f:
+        with open(path + '.tmp', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(path + '.tmp', path)
         size_kb = os.path.getsize(path) / 1024
         print(f"  Saved ConceptSpace ({'PQ ' if use_pq else ''}{size_kb:.0f}KB) to {path}")
 

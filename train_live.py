@@ -238,10 +238,16 @@ def run_training(args):
         resume_cs = os.path.join(args.resume, 'concept_space.json')
         resume_lat = os.path.join(args.resume, 'syntax_lattice.json')
         if os.path.exists(resume_cs):
-            cs = ConceptSpace.load(resume_cs)
-            gen.cs = cs
+            try:
+                cs = ConceptSpace.load(resume_cs)
+                gen.cs = cs
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f'  WARNING: corrupted checkpoint ({e}), starting fresh')
         if os.path.exists(resume_lat):
-            lattice.load(resume_lat)
+            try:
+                lattice.load(resume_lat)
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f'  WARNING: corrupted lattice ({e}), starting fresh')
         meta_path = os.path.join(args.resume, 'meta.json')
         if os.path.exists(meta_path):
             with open(meta_path, 'r', encoding='utf-8') as f:

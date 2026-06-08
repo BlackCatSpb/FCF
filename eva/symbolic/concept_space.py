@@ -22,6 +22,137 @@ from sklearn.cluster import KMeans
 import math, json, os, pickle
 
 
+class FractalField:
+    """Fractal computation matrix for relative concept vector space.
+
+    Each concept's vector is computed from a shared orthogonal basis:
+        v = coords @ basis   (then unit-normalized)
+
+    The basis is a fixed random orthogonal matrix (latent_dim × dim)
+    that provides the 'fractal unfolding' — all vectors live in the
+    same coordinate system, defined relative to each other through
+    the shared basis. This is the 'развертка вычислений, дающих
+    точные координаты' — a computational unfolding of exact coordinates.
+
+    Autonomous fluctuations: latent codes evolve via a Langevin-like
+    process (random walk with drift), giving natural vector dynamics.
+    """
+
+    def __init__(self, dim=384, latent_dim=512):
+        self.dim = dim
+        self.latent_dim = latent_dim
+
+        # Fractal basis: (latent_dim, dim) with orthonormal columns
+        rng = np.random.RandomState(42)
+        mat = rng.randn(latent_dim, dim).astype(np.float32)
+        Q, _ = np.linalg.qr(mat, mode='reduced')
+        self.basis = Q.astype(np.float32)  # (latent_dim, dim), Q.T @ Q = I
+
+        # Latent codes: cid → (latent_dim,) array
+        self.codes = {}
+
+        # Cache for full vector matrix
+        self._vector_matrix = None
+        self._cid_order = []
+        self._matrix_dirty = True
+
+    def init_concept(self, cid, rng_seed=None):
+        """Initialize a concept with random sparse latent code."""
+        seed = rng_seed if rng_seed is not None else cid * 137 + 42
+        rng = np.random.RandomState(seed % (2**31))
+
+        # Sparse initialization: only ~12% of latent dims active
+        n_active = max(self.latent_dim // 8, 16)
+        coords = np.zeros(self.latent_dim, dtype=np.float32)
+        idxs = rng.choice(self.latent_dim, n_active, replace=False)
+        vals = rng.randn(n_active).astype(np.float32)
+        coords[idxs] = vals
+
+        # Rescale so |code @ basis| = 1
+        v_raw = coords @ self.basis
+        scale = 1.0 / (np.linalg.norm(v_raw) + 1e-10)
+        coords *= scale
+
+        self.codes[cid] = coords
+        self._matrix_dirty = True
+        return self.compute_vector(cid)
+
+    def compute_vector(self, cid):
+        """Compute full vector from latent coords @ basis + normalize."""
+        coords = self.codes.get(cid)
+        if coords is None:
+            return None
+        v = coords @ self.basis
+        nv = np.linalg.norm(v)
+        if nv > 1e-10:
+            v /= nv
+        return v
+
+    def ensure_matrix(self):
+        """Build (N, D) normalized vector matrix from all latent codes."""
+        if not self._matrix_dirty and self._vector_matrix is not None:
+            return self._vector_matrix, self._cid_order
+
+        self._cid_order = list(self.codes.keys())
+        n = len(self._cid_order)
+        if n == 0:
+            self._vector_matrix = np.empty((0, self.dim), dtype=np.float32)
+            return self._vector_matrix, self._cid_order
+
+        # V = C @ B : (N x latent_dim) @ (latent_dim x dim)
+        C = np.array([self.codes[cid] for cid in self._cid_order], dtype=np.float32)
+        V = C @ self.basis
+
+        norms = np.linalg.norm(V, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        V /= norms
+
+        self._vector_matrix = V
+        self._matrix_dirty = False
+        return self._vector_matrix, self._cid_order
+
+    def fluctuate(self, noise_scale=0.005, decay=0.999):
+        """Autonomous fluctuation: all latent codes drift.
+
+        Langevin-like process with Ornstein-Uhlenbeck decay:
+            dc = -(1-decay) * c * dt + noise_scale * N(0, I)
+
+        This creates smooth autonomous motion in vector space
+        without external input — concepts 'dream'.
+        """
+        rng = np.random.RandomState(None)
+        for cid in list(self.codes.keys()):
+            c = self.codes[cid]
+            noise = rng.randn(self.latent_dim).astype(np.float32) * noise_scale
+            c[:] = c * decay + noise
+        self._matrix_dirty = True
+
+    def reinitialize_all(self, cid_list):
+        """Reset all latent codes to random initialization."""
+        self.codes = {}
+        for cid in cid_list:
+            self.init_concept(cid)
+        self._matrix_dirty = True
+
+    def to_dict(self):
+        """Serialize for saving."""
+        return {
+            'dim': self.dim,
+            'latent_dim': self.latent_dim,
+            'basis': self.basis.tolist(),
+            'codes': {str(cid): c.tolist() for cid, c in self.codes.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        field = cls(dim=data['dim'], latent_dim=data['latent_dim'])
+        field.basis = np.array(data['basis'], dtype=np.float32)
+        field.codes = {int(cid): np.array(c, dtype=np.float32)
+                        for cid, c in data['codes'].items()}
+        field._matrix_dirty = True
+        return field
+
+
 class ConceptSpace:
     """Vector space organized by ConceptNet concepts.
 
@@ -37,7 +168,10 @@ class ConceptSpace:
         self.skeleton = skeleton
         self.dim = dim
 
-        # Concept vectors
+        # Fractal field: latent codes → full vectors via shared basis
+        self.fractal = FractalField(dim=self.dim, latent_dim=512)
+
+        # Concept vectors (rebuilt from fractal on init/load)
         self.concept_vectors = {}     # cid → np.array(dim,)
         self.concept_info = {}        # cid → concept dict from skeleton
 
@@ -202,65 +336,46 @@ class ConceptSpace:
             self.concept_transitions = csr_matrix((n, n), dtype=np.float32)
 
     def _compute_concept_vectors(self, n_concepts):
-        """Compute concept vectors via SVD on transition matrix."""
-        if self.concept_transitions is None or self.concept_transitions.nnz == 0:
-            # Fallback: random vectors
-            print("  WARNING: No transitions, using random concept vectors")
-            for cid in self.cid_list:
-                v = self.rng.randn(self.dim).astype(np.float32)
-                v /= max(np.linalg.norm(v), 1e-10)
-                self.concept_vectors[cid] = v
-            return
+        """Initialize all concept vectors via FractalField.
 
-        ndim = min(self.dim, n_concepts - 1, self.concept_transitions.shape[0] - 1)
-        ndim = max(ndim, 2)
-
-        svd = TruncatedSVD(n_components=ndim, random_state=42)
-        emb = svd.fit_transform(self.concept_transitions)
-
-        # Normalize
-        norms = np.linalg.norm(emb, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        emb /= norms
-
-        # If ndim < self.dim, pad with zeros
-        if ndim < self.dim:
-            padded = np.zeros((emb.shape[0], self.dim), dtype=np.float32)
-            padded[:, :ndim] = emb
-            emb = padded
-
-        # Store
-        for i, cid in enumerate(self.cid_list):
-            self.concept_vectors[cid] = emb[i].astype(np.float32)
-
-        # Reinitialize zero-norm concepts using ConceptNet neighbors
-        zero_count = 0
+        Each concept gets a sparse latent code in the fractal basis,
+        producing a unique unit vector on the 384D sphere — no SVD
+        degeneracy, no identical vectors.
+        """
         for cid in self.cid_list:
-            v = self.concept_vectors[cid]
-            if np.linalg.norm(v) < 0.01:
-                zero_count += 1
-                # Try to use ConceptNet neighbors
-                neighbor_vecs = []
-                for (ci, cj), rels in self.skeleton.relations.items():
-                    other = cj if ci == cid else (ci if cj == cid else None)
-                    if other is not None:
-                        other_v = self.concept_vectors.get(other)
-                        if other_v is not None and np.linalg.norm(other_v) > 0.01:
-                            neighbor_vecs.append(other_v)
-                if neighbor_vecs:
-                    new_v = np.mean(neighbor_vecs, axis=0).astype(np.float32)
-                    new_v /= max(np.linalg.norm(new_v), 1e-10)
-                    self.concept_vectors[cid] = new_v
-                else:
-                    # Random unit vector
-                    new_v = self.rng.randn(self.dim).astype(np.float32)
-                    new_v /= np.linalg.norm(new_v)
-                    self.concept_vectors[cid] = new_v
+            v = self.fractal.init_concept(cid)
+            if v is not None:
+                self.concept_vectors[cid] = v
+            else:
+                self.concept_vectors[cid] = self.rng.randn(self.dim).astype(np.float32)
+                self.concept_vectors[cid] /= max(np.linalg.norm(self.concept_vectors[cid]), 1e-10)
 
-        if zero_count > 0:
-            print(f"  Reinitialized {zero_count} zero-norm concepts")
+        print(f"  Fractal concept vectors: {len(self.cid_list)} @ {self.dim}D (latent {self.fractal.latent_dim}D)")
 
-        print(f"  SVD concept vectors: {len(self.cid_list)} @ {self.dim}D (effective {ndim}D)")
+    def _sync_concept_vectors_from_fractal(self):
+        """Rebuild concept_vectors dict from fractal latent codes."""
+        for cid in list(self.fractal.codes.keys()):
+            v = self.fractal.compute_vector(cid)
+            if v is not None:
+                self.concept_vectors[cid] = v
+        self.mark_matrix_dirty()
+
+    def reinit_fractal(self, cid_list=None):
+        """Reinitialize all fractal latent codes (resets all vectors)."""
+        cids = cid_list if cid_list is not None else list(self.concept_vectors.keys())
+        self.fractal.reinitialize_all(cids)
+        self._sync_concept_vectors_from_fractal()
+        print(f"  Reinitialized {len(cids)} concepts via fractal field")
+
+    def fluctuate_fractal(self, noise_scale=0.003, decay=0.9995):
+        """Autonomous drift of all concept vectors.
+
+        Each call adds a small Langevin perturbation to latent codes,
+        then rebuilds concept_vectors. Call periodically during
+        generation for smooth conceptual drift.
+        """
+        self.fractal.fluctuate(noise_scale=noise_scale, decay=decay)
+        self._sync_concept_vectors_from_fractal()
 
     def _apply_conceptnet_constraints(self):
         """Adjust concept vectors based on ConceptNet relations.
@@ -305,14 +420,42 @@ class ConceptSpace:
 
         print(f"  ConceptNet constraints applied to {len(self.skeleton.relations)} relations")
 
-    # ---- STDP: Spike-Timing-Dependent Plasticity on concept vectors ----
+    # ---- STDP: Spike-Timing-Dependent Plasticity on fractal codes ----
 
-    def svd_shift(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0):
-        """Concept-level STDP on sphere.
+    def _apply_vector_update(self, cid, v_new):
+        """Set concept_vector[cid] and project delta back into fractal code.
 
-        Riemannian gradient descent on concept vectors:
-        - Match (gen == expected or no expected): LTP — pull gen toward prev
-        - Mismatch (gen != expected): LTD — push gen away from prev, pull toward expected
+        Maintains the invariant: normalize(code @ basis) == concept_vector[cid]
+        by rescaling code so |code @ basis| = 1 after each update.
+        """
+        v_old = self.concept_vectors.get(cid)
+        self.concept_vectors[cid] = v_new
+
+        code = self.fractal.codes.get(cid)
+        if code is None or v_old is None:
+            return
+
+        delta_v = v_new - v_old
+        delta_code = delta_v @ self.fractal.basis.T
+        code_new = code + delta_code
+
+        # Rescale so |code_new @ basis| = 1 — preserves exact relationship
+        v_unscaled = code_new @ self.fractal.basis
+        scale = 1.0 / (np.linalg.norm(v_unscaled) + 1e-10)
+        code_new *= scale
+
+        self.fractal.codes[cid] = code_new
+        self._matrix_dirty = True
+
+    def fractal_stdp(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0):
+        """STDP on fractal latent codes — self-organisation through code projection.
+
+        Same Riemannian geometry as svd_shift(), but the vector update
+        is projected back into fractal code space via basis.T.
+
+        This preserves the fractal coordinate system: the column-space
+        components (384 dims) carry the learned update, while the null
+        space (128 dims) is untouched — available for autonomous drift.
 
         Args:
             prev_cid: context concept (pre-synaptic)
@@ -321,8 +464,7 @@ class ConceptSpace:
             lr: learning rate
             word_num: position in sentence (theta-rhythm modulates learning)
         """
-        # Theta rhythm: early words learn more, later less (STDP window)
-        theta_gate = math.exp(-word_num / 7.0)  # τ=7 words
+        theta_gate = math.exp(-word_num / 7.0)
         effective_lr = lr * max(theta_gate, 0.1)
 
         expected = expected_cid or gen_cid
@@ -333,49 +475,41 @@ class ConceptSpace:
         if v_ctx is None or v_gen is None:
             return
 
-        # STDP: LTP for match, LTD for mismatch
         if is_match:
-            # LTP: pull generated toward context (pre→post association)
             scale = 1.0 * effective_lr
         else:
-            # LTD: push generated away from context
             scale = -0.05 * effective_lr
-            # Correction: pull generated toward expected (target)
             v_exp = self.concept_vectors.get(expected)
             if v_exp is not None:
                 y_exp = float(np.dot(v_gen, v_exp))
                 y_exp = max(y_exp, 0.05)
                 corr = (v_exp - y_exp * v_gen) * effective_lr
-                self.concept_vectors[gen_cid] = v_gen + corr
-                n = np.linalg.norm(self.concept_vectors[gen_cid])
-                if n > 0:
-                    self.concept_vectors[gen_cid] /= n
+                v_corrected = v_gen + corr
+                cn = np.linalg.norm(v_corrected)
+                if cn > 1e-10:
+                    v_corrected /= cn
+                self._apply_vector_update(gen_cid, v_corrected)
                 v_gen = self.concept_vectors[gen_cid]
 
-        # Riemannian gradient: ∇ = v_ctx - (v_gen·v_ctx) × v_gen
         y = float(np.dot(v_gen, v_ctx))
         y = max(y, 0.05)
         shift = (v_ctx - y * v_gen) * scale
+        v_new = v_gen + shift
+        nv = np.linalg.norm(v_new)
+        if nv > 1e-10:
+            v_new /= nv
+        self._apply_vector_update(gen_cid, v_new)
 
-        self.concept_vectors[gen_cid] = v_gen + shift
-        n = np.linalg.norm(self.concept_vectors[gen_cid])
-        if n > 0:
-            self.concept_vectors[gen_cid] /= n
-
-        # Lateral inhibition: dampen concepts similar to generated one
         self._lateral_inhibition(gen_cid, strength=0.02 * effective_lr)
-
         self.mark_matrix_dirty()
 
-    def _lateral_inhibition(self, winner_cid, strength=0.01):
-        """Suppress concepts similar to the winner.
-        In cortex: winner suppresses neighbors via inhibitory interneurons."""
+    def _lateral_inhibition_fractal(self, winner_cid, strength=0.01):
+        """Lateral inhibition with fractal code projection."""
         v_win = self.concept_vectors.get(winner_cid)
         if v_win is None:
             return
         vw_n = v_win / max(np.linalg.norm(v_win), 1e-10)
 
-        # To avoid O(n²), sample ~500 random concepts
         n_total = len(self.concept_vectors)
         sample_size = min(500, n_total)
 
@@ -390,16 +524,25 @@ class ConceptSpace:
             v = self.concept_vectors[cid]
             vn = v / max(np.linalg.norm(v), 1e-10)
             sim = float(np.dot(vw_n, vn))
-            if sim > 0.3:  # only inhibit if similar enough
-                # Push away from winner
+            if sim > 0.3:
                 away = v - v_win
                 d = np.linalg.norm(away)
                 if d > 1e-10:
                     away /= d
-                    self.concept_vectors[cid] = v - away * strength * sim
-                    n = np.linalg.norm(self.concept_vectors[cid])
-                    if n > 0:
-                        self.concept_vectors[cid] /= n
+                    v_new = v - away * strength * sim
+                    nv = np.linalg.norm(v_new)
+                    if nv > 1e-10:
+                        v_new /= nv
+                    self._apply_vector_update(cid, v_new)
+        self._matrix_dirty = True
+
+    def svd_shift(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0):
+        """[DEPRECATED] Use fractal_stdp() instead — kept for backward compat."""
+        self.fractal_stdp(prev_cid, gen_cid, expected_cid, lr, word_num)
+
+    def _lateral_inhibition(self, winner_cid, strength=0.01):
+        """[DEPRECATED] Use _lateral_inhibition_fractal() — kept for backward compat."""
+        self._lateral_inhibition_fractal(winner_cid, strength)
 
     # ---- Homeostatic plasticity ----
 
@@ -730,6 +873,12 @@ class ConceptSpace:
         self.concept_vectors = new_vectors
         self.dim = new_dim
 
+        # Reset fractal field to new dimension (codes will be regenerated)
+        self.fractal = FractalField(dim=self.dim, latent_dim=self.fractal.latent_dim)
+        for cid in self.cid_list:
+            self.fractal.init_concept(cid)
+        self._sync_concept_vectors_from_fractal()
+
         # Expand affix shifts to new dimension
         new_affix = {}
         for affix, shift in self.affix_shifts.items():
@@ -751,6 +900,128 @@ class ConceptSpace:
         self._cid_order = []
         self._matrix_dirty = True
         print(f'  Done: {len(new_vectors)} concepts @ {self.dim}D')
+
+    def normalize_vectors(self):
+        """Center and normalize all concept vectors onto the unit sphere.
+
+        Current vectors are clustered (mean pair sim > 0.3, all pointing
+        toward centroid). This spreads them: subtract global centroid,
+        then L2-normalize each vector. Call after load or training shift.
+        """
+        if not self.concept_vectors:
+            return
+        vecs = np.array(list(self.concept_vectors.values()), dtype=np.float32)
+        centroid = np.mean(vecs, axis=0)
+        centroid_norm = np.linalg.norm(centroid)
+        print(f'  Centroid norm before: {centroid_norm:.4f} (0 = centered)')
+
+        # Center: subtract centroid
+        centered = vecs - centroid
+
+        # Normalize each to unit sphere
+        norms = np.linalg.norm(centered, axis=1)
+        norms[norms < 1e-10] = 1.0
+        centered /= norms[:, np.newaxis]
+
+        for i, cid in enumerate(self.concept_vectors):
+            self.concept_vectors[cid] = centered[i]
+
+        # Re-center affix shifts
+        for affix in list(self.affix_shifts.keys()):
+            v = self.affix_shifts[affix]
+            vc = v - centroid[:len(v)] if len(v) <= len(centroid) else v
+            n = np.linalg.norm(vc)
+            if n > 1e-10:
+                self.affix_shifts[affix] = vc / n
+
+        # Invalidate caches
+        self._vector_matrix = None
+        self._cid_order = []
+        self._matrix_dirty = True
+
+        new_norms = np.linalg.norm(centered, axis=1)
+        print(f'  All vectors normalized: mean_norm={np.mean(new_norms):.4f}')
+        print(f'  New centroid norm: {np.linalg.norm(np.mean(centered, axis=0)):.4f}')
+
+    def contrastive_spread(self, target_sim=0.5, lr=0.1, epochs=10):
+        """Push over-clustered vectors apart via targeted repulsion.
+
+        Unlike random-pair sampling, this finds each vector's nearest
+        neighbor and pushes THAT pair apart — directly attacking the
+        most egregious clustering.
+
+        Args:
+            target_sim: push if sim > this value
+            lr: learning rate
+            epochs: full passes
+        """
+        cids = list(self.concept_vectors.keys())
+        n = len(cids)
+        rng = np.random.RandomState(42)
+
+        from scipy.spatial.distance import cdist
+        print(f'  Contrastive spread: {n} concepts, target_sim={target_sim}, lr={lr}, epochs={epochs}')
+
+        for epoch in range(epochs):
+            vecs = np.array([self.concept_vectors[c] for c in cids], dtype=np.float32)
+            # Similarity matrix (or just compute on the fly)
+            # For speed: get nearest neighbor for a random subset each epoch
+            subset_size = min(n, 3000)
+            idxs = rng.choice(n, subset_size, replace=False)
+            n_pushed = 0
+            for idx in idxs:
+                vi = vecs[idx]
+                # Dot product with all others
+                sims = np.dot(vecs, vi)
+                sims[idx] = -1  # exclude self
+                max_sim = sims.max()
+                if max_sim > target_sim:
+                    j = sims.argmax()
+                    vj = vecs[j]
+                    # Push vi away from vj
+                    grad = vj - max_sim * vi
+                    new_vi = vi + lr * grad
+                    nvi = np.linalg.norm(new_vi)
+                    if nvi > 1e-10:
+                        self.concept_vectors[cids[idx]] = new_vi / nvi
+                    # Symmetric push for vj
+                    grad2 = vi - max_sim * vj
+                    new_vj = vj + lr * grad2
+                    nvj = np.linalg.norm(new_vj)
+                    if nvj > 1e-10:
+                        self.concept_vectors[cids[j]] = new_vj / nvj
+                    n_pushed += 1
+
+            # Verify
+            check = np.array([self.concept_vectors[c] for c in cids], dtype=np.float32) if epoch == epochs-1 or epoch % 3 == 2 else None
+            if check is not None:
+                sim_vals = []
+                for _ in range(10000):
+                    i = rng.randint(0, n)
+                    j = rng.randint(0, n)
+                    if i != j:
+                        sim_vals.append(float(np.dot(check[i], check[j])))
+                p50 = np.percentile(sim_vals, 50)
+                p99 = np.percentile(sim_vals, 99)
+                print(f'    epoch {epoch+1}: pushed {n_pushed}, mean_sim={np.mean(sim_vals):.3f}, p99={p99:.3f}')
+                # Show worst pair
+                ci_worst = None
+                cj_worst = None
+                worst_sim = -1
+                for a, b in [('человек', 'война'), ('человек', 'собака'), ('человек', 'время')]:
+                    ca = self.word_to_cid.get(a)
+                    cb = self.word_to_cid.get(b)
+                    if ca and cb and ca in self.concept_vectors and cb in self.concept_vectors:
+                        s = float(np.dot(self.concept_vectors[ca], self.concept_vectors[cb]))
+                        if s > worst_sim:
+                            worst_sim = s
+                            ci_worst, cj_worst = a, b
+                print(f'      worst pair: sim({ci_worst}, {cj_worst}) = {worst_sim:.4f}')
+
+        self._vector_matrix = None
+        self._cid_order = []
+        self._matrix_dirty = True
+        print(f'  Done')
 
     def predict_next_concept(self, prev_cid, top_k=20):
         """Predict next concept from transition matrix."""
@@ -815,6 +1086,8 @@ class ConceptSpace:
                 'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}
                                       for c, info in self.concept_info.items()},
             }
+        # Save fractal field
+        data['fractal'] = self.fractal.to_dict()
         # Save homeostatic state if initialized
         if hasattr(self, 'concept_usage'):
             data['concept_usage'] = {str(c): u for c, u in self.concept_usage.items()}
@@ -901,6 +1174,17 @@ class ConceptSpace:
         obj.affix_shifts = {}
         obj._init_affix_shifts()
 
+        # Restore fractal field if present (backward compat)
+        if 'fractal' in data:
+            obj.fractal = FractalField.from_dict(data['fractal'])
+            # Rebuild concept_vectors from fractal (overwrites loaded vectors)
+            for cid in list(obj.fractal.codes.keys()):
+                v = obj.fractal.compute_vector(cid)
+                if v is not None:
+                    obj.concept_vectors[cid] = v
+        else:
+            obj.fractal = FractalField(dim=obj.dim, latent_dim=512)
+
         # Restore or initialize homeostasis state
         saved_usage = data.get('concept_usage')
         saved_fitness = data.get('concept_fitness')
@@ -914,10 +1198,10 @@ class ConceptSpace:
         return obj
 
 
-# ---- Training: concept-level SVD shift ----
+# ---- Training: STDP via fractal codes (legacy wrapper) ----
 
 def concept_svd_shift(cs, prev_cid, next_cid, is_match, lr=0.1):
-    """Riemannian gradient descent on concept vectors.
+    """Legacy wrapper — delegates to cs.fractal_stdp().
 
     Args:
         cs: ConceptSpace
@@ -926,21 +1210,8 @@ def concept_svd_shift(cs, prev_cid, next_cid, is_match, lr=0.1):
         is_match: whether next_cid matches the expected concept
         lr: learning rate
     """
-    v_prev = cs.concept_vectors.get(prev_cid)
-    v_next = cs.concept_vectors.get(next_cid)
-    if v_prev is None or v_next is None:
-        return
-
-    scale = 1.0 if is_match else 0.05
-    y = float(np.dot(v_next, v_prev))
-    y = max(y, 0.05)
-    # Riemannian gradient on sphere: ∇ = v_prev - (v_next·v_prev) × v_next
-    shift = (v_prev - y * v_next) * lr * scale
-
-    cs.concept_vectors[next_cid] = v_next + shift
-    n = np.linalg.norm(cs.concept_vectors[next_cid])
-    if n > 0:
-        cs.concept_vectors[next_cid] /= n
+    expected_cid = next_cid if is_match else None
+    cs.fractal_stdp(prev_cid, next_cid, expected_cid=expected_cid, lr=lr)
 
 
 if __name__ == '__main__':

@@ -609,9 +609,9 @@ class CrystalGenerator:
                     conf = 1.0 / (1.0 + ci * 0.5)
                     is_match = (expected_cid is not None and cid == expected_cid)
 
-                    # ---- STDP ----
-                    self.cs.svd_shift(prev_cid, cid, expected_cid=expected_cid,
-                                       lr=h_lr, word_num=wn)
+                    # ---- STDP (fractal) ----
+                    self.cs.fractal_stdp(prev_cid, cid, expected_cid=expected_cid,
+                                         lr=h_lr, word_num=wn)
                     self.cs.update_usage(cid)
 
                     # ---- Lattice learning ----
@@ -1059,11 +1059,14 @@ class CrystalGenerator:
             if len(concept_seq) >= 2:
                 self.lattice.update(concept_seq)
 
-            # 5. STDP on core→modifier transitions
+            # 5. STDP on core→modifier transitions (fractal)
             for d in word_data:
                 if d['cid'] is not None and d['cid'] != core_cid:
-                    self.cs.svd_shift(core_cid, d['cid'],
-                                      expected_cid=core_cid, lr=0.05)
+                    self.cs.fractal_stdp(core_cid, d['cid'],
+                                         expected_cid=core_cid, lr=0.05)
+
+        # Gentle drift after each sentence to prevent code stagnation
+        self.cs.fluctuate_fractal(noise_scale=0.001, decay=0.9998)
 
         return len(sentences)
 

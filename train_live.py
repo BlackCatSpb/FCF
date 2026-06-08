@@ -36,7 +36,7 @@ MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'real_data'
 CKPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'checkpoints')
 
 TEST_EVERY = 500          # lines between test generations
-SAVE_EVERY = 5000         # lines between model saves (named checkpoints)
+SAVE_EVERY = 1000         # lines between model saves (named checkpoints)
 SAVE_EVERY_LIVE = 50      # lines between live checkpoint overwrites
 MAX_WORDS_PER_LINE = 50   # skip lines longer than this
 

@@ -894,13 +894,21 @@ class ConceptSpace:
                 'size': info['size'],
             }
         obj.rng = np.random.RandomState(42)
-        obj._concept_usage = Counter()
         obj._inhibition_step = 0
         obj._vector_matrix = None
         obj._cid_order = []
         obj._matrix_dirty = True
         obj.affix_shifts = {}
         obj._init_affix_shifts()
+
+        # Restore or initialize homeostasis state
+        saved_usage = data.get('concept_usage')
+        saved_fitness = data.get('concept_fitness')
+        if saved_usage:
+            obj.concept_usage = {int(c): u for c, u in saved_usage.items()}
+            obj.concept_fitness = {int(c): f for c, f in saved_fitness.items()}
+        else:
+            obj.init_homeostasis()
         pq_note = ' (PQ)' if data.get('pq') else ''
         print(f"  Loaded ConceptSpace: {len(obj.cid_list)} concepts @ {obj.dim}D{pq_note}")
         return obj

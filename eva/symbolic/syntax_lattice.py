@@ -111,7 +111,7 @@ class SyntaxLattice:
             [(concept_id, score), ...] scored by interpolated probability
         """
         if n_orders is None:
-            n_orders = sorted(self.ngrams.keys(), reverse=True)
+            n_orders = [2, 3]  # exclude 4-grams (statistically empty)
 
         # Collect predictions from each order
         predictions = defaultdict(float)
@@ -128,12 +128,12 @@ class SyntaxLattice:
                 continue
 
             total = sum(counter.values())
-            if total <= 0:
+            if total < 3:  # minimum count threshold (was 0)
                 continue
 
             # Weight: higher n has more weight when data exists
             # but also discount for statistical noise
-            weight = total / (total + 5.0)  # Bayesian: confident when count >> 5
+            weight = total / (total + 10.0)  # Bayesian: confident when count >> 10
             weights.append(weight)
 
             for cid, count in counter.items():

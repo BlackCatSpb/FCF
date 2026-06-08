@@ -1,3 +1,5 @@
+import re
+
 """EVA Concept Generator v3 — intent-driven concept navigation.
 
 Architecture:
@@ -21,6 +23,7 @@ from collections import defaultdict, Counter
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.hormonal_system import HormonalSystem
 from eva.symbolic.concept_inductor import ConceptInductor
+from eva.symbolic.semantic_gate import SemanticGate
 
 
 class CrystalGenerator:
@@ -43,14 +46,14 @@ class CrystalGenerator:
         self.config = config or {}
 
         # Beam parameters
-        self.beam_width = self.config.get('beam_width', 3)
+        self.beam_width = self.config.get('beam_width', 5)
         self.max_words = self.config.get('max_words', 20)
         self.min_words = self.config.get('min_words', 3)
 
         # Base temperature (theta-rhythm + hormones modulate these)
         self.base_concept_temp = self.config.get('concept_temp', 0.5)
         self.base_word_temp = self.config.get('word_temp', 0.3)
-        self.theta_tau = self.config.get('theta_tau', 5.0)
+        self.theta_tau = self.config.get('theta_tau', 12.0)
 
         # Base STDP learning rate (modulated by ACh + DA)
         self.base_learning_rate = self.config.get('learning_rate', 0.1)
@@ -70,6 +73,13 @@ class CrystalGenerator:
         # Merge potential cache (precomputed on first use)
         self._merge_cache = None
 
+        # --- Semantic Gate (core concept extraction) ---
+        self.gate = SemanticGate(
+            cs, lattice,
+            resolve_anchor_fn=self.resolve_anchor,
+            closest_concept_fn=self._closest_concept,
+        )
+
         # --- Concept Induction (semantic resonance) ---
         self.inductor = ConceptInductor(self.config)
 
@@ -79,9 +89,14 @@ class CrystalGenerator:
         self._query_confidence = 1.0  # how well we understood the query
         self._response_centroid = None # mean vector of response so far
 
+        # --- Core concept & modifier field (from gate) ---
+        self._core_cid = None
+        self._modifier_field = {}
+
     def _theta_temp(self, word_num):
         """Theta-rhythm temperature: high early (explore), low late (exploit)."""
-        return self.base_concept_temp * math.exp(-word_num / self.theta_tau)
+        t = self.base_concept_temp * math.exp(-word_num / self.theta_tau)
+        return max(t, self.base_concept_temp * 0.15)  # floor at 15% of base
 
     def _get_branch_rng(self, branch_id):
         """Get a seeded RNG for a specific beam branch."""
@@ -90,6 +105,22 @@ class CrystalGenerator:
         return self.branch_rngs[branch_id]
 
     # ── Anchor resolution (no fallbacks) ──────────────────────────
+
+    def _is_noise(self, w):
+        """Detect pure noise input: mixed scripts, abnormal composition."""
+        if not w:
+            return True
+        has_cyrillic = bool(re.search(r'[а-яё]', w))
+        has_latin = bool(re.search(r'[a-z]', w))
+        if has_cyrillic and has_latin:
+            return True
+        digit_ratio = sum(c.isdigit() for c in w) / len(w)
+        if digit_ratio > 0.3:
+            return True
+        non_alpha_ratio = sum(not c.isalpha() for c in w) / len(w)
+        if non_alpha_ratio > 0.3:
+            return True
+        return False
 
     def resolve_anchor(self, word):
         """Resolve word to concept anchor with confidence.
@@ -105,8 +136,7 @@ class CrystalGenerator:
         from such anchors — they signal uncertainty, not knowledge.
         """
         w = word.lower().strip()
-        if not w:
-            # Empty input: return neutral anchor at semantic origin
+        if not w or self._is_noise(w):
             return self._neutral_anchor(), 0.0
 
         # 1. Direct lookup (exact dictionary match)
@@ -265,9 +295,11 @@ class CrystalGenerator:
         else:
             delta = 0.0
 
-        # Intent anchor = concept closest to centroid, but NOT an exact query match
-        # (model should GENERATE from the intent, not repeat the query)
-        intent_cid = self._closest_concept(intent_vec, k=1, exclude=anchors)[0][0]
+        # Intent anchor = concept closest to centroid
+        # Prefer non-query concepts, but don't exclude if no good alternative
+        candidates = self._closest_concept(intent_vec, k=5)
+        non_query = [(c, s) for c, s in candidates if c not in anchors]
+        intent_cid = non_query[0][0] if non_query else candidates[0][0]
 
         return intent_cid, intent_vec, delta
 
@@ -316,14 +348,22 @@ class CrystalGenerator:
         Returns:
             dict with response text, concept path, intent info
         """
-        # ── Resolve intent from query ──
+        # ── Extract core concept via semantic gate ──
         src_words = query_words or ([seed_word] if seed_word else [])
-        intent_cid, intent_vec, intent_delta = self.project_intent(src_words)
-        self._query_centroid = intent_vec
+        core_cid, modifier_field, core_centroid, noise_words = self.gate.extract_core(src_words)
 
-        # Use intent as seed if no explicit seed given
+        if core_centroid is not None:
+            self._query_centroid = core_centroid
+        self._core_cid = core_cid
+        self._modifier_field = modifier_field
+
+        # Confidence = how cleanly the gate found a core
+        gate_noise_ratio = len(noise_words) / max(len(src_words), 1)
+        self._query_confidence = max(0.1, 1.0 - gate_noise_ratio)
+
+        # Use core as seed if no explicit seed given
         if seed_cid is None and seed_word is None:
-            seed_cid = intent_cid
+            seed_cid = core_cid
         elif seed_cid is None and seed_word is not None:
             seed_cid, seed_conf = self.resolve_anchor(seed_word)
             self._query_confidence = min(self._query_confidence, seed_conf)
@@ -355,7 +395,8 @@ class CrystalGenerator:
             h_beam = self.hormones.modulate_beam_width(self.beam_width)
 
             # ---- Semantic distance check ----
-            delta = self._semantic_delta(intent_vec, [b[0][-1] for b in beam])
+            qv = self._query_centroid
+            delta = self._semantic_delta(qv, [b[0][-1] for b in beam])
             # If drifting too far, increase temperature (explore back)
             # If too close, also increase temperature (explore away from parroting)
             ideal_delta = 0.3 + 0.4 * (1.0 - math.exp(-wn / 5.0))  # increases with wn
@@ -369,7 +410,7 @@ class CrystalGenerator:
                 expected_cid = target_concepts[expected_idx] if expected_idx < len(target_concepts) else None
 
                 # ---- Branch: get candidates (with distance awareness) ----
-                candidates = self._branch(seq, wn, h_temp, expected_cid, intent_vec)
+                candidates = self._branch(seq, wn, h_temp, expected_cid, self._query_centroid)
                 if not candidates:
                     self.hormones.update(confidence=0.0, is_match=False,
                         novelty=0.0, surprise=0.5, expected_cid=expected_cid)
@@ -433,14 +474,7 @@ class CrystalGenerator:
 
             # ---- Prune beam ----
             new_beam.sort(key=lambda x: -x[1])
-            top_beams = new_beam[:max(1, h_beam)]
-
-            if len(new_beam) > h_beam:
-                runner_ups = new_beam[h_beam:]
-                pick = self.main_rng.randint(0, min(3, len(runner_ups) - 1))
-                top_beams.append(runner_ups[pick])
-
-            beam = top_beams[:max(1, h_beam)]
+            beam = new_beam[:max(1, h_beam)]
             all_chains.extend([(s, sc) for s, sc, _, _ in new_beam])
 
             # EOS
@@ -473,8 +507,9 @@ class CrystalGenerator:
             'word_count': len(best_seq) - 1,
             'max_words': effective_max,
             'chains': all_chains,
-            'intent_cid': intent_cid,
-            'intent_delta': intent_delta,
+            'core_cid': core_cid,
+            'modifier_field': modifier_field,
+            'noise_words': noise_words,
             'intent_drift': self._intent_drift,
         }
 
@@ -484,20 +519,25 @@ class CrystalGenerator:
         Uses Reciprocal Rank Fusion (RRF) to combine:
         - Syntax lattice (n-gram) ~ syntactic crystal field
         - Vector similarity (semantic) ~ semantic electron field
-        - Intent relevance (distance from query) ~ what was MEANT
+        - Core modifier field ~ what aspects of core to express
         - Content word bias ~ imagery potential
         - Target boosting (training) ~ supervised alignment
 
-        The intent relevance ensures the model always considers
-        whether a candidate moves TOWARD or AWAY from what the
-        query meant — semantic proximity AND distance awareness.
+        Core modifier field ensures generation stays within the
+        semantic orbit of the core concept, not jumping to unrelated
+        concepts.
 
         Returns:
             [(cid, log_score), ...]
         """
         cids = seq[-3:] if len(seq) >= 3 else seq
         prev_cid = seq[-1]
-        K = 60  # RRF constant (dampens top-rank advantage)
+        K = 3  # RRF constant (for 20-30 candidates, K=3 gives meaningful rank discrimination)
+
+        # POS context: get POS of previous concept's anchor
+        from eva.symbolic.pos_tagger import get_pos, pos_transition_score
+        prev_anchor = self.cs.concept_info.get(prev_cid, {}).get('anchor', '')
+        prev_pos = get_pos(prev_anchor) if prev_anchor else 'UNK'
 
         # 1. N-gram syntax candidates with ranks
         syn_preds = self.lattice.predict(cids)
@@ -511,14 +551,16 @@ class CrystalGenerator:
             vec_candidates = [(cid, sim) for cid, anchor, sim in similar]
         vec_ranked = {cid: i+1 for i, (cid, _) in enumerate(vec_candidates[:20])}
 
-        # 3. All candidate cids (union of syntax + vector + corpus)
-        all_cids = set(syn_ranked.keys()) | set(vec_ranked.keys())
+        # 3. All candidate cids (union of syntax + vector + modifier field)
+        modifier_cids = set(self._modifier_field.keys())
+        all_cids = set(syn_ranked.keys()) | set(vec_ranked.keys()) | modifier_cids
 
         if not all_cids:
             return []
 
         # 4. RRF scoring
         combined = {}
+        core_cid = self._core_cid if hasattr(self, '_core_cid') else None
         for cid in all_cids:
             rrf = 0.0
 
@@ -529,6 +571,16 @@ class CrystalGenerator:
             # Vector component: 1/(K + rank_in_vectors)
             if cid in vec_ranked:
                 rrf += 0.3 / (K + vec_ranked[cid])
+
+            # Modifier field boost: exploring aspects of core concept
+            if cid in modifier_cids:
+                mod_strength = self._modifier_field[cid].get('strength', 0.5)
+                rrf += 0.4 * mod_strength / (K + 1)
+
+            # Core connection boost: staying relevant to core concept
+            if core_cid is not None and cid != core_cid:
+                conn = self.gate._connection_strength(core_cid, cid)
+                rrf += 0.2 * conn / (K + 1)
 
             # Novelty prior: rare concepts get a small boost
             freq = self.lattice.concept_freq.get(cid, 0)
@@ -560,30 +612,29 @@ class CrystalGenerator:
                 # Small penalty for function words
                 combined[cid] *= 0.85
 
-        # 6. Intent relevance: how close is each candidate to what was MEANT?
-        #    Concepts that are semantically relevant to the query get a boost.
-        #    Concepts too far from the intent get penalized.
-        #    This implements "what did the interlocutor mean?"
-        if intent_vec is not None:
-            iv_n = intent_vec / max(np.linalg.norm(intent_vec), 1e-10)
-            for cid in list(combined.keys()):
-                cv = self.cs.concept_vector(cid)
-                if cv is not None:
-                    cv_n = cv / max(np.linalg.norm(cv), 1e-10)
-                    rel = float(np.dot(iv_n, cv_n))  # cosine similarity to intent
-                    # Boost near intent (rel > 0.3), penalize far (rel < 0)
-                    if rel > 0.3:
-                        combined[cid] *= (1.0 + 0.2 * rel)
-                    elif rel < 0.0:
-                        combined[cid] *= max(0.5, 1.0 + rel * 0.5)
+            # POS transition score: prefer syntactically compatible sequences
+            cand_anchor = info.get('anchor', '')
+            cand_pos = get_pos(cand_anchor) if cand_anchor else 'UNK'
+            pos_score = pos_transition_score(prev_pos, cand_pos)
+            combined[cid] *= (1.0 + pos_score * 2.0)  # up to 3x boost for good transitions
 
-        # 7. Avoid immediate repetition
-        if len(seq) > 1:
-            for cid in list(combined.keys()):
-                if cid == seq[-1]:
-                    combined[cid] *= 0.05
-                elif len(seq) > 2 and cid == seq[-2]:
-                    combined[cid] *= 0.2
+            # Core connection penalty: concepts unrelated to core get penalized
+            if core_cid is not None and cid != core_cid and cid not in modifier_cids:
+                conn = self.gate._connection_strength(core_cid, cid)
+                if conn < 0.05:
+                    combined[cid] *= 0.5  # strong penalty for drifting
+
+        # 7. Avoid repetition and loops
+        recent = seq[-6:] if len(seq) >= 6 else seq
+        for cid in list(combined.keys()):
+            # Exact concept repetition in recent window
+            if cid in recent:
+                count = recent.count(cid)
+                combined[cid] *= (0.05 ** count)
+
+            # Bigram loop detection: A→B→A→B pattern
+            if len(seq) >= 4 and cid == seq[-2] and seq[-1] == seq[-3]:
+                combined[cid] *= 0.01  # strong loop penalty
 
         # 8. Apply temperature (softmax with theta_temp)
         result = [(cid, max(s, 1e-10)) for cid, s in combined.items()]
@@ -648,10 +699,18 @@ class CrystalGenerator:
         }
         print(f"    {len(self._merge_cache)} concepts with merge potential")
 
-    def _select_word(self, cid, theta_temp=0.2):
+    def _select_word(self, cid, theta_temp=0.2, prev_word=None):
         """Select word from concept's electron cloud.
         Anchor = nucleus (preferred, stable).
-        Satellites = electron cloud (morphological variety, volatile)."""
+        Satellites = electron cloud (morphological variety, volatile).
+
+        Args:
+            cid: concept ID
+            theta_temp: temperature for word selection
+            prev_word: previous word (for agreement checking)
+        """
+        from eva.symbolic.pos_tagger import get_pos, check_agreement
+
         words = self.cs.words_in_concept(cid, top_k=15)
         if not words:
             return None
@@ -662,11 +721,22 @@ class CrystalGenerator:
         if theta_temp <= 0.01:
             return anchor
 
+        # Filter words by agreement with prev_word
+        if prev_word:
+            compatible = [w for w in words if check_agreement(prev_word, w)]
+            if compatible:
+                words = compatible
+
         scored = []
         for w in words:
             is_anchor = (w == anchor)
             base_score = 3.0 if is_anchor else 1.0
             base_score *= math.exp(-0.03 * len(w))
+
+            # Bonus for agreement with prev_word
+            if prev_word and check_agreement(prev_word, w):
+                base_score *= 1.2
+
             scored.append((w, base_score))
 
         scores = np.array([s for _, s in scored], dtype=np.float64)
@@ -727,6 +797,13 @@ class CrystalGenerator:
             self.main_rng = random.Random(epoch * 42)
 
             result = self.generate(seed_word=seed_word, target_text=target_text)
+
+            # Update gate role memory from this generation
+            query_words = (seed_word or '').split() + target_text.split()
+            core_cid = self._core_cid
+            mod_cids = set(self._modifier_field.keys())
+            if core_cid is not None and query_words:
+                self.gate.update_role_memory(query_words, core_cid, mod_cids)
 
             gen_c = result.get('concept_path', [])
             matches = sum(1 for i, c in enumerate(gen_c)

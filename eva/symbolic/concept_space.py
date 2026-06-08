@@ -54,6 +54,7 @@ class ConceptSpace:
 
         # Random state
         self.rng = np.random.RandomState(42)
+        self._inhibition_step = 0  # counter for lateral inhibition seed
 
     def build(self, corpus_path=None, tok=None):
         """Build ConceptSpace from skeleton and corpus.
@@ -163,6 +164,33 @@ class ConceptSpace:
         # Store
         for i, cid in enumerate(self.cid_list):
             self.concept_vectors[cid] = emb[i].astype(np.float32)
+
+        # Reinitialize zero-norm concepts using ConceptNet neighbors
+        zero_count = 0
+        for cid in self.cid_list:
+            v = self.concept_vectors[cid]
+            if np.linalg.norm(v) < 0.01:
+                zero_count += 1
+                # Try to use ConceptNet neighbors
+                neighbor_vecs = []
+                for (ci, cj), rels in self.skeleton.relations.items():
+                    other = cj if ci == cid else (ci if cj == cid else None)
+                    if other is not None:
+                        other_v = self.concept_vectors.get(other)
+                        if other_v is not None and np.linalg.norm(other_v) > 0.01:
+                            neighbor_vecs.append(other_v)
+                if neighbor_vecs:
+                    new_v = np.mean(neighbor_vecs, axis=0).astype(np.float32)
+                    new_v /= max(np.linalg.norm(new_v), 1e-10)
+                    self.concept_vectors[cid] = new_v
+                else:
+                    # Random unit vector
+                    new_v = self.rng.randn(self.dim).astype(np.float32)
+                    new_v /= np.linalg.norm(new_v)
+                    self.concept_vectors[cid] = new_v
+
+        if zero_count > 0:
+            print(f"  Reinitialized {zero_count} zero-norm concepts")
 
         print(f"  SVD concept vectors: {len(self.cid_list)} @ {self.dim}D (effective {ndim}D)")
 
@@ -281,7 +309,8 @@ class ConceptSpace:
         n_total = len(self.concept_vectors)
         sample_size = min(500, n_total)
 
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(winner_cid + self._inhibition_step)
+        self._inhibition_step += 1
         candidates = list(self.concept_vectors.keys())
         sampled = rng.choice(candidates, size=min(sample_size, len(candidates)), replace=False)
 
@@ -377,7 +406,8 @@ class ConceptSpace:
         if n_total <= sample_size:
             candidates = list(self.concept_vectors.keys())
         else:
-            rng = np.random.RandomState(42)
+            rng = np.random.RandomState(cid + self._inhibition_step)
+            self._inhibition_step += 1
             candidates = rng.choice(
                 list(self.concept_vectors.keys()),
                 size=min(sample_size, n_total),
@@ -468,6 +498,7 @@ class ConceptSpace:
             }
         obj.rng = np.random.RandomState(42)
         obj._concept_usage = Counter()
+        obj._inhibition_step = 0
         print(f"  Loaded ConceptSpace: {len(obj.cid_list)} concepts @ {obj.dim}D")
         return obj
 

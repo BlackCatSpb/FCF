@@ -122,16 +122,16 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         text = self._tok.decode(input_ids[0].tolist() if hasattr(input_ids, 'tolist') else input_ids)
         words = text.split()
 
-        # Project intent from decoded words
-        intent_cid, intent_vec, delta = self.generator.project_intent(words)
+        # Extract core concept via semantic gate
+        core_cid, modifier_field, centroid, noise = self.generator.gate.extract_core(words)
 
-        anchor = self._space.concept_info.get(intent_cid, {}).get("anchor", "?")
+        anchor = self._space.concept_info.get(core_cid, {}).get("anchor", "?")
 
         return FCFOutput(
             text=text,
-            concept_path=[intent_cid],
+            concept_path=[core_cid],
             intent_anchor=anchor,
-            semantic_delta=float(delta),
+            semantic_delta=float(len(noise) / max(len(words), 1)),
             confidence=float(self.generator._query_confidence),
         )
 
@@ -173,10 +173,9 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         result = self.generator.generate(query_words=query_words)
 
         hm = self.generator.hormones
-        intent_drift = result.get("intent_drift", result.get("intent_delta", 0.0))
         return FCFOutput(
             text=result.get("text", ""),
-            concept_path=result.get("concept_path", result.get("path", [])),
+            concept_path=result.get("concept_path", []),
             hormones={
                 "da": float(hm.dopamine),
                 "5ht": float(hm.serotonin),
@@ -184,8 +183,9 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
                 "ach": float(hm.acetylcholine),
             },
             confidence=float(self.generator._query_confidence),
-            intent_anchor=None,
-            semantic_delta=float(intent_drift),
+            intent_anchor=self._space.concept_info.get(
+                result.get("core_cid", 0), {}).get("anchor", None),
+            semantic_delta=float(result.get("intent_drift", 0.0)),
         )
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):

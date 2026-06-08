@@ -184,7 +184,18 @@ class CrystalGenerator:
                 self._resolve_cache[w] = result
                 return result
 
-        # 3. Word not in dictionary → unknown.
+        # 3. Compound word decomposition: split into known subwords
+        #    E.g., "резервуардляводы" → "резервуар" + "для" + "воды"
+        subwords = self._decompose_word(w)
+        if subwords:
+            main = subwords[-1]
+            cid = self.cs.word_to_cid.get(main)
+            if cid is not None:
+                result = (cid, 0.7)
+                self._resolve_cache[w] = result
+                return result
+
+        # 4. Word not in dictionary → unknown.
         #    No forced fallback (no orthographic/BPE scan).
         #    Unknown = signal: "I have no data for this word."
         #    The gate will still see its vector position via centroid,
@@ -192,6 +203,34 @@ class CrystalGenerator:
         result = (self._neutral_anchor(), 0.0)
         self._resolve_cache[w] = result
         return result
+
+    def _decompose_word(self, word):
+        """Split concatenated word into known subwords via longest-prefix match.
+        Uses the model's own vocabulary — no external data.
+
+        E.g., 'резервуардляводы' → ['резервуар', 'для', 'воды']
+        Returns list of subwords or None if no decomposition found.
+        """
+        if not word or len(word) < 4:
+            return None
+        parts = []
+        remaining = word
+        while remaining:
+            found = False
+            for end in range(len(remaining), 2, -1):
+                prefix = remaining[:end]
+                if prefix in self.cs.word_to_cid:
+                    parts.append(prefix)
+                    remaining = remaining[end:]
+                    found = True
+                    break
+            if not found:
+                # Partial match: if we already found at least one subword,
+                # accept what we have (the remainder is likely a suffix)
+                if parts:
+                    return parts
+                return None
+        return parts if len(parts) > 1 else None
 
     def _lookup_morph(self, word):
         """Look up morphological parse: first from in-model cache, then live parse."""

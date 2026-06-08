@@ -329,9 +329,9 @@ def run_training(args):
                 save_checkpoint(cs, lattice, gen, line_count, elapsed, ckpt_dir, tag=str(line_count))
                 checkpoint_connections = len(lattice.connections)
 
-            # Live checkpoint (overwrite main files every SAVE_EVERY_LIVE)
+            # Live checkpoint (overwrite main files every SAVE_EVERY_LINE)
             if line_count % SAVE_EVERY_LIVE < 1 and line_count > start_from:
-                cs.save(os.path.join(ckpt_dir, 'concept_space.json'))
+                cs.save(os.path.join(ckpt_dir, 'concept_space.json'), include_morph=False)
                 lattice.save(os.path.join(ckpt_dir, 'syntax_lattice.json'))
                 meta = {
                     'lines': line_count,

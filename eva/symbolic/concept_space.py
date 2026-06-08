@@ -777,13 +777,14 @@ class ConceptSpace:
             return self.concept_info[cid]['anchor']
         return None
 
-    def save(self, path, use_pq=False):
+    def save(self, path, use_pq=False, include_morph=True):
         """Save ConceptSpace to disk.
 
         Args:
             path: file path
             use_pq: if True, save PQ-compressed format (much smaller).
                     Requires pq_codes to be computed (call pq_encode() first).
+            include_morph: if False, omit word_to_morph (for live checkpoints).
         """
         if use_pq and self.pq_codes is not None:
             # PQ format: codes + codebooks, no full vectors
@@ -797,7 +798,7 @@ class ConceptSpace:
                 'codebooks': [cb.tolist() for cb in self.pq_codebooks],
                 'cid_list': self.cid_list,
                 'word_to_cid': self.word_to_cid,
-                'word_to_morph': self.word_to_morph,
+                'word_to_morph': self.word_to_morph if include_morph else {},
                 'cid_to_words': {str(c): ws for c, ws in self.cid_to_words.items()},
                 'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}
                                       for c, info in self.concept_info.items()},
@@ -808,7 +809,7 @@ class ConceptSpace:
                 'pq': False,
                 'cid_list': self.cid_list,
                 'word_to_cid': self.word_to_cid,
-                'word_to_morph': self.word_to_morph,
+                'word_to_morph': self.word_to_morph if include_morph else {},
                 'cid_to_words': {str(c): ws for c, ws in self.cid_to_words.items()},
                 'concept_vectors': {str(c): v.tolist() for c, v in self.concept_vectors.items()},
                 'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}

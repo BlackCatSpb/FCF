@@ -735,7 +735,8 @@ class CrystalGenerator:
         if not all_cids:
             return []
 
-        # 5. RRF scoring — learned patterns dominate
+        # 5. RRF scoring — core aspects + modifiers dominate, n-grams reduced
+        #    (n-grams from noisy corpus overfit to boilerplate patterns)
         combined = {}
         for cid in all_cids:
             rrf = 0.0
@@ -744,18 +745,18 @@ class CrystalGenerator:
             if cid in connected_prev:
                 rrf += 0.5 * connected_prev[cid] / (K + 1)
 
-            # Learned: n-gram sequence (real corpus patterns)
+            # Learned: n-gram sequence — reduced weight (was 0.4)
             if cid in syn_ranked:
-                rrf += 0.4 / (K + syn_ranked[cid])
+                rrf += 0.25 / (K + syn_ranked[cid])
 
             # Learned: core aspect (decomposed from connections + ngrams)
             if cid in aspect_cids:
-                rrf += 0.3 * aspect_cids[cid] / (K + 1)
+                rrf += 0.5 * aspect_cids[cid] / (K + 1)
 
             # Query-specific: modifier field from gate
             if cid in modifier_cids:
                 mod_strength = self._modifier_field[cid].get('strength', 0.5)
-                rrf += 0.2 * mod_strength / (K + 1)
+                rrf += 0.3 * mod_strength / (K + 1)
 
             # Novelty prior: rare concepts get tiny boost
             freq = self.lattice.concept_freq.get(cid, 0)
@@ -799,17 +800,54 @@ class CrystalGenerator:
                 if conn < 0.05:
                     combined[cid] *= 0.5  # strong penalty for drifting
 
-        # 7. Avoid repetition and loops
+        # 7. Anti-repetition: repeat penalty + contrastive + n-gram blocking
+        #    Inspired by contrastive search (SimCTG), repetition_penalty (GPT),
+        #    and n-gram blocking (CTRL, Fairseq).
         recent = seq[-6:] if len(seq) >= 6 else seq
-        for cid in list(combined.keys()):
-            # Exact concept repetition in recent window
-            if cid in recent:
-                count = recent.count(cid)
-                combined[cid] *= (0.05 ** count)
 
-            # Bigram loop detection: A→B→A→B pattern
+        # Precompute vectors for last 3 CIDs for contrastive check
+        contrastive_vectors = []
+        for rc in seq[-3:]:
+            v = self.cs.concept_vector(rc)
+            if v is not None:
+                contrastive_vectors.append(v)
+
+        # Set of all trigrams in seq for n-gram blocking
+        trigram_set = set()
+        if len(seq) >= 3:
+            for i in range(len(seq) - 2):
+                trigram_set.add((seq[i], seq[i+1], seq[i+2]))
+
+        for cid in list(combined.keys()):
+            # 7a. Repetition penalty (GPT-style):
+            #     scale = 1 / (rep_penalty ^ count_in_window)
+            count = recent.count(cid)
+            if count > 0:
+                combined[cid] *= (0.2 ** count)
+
+            # 7b. Contrastive penalty (SimCTG-style):
+            #     penalize CIDs whose vector is cos-similar to recent CIDs
+            v_cand = self.cs.concept_vector(cid)
+            if v_cand is not None and contrastive_vectors:
+                max_sim = max(np.dot(v_cand, cv) for cv in contrastive_vectors)
+                if max_sim > 0.7:
+                    # Scale: 1.0 at sim=0.7 → 0.1 at sim=1.0
+                    pen = 1.0 - 3.0 * (max_sim - 0.7)
+                    combined[cid] *= max(pen, 0.1)
+
+            # 7c. N-gram blocking (CTRL/Fairseq-style):
+            #     block any CID that would create an already-seen trigram
+            if len(seq) >= 2:
+                candidate_trigram = (seq[-2], seq[-1], cid)
+                if candidate_trigram in trigram_set:
+                    combined.pop(cid, None)
+
+            # 7d. Bigram loop detection: A→B→A→B pattern
             if len(seq) >= 4 and cid == seq[-2] and seq[-1] == seq[-3]:
-                combined[cid] *= 0.01  # strong loop penalty
+                combined.pop(cid, None)
+
+        if not combined:
+            return []
 
         # 8. Apply temperature (softmax with theta_temp)
         result = [(cid, max(s, 1e-10)) for cid, s in combined.items()]

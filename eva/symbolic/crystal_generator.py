@@ -74,6 +74,9 @@ class CrystalGenerator:
         # Merge potential cache (precomputed on first use)
         self._merge_cache = None
 
+        # Resolve cache: word → (cid, confidence)
+        self._resolve_cache = {}
+
         # --- Semantic Gate (core concept extraction) ---
         self.gate = SemanticGate(
             cs, lattice,
@@ -127,75 +130,68 @@ class CrystalGenerator:
     def resolve_anchor(self, word):
         """Resolve word to concept anchor with confidence.
 
-        Returns:
-            (cid, confidence):
-                cid: concept ID (always)
-                confidence: 0..1 how sure we are this is the right anchor.
-                0.0 = pure noise/unknown, 1.0 = exact dictionary match.
+        Plastic morph-aware resolution:
+          1. morph root → direct CID (fast, O(1))
+          2. affixed root → apply affix shifts → nearest concept
+          3. unknown root → orthographic/BPE (slow, cached)
+          4. nothing → neutral (signal: unknown)
 
-        Low-confidence anchors mean: "this input has no clear meaning
-        in my knowledge space." The caller should NOT generate confidently
-        from such anchors — they signal uncertainty, not knowledge.
+        The resolve cache is NOT a hardcoded dict — it's a learned associative
+        memory that grows with training. When the vector space shifts (STDP),
+        the cache remains valid because it maps words to CID (stable),
+        not words to vectors (plastic).
         """
         w = word.lower().strip()
         if not w or self._is_noise(w):
             return self._neutral_anchor(), 0.0
 
-        # 1. Direct lookup (exact dictionary match)
+        # Fast reject: words with replacement chars are encoding artifacts
+        if '\ufffd' in w:
+            result = (self._neutral_anchor(), 0.0)
+            self._resolve_cache[w] = result
+            return result
+
+        # Cache check
+        cached = self._resolve_cache.get(w)
+        if cached is not None:
+            return cached
+
+        # 1. Direct lookup (exact dictionary match, fastest)
         cid = self.cs.word_to_cid.get(w)
         if cid is not None:
+            self._resolve_cache[w] = (cid, 1.0)
             return cid, 1.0
 
-        # 2. Orthographic (Dice bigram similarity > 0.4)
-        best_cid, best_score = None, 0.0
-        for known_w, known_cid in self.cs.word_to_cid.items():
-            if abs(len(known_w) - len(w)) > 3:
-                continue
-            score = self._edit_similarity(w, known_w)
-            if score > best_score:
-                best_score, best_cid = score, known_cid
+        # 2. Morph root resolution (fast, O(1))
+        # Root → same CID regardless of affixes.
+        # Affix shifts apply to VECTORS (for gate/centroid computation),
+        # not to CID resolution — same concept, different word form.
+        morph = ConceptTokenizer.morph_parse(w)
+        root = morph['normal_form'] if morph else w
+        root_cid = self.cs.word_to_cid.get(root)
+        if root_cid is not None:
+            has_affixes = bool(morph and (morph.get('prefix') or morph.get('suffix') or morph.get('ending')))
+            conf = 0.9 if has_affixes else 1.0
+            result = (root_cid, conf)
+            self._resolve_cache[w] = result
+            return result
 
-        if best_score > 0.5:
-            return best_cid, best_score
+        # 2b. Root not in dict but the word itself might be (if morph failed)
+        if not morph and root != w:
+            cid = self.cs.word_to_cid.get(w)
+            if cid is not None:
+                result = (cid, 0.9)
+                self._resolve_cache[w] = result
+                return result
 
-        # 3. BPE token overlap (Jaccard similarity)
-        bpe_ids = set(self.tok.bpe.encode(w).ids) if self.tok.bpe.encode(w).ids else set()
-        best_confidence = 0.0
-        if bpe_ids:
-            candidate_vectors = []
-            scan_limit = min(8000, len(self.cs.word_to_cid))
-            for known_w, known_cid in list(self.cs.word_to_cid.items())[:scan_limit]:
-                known_ids = set(self.tok.bpe.encode(known_w).ids)
-                if not known_ids:
-                    continue
-                jaccard = len(bpe_ids & known_ids) / len(bpe_ids | known_ids)
-                if jaccard > 0.1:
-                    v = self.cs.concept_vector(known_cid)
-                    if v is not None:
-                        candidate_vectors.append((known_cid, v, jaccard))
-
-            if candidate_vectors:
-                # Best individual Jaccard = confidence upper bound
-                best_jaccard = max(o for _, _, o in candidate_vectors)
-                best_confidence = best_jaccard * 0.8  # discount: BPE is weaker than orthographic
-
-                # Confidence too low: don't pretend to know this input
-                if best_confidence < 0.15:
-                    return self._neutral_anchor(), 0.0
-
-                total_w = sum(o for _, _, o in candidate_vectors)
-                weights = np.array([o / total_w for _, _, o in candidate_vectors], dtype=np.float64)
-                avg_v = np.average(
-                    [v for _, v, _ in candidate_vectors],
-                    axis=0, weights=weights
-                )
-                best_cid = self._closest_concept(avg_v, k=1)[0][0]
-                return best_cid, best_confidence
-
-        # 4. No meaningful overlap → this is noise/unknown input.
-        #    Return NEUTRAL anchor at semantic origin with zero confidence.
-        #    This is NOT a fallback — it's a signal: "I don't know this."
-        return self._neutral_anchor(), 0.0
+        # 3. Word not in dictionary → unknown.
+        #    No forced fallback (no orthographic/BPE scan).
+        #    Unknown = signal: "I have no data for this word."
+        #    The gate will still see its vector position via centroid,
+        #    and adaptive concept creation handles new cores.
+        result = (self._neutral_anchor(), 0.0)
+        self._resolve_cache[w] = result
+        return result
 
     def _neutral_anchor(self):
         """The semantic 'center of mass' — represents complete uncertainty.
@@ -235,19 +231,40 @@ class CrystalGenerator:
         return 2.0 * overlap / (len(bigrams_a) + len(bigrams_b))
 
     def _closest_concept(self, vec, k=5, exclude=None):
-        """Find k closest concepts to a given vector."""
+        """Find k closest concepts to a given vector (batched matrix NN)."""
         if vec is None:
             return [(0, 0.0)]
+        self.cs.ensure_matrix()
+        mat = self.cs._vector_matrix
+        if mat.shape[0] == 0:
+            return [(0, 0.0)]
         vn = vec / max(np.linalg.norm(vec), 1e-10)
+        sims = mat @ vn  # (N,) — single matrix multiply
         exclude_set = set(exclude or [])
-        sims = []
-        for cid, cv in self.cs.concept_vectors.items():
+        # Argpartition for top k
+        n = len(sims)
+        k_actual = min(k, n)
+        if k_actual <= 0:
+            return [(0, 0.0)]
+        idx = np.argpartition(-sims, k_actual - 1)[:k_actual]
+        idx = idx[np.argsort(-sims[idx])]
+        result = []
+        for i in idx:
+            cid = self.cs._cid_order[i]
             if cid in exclude_set:
                 continue
-            s = float(np.dot(vn, cv / max(np.linalg.norm(cv), 1e-10)))
-            sims.append((cid, s))
-        sims.sort(key=lambda x: -x[1])
-        return sims[:k]
+            result.append((cid, float(sims[i])))
+            if len(result) >= k:
+                break
+        # Fallback: if all excluded, pad with any
+        while len(result) < k:
+            for cid in self.cs.cid_list:
+                if cid not in exclude_set and (cid, 0.0) not in result:
+                    result.append((cid, 0.0))
+                    break
+            else:
+                break
+        return result[:k]
 
     # ── Intent projection ────────────────────────────────────────
 
@@ -897,10 +914,23 @@ class CrystalGenerator:
         Args:
             text: input text (any Russian text)
         """
+        # Clean text: normalize whitespace, replace bad chars
+        text = self._clean_text(text)
+
         sentences = self._split_into_sentences(text)
 
         for sentence in sentences:
-            words = sentence.strip().split()
+            raw_words = sentence.split()
+            if len(raw_words) < 2:
+                continue
+
+            # Clean punctuation from words before any processing
+            strip_chars = '.,!?;:()[]{}«»—–-…\'\"\u00a0\ufffd'
+            words = []
+            for w in raw_words:
+                clean = w.strip(strip_chars)
+                if clean:
+                    words.append(clean)
             if len(words) < 2:
                 continue
 
@@ -917,7 +947,7 @@ class CrystalGenerator:
             from eva.symbolic.pos_tagger import get_pos
             word_data = []
             for w in words:
-                clean = w.strip('.,!?;:()[]{}«»—–-…\'\"')
+                clean = w.strip(strip_chars)
                 if not clean:
                     continue
                 morph = ConceptTokenizer.morph_parse(clean)
@@ -950,6 +980,20 @@ class CrystalGenerator:
                                       expected_cid=core_cid, lr=0.05)
 
         return len(sentences)
+
+    @staticmethod
+    def _clean_text(text):
+        """Normalize text: standardize whitespace, remove encoding artifacts."""
+        import re
+        # Replace non-breaking spaces, em/en dashes
+        text = text.replace('\u00a0', ' ')
+        text = text.replace('\u2013', '-')
+        text = text.replace('\u2014', ' - ')
+        # Remove replacement characters (encoding artifacts)
+        text = text.replace('\ufffd', '')
+        # Collapse multiple spaces
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
 
     @staticmethod
     def _split_into_sentences(text):

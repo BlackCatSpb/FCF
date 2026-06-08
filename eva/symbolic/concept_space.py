@@ -56,6 +56,12 @@ class ConceptSpace:
         self.rng = np.random.RandomState(42)
         self._inhibition_step = 0  # counter for lateral inhibition seed
 
+        # Precomputed vector matrix for fast nearest-neighbor
+        # (N, D) normalized array + CID ordering
+        self._vector_matrix = None
+        self._cid_order = []
+        self._matrix_dirty = True
+
         # Affix shift vectors (morphological modifiers)
         # affix → 128D shift vector, initialized as random unit vectors
         self.affix_shifts = {}
@@ -347,6 +353,8 @@ class ConceptSpace:
         # Lateral inhibition: dampen concepts similar to generated one
         self._lateral_inhibition(gen_cid, strength=0.02 * effective_lr)
 
+        self.mark_matrix_dirty()
+
     def _lateral_inhibition(self, winner_cid, strength=0.01):
         """Suppress concepts similar to the winner.
         In cortex: winner suppresses neighbors via inhibitory interneurons."""
@@ -420,6 +428,31 @@ class ConceptSpace:
 
     # ---- Query API ----
 
+    def ensure_matrix(self):
+        """Build or rebuild the precomputed vector matrix for fast NN search."""
+        if not self._matrix_dirty and self._vector_matrix is not None:
+            return
+        cids = []
+        vecs = []
+        for cid, v in self.concept_vectors.items():
+            cids.append(cid)
+            vecs.append(v)
+        if not vecs:
+            self._vector_matrix = np.empty((0, self.dim), dtype=np.float32)
+            self._cid_order = []
+            self._matrix_dirty = False
+            return
+        mat = np.array(vecs, dtype=np.float32)
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        self._vector_matrix = mat / norms
+        self._cid_order = cids
+        self._matrix_dirty = False
+
+    def mark_matrix_dirty(self):
+        """Call after vector changes (STDP, new concepts)."""
+        self._matrix_dirty = True
+
     def concept_vector(self, cid):
         """Get concept centroid vector."""
         return self.concept_vectors.get(cid)
@@ -445,34 +478,31 @@ class ConceptSpace:
         ))
 
     def topk_similar_concepts(self, cid, k=10, sample_size=500):
-        """Top-k concepts closest to given concept.
-        Uses random sampling for efficiency with large concept spaces."""
+        """Top-k concepts closest to given concept (batched matrix NN)."""
         v = self.concept_vectors.get(cid)
         if v is None:
             return []
+        self.ensure_matrix()
+        mat = self._vector_matrix
+        if mat.shape[0] == 0:
+            return []
         vn = v / max(np.linalg.norm(v), 1e-10)
-
-        n_total = len(self.concept_vectors)
-        if n_total <= sample_size:
-            candidates = list(self.concept_vectors.keys())
-        else:
-            rng = np.random.RandomState(cid + self._inhibition_step)
-            self._inhibition_step += 1
-            candidates = rng.choice(
-                list(self.concept_vectors.keys()),
-                size=min(sample_size, n_total),
-                replace=False
-            ).tolist()
-
-        sims = []
-        for other_cid in candidates:
-            if other_cid == cid:
+        sims = mat @ vn
+        n = len(sims)
+        k_actual = min(k + 1, n)  # +1 to skip self
+        if k_actual <= 0:
+            return []
+        idx = np.argpartition(-sims, k_actual - 1)[:k_actual]
+        idx = idx[np.argsort(-sims[idx])]
+        result = []
+        for i in idx:
+            c = self._cid_order[i]
+            if c == cid:
                 continue
-            ov = self.concept_vectors[other_cid]
-            s = float(np.dot(vn, ov / max(np.linalg.norm(ov), 1e-10)))
-            sims.append((other_cid, s))
-        sims.sort(key=lambda x: -x[1])
-        return [(c, self.concept_info[c]['anchor'], s) for c, s in sims[:k]]
+            result.append((c, self.concept_info[c]['anchor'], float(sims[i])))
+            if len(result) >= k:
+                break
+        return result[:k]
 
     def predict_next_concept(self, prev_cid, top_k=20):
         """Predict next concept from transition matrix."""
@@ -549,6 +579,9 @@ class ConceptSpace:
         obj.rng = np.random.RandomState(42)
         obj._concept_usage = Counter()
         obj._inhibition_step = 0
+        obj._vector_matrix = None
+        obj._cid_order = []
+        obj._matrix_dirty = True
         obj.affix_shifts = {}
         obj._init_affix_shifts()
         print(f"  Loaded ConceptSpace: {len(obj.cid_list)} concepts @ {obj.dim}D")

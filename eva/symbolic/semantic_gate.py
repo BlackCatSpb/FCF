@@ -262,6 +262,7 @@ class SemanticGate:
             'size': 1,
         }
         cs.cid_to_words[new_cid] = [f'auto_{new_cid}']
+        cs.mark_matrix_dirty()
 
         return new_cid
 

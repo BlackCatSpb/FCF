@@ -549,6 +549,8 @@ class ConceptSpace:
         obj.rng = np.random.RandomState(42)
         obj._concept_usage = Counter()
         obj._inhibition_step = 0
+        obj.affix_shifts = {}
+        obj._init_affix_shifts()
         print(f"  Loaded ConceptSpace: {len(obj.cid_list)} concepts @ {obj.dim}D")
         return obj
 

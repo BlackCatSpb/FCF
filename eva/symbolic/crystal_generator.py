@@ -308,38 +308,40 @@ class CrystalGenerator:
     # ── Core decomposition (field exploration) ─────────────────
 
     def decompose_core(self, core_cid, top_k=10):
-        """Decompose core concept into its semantic aspects.
+        """Decompose core concept into aspects learned from corpus.
 
-        Aspects are sub-concepts that can be expressed about the core:
-        - Similar concepts in vector space (semantic neighbors)
-        - Connected concepts from lattice (co-occurring modifiers)
-        - Concepts in the modifier field (adjectives, relations)
+        Aspects are what the model LEARNED about the core from training:
+        - Connected concepts from connection graph (highest priority: real data)
+        - N-gram successors from lattice (real sequences from corpus)
+        - Modifier field from gate (query-specific)
+        - Vector neighbors only as fallback (weakest signal)
 
-        Returns:
-            list of dicts: {cid, strength, relation, type}
+        No hardcoded rules — everything comes from training data.
         """
         aspects = {}
-        v_core = self.cs.concept_vector(core_cid)
 
-        # 1. Vector space neighbors (semantic aspects)
-        if v_core is not None:
-            similar = self.cs.topk_similar_concepts(core_cid, k=top_k)
-            for cid, anchor, sim in similar:
-                aspects[cid] = {
-                    'cid': cid, 'strength': sim,
-                    'relation': 'similar_to', 'type': 'semantic',
-                }
-
-        # 2. Lattice connections (syntagmatic aspects)
+        # 1. Connection graph: what concepts co-occur with core in corpus
         connected = self.lattice.connections_of(core_cid, top_k=top_k)
         for cid, conn in connected:
-            if cid not in aspects or conn['strength'] > aspects[cid]['strength']:
+            aspects[cid] = {
+                'cid': cid,
+                'strength': conn['strength'] * 1.5,  # boost: real data
+                'relation': conn['type'],
+                'type': 'connection',
+            }
+
+        # 2. N-gram lattice: what concepts follow core in real texts
+        ngram_preds = self.lattice.predict([core_cid])
+        for cid, score in ngram_preds[:top_k]:
+            if cid not in aspects or score > aspects[cid]['strength']:
                 aspects[cid] = {
-                    'cid': cid, 'strength': conn['strength'],
-                    'relation': conn['type'], 'type': 'connection',
+                    'cid': cid,
+                    'strength': score * 1.3,  # boost: real sequences
+                    'relation': 'follows',
+                    'type': 'ngram',
                 }
 
-        # 3. Modifier field (query-specific aspects)
+        # 3. Modifier field (query-specific from gate)
         for cid, mod_info in self._modifier_field.items():
             if cid not in aspects or mod_info['strength'] > aspects[cid]['strength']:
                 aspects[cid] = {
@@ -348,6 +350,17 @@ class CrystalGenerator:
                     'relation': mod_info.get('relation', 'modifies'),
                     'type': 'modifier',
                 }
+
+        # 4. Vector neighbors (weakest — only as novelty fallback)
+        v_core = self.cs.concept_vector(core_cid)
+        if v_core is not None:
+            similar = self.cs.topk_similar_concepts(core_cid, k=top_k)
+            for cid, anchor, sim in similar:
+                if cid not in aspects:
+                    aspects[cid] = {
+                        'cid': cid, 'strength': sim * 0.3,  # discounted
+                        'relation': 'similar_to', 'type': 'novelty',
+                    }
 
         result = sorted(aspects.values(), key=lambda x: -x['strength'])[:top_k]
         self._core_aspects = result
@@ -633,61 +646,55 @@ class CrystalGenerator:
         prev_anchor = self.cs.concept_info.get(prev_cid, {}).get('anchor', '')
         prev_pos = get_pos(prev_anchor) if prev_anchor else 'UNK'
 
-        # 1. Core aspects (decomposed field — THE key signal)
+        # 1. Core aspects (decomposed field — learned from training data)
         aspect_cids = {}
         if core_cid is not None and self._core_aspects:
             for asp in self._core_aspects:
                 aspect_cids[asp['cid']] = asp['strength']
 
-        # 2. N-gram syntax candidates
+        # 2. Connection graph: what's connected to PREV concept (learned co-occurrence)
+        connected_prev = {}
+        prev_connections = self.lattice.connections_of(prev_cid, top_k=15)
+        for cid, conn in prev_connections:
+            connected_prev[cid] = conn['strength']
+
+        # 3. N-gram syntax: what follows in real corpus
         syn_preds = self.lattice.predict(cids)
         syn_ranked = {cid: i+1 for i, (cid, _) in enumerate(syn_preds[:30])}
 
-        # 3. Vector similarity (from prev concept)
-        v_prev = self.cs.concept_vector(prev_cid)
-        vec_candidates = []
-        if v_prev is not None:
-            similar = self.cs.topk_similar_concepts(prev_cid, k=20)
-            vec_candidates = [(cid, sim) for cid, anchor, sim in similar]
-        vec_ranked = {cid: i+1 for i, (cid, _) in enumerate(vec_candidates[:20])}
-
-        # 4. All candidate cids (union of all sources)
+        # 4. All candidate cids (learned > query > novelty)
         modifier_cids = set(self._modifier_field.keys())
-        all_cids = (set(aspect_cids.keys()) | set(syn_ranked.keys()) |
-                    set(vec_ranked.keys()) | modifier_cids)
+        all_cids = (set(aspect_cids.keys()) | set(connected_prev.keys()) |
+                    set(syn_ranked.keys()) | modifier_cids)
 
         if not all_cids:
             return []
 
-        # 5. RRF scoring with core field dominance
+        # 5. RRF scoring — learned patterns dominate
         combined = {}
         for cid in all_cids:
             rrf = 0.0
 
-            # Core aspect priority: exploring what we can say about core
-            if cid in aspect_cids:
-                rrf += 0.6 * aspect_cids[cid] / (K + 1)
-            elif core_cid is not None and cid != core_cid:
-                conn = self.lattice.connection_strength(core_cid, cid, self.cs)
-                if conn > 0.1:
-                    rrf += 0.3 * conn / (K + 1)
+            # Learned: connection from previous concept (real co-occurrence)
+            if cid in connected_prev:
+                rrf += 0.5 * connected_prev[cid] / (K + 1)
 
-            # Syntax component
+            # Learned: n-gram sequence (real corpus patterns)
             if cid in syn_ranked:
-                rrf += 0.3 / (K + syn_ranked[cid])
+                rrf += 0.4 / (K + syn_ranked[cid])
 
-            # Vector component
-            if cid in vec_ranked:
-                rrf += 0.2 / (K + vec_ranked[cid])
+            # Learned: core aspect (decomposed from connections + ngrams)
+            if cid in aspect_cids:
+                rrf += 0.3 * aspect_cids[cid] / (K + 1)
 
-            # Modifier field boost
+            # Query-specific: modifier field from gate
             if cid in modifier_cids:
                 mod_strength = self._modifier_field[cid].get('strength', 0.5)
                 rrf += 0.2 * mod_strength / (K + 1)
 
-            # Novelty prior
+            # Novelty prior: rare concepts get tiny boost
             freq = self.lattice.concept_freq.get(cid, 0)
-            prior = 0.05 / (K + 1) * (1.0 - min(freq / 1000, 1.0))
+            prior = 0.02 / (K + 1) * (1.0 - min(freq / 1000, 1.0))
             rrf += prior
 
             combined[cid] = rrf

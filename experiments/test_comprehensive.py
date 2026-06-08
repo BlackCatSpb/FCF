@@ -2,6 +2,8 @@
 Tests are pure request→response: no concept IDs, no internal state inspection."""
 
 import sys; sys.path.insert(0, "C:/Users/black/OneDrive/Desktop/FCF")
+import io; sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stdout.reconfigure(encoding='utf-8')
 
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.concept_tokenizer import ConceptTokenizer

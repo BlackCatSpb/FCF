@@ -100,24 +100,56 @@ def run_test_generation(gen, cs, seeds, max_words=8):
 # ── Dashboard ──────────────────────────────────────────────────────────────
 
 class Dashboard:
-    """Terminal dashboard showing live training progress."""
+    """Terminal dashboard — static header drawn once, only live values update."""
+
+    NUM_STATIC_LINES = 10  # lines before the update block starts
+    UPDATE_ROW_OFFSET = 4  # first row that changes (0-indexed from static top)
 
     def __init__(self, total_lines=None):
         self.start_time = time.time()
         self.prev_count = 0
         self.prev_time = self.start_time
-        self.last_tests = []
         self.total_lines = total_lines
+        self._rendered = False
+        self._template_lines = []
+
+    def _safe_write(self, text):
+        try:
+            sys.stdout.write(text)
+        except UnicodeEncodeError:
+            sys.stdout.write(text.encode('ascii', errors='replace').decode('ascii'))
+
+    def render_static(self):
+        """Draw the static frame once."""
+        lines = []
+        lines.append('=' * 62)
+        lines.append('  EVA-Ai LIVE TRAINING - concept learning from corpus')
+        lines.append('=' * 62)
+        lines.append('')
+        lines.append('')
+        lines.append('')
+        lines.append('')
+        lines.append('')
+        lines.append('')
+        lines.append('')
+        lines.append('')
+        lines.append('')
+        lines.append('')
+        lines.append('')
+        self._safe_write('\033[2J\033[H' + '\n'.join(lines))
+        self._rendered = True
 
     def update(self, line_count, connections, role_mem, ngram_counts,
                gate_info, test_results=None):
+        if not self._rendered:
+            self.render_static()
+
         now = time.time()
         elapsed = now - self.start_time
         rate = max((line_count - self.prev_count) / max(now - self.prev_time, 0.001), 0)
         self.prev_count = line_count
         self.prev_time = now
 
-        # Progress
         pct = ''
         if self.total_lines:
             pct = f' ({line_count/self.total_lines*100:.1f}%)'
@@ -126,64 +158,43 @@ class Dashboard:
             remaining = (self.total_lines - line_count) / rate
             eta = f' ETA {fmt_time(remaining)}'
 
-        # Build display (ASCII-safe — no Unicode chars for terminal compat)
-        lines = []
-        lines.append('=' * 62)
-        lines.append('  EVA-Ai LIVE TRAINING - concept learning from corpus')
-        lines.append('=' * 62)
-        lines.append('')
-        lines.append(f'  [PROGRESS]  {line_count:,} lines{pct}')
-        lines.append(f'              speed {rate:.1f} l/s  elapsed {fmt_time(elapsed)}{eta}')
-
-        # Memory
         bi = ngram_counts.get(2, 0)
         tri = ngram_counts.get(3, 0)
-        lines.append(f'  [MEMORY]    connections={connections:,}  '
-                     f'role_mem={role_mem:,}  '
-                     f'bi={bi:,}  tri={tri:,}')
-
-        # Gate
         core_conf = gate_info.get('core_confidence', 0)
         mod_size = gate_info.get('modifier_field_size', 0)
         top_cores = gate_info.get('top_cores', [])
         top_str = ', '.join(top_cores[:5]) if top_cores else '(cold)'
-        lines.append(f'  [GATE]      conf={core_conf:.2f}  '
-                     f'mods={mod_size}  '
-                     f'cores=[{top_str}]')
-
-        # Connections growth rate
         conn_rate = gate_info.get('connections_per_1k', 0)
         status = 'warming' if conn_rate < 1 else 'steady' if conn_rate < 5 else 'accelerating'
-        lines.append(f'              conn/1K={conn_rate:.1f}  ({status})')
 
-        lines.append('')
+        # Row 4: PROGRESS line
+        self._safe_write(f'\033[4;1H  [PROGRESS]  {line_count:,} lines{pct}')
+        # Row 5: speed line
+        self._safe_write(f'\033[5;1H              speed {rate:.1f} l/s  elapsed {fmt_time(elapsed)}{eta}')
+        # Row 7: MEMORY line
+        self._safe_write(f'\033[7;1H  [MEMORY]    connections={connections:,}  '
+                         f'role_mem={role_mem:,}  bi={bi:,}  tri={tri:,}')
+        # Row 9: GATE line
+        self._safe_write(f'\033[9;1H  [GATE]      conf={core_conf:.2f}  '
+                         f'mods={mod_size}  cores=[{top_str}]')
+        # Row 10: connections rate
+        self._safe_write(f'\033[10;1H              conn/1K={conn_rate:.1f}  ({status})')
+        # Row 12: tips
+        tip = 'Cold start: caches filling. Speed will increase.' if conn_rate < 1 else \
+              f'Checkpoint every {SAVE_EVERY:,} lines, live overwrite every {SAVE_EVERY_LIVE} lines.'
+        self._safe_write(f'\033[12;1H  [{"=" * 60}\033[13;1H  {tip}')
+        self._safe_write(f'\033[13;1H  {tip}')
 
-        # Test generation
+        # Test generation (rows 15+)
         if test_results:
-            lines.append(f'  [TEST GEN]  --- last {len(test_results)} queries ---')
-            for label, text, core in test_results:
+            self._safe_write(f'\033[15;1H  [TEST GEN]  --- last {len(test_results)} queries ---')
+            for i, (label, text, core) in enumerate(test_results):
                 display = text if len(text) <= 90 else text[:87] + '...'
-                # Force ASCII-safe in case of encoding issues
-                display = display.encode('ascii', errors='replace').decode('ascii')
-                lines.append(f'  [{label:10s}] core={core:10s}  txt={display}')
-            lines.append('')
+                self._safe_write(f'\033[{16 + i};1H  [{label:10s}] core={core:10s}  txt={display}')
 
-        # Tips
-        if conn_rate < 1:
-            lines.append(f'  [i] Cold start: caches filling. Speed will increase.')
-        lines.append(f'  [i] Checkpoint every {SAVE_EVERY:,} lines, live overwrite every {SAVE_EVERY_LIVE} lines.')
-        lines.append('')
-
-        try:
-            sys.stdout.write('\033[2J\033[H')
-            sys.stdout.write('\n'.join(lines))
-            sys.stdout.flush()
-        except UnicodeEncodeError:
-            # Fallback: write ASCII-safe only
-            safe = '\n'.join(lines).encode('ascii', errors='replace').decode('ascii')
-            sys.stdout.write('\033[2J\033[H')
-            sys.stdout.write(safe)
-            sys.stdout.flush()
+        # Move cursor below output
+        self._safe_write(f'\033[{22};1H')
+        sys.stdout.flush()
 
 
 # ── Main ───────────────────────────────────────────────────────────────────

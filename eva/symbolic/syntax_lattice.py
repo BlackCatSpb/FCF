@@ -74,6 +74,9 @@ class SyntaxLattice:
         # Connection graph: (cid_a, cid_b) → {count, type_counter}
         self.connections = defaultdict(lambda: {'count': 0, 'types': Counter()})
 
+        # Per-CID index for O(1) lookup (maintained by add_connection)
+        self._connections_index = defaultdict(dict)  # cid -> {other_cid: connection_dict}
+
     def build(self, corpus_path, sp, max_n=4, min_count=2):
         """Build n-gram model from corpus via SentencePiece.
 
@@ -284,6 +287,10 @@ class SyntaxLattice:
         if relation in RELATION_TYPES:
             self.connections[key]['types'][relation] += count
 
+        # Maintain per-CID index
+        self._connections_index[cid_a][cid_b] = self.connections[key]
+        self._connections_index[cid_b][cid_a] = self.connections[key]
+
     def get_connection(self, cid_a, cid_b):
         """Get connection info between two concepts.
 
@@ -337,17 +344,16 @@ class SyntaxLattice:
     def connections_of(self, cid, top_k=20):
         """Get all concepts connected to a given concept.
 
+        O(1) via per-CID index (not O(N) scan over all edges).
+
         Returns:
             [(connected_cid, {strength, type}), ...] sorted by strength
         """
+        conns = self._connections_index.get(cid)
+        if not conns:
+            return []
         results = []
-        for (a, b), conn in self.connections.items():
-            if a == cid:
-                other = b
-            elif b == cid:
-                other = a
-            else:
-                continue
+        for other, conn in conns.items():
             max_c = max(self.concept_freq.get(cid, 1),
                         self.concept_freq.get(other, 1))
             strength = min(conn['count'] / max(max_c, 1), 1.0)
@@ -395,6 +401,7 @@ class SyntaxLattice:
         self.concept_freq = Counter({int(k): v for k, v in data['concept_freq'].items()})
         # Load connection graph if present
         self.connections = defaultdict(lambda: {'count': 0, 'types': Counter()})
+        self._connections_index = defaultdict(dict)
         if 'connections' in data:
             for key_str, conn_data in data['connections'].items():
                 a, b = int(key_str.split(',')[0]), int(key_str.split(',')[1])
@@ -402,6 +409,8 @@ class SyntaxLattice:
                     'count': conn_data['count'],
                     'types': Counter({k: v for k, v in conn_data['types'].items()}),
                 }
+                self._connections_index[a][b] = self.connections[(a, b)]
+                self._connections_index[b][a] = self.connections[(a, b)]
         print(f"  Loaded SyntaxLattice: {[len(v) for v in self.ngrams.values()]} prefixes, "
               f"{len(self.connections)} connections")
         return self

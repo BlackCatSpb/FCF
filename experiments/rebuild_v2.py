@@ -37,30 +37,50 @@ if os.path.exists(DATA_DIR):
 print("\n" + "=" * 60)
 print("STEP 2: Training character-level BPE (vocab_size=8192)")
 print("=" * 60)
-from eva.symbolic.concept_tokenizer import train_character_bpe
+import sentencepiece as spm
 t = time.time()
-train_character_bpe(CORPUS_PATH, vocab_size=8192, save_path=BPE_PATH)
-print(f"  BPE training: {time.time()-t:.1f}s")
+_sp = spm.SentencePieceProcessor()
+_sp.load(os.path.join(DATA_DIR, 'bpe_ru.model'))
+print(f"  Loaded SentencePiece model (vocab={_sp.get_piece_size()}) ({time.time()-t:.1f}s)")
 
 # ── Step 3: Build ConceptNet skeleton ──
 print("\n" + "=" * 60)
 print("STEP 3: Building ConceptNet concept skeleton (filter >30 chars)")
 print("=" * 60)
-from eva.symbolic.concept_net import ConceptSkeleton
 t = time.time()
-sk = ConceptSkeleton()
-sk.build()
-sk.save(SKELETON_PATH)
-print(f"  {sk.n_concepts} concepts, {len(sk.relations)} relations ({time.time()-t:.1f}s)")
+class _SkeletonStub:
+    n_concepts = 0
+    relations = {}
+    def save(self, path):
+        pass
+sk = _SkeletonStub()
+print(f"  ConceptSkeleton skipped (using SentencePiece directly) ({time.time()-t:.1f}s)")
 
 # ── Step 4: Initialize tokenizer ──
 print("\n" + "=" * 60)
 print("STEP 4: Initializing ConceptTokenizer")
 print("=" * 60)
-from eva.symbolic.concept_tokenizer import ConceptTokenizer
-tok = ConceptTokenizer(bpe_path=BPE_PATH, skeleton_path=SKELETON_PATH)
-tok.initialize()
-print(f"  Vocab: {len(tok)}, BPE: {tok.bpe_vocab_size}, Concepts: {tok.skeleton.n_concepts}")
+class _SPTokenizer:
+    def __init__(self, sp):
+        self.sp = sp
+    def initialize(self):
+        pass
+    def encode(self, text):
+        return self.sp.encode(text)
+    def decode(self, ids):
+        return self.sp.decode(ids)
+    def word_to_cid(self, word):
+        return self.sp.encode(word)[0]
+    def __len__(self):
+        return self.sp.get_piece_size()
+    @property
+    def bpe_vocab_size(self):
+        return self.sp.get_piece_size()
+    @property
+    def skeleton(self):
+        return _SkeletonStub()
+tok = _SPTokenizer(_sp)
+print(f"  Vocab: {len(tok)}, BPE: {tok.bpe_vocab_size}")
 
 # ── Step 5: Build ConceptSpace ──
 print("\n" + "=" * 60)

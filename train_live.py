@@ -22,10 +22,44 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tqdm
 
+import sentencepiece as spm
 from eva.symbolic.concept_space import ConceptSpace
-from eva.symbolic.concept_tokenizer import ConceptTokenizer
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
+
+
+class _SPTokenizer:
+
+    def __init__(self, model_path=None):
+        self.sp = spm.SentencePieceProcessor()
+        self._model_path = model_path or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'real_data', 'bpe_ru.model')
+
+    def initialize(self):
+        self.sp.load(self._model_path)
+
+    def encode(self, text):
+        return self.sp.encode(text)
+
+    def decode(self, ids):
+        return self.sp.decode(ids)
+
+    def word_to_cid(self, word):
+        return self.sp.encode(word)[0]
+
+    def __len__(self):
+        return self.sp.get_piece_size()
+
+    @property
+    def bpe_vocab_size(self):
+        return self.sp.get_piece_size()
+
+    class _SkeletonStub:
+        n_concepts = 0
+
+    @property
+    def skeleton(self):
+        return self._SkeletonStub()
 
 
 # ── Configuration ──────────────────────────────────────────────────────────
@@ -214,7 +248,7 @@ def run_training(args):
     print(f'Loading model from {model_dir}...', flush=True)
     t0 = time.time()
 
-    tok = ConceptTokenizer()
+    tok = _SPTokenizer()
     tok.initialize()
     cs = ConceptSpace.load(os.path.join(model_dir, 'concept_space.json'))
     lattice = SyntaxLattice()

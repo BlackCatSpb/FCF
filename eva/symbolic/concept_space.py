@@ -1,25 +1,18 @@
-"""ConceptSpace — vector space organized by ConceptNet concepts.
+"""ConceptSpace — vector space for BPE-token concepts.
 
 Architecture:
-  - Each concept has a VECTOR (centroid of its semantic field)
-  - Words within a concept are SATELLITES around the centroid
-  - Concept transitions learned from corpus (concept_i → concept_j)
-  - ConceptNet relations = HARD CONSTRAINTS on vector positions
-  - Generation = concept navigation → word selection within concept
+  - Each BPE token is a concept with a vector on the unit sphere
+  - Vectors are computed from a fractal field: v = code @ basis
+  - Concept transitions learned via STDP from corpus (token_i → token_j)
+  - Generation = concept navigation -> token sequence -> SentencePiece decode
 
-Levels:
-  L3: Meta-concepts (Louvain clusters of concept vectors)
-  L2: Concepts (from ConceptNet + corpus transitions)
-  L1: Words (concept anchor + morphological satellites)
-  L0: Characters (BPE subword tokens within words)
+The concept vocabulary is defined by a SentencePiece model trained
+on the corpus. No external knowledge bases (ConceptNet) needed.
 """
 
 import numpy as np
 from collections import defaultdict, Counter
-from scipy.sparse import csr_matrix, vstack
-from sklearn.decomposition import TruncatedSVD
-from sklearn.cluster import KMeans
-import math, json, os, pickle
+import math, json, os
 
 
 class FractalField:
@@ -47,6 +40,7 @@ class FractalField:
         mat = rng.randn(latent_dim, dim).astype(np.float32)
         Q, _ = np.linalg.qr(mat, mode='reduced')
         self.basis = Q.astype(np.float32)  # (latent_dim, dim), Q.T @ Q = I
+        self._fluctuation_step = 0
 
         # Latent codes: cid → (latent_dim,) array
         self.codes = {}
@@ -120,7 +114,8 @@ class FractalField:
         This creates smooth autonomous motion in vector space
         without external input — concepts 'dream'.
         """
-        rng = np.random.RandomState(None)
+        rng = np.random.RandomState(42 + self._fluctuation_step)
+        self._fluctuation_step += 1
         for cid in list(self.codes.keys()):
             c = self.codes[cid]
             noise = rng.randn(self.latent_dim).astype(np.float32) * noise_scale
@@ -147,6 +142,14 @@ class FractalField:
     def from_dict(cls, data):
         field = cls(dim=data['dim'], latent_dim=data['latent_dim'])
         field.basis = np.array(data['basis'], dtype=np.float32)
+
+        # Verify basis orthogonality: JSON round-trip (float64→float32) drifts
+        QtQ = field.basis.T @ field.basis
+        err = np.max(np.abs(QtQ - np.eye(field.dim, dtype=np.float32)))
+        if err > 1e-5:
+            Q, _ = np.linalg.qr(field.basis, mode='reduced')
+            field.basis = Q.astype(np.float32)
+
         field.codes = {int(cid): np.array(c, dtype=np.float32)
                         for cid, c in data['codes'].items()}
         field._matrix_dirty = True
@@ -154,203 +157,53 @@ class FractalField:
 
 
 class ConceptSpace:
-    """Vector space organized by ConceptNet concepts.
+    """Vector space for BPE-token concepts.
 
-    Each concept has:
-      - cid: concept ID
-      - anchor: the lemma/root word
-      - vector: centroid vector in semantic space
-      - word_vectors: dict {word: offset_from_centroid}
-      - transitions: concept → concept transition probabilities
+    Each BPE token is a concept with:
+      - cid: token ID (0..vocab_size-1)
+      - vector: unit sphere vector from fractal field
+      - STDP-learned transitions to other tokens
     """
 
-    def __init__(self, skeleton, dim=256):
-        self.skeleton = skeleton
+    def __init__(self, vocab_size=None, dim=384):
+        self.vocab_size = vocab_size or 0
         self.dim = dim
 
         # Fractal field: latent codes → full vectors via shared basis
         self.fractal = FractalField(dim=self.dim, latent_dim=512)
 
-        # Concept vectors (rebuilt from fractal on init/load)
-        self.concept_vectors = {}     # cid → np.array(dim,)
-        self.concept_info = {}        # cid → concept dict from skeleton
-
-        # Word → concept mapping
-        self.word_to_cid = {}         # word → cid (from skeleton)
-        self.cid_to_words = {}        # cid → [words]
-        self.word_to_morph = {}       # word → {normal_form, prefix, suffix, ending, pos}
-
-        # Transition matrix (concept → concept)
-        self.concept_transitions = None  # CSR matrix (n_concepts × n_concepts)
-        self.cid_list = []               # ordered list of concept IDs
-        self.cid_to_idx = {}             # cid → row/col index
-
-        # Concept → concept vectors (via SVD on transitions)
-        self.cid_vectors = {}         # cid → concept-level vector
+        # Concept vectors (cid → np.array)
+        self.concept_vectors = {}
 
         # Random state
         self.rng = np.random.RandomState(42)
-        self._inhibition_step = 0  # counter for lateral inhibition seed
+        self._inhibition_step = 0
 
         # Precomputed vector matrix for fast nearest-neighbor
-        # (N, D) normalized array + CID ordering
         self._vector_matrix = None
         self._cid_order = []
         self._matrix_dirty = True
 
         # Product Quantization (storage compression)
-        # PQ replaces full float32 vectors with compact codes:
-        #   n_subvectors × uint8 per vector instead of D × float32
-        #   typical ratio: 32 bytes vs 512 bytes (128D) → 16× compression
-        self.pq_codebooks = None    # list of (n_centroids, subdim) arrays
-        self.pq_codes = None        # (N, n_subvectors) uint8 array
-        self.pq_cid_order = []      # CID order matching pq_codes rows
+        self.pq_codebooks = None
+        self.pq_codes = None
+        self.pq_cid_order = []
         self.pq_n_subvectors = 0
         self.pq_n_centroids = 0
 
-        # Affix shift vectors (morphological modifiers)
-        # affix → dim-D shift vector, initialized as random unit vectors
-        self.affix_shifts = {}
-        self._init_affix_shifts()
+        # ---- Initialization ----
 
-    def _init_affix_shifts(self):
-        """Initialize affix shift vectors as random unit vectors.
-
-        These represent grammatical modifications to root concepts:
-        - prefix: directional/aspectual modification
-        - suffix: derivational modification
-        - ending: grammatical role (case, number, gender, person)
-        """
-        rng = np.random.RandomState(42)
-        common_prefixes = ['по', 'за', 'на', 'вы', 'от', 'при', 'пере', 'про',
-                           'раз', 'рас', 'вз', 'воз', 'вос', 'из', 'ис',
-                           'под', 'над', 'об', 'о', 'у', 'с', 'со', 'в', 'во',
-                           'до', 'без', 'бес', 'пре', 'пред']
-        common_suffixes = ['к', 'ок', 'ек', 'ик', 'ник', 'тель', 'чик', 'щик',
-                           'ств', 'ость', 'ени', 'ани', 'изм', 'ист',
-                           'лив', 'чив', 'оват', 'ну', 'а']
-        common_endings =  ['а', 'я', 'о', 'е', 'ы', 'и', 'у', 'ю',
-                           'ой', 'ей', 'ых', 'их', 'ам', 'ям',
-                           'ого', 'его', 'ому', 'ему', 'ым', 'им',
-                           'ую', 'юю', 'ая', 'яя', 'ое', 'ее', 'ые', 'ие']
-
-        for affix in common_prefixes + common_suffixes + common_endings:
-            v = rng.randn(self.dim).astype(np.float32)
-            norm = np.linalg.norm(v)
-            if norm > 1e-10:
-                v /= norm
-            self.affix_shifts[affix] = v
-
-    def get_affix_shift(self, affix):
-        """Get shift vector for a morphological affix.
-
-        Returns 128D unit vector (or zero vector if unknown).
-        """
-        v = self.affix_shifts.get(affix)
-        if v is not None:
-            return v
-        # Create on first use
-        rng = np.random.RandomState(hash(affix) % (2**31))
-        v = rng.randn(self.dim).astype(np.float32)
-        norm = np.linalg.norm(v)
-        if norm > 1e-10:
-            v /= norm
-        self.affix_shifts[affix] = v
-        return v
-
-    def build(self, corpus_path=None, tok=None):
-        """Build ConceptSpace from skeleton and corpus.
-
-        Args:
-            corpus_path: path to corpus text file
-            tok: ConceptTokenizer instance (for encoding corpus)
-        """
-        # Copy skeleton data
-        for cid, concept in self.skeleton.concepts.items():
-            self.concept_info[cid] = concept
-            self.cid_to_words[cid] = self.skeleton.cid_to_words.get(cid, [concept['anchor']])
-            for w in self.cid_to_words[cid]:
-                self.word_to_cid[w] = cid
-
-        self.cid_list = sorted(self.skeleton.concepts.keys())
-        self.cid_to_idx = {cid: i for i, cid in enumerate(self.cid_list)}
-        n_concepts = len(self.cid_list)
-
-        # Build concept transitions from corpus
-        if corpus_path and tok:
-            self._build_concept_transitions(corpus_path, tok, n_concepts)
-
-        # Compute concept vectors via SVD on concept transitions
-        self._compute_concept_vectors(n_concepts)
-
-        # Apply ConceptNet constraints (pull synonyms, push antonyms)
-        self._apply_conceptnet_constraints()
-
-        return self
-
-    def _build_concept_transitions(self, corpus_path, tok, n_concepts):
-        """Build concept→concept transition matrix from corpus."""
-        trans_count = np.zeros((n_concepts, n_concepts), dtype=np.float32)
-        word_count = Counter()
-
-        with open(corpus_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # Encode line with tokenizer
-                ids = tok.encode(line)
-                meta = tok.metadata_from_ids(ids)
-
-                # Extract concept sequence from word starts
-                prev_cid = None
-                for m in meta:
-                    if m['flags'] & 1:  # word_start
-                        cid = m.get('concept_id')
-                        if cid is not None and prev_cid is not None and cid != prev_cid:
-                            ci = self.cid_to_idx.get(prev_cid)
-                            cj = self.cid_to_idx.get(cid)
-                            if ci is not None and cj is not None:
-                                trans_count[ci, cj] += 1
-                        if cid is not None:
-                            prev_cid = cid
-
-        # Build CSR matrix
-        n = n_concepts
-        rows, cols, data = [], [], []
-        for i in range(n):
-            for j in range(n):
-                if trans_count[i, j] > 0:
-                    rows.append(i)
-                    cols.append(j)
-                    data.append(trans_count[i, j])
-
-        if rows:
-            self.concept_transitions = csr_matrix(
-                (data, (rows, cols)), shape=(n, n), dtype=np.float32
-            )
-            print(f"  Concept transitions: {len(rows)} edges")
-        else:
-            print("  WARNING: No concept transitions found!")
-            self.concept_transitions = csr_matrix((n, n), dtype=np.float32)
-
-    def _compute_concept_vectors(self, n_concepts):
-        """Initialize all concept vectors via FractalField.
-
-        Each concept gets a sparse latent code in the fractal basis,
-        producing a unique unit vector on the 384D sphere — no SVD
-        degeneracy, no identical vectors.
-        """
-        for cid in self.cid_list:
+    def init_concepts(self):
+        """Initialize all concept vectors (0..vocab_size-1) via fractal field."""
+        for cid in range(self.vocab_size):
             v = self.fractal.init_concept(cid)
             if v is not None:
                 self.concept_vectors[cid] = v
             else:
-                self.concept_vectors[cid] = self.rng.randn(self.dim).astype(np.float32)
-                self.concept_vectors[cid] /= max(np.linalg.norm(self.concept_vectors[cid]), 1e-10)
-
-        print(f"  Fractal concept vectors: {len(self.cid_list)} @ {self.dim}D (latent {self.fractal.latent_dim}D)")
+                v = self.rng.randn(self.dim).astype(np.float32)
+                v /= max(np.linalg.norm(v), 1e-10)
+                self.concept_vectors[cid] = v
+        print(f"  Initialized {len(self.concept_vectors)} concepts via fractal")
 
     def _sync_concept_vectors_from_fractal(self):
         """Rebuild concept_vectors dict from fractal latent codes."""
@@ -367,58 +220,46 @@ class ConceptSpace:
         self._sync_concept_vectors_from_fractal()
         print(f"  Reinitialized {len(cids)} concepts via fractal field")
 
-    def fluctuate_fractal(self, noise_scale=0.003, decay=0.9995):
-        """Autonomous drift of all concept vectors.
-
-        Each call adds a small Langevin perturbation to latent codes,
-        then rebuilds concept_vectors. Call periodically during
-        generation for smooth conceptual drift.
-        """
+    def fluctuate_fractal(self, noise_scale=0.003, decay=0.9995, repel_strength=0.0):
+        """Autonomous drift + optional centroid repulsion."""
         self.fractal.fluctuate(noise_scale=noise_scale, decay=decay)
         self._sync_concept_vectors_from_fractal()
+        if repel_strength > 0:
+            self._repel_centroid(repel_strength)
 
-    def _apply_conceptnet_constraints(self):
-        """Adjust concept vectors based on ConceptNet relations.
+    def _repel_centroid(self, strength=0.05):
+        """Push all vectors away from global centroid via Riemannian gradient.
 
-        Synonyms: pulled closer
-        Antonyms: pushed apart
-        is_a: sub-concept pulled toward parent
+        Uses the negative Riemannian gradient of dot(v, cn) on the sphere:
+            -grad_R = sim * v - cn
+        which is tangent at v (dot(-grad_R, v) = 0) and maximally decreases
+        alignment with centroid. Degenerate at v = ±cn → random fallback.
         """
-        lr = 0.05
-        for (ci, cj), rels in self.skeleton.relations.items():
-            vi = self.concept_vectors.get(ci)
-            vj = self.concept_vectors.get(cj)
-            if vi is None or vj is None:
-                continue
-
-            if 'synonym' in rels or 'similar_to' in rels:
-                # Pull together
-                mid = (vi + vj) / 2
-                self.concept_vectors[ci] = vi + lr * (mid - vi)
-                self.concept_vectors[cj] = vj + lr * (mid - vj)
-            elif 'antonym' in rels or 'distinct_from' in rels:
-                # Push apart
-                away = vj - vi
-                d = np.linalg.norm(away)
-                if d > 0:
-                    away /= d
-                    self.concept_vectors[ci] = vi - lr * away * 0.5
-                    self.concept_vectors[cj] = vj + lr * away * 0.5
-
-            if 'is_a' in rels:
-                # Sub-concept pulled toward parent
-                # ci is_a cj → ci pulled toward cj
-                diff = vj - vi
-                self.concept_vectors[ci] = vi + lr * diff * 0.5
-
-        # Renormalize all
-        for cid in self.concept_vectors:
-            v = self.concept_vectors[cid]
-            n = np.linalg.norm(v)
-            if n > 1e-10:
-                self.concept_vectors[cid] = v / n
-
-        print(f"  ConceptNet constraints applied to {len(self.skeleton.relations)} relations")
+        vecs = np.array(list(self.concept_vectors.values()), dtype=np.float32)
+        centroid = np.mean(vecs, axis=0)
+        cn = centroid / max(np.linalg.norm(centroid), 1e-10)
+        for cid, v in self.concept_vectors.items():
+            sim = float(np.dot(v, cn))
+            factor = strength * 2.0 if sim > 0.01 else strength * 0.5
+            repel = sim * v - cn
+            nrep = np.linalg.norm(repel)
+            if nrep > 1e-10:
+                repel /= nrep
+                v_new = v + repel * abs(sim) * factor
+            else:
+                rng = np.random.RandomState(cid * 137 + 42)
+                tangent = rng.randn(self.dim).astype(np.float32)
+                tangent -= np.dot(tangent, v) * v
+                nt = np.linalg.norm(tangent)
+                if nt < 1e-10:
+                    continue
+                tangent /= nt
+                v_new = v + tangent * factor
+            nv = np.linalg.norm(v_new)
+            if nv > 1e-10:
+                v_new /= nv
+            self._apply_vector_update(cid, v_new)
+        self._matrix_dirty = True
 
     # ---- STDP: Spike-Timing-Dependent Plasticity on fractal codes ----
 
@@ -439,10 +280,17 @@ class ConceptSpace:
         delta_code = delta_v @ self.fractal.basis.T
         code_new = code + delta_code
 
-        # Rescale so |code_new @ basis| = 1 — preserves exact relationship
+        # Rescale so |code_new @ basis| = 1
         v_unscaled = code_new @ self.fractal.basis
         scale = 1.0 / (np.linalg.norm(v_unscaled) + 1e-10)
         code_new *= scale
+
+        # Recompute vector from code to ensure perfect consistency
+        v_recomp = code_new @ self.fractal.basis
+        nvr = np.linalg.norm(v_recomp)
+        if nvr > 1e-10:
+            v_recomp /= nvr
+            self.concept_vectors[cid] = v_recomp
 
         self.fractal.codes[cid] = code_new
         self._matrix_dirty = True
@@ -500,11 +348,18 @@ class ConceptSpace:
             v_new /= nv
         self._apply_vector_update(gen_cid, v_new)
 
-        self._lateral_inhibition(gen_cid, strength=0.02 * effective_lr)
+        self._lateral_inhibition_fractal(gen_cid, strength=0.3 * effective_lr)
         self.mark_matrix_dirty()
 
     def _lateral_inhibition_fractal(self, winner_cid, strength=0.01):
-        """Lateral inhibition with fractal code projection."""
+        """Lateral inhibition with correct Riemannian gradient.
+
+        The negative Riemannian gradient of sim = dot(v, v_win) is:
+            -grad_R = sim * v - v_win
+        which is tangent at v and maximally decreases alignment with winner.
+        The Euclidean chord (v - v_win) used previously has a radial component
+        and does not follow the geodesic — fixed.
+        """
         v_win = self.concept_vectors.get(winner_cid)
         if v_win is None:
             return
@@ -524,27 +379,18 @@ class ConceptSpace:
             v = self.concept_vectors[cid]
             vn = v / max(np.linalg.norm(v), 1e-10)
             sim = float(np.dot(vw_n, vn))
-            if sim > 0.3:
-                away = v - v_win
-                d = np.linalg.norm(away)
+            if sim > 0.15:
+                # Riemannian direction away from winner on the sphere
+                inhibit = sim * vn - vw_n
+                d = np.linalg.norm(inhibit)
                 if d > 1e-10:
-                    away /= d
-                    v_new = v - away * strength * sim
+                    inhibit /= d
+                    v_new = v - inhibit * strength * sim
                     nv = np.linalg.norm(v_new)
                     if nv > 1e-10:
                         v_new /= nv
                     self._apply_vector_update(cid, v_new)
         self._matrix_dirty = True
-
-    def svd_shift(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0):
-        """[DEPRECATED] Use fractal_stdp() instead — kept for backward compat."""
-        self.fractal_stdp(prev_cid, gen_cid, expected_cid, lr, word_num)
-
-    def _lateral_inhibition(self, winner_cid, strength=0.01):
-        """[DEPRECATED] Use _lateral_inhibition_fractal() — kept for backward compat."""
-        self._lateral_inhibition_fractal(winner_cid, strength)
-
-    # ---- Homeostatic plasticity ----
 
     def init_homeostasis(self):
         """Initialize homeostasis tracking for concepts."""
@@ -612,26 +458,6 @@ class ConceptSpace:
         """Get concept centroid vector."""
         return self.concept_vectors.get(cid)
 
-    def word_vector(self, word):
-        """Get vector for a word (concept centroid + offset)."""
-        cid = self.word_to_cid.get(word.lower())
-        if cid is None:
-            return None
-        cv = self.concept_vectors.get(cid)
-        if cv is None:
-            return None
-        return cv.copy()
-
-    def similarity(self, word_a, word_b):
-        """Cosine similarity between two words (via concept vectors)."""
-        va = self.word_vector(word_a)
-        vb = self.word_vector(word_b)
-        if va is None or vb is None:
-            return 0.0
-        return float(np.dot(va, vb) / (
-            max(np.linalg.norm(va), 1e-10) * max(np.linalg.norm(vb), 1e-10)
-        ))
-
     def topk_similar_concepts(self, cid, k=10, sample_size=500):
         """Top-k concepts closest to given concept (batched matrix NN)."""
         v = self.concept_vectors.get(cid)
@@ -654,7 +480,7 @@ class ConceptSpace:
             c = self._cid_order[i]
             if c == cid:
                 continue
-            result.append((c, self.concept_info[c]['anchor'], float(sims[i])))
+            result.append((c, float(sims[i])))
             if len(result) >= k:
                 break
         return result[:k]
@@ -875,22 +701,9 @@ class ConceptSpace:
 
         # Reset fractal field to new dimension (codes will be regenerated)
         self.fractal = FractalField(dim=self.dim, latent_dim=self.fractal.latent_dim)
-        for cid in self.cid_list:
+        for cid in self.concept_vectors:
             self.fractal.init_concept(cid)
         self._sync_concept_vectors_from_fractal()
-
-        # Expand affix shifts to new dimension
-        new_affix = {}
-        for affix, shift in self.affix_shifts.items():
-            if len(shift) == old_dim:
-                new_shift = shift @ proj
-                n = np.linalg.norm(new_shift)
-                if n > 1e-10:
-                    new_shift /= n
-                new_affix[affix] = new_shift
-            else:
-                new_affix[affix] = shift
-        self.affix_shifts = new_affix
 
         # Invalidate caches
         self.pq_codebooks = None
@@ -925,14 +738,6 @@ class ConceptSpace:
 
         for i, cid in enumerate(self.concept_vectors):
             self.concept_vectors[cid] = centered[i]
-
-        # Re-center affix shifts
-        for affix in list(self.affix_shifts.keys()):
-            v = self.affix_shifts[affix]
-            vc = v - centroid[:len(v)] if len(v) <= len(centroid) else v
-            n = np.linalg.norm(vc)
-            if n > 1e-10:
-                self.affix_shifts[affix] = vc / n
 
         # Invalidate caches
         self._vector_matrix = None
@@ -1004,91 +809,38 @@ class ConceptSpace:
                 p50 = np.percentile(sim_vals, 50)
                 p99 = np.percentile(sim_vals, 99)
                 print(f'    epoch {epoch+1}: pushed {n_pushed}, mean_sim={np.mean(sim_vals):.3f}, p99={p99:.3f}')
-                # Show worst pair
-                ci_worst = None
-                cj_worst = None
-                worst_sim = -1
-                for a, b in [('человек', 'война'), ('человек', 'собака'), ('человек', 'время')]:
-                    ca = self.word_to_cid.get(a)
-                    cb = self.word_to_cid.get(b)
-                    if ca and cb and ca in self.concept_vectors and cb in self.concept_vectors:
-                        s = float(np.dot(self.concept_vectors[ca], self.concept_vectors[cb]))
-                        if s > worst_sim:
-                            worst_sim = s
-                            ci_worst, cj_worst = a, b
-                print(f'      worst pair: sim({ci_worst}, {cj_worst}) = {worst_sim:.4f}')
 
         self._vector_matrix = None
         self._cid_order = []
         self._matrix_dirty = True
         print(f'  Done')
 
-    def predict_next_concept(self, prev_cid, top_k=20):
-        """Predict next concept from transition matrix."""
-        if self.concept_transitions is None:
-            return []
-        idx = self.cid_to_idx.get(prev_cid)
-        if idx is None:
-            return []
-        row = self.concept_transitions[idx].toarray().flatten()
-        if row.sum() == 0:
-            return []
-        probs = row / row.sum()
-        top_indices = np.argsort(probs)[::-1][:top_k]
-        return [(self.cid_list[i], probs[i]) for i in top_indices if probs[i] > 0]
-
-    def words_in_concept(self, cid, top_k=10):
-        """Get words belonging to a concept."""
-        return self.cid_to_words.get(cid, [])[:top_k]
-
-    def concept_anchor(self, word):
-        """Get anchor/lemma for a word."""
-        cid = self.word_to_cid.get(word.lower())
-        if cid is not None:
-            return self.concept_info[cid]['anchor']
-        return None
-
-    def save(self, path, use_pq=False, include_morph=True):
+    def save(self, path, use_pq=False):
         """Save ConceptSpace to disk.
 
         Args:
             path: file path
             use_pq: if True, save PQ-compressed format (much smaller).
-                    Requires pq_codes to be computed (call pq_encode() first).
-            include_morph: if False, omit word_to_morph (for live checkpoints).
         """
         if use_pq and self.pq_codes is not None:
-            # PQ format: codes + codebooks, no full vectors
             data = {
                 'dim': self.dim,
+                'vocab_size': self.vocab_size,
                 'pq': True,
                 'n_subvectors': self.pq_n_subvectors,
                 'n_centroids': self.pq_n_centroids,
                 'pq_cid_order': self.pq_cid_order,
                 'pq_codes': self.pq_codes.tolist(),
                 'codebooks': [cb.tolist() for cb in self.pq_codebooks],
-                'cid_list': self.cid_list,
-                'word_to_cid': self.word_to_cid,
-                'word_to_morph': self.word_to_morph if include_morph else {},
-                'cid_to_words': {str(c): ws for c, ws in self.cid_to_words.items()},
-                'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}
-                                      for c, info in self.concept_info.items()},
             }
         else:
             data = {
                 'dim': self.dim,
+                'vocab_size': self.vocab_size,
                 'pq': False,
-                'cid_list': self.cid_list,
-                'word_to_cid': self.word_to_cid,
-                'word_to_morph': self.word_to_morph if include_morph else {},
-                'cid_to_words': {str(c): ws for c, ws in self.cid_to_words.items()},
                 'concept_vectors': {str(c): v.tolist() for c, v in self.concept_vectors.items()},
-                'concept_info_keys': {str(c): {'anchor': info['anchor'], 'size': info['size']}
-                                      for c, info in self.concept_info.items()},
             }
-        # Save fractal field
         data['fractal'] = self.fractal.to_dict()
-        # Save homeostatic state if initialized
         if hasattr(self, 'concept_usage'):
             data['concept_usage'] = {str(c): u for c, u in self.concept_usage.items()}
             data['concept_fitness'] = {str(c): f for c, f in self.concept_fitness.items()}
@@ -1101,32 +853,20 @@ class ConceptSpace:
 
     @classmethod
     def load(cls, path):
-        """Load ConceptSpace from disk (class method).
-
-        Handles both regular and PQ-compressed formats automatically.
-        """
+        """Load ConceptSpace from disk (class method)."""
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         obj = cls.__new__(cls)
-        obj.skeleton = None
         obj.dim = data['dim']
-        obj.cid_list = data['cid_list']
-        obj.cid_to_idx = {c: i for i, c in enumerate(obj.cid_list)}
+        obj.vocab_size = data.get('vocab_size', 0)
 
-        # PQ attributes (set defaults before potential override)
         obj.pq_codebooks = None
         obj.pq_codes = None
         obj.pq_cid_order = []
         obj.pq_n_subvectors = 0
         obj.pq_n_centroids = 0
 
-        # Always load mapping data
-        obj.word_to_cid = data.get('word_to_cid') or {}
-        obj.cid_to_words = {int(c): ws for c, ws in data.get('cid_to_words', {}).items()}
-        obj.word_to_morph = data.get('word_to_morph') or {}
-
         if data.get('pq'):
-            # PQ-compressed format: decode back to full vectors
             n_sub = data['n_subvectors']
             n_cen = data['n_centroids']
             obj.pq_n_subvectors = n_sub
@@ -1134,7 +874,6 @@ class ConceptSpace:
             obj.pq_cid_order = data['pq_cid_order']
             obj.pq_codebooks = [np.array(cb, dtype=np.float32) for cb in data['codebooks']]
             obj.pq_codes = np.array(data['pq_codes'], dtype=np.uint8)
-
             subdim = obj.dim // n_sub
             N = len(obj.pq_cid_order)
             decoded = np.zeros((N, obj.dim), dtype=np.float32)
@@ -1145,7 +884,6 @@ class ConceptSpace:
             norms = np.linalg.norm(decoded, axis=1, keepdims=True)
             norms[norms < 1e-10] = 1.0
             decoded /= norms
-
             obj.concept_vectors = {}
             for i, cid in enumerate(obj.pq_cid_order):
                 obj.concept_vectors[cid] = decoded[i]
@@ -1153,31 +891,14 @@ class ConceptSpace:
             obj.concept_vectors = {int(c): np.array(v, dtype=np.float32)
                                      for c, v in data['concept_vectors'].items()}
 
-        obj.cid_vectors = {}
-        obj.concept_transitions = None
-        obj.concept_info = {}
-        for c_str, info in data['concept_info_keys'].items():
-            c = int(c_str)
-            obj.concept_info[c] = {
-                'cid': c,
-                'anchor': info['anchor'],
-                'satellites': [],
-                'relations': defaultdict(list),
-                'vector': obj.concept_vectors.get(c),
-                'size': info['size'],
-            }
         obj.rng = np.random.RandomState(42)
         obj._inhibition_step = 0
         obj._vector_matrix = None
         obj._cid_order = []
         obj._matrix_dirty = True
-        obj.affix_shifts = {}
-        obj._init_affix_shifts()
 
-        # Restore fractal field if present (backward compat)
         if 'fractal' in data:
             obj.fractal = FractalField.from_dict(data['fractal'])
-            # Rebuild concept_vectors from fractal (overwrites loaded vectors)
             for cid in list(obj.fractal.codes.keys()):
                 v = obj.fractal.compute_vector(cid)
                 if v is not None:
@@ -1185,7 +906,6 @@ class ConceptSpace:
         else:
             obj.fractal = FractalField(dim=obj.dim, latent_dim=512)
 
-        # Restore or initialize homeostasis state
         saved_usage = data.get('concept_usage')
         saved_fitness = data.get('concept_fitness')
         if saved_usage:
@@ -1194,67 +914,47 @@ class ConceptSpace:
         else:
             obj.init_homeostasis()
         pq_note = ' (PQ)' if data.get('pq') else ''
-        print(f"  Loaded ConceptSpace: {len(obj.cid_list)} concepts @ {obj.dim}D{pq_note}")
+        print(f"  Loaded ConceptSpace: {len(obj.concept_vectors)} concepts @ {obj.dim}D{pq_note}")
         return obj
 
 
-# ---- Training: STDP via fractal codes (legacy wrapper) ----
-
-def concept_svd_shift(cs, prev_cid, next_cid, is_match, lr=0.1):
-    """Legacy wrapper — delegates to cs.fractal_stdp().
-
-    Args:
-        cs: ConceptSpace
-        prev_cid: previous concept ID (context anchor)
-        next_cid: predicted/expected concept ID
-        is_match: whether next_cid matches the expected concept
-        lr: learning rate
-    """
-    expected_cid = next_cid if is_match else None
-    cs.fractal_stdp(prev_cid, next_cid, expected_cid=expected_cid, lr=lr)
-
-
 if __name__ == '__main__':
-    import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
-    from eva.symbolic.concept_net import ConceptSkeleton
-    from eva.symbolic.concept_tokenizer import ConceptTokenizer
+    import sentencepiece as spm
+    sp = spm.SentencePieceProcessor(model_file=r'C:\Users\black\OneDrive\Desktop\FCF\real_data\bpe_ru.model')
 
-    print("Loading ConceptNet skeleton...")
-    skeleton = ConceptSkeleton()
-    skeleton.load(r'C:\Users\black\OneDrive\Desktop\FCF\real_data\concept_skeleton.json')
+    print("Initializing ConceptSpace with BPE vocabulary...")
+    cs = ConceptSpace(vocab_size=sp.vocab_size(), dim=384)
+    cs.init_concepts()
+    cs.init_homeostasis()
 
-    print("Initializing tokenizer...")
-    tok = ConceptTokenizer()
-    tok.initialize()
-
-    print("Building ConceptSpace...")
-    cs = ConceptSpace(skeleton, dim=128)
-    cs.build(corpus_path=r'C:\Users\black\OneDrive\Desktop\FCF\real_data\full_corpus_ru.txt', tok=tok)
-
-    print(f"\nConcepts: {len(cs.cid_list)}")
+    print(f"\nConcepts: {cs.vocab_size}")
     print(f"Vector dim: {cs.dim}")
 
-    # Test: get vectors and similarities
-    test_words = ['собака', 'армия', 'война', 'человек', 'князь', 'сказал']
-    for w in test_words:
-        cid = cs.word_to_cid.get(w)
-        v = cs.concept_vector(cid) if cid is not None else None
-        anchor = cs.concept_anchor(w)
-        print(f"  {w:12s} -> concept [{cid:4d}] anchor='{anchor}' vector_norm={np.linalg.norm(v):.4f}" if v is not None else f"  {w:12s} -> NO VECTOR")
+    # Test vector properties
+    sample_tokens = [0, 100, 1000, 5000, 9999]
+    for tid in sample_tokens:
+        tok_text = sp.IdToPiece(tid) if tid < sp.vocab_size() else '?'
+        v = cs.concept_vector(tid)
+        norm = np.linalg.norm(v) if v is not None else 0.0
+        print(f"  CID {tid:5d} ({tok_text:12s}) -> norm={norm:.4f}")
 
-    # Test concept similarity
-    pairs = [('собака', 'собаки'), ('война', 'армия'), ('человек', 'князь'),
-             ('сказал', 'говорить'), ('большой', 'маленький')]
+    # Test similarity of related tokens
+    pairs = [('▁соба', 'ка'), ('▁ко', 'шка'), ('▁человек', 'а')]
     for a, b in pairs:
-        sim = cs.similarity(a, b)
-        print(f"  sim({a}, {b}) = {sim:.4f}")
+        id_a = sp.PieceToId(a)
+        id_b = sp.PieceToId(b)
+        if id_a >= 0 and id_b >= 0:
+            va = cs.concept_vector(id_a)
+            vb = cs.concept_vector(id_b)
+            sim = float(va @ vb) if va is not None and vb is not None else -99
+            print(f"  sim({a:12s} [{id_a}], {b:12s} [{id_b}]) = {sim:.4f}")
 
-    # Test concept prediction
-    test_cid = cs.word_to_cid.get('князь')
-    if test_cid is not None:
-        next_c = cs.predict_next_concept(test_cid, top_k=5)
-        print(f"\nConcepts following '{'князь'}' (concept {test_cid}):")
-        for cid, prob in next_c:
-            print(f"  {cs.concept_info[cid]['anchor']:20s} p={prob:.4f}")
+    # Top-k from one token
+    cid = sp.PieceToId('▁человек')
+    if cid >= 0:
+        top = cs.topk_similar_concepts(cid, k=10)
+        print(f"\nTop-10 similar to {sp.IdToPiece(cid)} (CID {cid}):")
+        for c, s in top:
+            print(f"  {sp.IdToPiece(c):20s} (CID {c:5d}) sim={s:.4f}")
 
     cs.save(r'C:\Users\black\OneDrive\Desktop\FCF\real_data\concept_space.json')

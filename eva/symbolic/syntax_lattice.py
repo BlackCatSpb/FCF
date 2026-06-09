@@ -74,22 +74,20 @@ class SyntaxLattice:
         # Connection graph: (cid_a, cid_b) → {count, type_counter}
         self.connections = defaultdict(lambda: {'count': 0, 'types': Counter()})
 
-    def build(self, corpus_path, tok, max_n=4, min_count=2):
-        """Build n-gram model from corpus concept sequences.
+    def build(self, corpus_path, sp, max_n=4, min_count=2):
+        """Build n-gram model from corpus via SentencePiece.
 
         Args:
             corpus_path: path to text corpus
-            tok: ConceptTokenizer (for encoding)
-            max_n: maximum n-gram order (4 = look back 3 concepts)
-            min_count: minimum occurrences to keep an n-gram
+            sp: SentencePieceProcessor
+            max_n: maximum n-gram order
+            min_count: minimum occurrences to keep an n-gram (unused, kept for compat)
         """
         self.max_n = max_n
-        # Initialize per-order containers
         for n in range(2, max_n + 1):
             self.ngrams[n] = defaultdict(Counter)
 
-        # Extract concept sequences from corpus
-        n_concepts = [0, 0, 0, 0]  # counts for n=1,2,3,4
+        n_concepts = [0, 0, 0, 0]
         line_count = 0
 
         with open(corpus_path, 'r', encoding='utf-8') as f:
@@ -98,35 +96,26 @@ class SyntaxLattice:
                 if not line:
                     continue
                 line_count += 1
-
-                ids = tok.encode(line)
-                meta = tok.metadata_from_ids(ids)
-
-                # Extract concept sequence from word starts
-                concepts = [m.get('concept_id') for m in meta
-                            if m['flags'] & 1 and m.get('concept_id') is not None]
-
-                if len(concepts) < 2:
+                ids = sp.encode(line)
+                if len(ids) < 2:
                     continue
-
-                # Count concept frequencies (unigram)
-                for c in concepts:
+                for c in ids:
                     self.concept_freq[c] += 1
                     n_concepts[0] += 1
-
-                # Build n-grams for orders 2..max_n
                 for n in range(2, max_n + 1):
-                    for i in range(len(concepts) - n + 1):
-                        prefix = tuple(concepts[i:i + n - 1])
-                        next_c = concepts[i + n - 1]
+                    for i in range(len(ids) - n + 1):
+                        prefix = tuple(ids[i:i + n - 1])
+                        next_c = ids[i + n - 1]
                         self.ngrams[n][prefix][next_c] += 1
                         n_concepts[n - 1] += 1
+                for i in range(len(ids) - 1):
+                    self.add_connection(ids[i], ids[i + 1])
 
         print(f"  SyntaxLattice: {line_count} lines, {n_concepts[0]} concept tokens")
         for n in range(2, max_n + 1):
             n_unique = sum(len(counter) for counter in self.ngrams[n].values())
             print(f"    {n}-grams: {len(self.ngrams[n])} prefixes, {n_unique} unique transitions")
-
+        print(f"    connections: {len(self.connections)}")
         return self
 
     def predict(self, context_concepts: List[int], n_orders=None) -> List:
@@ -186,25 +175,10 @@ class SyntaxLattice:
 
     def predict_with_context(self, concept_sequence: List[int], concept_space,
                               temperature=0.3, top_k=20):
-        """Predict next concept using both n-gram lattice and vector space.
-
-        The lattice provides syntactic structure (what concepts typically follow).
-        The vector space provides semantic coherence (what's similar to context).
-
-        Args:
-            concept_sequence: full concept path so far
-            concept_space: ConceptSpace instance for vector similarity
-            temperature: sampling temperature
-            top_k: max candidates to consider
-
-        Returns:
-            [(cid, score), ...]
-        """
-        # 1. Get n-gram predictions (syntax)
+        """Predict next concept using both n-gram lattice and vector space."""
         context = concept_sequence[-3:] if len(concept_sequence) >= 3 else concept_sequence
         syn_preds = self.predict(context)
 
-        # 2. Get vector similarity predictions (semantics)
         if concept_sequence:
             prev_cid = concept_sequence[-1]
             v_prev = concept_space.concept_vector(prev_cid)
@@ -212,7 +186,7 @@ class SyntaxLattice:
             if v_prev is not None:
                 vp_n = v_prev / max(np.linalg.norm(v_prev), 1e-10)
                 similar = concept_space.topk_similar_concepts(prev_cid, k=top_k)
-                for cid, anchor, sim in similar:
+                for cid, sim in similar:
                     vec_preds.append((cid, sim))
         else:
             vec_preds = []
@@ -262,7 +236,7 @@ class SyntaxLattice:
         return scored
 
     def update(self, concept_sequence):
-        """Increment n-gram counts from a concept sequence (online learning).
+        """Increment n-gram counts + connections from a concept sequence.
 
         Args:
             concept_sequence: list of concept IDs (e.g., [князь, выйти, на, крыльцо])
@@ -271,11 +245,13 @@ class SyntaxLattice:
             for i in range(len(concept_sequence) - n + 1):
                 prefix = tuple(concept_sequence[i:i + n - 1])
                 next_c = concept_sequence[i + n - 1]
-                # Auto-create missing prefixes (new patterns)
                 if prefix not in self.ngrams[n]:
                     self.ngrams[n][prefix] = Counter()
                 self.ngrams[n][prefix][next_c] += 1
                 self.concept_freq[next_c] += 1
+
+        for i in range(len(concept_sequence) - 1):
+            self.add_connection(concept_sequence[i], concept_sequence[i + 1])
 
     # ── Connection Strength Graph ────────────────────────────
 
@@ -381,90 +357,6 @@ class SyntaxLattice:
         results.sort(key=lambda x: -x[1]['strength'])
         return results[:top_k]
 
-    def build_connections_from_corpus(self, corpus_path, tok, cs):
-        """Build connection graph from corpus using morphology.
-
-        For each sentence, extract concept pairs and infer relations
-        from environment words between them.
-        """
-        import re
-        with open(corpus_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # Split into sentences
-                sents = re.split(r'(?<=[.!?…])\s+(?=[А-ЯЁA-Z])', line)
-                for sent in sents:
-                    self._build_connections_from_sentence(sent, tok, cs)
-
-    def _build_connections_from_sentence(self, sentence, tok, cs):
-        """Extract connections from a single sentence."""
-        from eva.symbolic.concept_tokenizer import ConceptTokenizer
-        from eva.symbolic.pos_tagger import get_pos
-
-        words = sentence.strip().split()
-        if len(words) < 2:
-            return
-
-        # Parse each word for morphology and concept
-        word_data = []
-        for w in words:
-            clean = w.strip('.,!?;:()[]{}«»—–-…\'\"')
-            if not clean:
-                continue
-            morph = ConceptTokenizer.morph_parse(clean)
-            root = morph['normal_form'] if morph else clean
-            cid = cs.word_to_cid.get(root) or cs.word_to_cid.get(clean)
-            if cid is None:
-                continue
-            pos = morph['pos'] if morph else get_pos(clean)
-            word_data.append({
-                'word': clean,
-                'cid': cid,
-                'pos': pos,
-                'root': root,
-            })
-
-        if len(word_data) < 2:
-            return
-
-        # Find core concepts (NOUN, VERB) and modifiers (ADJ, ADV, PREP)
-        cores = [(i, d) for i, d in enumerate(word_data) if d['pos'] in ('NOUN', 'VERB')]
-        modifiers = [(i, d) for i, d in enumerate(word_data) if d['pos'] in ('ADJ', 'ADV', 'PREP', 'NUM')]
-
-        # Core→core connections (NOUN→VERB, VERB→NOUN, etc.)
-        for i in range(len(cores)):
-            for j in range(i + 1, len(cores)):
-                idx_a, da = cores[i]
-                idx_b, db = cores[j]
-
-                # Environment words between cores
-                env_words = [word_data[k]['word'] for k in range(idx_a + 1, idx_b)]
-
-                # Infer relation
-                relation = self.infer_relation(env_words)
-                if 'PREP' in [word_data[k]['pos'] for k in range(idx_a + 1, idx_b)]:
-                    relation = 'located_at'
-
-                self.add_connection(da['cid'], db['cid'], relation)
-
-        # Core→modifier connections
-        for core_idx, core in cores:
-            for mod_idx, mod in modifiers:
-                if mod_idx == core_idx:
-                    continue
-                if core_idx < mod_idx:
-                    # Modifier after core: check if adjacent
-                    if mod_idx - core_idx <= 2:
-                        rel = 'has_quality' if mod['pos'] == 'ADJ' else \
-                              'has_manner' if mod['pos'] == 'ADV' else \
-                              'located_at' if mod['pos'] == 'PREP' else \
-                              'has_quantity' if mod['pos'] == 'NUM' else \
-                              'related_to'
-                        self.add_connection(core['cid'], mod['cid'], rel)
-
     def save(self, path):
         """Save to JSON."""
         data = {
@@ -517,38 +409,22 @@ class SyntaxLattice:
 
 if __name__ == '__main__':
     import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
-    from eva.symbolic.concept_tokenizer import ConceptTokenizer
+    import sentencepiece as spm
     from eva.symbolic.concept_space import ConceptSpace
 
-    print("Loading...")
-    tok = ConceptTokenizer()
-    tok.initialize()
-    cs = ConceptSpace(None, dim=128)
-    cs.load(r'C:\Users\black\OneDrive\Desktop\FCF\real_data\concept_space.json')
+    sp = spm.SentencePieceProcessor(
+        model_file=r'C:\Users\black\OneDrive\Desktop\FCF\real_data\bpe_ru.model')
 
-    print("Building SyntaxLattice...")
+    cs = ConceptSpace.load(
+        r'C:\Users\black\OneDrive\Desktop\FCF\real_data\concept_space.json')
+
+    print("Building SyntaxLattice from full corpus via SentencePiece...")
     lattice = SyntaxLattice()
     lattice.build(
         r'C:\Users\black\OneDrive\Desktop\FCF\real_data\full_corpus_ru.txt',
-        tok,
+        sp,
         max_n=4,
-        min_count=2,
     )
 
-    # Test predictions
-    for test_concept_chain in [
-        ['князь', 'Андрей'],
-        ['война'],
-        ['сказать'],
-        ['князь', 'быть'],
-    ]:
-        cids = [cs.word_to_cid.get(w) for w in test_concept_chain if w in cs.word_to_cid]
-        if cids:
-            preds = lattice.predict_with_context(cids, cs, temperature=0)
-            chain_str = ' -> '.join(test_concept_chain)
-            print(f"\nAfter {chain_str}:")
-            for cid, score in preds[:8]:
-                anchor = cs.concept_info.get(cid, {}).get('anchor', '?')[:20]
-                print(f"  [{cid:5d}] {anchor:20s} score={score:.4f}")
-
     lattice.save(r'C:\Users\black\OneDrive\Desktop\FCF\real_data\syntax_lattice.json')
+    print("Done.")

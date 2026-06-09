@@ -12,12 +12,35 @@ except ImportError:
 
 from .configuration_fcf import FCFConfig
 
+import sentencepiece as spm
 from eva.symbolic.concept_space import ConceptSpace
-from eva.symbolic.concept_tokenizer import ConceptTokenizer
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.hormonal_system import HormonalSystem
-from eva.symbolic.concept_inductor import ConceptInductor
 from eva.symbolic.crystal_generator import CrystalGenerator
+
+
+
+class _SPTokenizer:
+
+    def __init__(self, model_path=None):
+        self.sp = spm.SentencePieceProcessor()
+        self._model_path = model_path
+
+    def initialize(self):
+        if self._model_path:
+            self.sp.load(self._model_path)
+
+    def encode(self, text):
+        return self.sp.encode(text)
+
+    def decode(self, ids):
+        return self.sp.decode(ids)
+
+    def word_to_cid(self, word):
+        return self.sp.encode(word)[0]
+
+    def __len__(self):
+        return self.sp.get_piece_size()
 
 
 @dataclass
@@ -45,7 +68,7 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
 
         # Lazy load: components are initialized on first use
         self._space: Optional[ConceptSpace] = None
-        self._tok: Optional[ConceptTokenizer] = None
+        self._tok: Optional[_SPTokenizer] = None
         self._lattice: Optional[SyntaxLattice] = None
         self._generator: Optional[CrystalGenerator] = None
 
@@ -56,14 +79,13 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         data_dir = self._data_dir
         space_path = os.path.join(data_dir, "concept_space.json")
         lattice_path = os.path.join(data_dir, "syntax_lattice.json")
-        bpe_path = os.path.join(data_dir, "bpe_tokenizer.json")
-        skeleton_path = os.path.join(data_dir, "concept_skeleton.json")
+        bpe_path = os.path.join(data_dir, "bpe_ru.model")
 
         if not os.path.exists(space_path):
             raise FileNotFoundError(f"ConceptSpace not found at {space_path}. Run rebuild_v2.py first.")
 
         # Load tokenizer
-        self._tok = ConceptTokenizer(bpe_path=bpe_path, skeleton_path=skeleton_path)
+        self._tok = _SPTokenizer(model_path=bpe_path)
         self._tok.initialize()
 
         # Load ConceptSpace
@@ -90,7 +112,7 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         return self._space
 
     @property
-    def tok(self) -> ConceptTokenizer:
+    def tok(self) -> _SPTokenizer:
         self._load()
         return self._tok
 

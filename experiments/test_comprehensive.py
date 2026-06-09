@@ -5,10 +5,31 @@ import sys; sys.path.insert(0, "C:/Users/black/OneDrive/Desktop/FCF")
 import io; sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stdout.reconfigure(encoding='utf-8')
 
+import sentencepiece as spm
 from eva.symbolic.concept_space import ConceptSpace
-from eva.symbolic.concept_tokenizer import ConceptTokenizer
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
+
+
+class _SPTokenizer:
+
+    def __init__(self):
+        self.sp = spm.SentencePieceProcessor()
+
+    def initialize(self):
+        self.sp.load('C:/Users/black/OneDrive/Desktop/FCF/real_data/bpe_ru.model')
+
+    def encode(self, text):
+        return self.sp.encode(text)
+
+    def decode(self, ids):
+        return self.sp.decode(ids)
+
+    def word_to_cid(self, word):
+        return self.sp.encode(word)[0]
+
+    def __len__(self):
+        return self.sp.get_piece_size()
 
 CS_PATH = "C:/Users/black/OneDrive/Desktop/FCF/real_data/concept_space.json"
 LATTICE_PATH = "C:/Users/black/OneDrive/Desktop/FCF/real_data/syntax_lattice.json"
@@ -18,7 +39,7 @@ print("BLACK-BOX TESTS: FCF Generation")
 print("=" * 60)
 
 print("\nLoading...")
-tok = ConceptTokenizer()
+tok = _SPTokenizer()
 tok.initialize()
 cs = ConceptSpace.load(CS_PATH)
 lattice = SyntaxLattice()

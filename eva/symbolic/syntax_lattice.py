@@ -33,6 +33,7 @@ RELATION_TYPES = {
     'time_at': 9,           # temporal (вчера, сегодня)
     'related_to': 10,       # generic
 }
+RELATION_NAMES = {v: k for k, v in RELATION_TYPES.items()}  # reverse lookup
 
 # Environment words that signal relation types
 ENV_TO_RELATION = {
@@ -56,16 +57,21 @@ class SyntaxLattice:
       Semantic: connection(core_A, core_B) → {type, strength}
 
     Generation uses both: syntax for ordering, connections for relevance.
+
+    Decay: concept_freq uses exponential moving average during online
+    update() to forget old statistics.  build() uses raw counts (full
+    corpus).  Call decay_all() periodically to sweep unseen tokens.
     """
 
-    def __init__(self):
+    def __init__(self, decay=0.999):
         # n-gram stores: prefix_tuple -> [(next_concept, count)]
         self.ngrams = {2: {}, 3: {}, 4: {}}  # n -> dict of prefix_key -> Counter
 
         # Total counts for smoothing
         self.total_ngrams = {}  # n -> total count
 
-        # Concept frequency (for backoff)
+        # Concept frequency — Counter for raw counts, decay=EMA factor
+        self.decay = decay
         self.concept_freq = Counter()
 
         # Max n-gram order
@@ -76,6 +82,12 @@ class SyntaxLattice:
 
         # Per-CID index for O(1) lookup (maintained by add_connection)
         self._connections_index = defaultdict(dict)  # cid -> {other_cid: connection_dict}
+
+        # Skip-2 co-occurrences: prev_cid -> Counter[next_cid at distance 2]
+        self.skip2 = defaultdict(Counter)
+
+        # PPMI cache (lazy, built on first use_ppmi=True call)
+        self._ppmi_cache = None
 
     def build(self, corpus_path, sp, max_n=4, min_count=2):
         """Build n-gram model from corpus via SentencePiece.
@@ -113,6 +125,8 @@ class SyntaxLattice:
                         n_concepts[n - 1] += 1
                 for i in range(len(ids) - 1):
                     self.add_connection(ids[i], ids[i + 1])
+                for i in range(len(ids) - 2):
+                    self.skip2[ids[i]][ids[i + 2]] += 1
 
         print(f"  SyntaxLattice: {line_count} lines, {n_concepts[0]} concept tokens")
         for n in range(2, max_n + 1):
@@ -251,10 +265,51 @@ class SyntaxLattice:
                 if prefix not in self.ngrams[n]:
                     self.ngrams[n][prefix] = Counter()
                 self.ngrams[n][prefix][next_c] += 1
-                self.concept_freq[next_c] += 1
+                prev = self.concept_freq.get(next_c, 0)
+                self.concept_freq[next_c] = prev * self.decay + 1.0
 
         for i in range(len(concept_sequence) - 1):
             self.add_connection(concept_sequence[i], concept_sequence[i + 1])
+        for i in range(len(concept_sequence) - 2):
+            self.skip2[concept_sequence[i]][concept_sequence[i + 2]] += 1
+
+    def decay_all(self, min_freq=0.01):
+        """Sweep all ngrams, concept frequencies, and connections with decay factor.
+
+        Periodic call during training to forget old statistics while
+        preserving a floor to prevent total decay to zero.
+
+        Args:
+            min_freq: floor for concept frequency
+        """
+        # Decay ngram counts (float)
+        for order in self.ngrams:
+            for prefix in self.ngrams[order]:
+                counter = self.ngrams[order][prefix]
+                for ncid in list(counter.keys()):
+                    counter[ncid] = max(counter[ncid] * self.decay, 0.1)
+
+        # Decay concept frequency
+        for c in list(self.concept_freq.keys()):
+            self.concept_freq[c] = max(self.concept_freq[c] * self.decay, min_freq)
+
+        # Decay skip2
+        for k, v in self.skip2.items():
+            self.skip2[k] = max(v * self.decay, 0.1)
+
+    def decay_connections(self, cutoff=0.1):
+        """Decay and prune connections (call periodically)."""
+        to_del = []
+        for (a, b), conn in self.connections.items():
+            conn['count'] = max(conn['count'] * self.decay, cutoff)
+            if conn['count'] <= cutoff:
+                to_del.append((a, b))
+                self._connections_index[a].pop(b, None)
+                self._connections_index[b].pop(a, None)
+        for k in to_del:
+            del self.connections[k]
+        # Invalidate PPMI cache after decay
+        self._ppmi_cache = None
 
     # ── Connection Strength Graph ────────────────────────────
 
@@ -341,76 +396,251 @@ class SyntaxLattice:
 
         return 0.6 * cooc_strength + 0.4 * cos_strength
 
-    def connections_of(self, cid, top_k=20):
+    def _ensure_ppmi(self):
+        """Lazily build PPMI cache for all connection pairs."""
+        if hasattr(self, '_ppmi_cache') and self._ppmi_cache is not None:
+            return
+        total_freq = max(sum(self.concept_freq.values()), 1)
+        total_pairs = max(sum(c['count'] for c in self.connections.values()), 1)
+        self._ppmi_cache = {}
+        for (cid_a, cid_b), conn in self.connections.items():
+            pair_p = conn['count'] / total_pairs
+            marg_p = (self.concept_freq.get(cid_a, 1) / total_freq *
+                      self.concept_freq.get(cid_b, 1) / total_freq)
+            ppmi = max(math.log2(max(pair_p / max(marg_p, 1e-10), 1.0)), 0)
+            self._ppmi_cache[(cid_a, cid_b)] = ppmi
+            self._ppmi_cache[(cid_b, cid_a)] = ppmi
+
+    def connections_of(self, cid, top_k=20, use_ppmi=False):
         """Get all concepts connected to a given concept.
 
         O(1) via per-CID index (not O(N) scan over all edges).
 
+        Args:
+            cid: concept ID
+            top_k: max results
+            use_ppmi: if True, sort by PPMI instead of raw connection strength
+
         Returns:
-            [(connected_cid, {strength, type}), ...] sorted by strength
+            [(connected_cid, {strength, type, ppmi?}), ...] sorted by strength
         """
         conns = self._connections_index.get(cid)
         if not conns:
             return []
         results = []
+        if use_ppmi:
+            self._ensure_ppmi()
         for other, conn in conns.items():
             max_c = max(self.concept_freq.get(cid, 1),
                         self.concept_freq.get(other, 1))
             strength = min(conn['count'] / max(max_c, 1), 1.0)
             dom_type = conn['types'].most_common(1)[0][0] if conn['types'] else 'related_to'
-            results.append((other, {'strength': strength, 'type': dom_type}))
+            entry = {'strength': strength, 'type': dom_type}
+            if use_ppmi:
+                entry['ppmi'] = self._ppmi_cache.get((cid, other), 0.0)
+            results.append((other, entry))
 
-        results.sort(key=lambda x: -x[1]['strength'])
+        if use_ppmi:
+            results.sort(key=lambda x: -x[1].get('ppmi', 0))
+        else:
+            results.sort(key=lambda x: -x[1]['strength'])
         return results[:top_k]
 
     def save(self, path):
-        """Save to JSON."""
-        data = {
-            'ngrams': {
-                str(n): {
-                    ' '.join(str(c) for c in prefix): dict(counter)
-                    for prefix, counter in ngrams.items()
-                }
-                for n, ngrams in self.ngrams.items()
-            },
-            'concept_freq': dict(self.concept_freq),
-            'connections': {
-                f'{a},{b}': {
-                    'count': conn['count'],
-                    'types': dict(conn['types']),
-                }
-                for (a, b), conn in self.connections.items()
-            },
-        }
-        with open(path + '.tmp', 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
-        os.replace(path + '.tmp', path)
-        print(f"  Saved SyntaxLattice to {path}")
+        """Save to hybrid binary+JSON format."""
+        binary_path = path.replace('.json', '.lattice.npz')
+        # N-grams → npz jagged arrays
+        npz_data = {}
+        for n in sorted(self.ngrams.keys()):
+            ng = self.ngrams[n]
+            N = len(ng)
+            if N == 0:
+                continue
+            prefixes = list(ng.keys())
+            n_prefix_len = n - 1
+            p_arr = np.zeros((N, n_prefix_len), dtype=np.int32)
+            next_list = []
+            count_list = []
+            splits = [0]
+            for i, pref in enumerate(prefixes):
+                p_arr[i] = list(pref)
+                for nxt, cnt in ng[pref].items():
+                    next_list.append(nxt)
+                    count_list.append(cnt)
+                splits.append(len(next_list))
+            npz_data[f'prefixes_{n}'] = p_arr
+            npz_data[f'nexts_{n}'] = np.array(next_list, dtype=np.int32)
+            npz_data[f'counts_{n}'] = np.array(count_list, dtype=np.int32)
+            npz_data[f'splits_{n}'] = np.array(splits, dtype=np.int64)
+        # concept_freq → npz
+        cf_items = list(self.concept_freq.items())
+        if cf_items:
+            npz_data['cf_cids'] = np.array([c for c, _ in cf_items], dtype=np.int32)
+            npz_data['cf_counts'] = np.array([v for _, v in cf_items], dtype=np.int32)
+        # skip2 → npz jagged
+        sk_items = list(self.skip2.items())
+        if sk_items:
+            sk_a, sk_n, sk_c = [], [], []
+            sk_splits = [0]
+            for a, counter in sk_items:
+                sk_a.append(a)
+                for b, cnt in counter.items():
+                    sk_n.append(b)
+                    sk_c.append(cnt)
+                sk_splits.append(len(sk_n))
+            npz_data['sk_a'] = np.array(sk_a, dtype=np.int32)
+            npz_data['sk_n'] = np.array(sk_n, dtype=np.int32)
+            npz_data['sk_c'] = np.array(sk_c, dtype=np.int32)
+            npz_data['sk_splits'] = np.array(sk_splits, dtype=np.int64)
+        # Connections → npz with type indices
+        conn_items = list(self.connections.items())
+        if conn_items:
+            conn_a, conn_b, conn_cnt = [], [], []
+            conn_typ_idx, conn_typ_cnt = [], []
+            conn_typ_splits = [0]
+            for (a, b), conn in conn_items:
+                conn_a.append(a)
+                conn_b.append(b)
+                conn_cnt.append(conn['count'])
+                for tname, tcnt in conn['types'].items():
+                    tidx = RELATION_TYPES.get(tname, 10)  # default: related_to
+                    conn_typ_idx.append(tidx)
+                    conn_typ_cnt.append(tcnt)
+                conn_typ_splits.append(len(conn_typ_idx))
+            npz_data['conn_a'] = np.array(conn_a, dtype=np.int32)
+            npz_data['conn_b'] = np.array(conn_b, dtype=np.int32)
+            npz_data['conn_cnt'] = np.array(conn_cnt, dtype=np.int32)
+            npz_data['conn_typ_idx'] = np.array(conn_typ_idx, dtype=np.uint8)
+            npz_data['conn_typ_cnt'] = np.array(conn_typ_cnt, dtype=np.int32)
+            npz_data['conn_typ_splits'] = np.array(conn_typ_splits, dtype=np.int64)
+        np.savez_compressed(binary_path, **npz_data)
+
+        # Minimal metadata → compact JSON
+        meta = {'decay': self.decay, 'max_n': self.max_n}
+        meta_path = path.replace('.json', '.meta.json')
+        with open(meta_path + '.tmp', 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False, separators=(',', ':'))
+        os.replace(meta_path + '.tmp', meta_path)
+
+        npz_kb = os.path.getsize(binary_path) / 1024
+        meta_kb = os.path.getsize(meta_path) / 1024
+        print(f"  Saved SyntaxLattice ({npz_kb/1024:.0f}MB npz + {meta_kb/1024:.1f}MB meta) to {path}")
 
     def load(self, path):
-        """Load from JSON."""
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        self.ngrams = {}
-        for n_str, ngrams_data in data['ngrams'].items():
-            n = int(n_str)
-            self.ngrams[n] = {}
-            for prefix_key, counter_data in ngrams_data.items():
-                prefix = tuple(int(c) for c in prefix_key.split())
-                self.ngrams[n][prefix] = Counter({int(k): v for k, v in counter_data.items()})
-        self.concept_freq = Counter({int(k): v for k, v in data['concept_freq'].items()})
-        # Load connection graph if present
+        """Load from hybrid binary+JSON format (also reads old monolithic JSON)."""
+        binary_path = path.replace('.json', '.lattice.npz')
+        meta_path = path.replace('.json', '.meta.json')
+
+        self.ngrams = {n: {} for n in range(2, 5)}
         self.connections = defaultdict(lambda: {'count': 0, 'types': Counter()})
         self._connections_index = defaultdict(dict)
-        if 'connections' in data:
-            for key_str, conn_data in data['connections'].items():
-                a, b = int(key_str.split(',')[0]), int(key_str.split(',')[1])
-                self.connections[(a, b)] = {
-                    'count': conn_data['count'],
-                    'types': Counter({k: v for k, v in conn_data['types'].items()}),
-                }
-                self._connections_index[a][b] = self.connections[(a, b)]
-                self._connections_index[b][a] = self.connections[(a, b)]
+        self.skip2 = defaultdict(Counter)
+        self.concept_freq = Counter()
+        self.decay = 0.999
+        self.max_n = 4
+
+        # Backward compatibility: load old monolithic JSON
+        if not os.path.exists(binary_path) and os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if 'ngrams' in data:
+                for n_str, ngrams_data in data['ngrams'].items():
+                    n = int(n_str)
+                    ng = {}
+                    for prefix_key, counter_data in ngrams_data.items():
+                        prefix = tuple(int(c) for c in prefix_key.split())
+                        ng[prefix] = Counter({int(k): v for k, v in counter_data.items()})
+                    self.ngrams[n] = ng
+            if 'concept_freq' in data:
+                self.concept_freq = Counter({int(k): v for k, v in data['concept_freq'].items()})
+            if 'skip2' in data:
+                for k, v in data['skip2'].items():
+                    self.skip2[int(k)] = Counter({int(ck): cv for ck, cv in v.items()})
+            if 'connections' in data:
+                for key_str, conn_data in data['connections'].items():
+                    a, b = int(key_str.split(',')[0]), int(key_str.split(',')[1])
+                    conn = {
+                        'count': conn_data['count'],
+                        'types': Counter(conn_data.get('types', {})),
+                    }
+                    self.connections[(a, b)] = conn
+                    self._connections_index[a][b] = conn
+                    self._connections_index[b][a] = conn
+            print(f"  Loaded SyntaxLattice ({os.path.getsize(path)/1024**2:.0f}MB JSON legacy): "
+                  f"{[len(v) for v in self.ngrams.values()]} prefixes, {len(self.connections)} connections")
+            return self
+
+        # New binary format
+        if os.path.exists(binary_path):
+            npz = np.load(binary_path)
+            # N-grams
+            for n_str in [k for k in npz.files if k.startswith('prefixes_')]:
+                n = int(n_str.split('_')[1])
+                p_arr = npz[f'prefixes_{n}']
+                nexts = npz[f'nexts_{n}']
+                counts = npz[f'counts_{n}']
+                splits = npz[f'splits_{n}']
+                N = len(p_arr)
+                ng = {}
+                for i in range(N):
+                    pref = tuple(p_arr[i].tolist())
+                    start, end = splits[i], splits[i + 1]
+                    if end > start:
+                        ng[pref] = Counter(dict(zip(nexts[start:end].tolist(),
+                                                     counts[start:end].tolist())))
+                    else:
+                        ng[pref] = Counter()
+                self.ngrams[n] = ng
+            # concept_freq
+            if 'cf_cids' in npz.files:
+                self.concept_freq = Counter(dict(zip(npz['cf_cids'].tolist(),
+                                                     npz['cf_counts'].tolist())))
+            # skip2
+            if 'sk_a' in npz.files:
+                sk_a = npz['sk_a']
+                sk_n = npz['sk_n']
+                sk_c = npz['sk_c']
+                sk_splits = npz['sk_splits']
+                for i in range(len(sk_a)):
+                    a = int(sk_a[i])
+                    start, end = sk_splits[i], sk_splits[i + 1]
+                    if end > start:
+                        self.skip2[a] = Counter(dict(zip(sk_n[start:end].tolist(),
+                                                         sk_c[start:end].tolist())))
+            # Connections
+            if 'conn_a' in npz.files:
+                conn_a = npz['conn_a']
+                conn_b = npz['conn_b']
+                conn_cnt = npz['conn_cnt']
+                conn_typ_idx = npz.get('conn_typ_idx')
+                conn_typ_cnt = npz.get('conn_typ_cnt')
+                conn_typ_splits = npz.get('conn_typ_splits')
+                K = len(conn_a)
+                for i in range(K):
+                    a, b = int(conn_a[i]), int(conn_b[i])
+                    types = Counter()
+                    if conn_typ_splits is not None:
+                        start, end = int(conn_typ_splits[i]), int(conn_typ_splits[i + 1])
+                        if end > start:
+                            tidxs = conn_typ_idx[start:end]
+                            tcnts = conn_typ_cnt[start:end]
+                            for tidx, tcnt in zip(tidxs.tolist(), tcnts.tolist()):
+                                tname = RELATION_NAMES.get(int(tidx), 'related_to')
+                                types[tname] = int(tcnt)
+                    conn = {'count': int(conn_cnt[i]), 'types': types}
+                    self.connections[(a, b)] = conn
+                    self._connections_index[a][b] = conn
+                    self._connections_index[b][a] = conn
+
+        # Load metadata from JSON
+        self.decay = 0.999
+        self.max_n = 4
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            self.decay = meta.get('decay', 0.999)
+            self.max_n = meta.get('max_n', 4)
+
         print(f"  Loaded SyntaxLattice: {[len(v) for v in self.ngrams.values()]} prefixes, "
               f"{len(self.connections)} connections")
         return self

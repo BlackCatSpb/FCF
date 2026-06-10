@@ -129,8 +129,24 @@ class FractalField:
             self.init_concept(cid)
         self._matrix_dirty = True
 
-    def to_dict(self):
-        """Serialize for saving."""
+    def to_dict(self, binary_path=None):
+        """Serialize for saving.
+
+        Args:
+            binary_path: if set, save codes+basis as .npz and return lightweight dict.
+        """
+        if binary_path:
+            # Save codes as numpy binary
+            cids = np.array(list(self.codes.keys()), dtype=np.int32)
+            codes_arr = np.array([self.codes[cid] for cid in cids], dtype=np.float32)
+            np.savez_compressed(binary_path,
+                                codes=codes_arr, cids=cids, basis=self.basis)
+            return {
+                'dim': self.dim,
+                'latent_dim': self.latent_dim,
+                'binary_codes': os.path.basename(binary_path),
+                'n_codes': len(cids),
+            }
         return {
             'dim': self.dim,
             'latent_dim': self.latent_dim,
@@ -139,9 +155,21 @@ class FractalField:
         }
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data, base_dir=None):
         field = cls(dim=data['dim'], latent_dim=data['latent_dim'])
-        field.basis = np.array(data['basis'], dtype=np.float32)
+        binary_file = data.get('binary_codes')
+        if binary_file and base_dir:
+            # Load codes from binary .npz
+            path = os.path.join(base_dir, binary_file) if os.path.isdir(base_dir) else binary_file
+            npz = np.load(path)
+            field.basis = npz['basis'].astype(np.float32)
+            cids = npz['cids']
+            codes_arr = npz['codes']
+            field.codes = {int(cid): codes_arr[i].copy() for i, cid in enumerate(cids)}
+        else:
+            field.basis = np.array(data['basis'], dtype=np.float32)
+            field.codes = {int(cid): np.array(c, dtype=np.float32)
+                            for cid, c in data['codes'].items()}
 
         # Verify basis orthogonality: JSON round-trip (float64→float32) drifts
         QtQ = field.basis.T @ field.basis
@@ -150,8 +178,6 @@ class FractalField:
             Q, _ = np.linalg.qr(field.basis, mode='reduced')
             field.basis = Q.astype(np.float32)
 
-        field.codes = {int(cid): np.array(c, dtype=np.float32)
-                        for cid, c in data['codes'].items()}
         field._matrix_dirty = True
         return field
 
@@ -178,6 +204,10 @@ class ConceptSpace:
         # Random state
         self.rng = np.random.RandomState(42)
         self._inhibition_step = 0
+
+        # Shift tracking
+        self._total_shift = 0.0
+        self._update_count = 0
 
         # Precomputed vector matrix for fast nearest-neighbor
         self._vector_matrix = None
@@ -234,18 +264,21 @@ class ConceptSpace:
             -grad_R = sim * v - cn
         which is tangent at v (dot(-grad_R, v) = 0) and maximally decreases
         alignment with centroid. Degenerate at v = ±cn → random fallback.
+
+        Uniform strength (no asymmetry threshold) — the gradient |repel| * |sim|
+        naturally handles magnitude: largest for mid-similarity vectors, zero
+        for v aligned with or opposite to centroid.
         """
         vecs = np.array(list(self.concept_vectors.values()), dtype=np.float32)
         centroid = np.mean(vecs, axis=0)
         cn = centroid / max(np.linalg.norm(centroid), 1e-10)
         for cid, v in self.concept_vectors.items():
             sim = float(np.dot(v, cn))
-            factor = strength * 2.0 if sim > 0.01 else strength * 0.5
             repel = sim * v - cn
             nrep = np.linalg.norm(repel)
             if nrep > 1e-10:
                 repel /= nrep
-                v_new = v + repel * abs(sim) * factor
+                v_new = v + repel * abs(sim) * strength
             else:
                 rng = np.random.RandomState(cid * 137 + 42)
                 tangent = rng.randn(self.dim).astype(np.float32)
@@ -254,7 +287,7 @@ class ConceptSpace:
                 if nt < 1e-10:
                     continue
                 tangent /= nt
-                v_new = v + tangent * factor
+                v_new = v + tangent * strength
             nv = np.linalg.norm(v_new)
             if nv > 1e-10:
                 v_new /= nv
@@ -263,11 +296,16 @@ class ConceptSpace:
 
     # ---- STDP: Spike-Timing-Dependent Plasticity on fractal codes ----
 
-    def _apply_vector_update(self, cid, v_new):
+    def _apply_vector_update(self, cid, v_new, max_shift=0.5):
         """Set concept_vector[cid] and project delta back into fractal code.
 
         Maintains the invariant: normalize(code @ basis) == concept_vector[cid]
         by rescaling code so |code @ basis| = 1 after each update.
+
+        Args:
+            cid: concept ID
+            v_new: new vector (should already be unit-normed)
+            max_shift: clamp delta_v norm to prevent explosive updates
         """
         v_old = self.concept_vectors.get(cid)
         self.concept_vectors[cid] = v_new
@@ -277,6 +315,21 @@ class ConceptSpace:
             return
 
         delta_v = v_new - v_old
+        shift = float(np.linalg.norm(delta_v))
+
+        # Clamp shift to prevent explosive updates
+        if shift > max_shift:
+            delta_v = delta_v / shift * max_shift
+            v_new = v_old + delta_v
+            nv = np.linalg.norm(v_new)
+            if nv > 1e-10:
+                v_new /= nv
+            self.concept_vectors[cid] = v_new
+            shift = max_shift
+
+        self._total_shift += shift
+        self._update_count += 1
+
         delta_code = delta_v @ self.fractal.basis.T
         code_new = code + delta_code
 
@@ -284,6 +337,9 @@ class ConceptSpace:
         v_unscaled = code_new @ self.fractal.basis
         scale = 1.0 / (np.linalg.norm(v_unscaled) + 1e-10)
         code_new *= scale
+
+        # Clamp code values to prevent unbounded growth
+        code_new = np.clip(code_new, -10.0, 10.0)
 
         # Recompute vector from code to ensure perfect consistency
         v_recomp = code_new @ self.fractal.basis
@@ -312,7 +368,7 @@ class ConceptSpace:
             lr: learning rate
             word_num: position in sentence (theta-rhythm modulates learning)
         """
-        theta_gate = math.exp(-word_num / 7.0)
+        theta_gate = math.exp(-word_num / 15.0)
         effective_lr = lr * max(theta_gate, 0.1)
 
         expected = expected_cid or gen_cid
@@ -348,10 +404,10 @@ class ConceptSpace:
             v_new /= nv
         self._apply_vector_update(gen_cid, v_new)
 
-        self._lateral_inhibition_fractal(gen_cid, strength=0.3 * effective_lr)
+        self._lateral_inhibition_fractal(gen_cid, strength=0.05 * effective_lr, threshold=0.35)
         self.mark_matrix_dirty()
 
-    def _lateral_inhibition_fractal(self, winner_cid, strength=0.01):
+    def _lateral_inhibition_fractal(self, winner_cid, strength=0.01, threshold=0.35):
         """Lateral inhibition with correct Riemannian gradient.
 
         The negative Riemannian gradient of sim = dot(v, v_win) is:
@@ -366,7 +422,7 @@ class ConceptSpace:
         vw_n = v_win / max(np.linalg.norm(v_win), 1e-10)
 
         n_total = len(self.concept_vectors)
-        sample_size = min(500, n_total)
+        sample_size = min(200, n_total)
 
         rng = np.random.RandomState(winner_cid + self._inhibition_step)
         self._inhibition_step += 1
@@ -379,7 +435,7 @@ class ConceptSpace:
             v = self.concept_vectors[cid]
             vn = v / max(np.linalg.norm(v), 1e-10)
             sim = float(np.dot(vw_n, vn))
-            if sim > 0.15:
+            if sim > threshold:
                 # Riemannian direction away from winner on the sphere
                 inhibit = sim * vn - vw_n
                 d = np.linalg.norm(inhibit)
@@ -400,6 +456,39 @@ class ConceptSpace:
                                  for cid in self.concept_vectors}
         self._hboost_mean_cache = None
         self._hboost_cache_step = 0
+        self._usage_decay_steps = 0
+
+    def decay_usage(self, decay=0.98):
+        """Exponential decay of concept usage to prevent homeostatic saturation."""
+        for cid in self.concept_usage:
+            self.concept_usage[cid] *= decay
+        self._usage_decay_steps += 1
+        self._hboost_mean_cache = None
+
+    def check_code_range(self, bound=10.0):
+        """Check if any fractal code exceeds |bound|. Returns (n_outliers, max_abs)."""
+        max_abs = 0.0
+        n_out = 0
+        for code in self.fractal.codes.values():
+            a = np.max(np.abs(code))
+            if a > max_abs:
+                max_abs = a
+            if a > bound:
+                n_out += 1
+        return n_out, max_abs
+
+    def validate_vector_norms(self):
+        """Check all vectors are unit norm. Returns (ok_count, total, max_deviation)."""
+        ok = 0
+        max_dev = 0.0
+        for v in self.concept_vectors.values():
+            n = np.linalg.norm(v)
+            dev = abs(n - 1.0)
+            if dev > max_dev:
+                max_dev = dev
+            if dev < 1e-6:
+                ok += 1
+        return ok, len(self.concept_vectors), max_dev
 
     _hboost_mean_cache = None
     _hboost_cache_step = 0
@@ -699,10 +788,23 @@ class ConceptSpace:
         self.concept_vectors = new_vectors
         self.dim = new_dim
 
-        # Reset fractal field to new dimension (codes will be regenerated)
-        self.fractal = FractalField(dim=self.dim, latent_dim=self.fractal.latent_dim)
-        for cid in self.concept_vectors:
-            self.fractal.init_concept(cid)
+        # Update fractal basis instead of creating new field:
+        #   old basis: (latent_dim, old_dim), orthonormal columns
+        #   new basis: (latent_dim, new_dim), orthonormal columns
+        #   new codes = v_new @ basis_new.T  preserves v = normalize(code @ basis)
+        old_latent_dim = self.fractal.latent_dim
+        rng = np.random.RandomState(42)
+        mat = rng.randn(old_latent_dim, new_dim).astype(np.float32)
+        Q, _ = np.linalg.qr(mat, mode='reduced')
+        self.fractal.basis = Q.astype(np.float32)
+
+        # Project learned vectors back into new codes
+        codes = {}
+        for cid, v in self.concept_vectors.items():
+            code_new = v @ self.fractal.basis.T  # (new_dim,) @ (new_dim, latent_dim) = (latent_dim,)
+            codes[cid] = code_new
+        self.fractal.codes = codes
+        self.fractal._matrix_dirty = True
         self._sync_concept_vectors_from_fractal()
 
         # Invalidate caches
@@ -822,6 +924,8 @@ class ConceptSpace:
             path: file path
             use_pq: if True, save PQ-compressed format (much smaller).
         """
+        # Binary .npz for fractal codes
+        binary_path = path.replace('.json', '.codes.npz')
         if use_pq and self.pq_codes is not None:
             data = {
                 'dim': self.dim,
@@ -838,9 +942,8 @@ class ConceptSpace:
                 'dim': self.dim,
                 'vocab_size': self.vocab_size,
                 'pq': False,
-                'concept_vectors': {str(c): v.tolist() for c, v in self.concept_vectors.items()},
             }
-        data['fractal'] = self.fractal.to_dict()
+        data['fractal'] = self.fractal.to_dict(binary_path=binary_path)
         if hasattr(self, 'concept_usage'):
             data['concept_usage'] = {str(c): u for c, u in self.concept_usage.items()}
             data['concept_fitness'] = {str(c): f for c, f in self.concept_fitness.items()}
@@ -848,8 +951,11 @@ class ConceptSpace:
         with open(path + '.tmp', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
         os.replace(path + '.tmp', path)
-        size_kb = os.path.getsize(path) / 1024
-        print(f"  Saved ConceptSpace ({'PQ ' if use_pq else ''}{size_kb:.0f}KB) to {path}")
+        json_kb = os.path.getsize(path) / 1024
+        npz_kb = os.path.getsize(binary_path) / 1024 if os.path.exists(binary_path) else 0
+        total_mb = (json_kb + npz_kb) / 1024
+        note = 'PQ ' if use_pq else ''
+        print(f"  Saved ConceptSpace ({note}{total_mb:.0f}MB = {json_kb/1024:.1f}MB json + {npz_kb/1024:.1f}MB npz) to {path}")
 
     @classmethod
     def load(cls, path):
@@ -888,17 +994,20 @@ class ConceptSpace:
             for i, cid in enumerate(obj.pq_cid_order):
                 obj.concept_vectors[cid] = decoded[i]
         else:
-            obj.concept_vectors = {int(c): np.array(v, dtype=np.float32)
-                                     for c, v in data['concept_vectors'].items()}
+            obj.concept_vectors = {}
 
         obj.rng = np.random.RandomState(42)
         obj._inhibition_step = 0
+        obj._total_shift = 0.0
+        obj._update_count = 0
         obj._vector_matrix = None
         obj._cid_order = []
         obj._matrix_dirty = True
 
         if 'fractal' in data:
-            obj.fractal = FractalField.from_dict(data['fractal'])
+            base_dir = os.path.dirname(path)
+            obj.fractal = FractalField.from_dict(data['fractal'], base_dir=base_dir)
+            obj.concept_vectors = {}
             for cid in list(obj.fractal.codes.keys()):
                 v = obj.fractal.compute_vector(cid)
                 if v is not None:

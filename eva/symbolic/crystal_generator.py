@@ -36,6 +36,7 @@ class CrystalGenerator:
         self.beam_width = self.config.get('beam_width', 5)
         self.max_words = self.config.get('max_words', 30)
         self.min_words = self.config.get('min_words', 3)
+        self._graph_cache = {}
         self.base_concept_temp = self.config.get('concept_temp', 0.5)
         self.theta_tau = self.config.get('theta_tau', 12.0)
         self.base_learning_rate = self.config.get('learning_rate', 0.1)
@@ -77,10 +78,23 @@ class CrystalGenerator:
     def _token_text(self, cid):
         return self.sp.IdToPiece(cid)
 
+    def _is_semantic_token(self, cid):
+        """Filter function words and punctuation that dominate graph connections."""
+        text = self._token_text(cid).strip()
+        if not text:
+            return False
+        # Punctuation and single non-letter characters
+        if len(text) == 1 and not ('а' <= text.lower() <= 'я' or text.isalpha()):
+            return False
+        # Pure punctuation tokens
+        if all(c in '.,!?;:()[]{}""''…—–«»' for c in text):
+            return False
+        return True
+
     # ── Generation ─────────────────────────────────────────────
 
     def generate(self, seed_word=None, seed_cid=None, target_text=None,
-                 query_words=None, max_words=None):
+                 query_words=None, max_words=None, beam_width=3):
         """Generate a token sequence via beam search over concept IDs.
 
         Args:
@@ -127,7 +141,7 @@ class CrystalGenerator:
             theta_temp = self._theta_temp(wn)
             h_temp = self.hormones.modulate_temperature(theta_temp)
             h_lr = self.hormones.modulate_stdp_lr(self.base_learning_rate)
-            h_beam = self.hormones.modulate_beam_width(self.beam_width)
+            effective_beam = max(1, beam_width)
 
             for seq, score, branch_id in beam:
                 prev_cid = seq[-1]
@@ -153,13 +167,7 @@ class CrystalGenerator:
                     conf = 1.0 / (1.0 + ci * 0.5)
                     is_match = (expected_cid is not None and cid == expected_cid)
 
-                    # STDP
-                    self.cs.fractal_stdp(prev_cid, cid,
-                        expected_cid=expected_cid, lr=h_lr, word_num=wn)
                     self.cs.update_usage(cid)
-
-                    # Lattice learning
-                    self.lattice.update([prev_cid, cid])
 
                     novelty = 1.0 - min(self.lattice.concept_freq.get(cid, 0) / 50, 1.0)
                     surprise = 0.1 if is_match else 0.5
@@ -171,7 +179,7 @@ class CrystalGenerator:
                     next_branch_id += 1
 
             new_beam.sort(key=lambda x: -x[1])
-            beam = new_beam[:max(1, h_beam)]
+            beam = new_beam[:effective_beam]
             all_chains.extend([(s, sc) for s, sc, _ in new_beam])
 
             # EOS
@@ -204,6 +212,71 @@ class CrystalGenerator:
             'chains': all_chains,
         }
 
+    # ── Graph-based semantic search ──────────────────────────────
+
+    def _graph_search(self, sources, B=2.0, max_candidates=30):
+        """BMSSP-EVA: single multi-source BFS for semantic paths."""
+        if not sources:
+            return {}
+        sources = list(set(sources))
+        # Keep only semantic sources (no punctuation / function words)
+        sources = [s for s in sources if self._is_semantic_token(s)]
+        if not sources:
+            return {}
+
+        d = {}
+        visited = set()
+        # Track which source(s) reached each node
+        origins = {}
+        frontier = []
+
+        for s in sources:
+            d[s] = 0.0
+            visited.add(s)
+            origins[s] = {sources.index(s)}
+            frontier.append(s)
+
+        step = 0
+        while frontier and step < 5:
+            step += 1
+            next_frontier = []
+            for u in frontier:
+                conns = self.lattice.connections_of(u, top_k=8, use_ppmi=True)
+                for v, conn_info in conns:
+                    if not self._is_semantic_token(v):
+                        continue
+                    # Edge weight from PPMI: high PPMI = specific connection = low weight (short path)
+                    ppmi = conn_info.get('ppmi', 0.0)
+                    w = max(0.20, 1.0 - min(ppmi / 8.0, 1.0) * 0.7)
+                    dv = d[u] + w
+                    if dv >= B:
+                        continue
+                    if v not in visited:
+                        d[v] = dv
+                        visited.add(v)
+                        origins[v] = origins.get(u, set())
+                        next_frontier.append(v)
+                    elif dv < d[v] - 0.01:
+                        d[v] = dv
+                        origins[v] |= origins.get(u, set())
+            frontier = next_frontier
+
+        for s in sources:
+            d.pop(s, None)
+
+        if not d:
+            return {}
+
+        # RRF: for each candidate, sum over unique sources reached
+        total_src = len(sources)
+        for cid, dist in d.items():
+            n_src = len(origins.get(cid, {1}))
+            rrf = (n_src / total_src) / (B + dist)
+            d[cid] = rrf
+
+        ranked = sorted(d.items(), key=lambda x: -x[1])
+        return dict(ranked[:max_candidates])
+
     # ── Branch ─────────────────────────────────────────────────
 
     def _branch(self, seq, word_num, theta_temp=0.3, target_cid=None, centroid=None):
@@ -212,19 +285,22 @@ class CrystalGenerator:
         cids = seq[-3:] if len(seq) >= 3 else seq
         K = 3
 
-        # 1. Connection graph
-        connected_prev = {}
-        for cid, conn in self.lattice.connections_of(prev_cid, top_k=15):
-            connected_prev[cid] = conn['strength']
+        # 1. Graph-based semantic paths (BMSSP-EVA, replaces single-hop connections)
+        sources = list(set(cids))  # unique context tokens
+        sources_key = tuple(sorted(set(sources)))
+        if sources_key not in self._graph_cache:
+            self._graph_cache[sources_key] = self._graph_search(sources, B=1.2, max_candidates=30)
+        graph_candidates = self._graph_cache[sources_key]
 
-        # 2. N-gram syntax
+        # 2. N-gram syntax (filter to semantic tokens only)
         syn_preds = self.lattice.predict(cids)
-        syn_ranked = {cid: i + 1 for i, (cid, _) in enumerate(syn_preds[:30])}
+        syn_ranked = {cid: i + 1 for i, (cid, _) in enumerate(syn_preds[:80])
+                      if self._is_semantic_token(cid)}
 
         # 3. All candidates from learned signals
-        all_cids = set(connected_prev.keys()) | set(syn_ranked.keys())
+        all_cids = set(graph_candidates.keys()) | set(syn_ranked.keys())
 
-        # 4. Vector similarity fallback (when lattice is cold)
+        # 4. Vector similarity fallback
         v_prev = self.cs.concept_vector(prev_cid)
         vector_sim = {}
         if v_prev is not None:
@@ -241,10 +317,10 @@ class CrystalGenerator:
         combined = {}
         for cid in all_cids:
             rrf = 0.0
-            if cid in connected_prev:
-                rrf += 0.5 * connected_prev[cid] / (K + 1)
+            if cid in graph_candidates:
+                rrf += 0.7 * graph_candidates[cid]
             if cid in syn_ranked:
-                rrf += 0.25 / (K + syn_ranked[cid])
+                rrf += 0.15 / (K + syn_ranked[cid])
             if cid in vector_sim:
                 rrf += 0.15 * vector_sim[cid] / (K + 1)
             freq = self.lattice.concept_freq.get(cid, 0)
@@ -315,7 +391,7 @@ class CrystalGenerator:
 
     # ── PMI-gated STDP ─────────────────────────────────────────
 
-    def _pmi_weight(self, prev_cid, next_cid):
+    def _pmi_weight(self, prev_cid, next_cid, distance=1):
         """Pointwise Mutual Information weight for STDP pull strength.
 
         PMI = log(P(next|prev) / P(next))
@@ -323,19 +399,32 @@ class CrystalGenerator:
         Low PMI  = generic transition (e.g. а→также→в→качестве)
         Negative PMI = they avoid each other
 
+        Uses adjacent ngrams for |i-j|=1, skip2 dict for |i-j|=2.
+
         Maps to [0.05, 2.0] multiplier on learning rate.
         """
-        n2 = self.lattice.ngrams[2]
-        prefix_counter = n2.get((prev_cid,))
-        if not prefix_counter:
-            return 0.1  # unseen pair → minimal pull
-
-        count_pair = prefix_counter.get(next_cid, 0)
-        count_prev = sum(prefix_counter.values())
-        count_next = self.lattice.concept_freq.get(next_cid, 0)
         total = sum(self.lattice.concept_freq.values())
+        if total < 1:
+            return 0.1
 
-        if count_pair < 1 or count_prev < 1 or count_next < 1 or total < 1:
+        if distance == 1:
+            n2 = self.lattice.ngrams[2]
+            prefix_counter = n2.get((prev_cid,))
+            if not prefix_counter:
+                return 0.1
+            count_pair = prefix_counter.get(next_cid, 0)
+            count_prev = sum(prefix_counter.values())
+        elif distance == 2:
+            skip2 = self.lattice.skip2.get(prev_cid)
+            if not skip2:
+                return 0.1
+            count_pair = skip2.get(next_cid, 0)
+            count_prev = sum(skip2.values())
+        else:
+            return 0.1
+
+        count_next = self.lattice.concept_freq.get(next_cid, 0)
+        if count_pair < 1 or count_prev < 1 or count_next < 1:
             return 0.1
 
         p_next_given_prev = count_pair / count_prev
@@ -347,8 +436,8 @@ class CrystalGenerator:
 
     # ── Training ───────────────────────────────────────────────
 
-    def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True):
-        """Train via PMI-gated context-window STDP.
+    def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, neg_samples=0):
+        """Train via PMI-gated context-window STDP with optional negative sampling.
 
         Each token pulls toward nearby tokens weighted by exponential
         distance decay AND pointwise mutual information. Generic
@@ -360,12 +449,14 @@ class CrystalGenerator:
             base_lr: learning rate override
             context_window: max distance for STDP pull (1 = adjacent only)
             pmi_gate: if True, weight STDP by PMI
+            neg_samples: number of negative samples per positive pair
         """
         ids = self._encode_input(text)
         if len(ids) < 2:
             return 0
 
         base_lr = base_lr if base_lr is not None else getattr(self, 'train_lr', 0.01)
+        vocab_size = max(ids) + 100  # rough upper bound for negative sampling
 
         for i in range(len(ids)):
             start = max(0, i - context_window)
@@ -381,15 +472,174 @@ class CrystalGenerator:
                 freq = max(freq_a, freq_b)
                 freq_weight = 1.0 / (1.0 + math.log(max(freq, 1)) * 0.15)
 
-                pmi_w = self._pmi_weight(ids[i], ids[j]) if pmi_gate else 1.0
+                pmi_w = self._pmi_weight(ids[i], ids[j], distance=dist) if pmi_gate else 1.0
 
                 lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w
 
                 self.cs.fractal_stdp(ids[i], ids[j],
                     expected_cid=ids[j], lr=lr)
 
+                # Negative sampling: push random tokens away from context
+                if neg_samples > 0:
+                    neg_lr = lr * 0.1  # weaker push than pull
+                    for _ in range(neg_samples):
+                        neg_cid = self.cs.rng.randint(0, vocab_size)
+                        if neg_cid not in self.cs.concept_vectors:
+                            continue
+                        self.cs.fractal_stdp(ids[i], neg_cid,
+                            expected_cid=ids[i], lr=neg_lr)
+
         self.lattice.update(ids)
         return 1
+
+    # ── Evaluation ────────────────────────────────────────────
+
+    def evaluate(self, corpus_path, max_lines=None, batch_size=500):
+        """Compute perplexity and accuracy on held-out corpus.
+
+        Full softmax over vocabulary at each position.  Scoring uses
+        the same components as _branch():
+          - 0.5  × connection PMI weight
+          - 0.25 × ngram probability
+          - 0.15 × vector cosine similarity
+          - 0.02 × frequency prior
+
+        The vector similarity + prior form a smooth background over
+        the full 32K vocabulary; ngram and PMI boost only seen tokens.
+        """
+        import time
+
+        with open(corpus_path, 'r', encoding='utf-8') as f:
+            lines = [l.strip() for l in f if l.strip()]
+        if max_lines:
+            lines = lines[:max_lines]
+
+        all_ids = []
+        for line in lines:
+            ids = self._encode_input(line)
+            if len(ids) >= 2:
+                all_ids.extend(ids)
+
+        n_positions = len(all_ids) - 1
+        if n_positions < 1:
+            return {'perplexity': float('inf'), 'accuracy_top1': 0.0,
+                    'accuracy_top5': 0.0, 'n_tokens': 0}
+
+        cids = sorted(self.cs.concept_vectors.keys())
+        cid_to_idx = {c: i for i, c in enumerate(cids)}
+        V = np.array([self.cs.concept_vectors[c] for c in cids], dtype=np.float32)
+        norms = np.linalg.norm(V, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        V /= norms
+        vocab_size = len(cids)
+        K = 3
+
+        # Precompute prior array for all tokens (shared across positions)
+        total_freq = sum(self.lattice.concept_freq.values()) or 1.0
+        prior_arr = np.zeros(vocab_size, dtype=np.float32)
+        for i, c in enumerate(cids):
+            freq = self.lattice.concept_freq.get(c, 0)
+            prior_arr[i] = 0.02 / (K + 1) * (1.0 - min(freq / 1000, 1.0))
+
+        total_log_prob = 0.0
+        vec_log_prob = 0.0
+        correct_top1 = 0
+        correct_top5 = 0
+        vec_correct_top1 = 0
+        n_eval = 0
+        t0 = time.time()
+
+        for start in range(0, n_positions, batch_size):
+            end = min(start + batch_size, n_positions)
+            batch_prev = all_ids[start:end]
+            batch_next = all_ids[start + 1:end + 1]
+            batch_n = len(batch_prev)
+
+            # Batch vector similarities: each context × all vocab
+            prev_vecs = np.array([
+                self.cs.concept_vectors.get(c, np.zeros(self.cs.dim, dtype=np.float32))
+                for c in batch_prev
+            ], dtype=np.float32)
+            pn = np.linalg.norm(prev_vecs, axis=1, keepdims=True)
+            pn[pn < 1e-10] = 1.0
+            prev_vecs /= pn
+            sims = prev_vecs @ V.T  # (batch, vocab_size)
+            sims = np.maximum(sims, 0)
+
+            for pos in range(batch_n):
+                prev_cid = batch_prev[pos]
+                next_cid = batch_next[pos]
+
+                scores = prior_arr.copy()
+                scores += 0.15 * sims[pos] / (K + 1)
+
+                # Ngram: boost only seen successors
+                counter = self.lattice.ngrams[2].get((prev_cid,))
+                if counter:
+                    total_ng = sum(counter.values())
+                    if total_ng > 0:
+                        for ncid, ncount in counter.items():
+                            idx = cid_to_idx.get(ncid)
+                            if idx is not None:
+                                prob = ncount / total_ng
+                                scores[idx] += 0.25 * prob / (K + 1)
+                            # PMI boost via _pmi_weight
+                            pmi_w = self._pmi_weight(prev_cid, ncid, distance=1)
+                            scores[idx] += 0.5 * pmi_w / (K + 1)
+
+                # Softmax
+                scores -= scores.max()
+                scores = np.clip(scores, -50, 50)
+                exp_s = np.exp(scores)
+                probs = exp_s / exp_s.sum()
+
+                actual_idx = cid_to_idx.get(next_cid)
+                if actual_idx is not None:
+                    lp = np.log(max(probs[actual_idx], 1e-30))
+                    total_log_prob += lp
+                    if cids[np.argmax(scores)] == next_cid:
+                        correct_top1 += 1
+                    if next_cid in {cids[i] for i in np.argsort(-scores)[:5]}:
+                        correct_top5 += 1
+
+                    # Vector-only PPL (cosine similarity, no ngram/PMI/prior)
+                    vec_scores = sims[pos]  # already clamped to ≥ 0
+                    vec_scores -= vec_scores.max()
+                    vec_scores = np.clip(vec_scores, -50, 50)
+                    exp_v = np.exp(vec_scores)
+                    vprobs = exp_v / exp_v.sum()
+                    vlp = np.log(max(vprobs[actual_idx], 1e-30))
+                    vec_log_prob += vlp
+                    if cids[np.argmax(vec_scores)] == next_cid:
+                        vec_correct_top1 += 1
+
+                    n_eval += 1
+
+            if start % 500 == 0 and n_eval > 0:
+                elapsed = time.time() - t0
+                rate = end / max(elapsed, 1)
+                ppl = np.exp(-total_log_prob / n_eval)
+                vppl = np.exp(-vec_log_prob / n_eval)
+                acc1 = correct_top1 / n_eval
+                vacc1 = vec_correct_top1 / n_eval
+                print(f"  eval {end}/{n_positions} | {rate:.0f} tok/s | "
+                      f"PPL={ppl:.1f} acc@1={acc1:.3f} | "
+                      f"vecPPL={vppl:.1f} vacc@1={vacc1:.3f}")
+
+        elapsed = time.time() - t0
+        perplexity = np.exp(-total_log_prob / max(n_eval, 1))
+        vec_perplexity = np.exp(-vec_log_prob / max(n_eval, 1))
+        return {
+            'perplexity': float(perplexity),
+            'vec_perplexity': float(vec_perplexity),
+            'accuracy_top1': correct_top1 / max(n_eval, 1),
+            'accuracy_top5': correct_top5 / max(n_eval, 1),
+            'vec_accuracy_top1': vec_correct_top1 / max(n_eval, 1),
+            'n_tokens': n_eval,
+            'total_log_prob': float(total_log_prob),
+            'vec_log_prob': float(vec_log_prob),
+            'elapsed_s': float(elapsed),
+        }
 
 
 if __name__ == '__main__':

@@ -299,6 +299,9 @@ class SyntaxLattice:
             for tgt in list(inner.keys()):
                 inner[tgt] = max(inner[tgt] * self.decay, 0.1)
 
+        # Invalidate PPMI cache after ngram decay
+        self._ppmi_cache = None
+
     def decay_connections(self, cutoff=0.1):
         """Decay and prune connections (call periodically)."""
         to_del = []

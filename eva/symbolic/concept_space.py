@@ -114,11 +114,11 @@ class FractalField:
         This creates smooth autonomous motion in vector space
         without external input — concepts 'dream'.
         """
-        rng = np.random.RandomState(42 + self._fluctuation_step)
-        self._fluctuation_step += 1
+        if not hasattr(self, '_fluct_rng'):
+            self._fluct_rng = np.random.RandomState(42)
         for cid in list(self.codes.keys()):
             c = self.codes[cid]
-            noise = rng.randn(self.latent_dim).astype(np.float32) * noise_scale
+            noise = self._fluct_rng.randn(self.latent_dim).astype(np.float32) * noise_scale
             c[:] = c * decay + noise
         self._matrix_dirty = True
 
@@ -179,6 +179,14 @@ class FractalField:
         err = np.max(np.abs(QtQ - np.eye(field.dim, dtype=np.float32)))
         if err > 1e-5:
             Q, _ = np.linalg.qr(field.basis, mode='reduced')
+            # Recompute all codes under new basis to maintain v = normalize(code @ basis)
+            old_basis = field.basis
+            for cid in list(field.codes.keys()):
+                v = field.codes[cid] @ old_basis.T
+                vn = np.linalg.norm(v)
+                if vn > 1e-10:
+                    v /= vn
+                field.codes[cid] = v @ Q
             field.basis = Q.astype(np.float32)
 
         field._matrix_dirty = True
@@ -312,10 +320,17 @@ class ConceptSpace:
             max_shift: clamp delta_v norm to prevent explosive updates
         """
         v_old = self.concept_vectors.get(cid)
-        self.concept_vectors[cid] = v_new
-
         code = self.fractal.codes.get(cid)
-        if code is None or v_old is None:
+
+        # Ensure fractal code exists before updating
+        if code is None:
+            if v_old is not None:
+                init_code = v_new @ self.fractal.basis.T
+                self.fractal.codes[cid] = init_code
+            self.concept_vectors[cid] = v_new
+            return
+        if v_old is None:
+            self.concept_vectors[cid] = v_new
             return
 
         delta_v = v_new - v_old
@@ -430,12 +445,20 @@ class ConceptSpace:
         if sample_size is None:
             sample_size = min(200, n_total)
 
-        rng = np.random.RandomState(winner_cid + self._inhibition_step)
-        self._inhibition_step += 1
         cids = self._all_cids
         n_cids = len(cids)
-        perm = rng.permutation(n_cids)
-        sampled_cids = [cids[i] for i in perm[:min(sample_size, n_cids)] if cids[i] != winner_cid][:sample_size]
+        if n_cids <= 1:
+            return
+
+        if not hasattr(self, '_inhibit_rng'):
+            self._inhibit_rng = np.random.RandomState(42)
+        perm = self._inhibit_rng.permutation(n_cids)
+        sampled_cids = []
+        for i in perm:
+            if cids[i] != winner_cid:
+                sampled_cids.append(cids[i])
+                if len(sampled_cids) >= sample_size:
+                    break
         if not sampled_cids:
             return
 
@@ -482,27 +505,22 @@ class ConceptSpace:
 
     def check_code_range(self, bound=10.0):
         """Check if any fractal code exceeds |bound|. Returns (n_outliers, max_abs)."""
-        max_abs = 0.0
-        n_out = 0
-        for code in self.fractal.codes.values():
-            a = np.max(np.abs(code))
-            if a > max_abs:
-                max_abs = a
-            if a > bound:
-                n_out += 1
+        if not self.fractal.codes:
+            return 0, 0.0
+        all_codes = np.array(list(self.fractal.codes.values()), dtype=np.float32)
+        max_abs = float(np.max(np.abs(all_codes)))
+        n_out = int(np.sum(np.max(np.abs(all_codes), axis=1) > bound))
         return n_out, max_abs
 
     def validate_vector_norms(self):
         """Check all vectors are unit norm. Returns (ok_count, total, max_deviation)."""
-        ok = 0
-        max_dev = 0.0
-        for v in self.concept_vectors.values():
-            n = np.linalg.norm(v)
-            dev = abs(n - 1.0)
-            if dev > max_dev:
-                max_dev = dev
-            if dev < 1e-6:
-                ok += 1
+        if not self.concept_vectors:
+            return 0, 0, 0.0
+        all_vecs = np.array(list(self.concept_vectors.values()), dtype=np.float32)
+        norms = np.linalg.norm(all_vecs, axis=1)
+        devs = np.abs(norms - 1.0)
+        ok = int(np.sum(devs < 1e-6))
+        max_dev = float(np.max(devs))
         return ok, len(self.concept_vectors), max_dev
 
     _hboost_mean_cache = None
@@ -513,15 +531,18 @@ class ConceptSpace:
         Underused -> positive boost (novelty)
         Overused -> negative boost (fatigue)"""
         usage = self.concept_usage.get(cid, 0.0)
-        # Refresh mean cache every 1000 calls
+        # Refresh cache every 1000 calls
         self._hboost_cache_step += 1
         if self._hboost_cache_step % 1000 == 1 or self._hboost_mean_cache is None:
             vals = list(self.concept_usage.values())
             self._hboost_mean_cache = np.mean(vals) if vals else 1.0
+            self._hboost_std_cache = np.std(vals) if vals and len(vals) > 1 else 0.0
         mean_usage = self._hboost_mean_cache
+        std_usage = self._hboost_std_cache
         if mean_usage < 0.01:
             return 0.0
-        boost = (mean_usage - usage) / max(mean_usage, 0.01)
+        denom = max(std_usage, 0.01 * mean_usage)
+        boost = (mean_usage - usage) / denom
         return np.clip(boost, -0.3, 0.3)
 
     def update_usage(self, cid, delta=1.0):
@@ -626,7 +647,12 @@ class ConceptSpace:
             kmeans = KMeans(n_clusters=n_centroids, random_state=42 + m,
                             n_init=1, max_iter=20)
             kmeans.fit(subvecs)
-            codebooks.append(kmeans.cluster_centers_.astype(np.float32))
+            cb = kmeans.cluster_centers_.astype(np.float32)
+            # Normalize centroids so sim = 1 - ||q-cb||²/2 is valid
+            cb_norms = np.linalg.norm(cb, axis=1, keepdims=True)
+            cb_norms[cb_norms < 1e-10] = 1.0
+            cb /= cb_norms
+            codebooks.append(cb)
 
         self.pq_codebooks = codebooks
         self.pq_n_subvectors = n_subvectors
@@ -655,14 +681,10 @@ class ConceptSpace:
         codes = np.zeros((N, n_sub), dtype=np.uint8)
 
         for m in range(n_sub):
-            subvecs = mat[:, m * subdim:(m + 1) * subdim]
+            sub = mat[:, m * subdim:(m + 1) * subdim]  # (N, subdim)
             cb = self.pq_codebooks[m]  # (n_centroids, subdim)
-            # Compute distances from each subvec to each centroid
-            # Use argmin across centroids
-            for i in range(N):
-                diffs = subvecs[i] - cb  # (n_centroids, subdim)
-                dists = np.sum(diffs ** 2, axis=1)
-                codes[i, m] = np.argmin(dists).astype(np.uint8)
+            dists = np.sum((sub[:, None, :] - cb[None, :, :]) ** 2, axis=2)  # (N, n_centroids)
+            codes[:, m] = np.argmin(dists, axis=1).astype(np.uint8)
 
         self.pq_codes = codes
         return codes
@@ -769,9 +791,9 @@ class ConceptSpace:
     def expand_dim(self, target_dim):
         """Expand vector space dimension (e.g. 128 → 384).
 
-        Existing vectors are kept in the first `self.dim` coordinates.
-        New dimensions are initialized from a random subspace
-        (orthogonal complement) to preserve existing relationships.
+        Extends existing basis with orthogonal new columns (Schur complement).
+        Existing fractal codes are preserved by appending zero coefficients
+        for the new dimensions — existing concept vectors remain unchanged.
 
         Args:
             target_dim: new dimension (must be > current dim)
@@ -781,44 +803,23 @@ class ConceptSpace:
         old_dim = self.dim
         print(f'  Expanding dimension: {old_dim} -> {target_dim}')
         new_dim = target_dim
+        n_new = new_dim - old_dim
 
-        # Generate random orthonormal basis for new dimensions
+        # Extend existing basis with orthogonal new columns
         rng = np.random.RandomState(42)
-        # Use QR decomposition to get orthogonal basis
-        rand_mat = rng.randn(new_dim, new_dim).astype(np.float32)
-        q, _ = np.linalg.qr(rand_mat)
-        # Take projection matrix: old_dim rows of the orthogonal matrix
-        # This preserves old vectors and adds orthogonal new dimensions
-        proj = q[:old_dim, :new_dim]  # (old_dim, new_dim)
+        extension = rng.randn(self.fractal.latent_dim, n_new).astype(np.float32)
+        # Orthogonalize against existing basis columns
+        extension = extension - self.fractal.basis @ (self.fractal.basis.T @ extension)
+        Q_ext, _ = np.linalg.qr(extension, mode='reduced')
+        self.fractal.basis = np.concatenate([self.fractal.basis, Q_ext], axis=1).astype(np.float32)
 
-        new_vectors = {}
-        for cid, v in self.concept_vectors.items():
-            # Project old vector to new space via random orthogonal matrix
-            v_new = v @ proj  # (new_dim,) — v is (old_dim,)
-            norm = np.linalg.norm(v_new)
-            if norm > 1e-10:
-                v_new /= norm
-            new_vectors[cid] = v_new
+        # Extend existing codes with zeros for new dimensions
+        for cid in self.fractal.codes:
+            code = self.fractal.codes[cid]
+            ext = np.zeros(n_new, dtype=np.float32)
+            self.fractal.codes[cid] = np.concatenate([code, ext])
 
-        self.concept_vectors = new_vectors
         self.dim = new_dim
-
-        # Update fractal basis instead of creating new field:
-        #   old basis: (latent_dim, old_dim), orthonormal columns
-        #   new basis: (latent_dim, new_dim), orthonormal columns
-        #   new codes = v_new @ basis_new.T  preserves v = normalize(code @ basis)
-        old_latent_dim = self.fractal.latent_dim
-        rng = np.random.RandomState(42)
-        mat = rng.randn(old_latent_dim, new_dim).astype(np.float32)
-        Q, _ = np.linalg.qr(mat, mode='reduced')
-        self.fractal.basis = Q.astype(np.float32)
-
-        # Project learned vectors back into new codes
-        codes = {}
-        for cid, v in self.concept_vectors.items():
-            code_new = v @ self.fractal.basis.T  # (new_dim,) @ (new_dim, latent_dim) = (latent_dim,)
-            codes[cid] = code_new
-        self.fractal.codes = codes
         self.fractal._matrix_dirty = True
         self._sync_concept_vectors_from_fractal()
 
@@ -829,7 +830,7 @@ class ConceptSpace:
         self._vector_matrix = None
         self._cid_order = []
         self._matrix_dirty = True
-        print(f'  Done: {len(new_vectors)} concepts @ {self.dim}D')
+        print(f'  Done: {len(self.concept_vectors)} concepts @ {self.dim}D')
 
     def normalize_vectors(self):
         """Center and normalize all concept vectors onto the unit sphere.
@@ -856,10 +857,19 @@ class ConceptSpace:
         for i, cid in enumerate(self.concept_vectors):
             self.concept_vectors[cid] = centered[i]
 
+        # Rebuild fractal codes to maintain invariant normalize(code @ basis) == v
+        for cid, v in self.concept_vectors.items():
+            code_new = v @ self.fractal.basis.T
+            self.fractal.codes[cid] = code_new
+        self.fractal._matrix_dirty = True
+
         # Invalidate caches
         self._vector_matrix = None
         self._cid_order = []
         self._matrix_dirty = True
+        self.pq_codebooks = None
+        self.pq_codes = None
+        self.pq_cid_order = []
 
         new_norms = np.linalg.norm(centered, axis=1)
         print(f'  All vectors normalized: mean_norm={np.mean(new_norms):.4f}')
@@ -886,28 +896,26 @@ class ConceptSpace:
 
         for epoch in range(epochs):
             vecs = np.array([self.concept_vectors[c] for c in cids], dtype=np.float32)
-            # Similarity matrix (or just compute on the fly)
-            # For speed: get nearest neighbor for a random subset each epoch
             subset_size = min(n, 3000)
             idxs = rng.choice(n, subset_size, replace=False)
             n_pushed = 0
             for idx in idxs:
                 vi = vecs[idx]
-                # Dot product with all others
                 sims = np.dot(vecs, vi)
-                sims[idx] = -1  # exclude self
+                sims[idx] = -1
                 max_sim = sims.max()
                 if max_sim > target_sim:
                     j = sims.argmax()
                     vj = vecs[j]
-                    # Push vi away from vj
-                    grad = vj - max_sim * vi
+                    # Correct Riemannian gradient: push vi away from vj
+                    # ∇_R sim(vi, vj) = vj - sim*vi  → negative = vi - sim*vj
+                    grad = vi - max_sim * vj
                     new_vi = vi + lr * grad
                     nvi = np.linalg.norm(new_vi)
                     if nvi > 1e-10:
                         self.concept_vectors[cids[idx]] = new_vi / nvi
-                    # Symmetric push for vj
-                    grad2 = vi - max_sim * vj
+                    # Symmetric push for vj away from vi
+                    grad2 = vj - max_sim * vi
                     new_vj = vj + lr * grad2
                     nvj = np.linalg.norm(new_vj)
                     if nvj > 1e-10:
@@ -959,9 +967,11 @@ class ConceptSpace:
                 'pq': False,
             }
         data['fractal'] = self.fractal.to_dict(binary_path=binary_path)
-        if hasattr(self, 'concept_usage'):
-            data['concept_usage'] = {str(c): u for c, u in self.concept_usage.items()}
-            data['concept_fitness'] = {str(c): f for c, f in self.concept_fitness.items()}
+        concept_usage = getattr(self, 'concept_usage', None)
+        if concept_usage is not None:
+            data['concept_usage'] = {str(c): u for c, u in concept_usage.items()}
+            data['concept_fitness'] = {str(c): f for c, f in
+                                       getattr(self, 'concept_fitness', {}).items()}
 
         with open(path + '.tmp', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=1)

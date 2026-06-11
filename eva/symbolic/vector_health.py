@@ -34,7 +34,11 @@ def check_antonym_collapse(cs, sp, antonym_pairs=None):
     results = {}
     for a, b in antonym_pairs:
         id_a = sp.PieceToId('▁' + a)
+        if id_a < 0:
+            id_a = sp.PieceToId(a)
         id_b = sp.PieceToId('▁' + b)
+        if id_b < 0:
+            id_b = sp.PieceToId(b)
         if id_a < 0 or id_b < 0:
             continue
         va = cs.concept_vector(id_a)

@@ -187,7 +187,7 @@ class CrystalGenerator:
                 seq, score, bid = item
                 if wn >= self.min_words:
                     token_text = self._token_text(seq[-1])
-                    if token_text in ('.', '!', '?', '…', '!', '?', '.', '...'):
+                    if token_text in ('.', '!', '?', '…', '...'):
                         finished.append((seq, score, wn))
                         beam.remove(item)
 
@@ -214,8 +214,15 @@ class CrystalGenerator:
 
     # ── Graph-based semantic search ──────────────────────────────
 
-    def _graph_search(self, sources, B=2.0, max_candidates=30):
-        """BMSSP-EVA: single multi-source BFS for semantic paths."""
+    def _graph_search(self, sources, B=2.0, max_candidates=30, max_depth=5):
+        """BMSSP-EVA: single multi-source BFS for semantic paths.
+
+        Args:
+            sources: seed concept IDs
+            B: distance budget (path cost threshold)
+            max_candidates: max results to return
+            max_depth: max BFS steps (safety bound, B is the primary limiter)
+        """
         if not sources:
             return {}
         sources = list(set(sources))
@@ -237,7 +244,7 @@ class CrystalGenerator:
             frontier.append(s)
 
         step = 0
-        while frontier and step < 5:
+        while frontier and step < max_depth:
             step += 1
             next_frontier = []
             for u in frontier:
@@ -391,7 +398,7 @@ class CrystalGenerator:
 
     # ── PMI-gated STDP ─────────────────────────────────────────
 
-    def _pmi_weight(self, prev_cid, next_cid, distance=1, total_freq=None):
+    def _pmi_weight(self, prev_cid, next_cid, distance=1, total_freq=None, min_weight=0.05):
         """Pointwise Mutual Information weight for STDP pull strength.
 
         PMI = log(P(next|prev) / P(next))
@@ -401,10 +408,11 @@ class CrystalGenerator:
 
         Uses adjacent ngrams for |i-j|=1, skip2 dict for |i-j|=2.
 
-        Maps to [0.05, 2.0] multiplier on learning rate.
+        Maps to [min_weight, 2.0] multiplier on learning rate.
 
         Args:
             total_freq: cached sum(concept_freq.values()), computed once per line
+            min_weight: floor for the PMI multiplier (tunable via pmi_gate_min)
         """
         if total_freq is None:
             total_freq = sum(self.lattice.concept_freq.values())
@@ -435,12 +443,12 @@ class CrystalGenerator:
         p_next = count_next / total_freq
         pmi = math.log(p_next_given_prev / max(p_next, 1e-10))
 
-        # PMI=0 → 0.2, PMI=2 → 1.0, PMI=5 → 2.0, negative → 0.05
-        return max(min(pmi / 2.0 + 0.2, 2.0), 0.05)
+        # PMI=0 → 0.2, PMI=2 → 1.0, PMI=5 → 2.0, negative → min_weight
+        return max(min(pmi / 2.0 + 0.2, 2.0), min_weight)
 
     # ── Training ───────────────────────────────────────────────
 
-    def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, neg_samples=0,
+    def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, pmi_gate_min=0.05, neg_samples=0,
                         inh_strength=0.05, inh_threshold=0.35):
         """Train via PMI-gated context-window STDP, batched by unique gen_cid.
 
@@ -460,7 +468,7 @@ class CrystalGenerator:
             return 0
 
         base_lr = base_lr if base_lr is not None else getattr(self, 'train_lr', 0.01)
-        vocab_size = max(ids) + 100
+        vocab_size = cs.vocab_size
         total_freq = sum(self.lattice.concept_freq.values())
         cs = self.cs
         T = len(ids)
@@ -482,7 +490,7 @@ class CrystalGenerator:
                 fb = self.lattice.concept_freq.get(ids[j], 0)
                 freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
 
-                pmi_w = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq) if pmi_gate else 1.0
+                pmi_w = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq, min_weight=pmi_gate_min) if pmi_gate else 1.0
 
                 lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w
 

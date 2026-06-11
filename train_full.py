@@ -61,9 +61,13 @@ def cleanup_old_checkpoints(keep=2):
     """Delete old numbered checkpoint files, keeping the `keep` most recent."""
     import re
     base_dir = os.path.dirname(CS_PATH)
-    files = sorted(glob.glob(os.path.join(base_dir, 'concept_space_*k.json')),
-                   key=lambda p: int(re.search(r'_(\d+)k\.json$', os.path.basename(p)).group(1)),
-                   reverse=True)
+    files = []
+    for p in glob.glob(os.path.join(base_dir, 'concept_space_*k.json')):
+        m = re.search(r'_(\d+)k\.json$', os.path.basename(p))
+        if m:
+            files.append((p, int(m.group(1))))
+    files.sort(key=lambda x: -x[1])
+    files = [p for p, _ in files]
     for f in files[keep:]:
         stem = re.search(r'_(\d+k)\.json$', os.path.basename(f)).group(1)
         for ext in ['.json', '.codes.npz', '.opt.json']:
@@ -479,7 +483,7 @@ try:
         # LR warmup
         gen.train_lr = get_lr(idx)
 
-        gen.train_from_text(line, pmi_gate=pmi_gate,
+        gen.train_from_text(line, pmi_gate=pmi_gate, pmi_gate_min=opt.p['pmi_gate_min'].current,
             neg_samples=int(round(opt.p['neg_samples'].current)),
             context_window=int(round(opt.p['context_window'].current)),
             inh_strength=opt.p['inh_strength'].current,

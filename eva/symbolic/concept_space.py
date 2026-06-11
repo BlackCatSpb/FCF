@@ -18,58 +18,102 @@ import math, json, os
 class FractalField:
     """Fractal computation matrix for relative concept vector space.
 
-    Each concept's vector is computed from a shared orthogonal basis:
-        v = coords @ basis   (then unit-normalized)
+    Code split into subspaces:
+        z = [z_c | z_a | z_m]
+        z_c: concept identity (slow plasticity)
+        z_a: attention/context mask (fast plasticity)
+        z_m: meta-plasticity (modulates learning)
 
-    The basis is a fixed random orthogonal matrix (latent_dim × dim)
-    that provides the 'fractal unfolding' — all vectors live in the
-    same coordinate system, defined relative to each other through
-    the shared basis. This is the 'развертка вычислений, дающих
-    точные координаты' — a computational unfolding of exact coordinates.
-
-    Autonomous fluctuations: latent codes evolve via a Langevin-like
-    process (random walk with drift), giving natural vector dynamics.
+    v = normalize(code @ basis) — unchanged.
     """
 
     def __init__(self, dim=384, latent_dim=512):
         self.dim = dim
         self.latent_dim = latent_dim
+        self.l_c = latent_dim // 2      # 256 — identity
+        self.l_a = latent_dim // 4      # 128 — attention
+        self.l_m = latent_dim - self.l_c - self.l_a  # 128 — meta
 
         # Fractal basis: (latent_dim, dim) with orthonormal columns
         rng = np.random.RandomState(42)
         mat = rng.randn(latent_dim, dim).astype(np.float32)
         Q, _ = np.linalg.qr(mat, mode='reduced')
-        self.basis = Q.astype(np.float32)  # (latent_dim, dim), Q.T @ Q = I
+        self.basis = Q.astype(np.float32)
         self._fluctuation_step = 0
 
         # Latent codes: cid → (latent_dim,) array
         self.codes = {}
 
-        # Cache for full vector matrix
+        # Meta-weights (trainable, modulate plasticity per concept)
+        self.meta_w_lr = np.zeros(self.l_m, dtype=np.float32)
+        self.meta_w_th = np.zeros(self.l_m, dtype=np.float32)
+        self.meta_b_lr = np.float32(0.0)
+        self.meta_b_th = np.float32(0.0)
+
+        # Cache
         self._vector_matrix = None
         self._cid_order = []
         self._matrix_dirty = True
 
+    # ── Subspace ops ─────────────────────────────────────────
+
+    def split_code(self, z):
+        """Разделить код на подпространства: (z_c, z_a, z_m)."""
+        return (z[:self.l_c],
+                z[self.l_c:self.l_c + self.l_a],
+                z[self.l_c + self.l_a:])
+
+    def merge_code(self, z_c, z_a, z_m):
+        """Собрать код из подпространств."""
+        return np.concatenate([z_c, z_a, z_m])
+
+    def meta_gate(self, z_m):
+        """Вычислить мета-ворота из meta-подпространства.
+
+        Returns:
+            lr_mod: множитель learning rate [0, 1]
+            th_mod: сдвиг inhibition threshold [-1, 1]
+        """
+        lr_mod = 1.0 / (1.0 + np.exp(-(np.dot(z_m, self.meta_w_lr) + self.meta_b_lr)))
+        th_mod = np.tanh(np.dot(z_m, self.meta_w_th) + self.meta_b_th)
+        return lr_mod, th_mod
+
+    # ── Init ─────────────────────────────────────────────────
+
     def init_concept(self, cid, rng_seed=None):
-        """Initialize a concept with random sparse latent code."""
+        """Initialize a concept with split subspace code.
+
+        z_c: sparse identity pattern (~12% active)
+        z_a: small noise (context attention starts neutral)
+        z_m: near zero (meta-gates start open)
+        """
         seed = rng_seed if rng_seed is not None else cid * 137 + 42
         rng = np.random.RandomState(seed % (2**31))
 
-        # Sparse initialization: only ~12% of latent dims active
-        n_active = max(self.latent_dim // 8, 16)
-        coords = np.zeros(self.latent_dim, dtype=np.float32)
-        idxs = rng.choice(self.latent_dim, n_active, replace=False)
+        z = np.zeros(self.latent_dim, dtype=np.float32)
+
+        # z_c: sparse identity (as before)
+        n_active = max(self.l_c // 8, 16)
+        idxs = rng.choice(self.l_c, n_active, replace=False)
         vals = rng.randn(n_active).astype(np.float32)
-        coords[idxs] = vals
+        z[:self.l_c][idxs] = vals
+
+        # z_a: small noise
+        z[self.l_c:self.l_c + self.l_a] = rng.randn(self.l_a).astype(np.float32) * 0.01
+
+        # z_m: near zero — meta gates start neutral
+        z[self.l_c + self.l_a:] = rng.randn(self.l_m).astype(np.float32) * 0.001
 
         # Rescale so |code @ basis| = 1
-        v_raw = coords @ self.basis
+        v_raw = z @ self.basis
         scale = 1.0 / (np.linalg.norm(v_raw) + 1e-10)
-        coords *= scale
+        z *= scale
 
-        self.codes[cid] = coords
+        self.codes[cid] = z
         self._matrix_dirty = True
         return self.compute_vector(cid)
+
+    # ── Vector computation ───────────────────────────────────
 
     def compute_vector(self, cid):
         """Compute full vector from latent coords @ basis + normalize."""
@@ -93,32 +137,100 @@ class FractalField:
             self._vector_matrix = np.empty((0, self.dim), dtype=np.float32)
             return self._vector_matrix, self._cid_order
 
-        # V = C @ B : (N x latent_dim) @ (latent_dim x dim)
         C = np.array([self.codes[cid] for cid in self._cid_order], dtype=np.float32)
         V = C @ self.basis
-
         norms = np.linalg.norm(V, axis=1, keepdims=True)
         norms[norms < 1e-10] = 1.0
         V /= norms
-
         self._vector_matrix = V
         self._matrix_dirty = False
         return self._vector_matrix, self._cid_order
 
+    # ── Concept updates ──────────────────────────────────────
+
+    def apply_code_update(self, cid, delta_code, lr_c=0.01, lr_a=1.0, lr_m=0.1):
+        """Apply subspace-aware STDP update to a latent code.
+
+        Args:
+            cid: concept ID
+            delta_code: full-dimensional delta (projected from vector delta)
+            lr_c: learning rate for identity subspace
+            lr_a: learning rate for attention subspace
+            lr_m: learning rate for meta subspace
+        """
+        code = self.codes.get(cid)
+        if code is None:
+            return
+
+        z_c, z_a, z_m = self.split_code(code)
+        d_c, d_a, d_m = self.split_code(delta_code)
+        lr_mod, th_mod = self.meta_gate(z_m)
+
+        # Apply updates with subspace-specific rates
+        z_c_new = z_c + d_c * lr_c * lr_mod
+        z_a_new = z_a + d_a * lr_a * lr_mod
+        z_m_new = z_m + d_m * lr_m * lr_mod
+
+        code_new = self.merge_code(z_c_new, z_a_new, z_m_new)
+
+        # Normalize so |code @ basis| = 1
+        v_raw = code_new @ self.basis
+        norm = np.linalg.norm(v_raw)
+        if norm > 1e-10:
+            code_new /= norm
+
+        self.codes[cid] = code_new.astype(np.float32)
+        self._matrix_dirty = True
+
+    # ── Attention shift ──────────────────────────────────────
+
+    def shift_attention(self, cid, context_code_deltas, weights):
+        """Вычислить сдвиг z_a под влиянием контекста.
+
+        Args:
+            cid: target concept ID
+            context_code_deltas: list of (ctx_cid, direction_hint) or None
+            weights: list of scalar weights (PMI × dist_decay)
+
+        Returns:
+            z_a_shifted: новый z_a вектор или None
+        """
+        code = self.codes.get(cid)
+        if code is None:
+            return None
+        z_c, z_a, z_m = self.split_code(code)
+        lr_mod, _ = self.meta_gate(z_m)
+
+        shift = np.zeros_like(z_a)
+        total_w = 0.0
+        for ctx_z, w in zip(context_code_deltas, weights):
+            if ctx_z is None:
+                continue
+            _, ctx_za, _ = self.split_code(ctx_z)
+            shift += w * (ctx_za - z_a)
+            total_w += w
+
+        if total_w > 1e-10:
+            shift /= total_w
+            z_a_shifted = z_a + shift * lr_mod
+            return z_a_shifted
+        return z_a
+
+    # ── Fluctuation ──────────────────────────────────────────
+
     def fluctuate(self, noise_scale=0.005, decay=0.999):
         """Autonomous fluctuation: all latent codes drift.
-
-        Langevin-like process with Ornstein-Uhlenbeck decay:
-            dc = -(1-decay) * c * dt + noise_scale * N(0, I)
-
-        This creates smooth autonomous motion in vector space
-        without external input — concepts 'dream'.
-        """
+        Noise scaled by subspace: more for z_a, less for z_c, minimal for z_m."""
         if not hasattr(self, '_fluct_rng'):
             self._fluct_rng = np.random.RandomState(42)
         for cid in list(self.codes.keys()):
             c = self.codes[cid]
+            z_c, z_a, z_m = self.split_code(c)
             noise = self._fluct_rng.randn(self.latent_dim).astype(np.float32) * noise_scale
+            # Subspace-specific noise scaling
+            noise[:self.l_c] *= 0.3           # identity: low drift
+            noise[self.l_c:self.l_c + self.l_a] *= 2.0   # attention: high drift
+            noise[self.l_c + self.l_a:] *= 0.1           # meta: minimal
             c[:] = c * decay + noise
         self._matrix_dirty = True
 
@@ -136,25 +248,31 @@ class FractalField:
             binary_path: if set, save codes+basis as .npz and return lightweight dict.
         """
         if binary_path:
-            # Save codes as numpy binary (atomic via .tmp + replace)
-            # NOTE: numpy.savez_compressed appends .npz if missing — keep it in tmp name
             tmp_path = binary_path.replace('.npz', '.tmp.npz')
             cids = np.array(list(self.codes.keys()), dtype=np.int32)
             codes_arr = np.array([self.codes[cid] for cid in cids], dtype=np.float32)
             np.savez_compressed(tmp_path,
-                                codes=codes_arr, cids=cids, basis=self.basis)
+                                codes=codes_arr, cids=cids, basis=self.basis,
+                                meta_w_lr=self.meta_w_lr,
+                                meta_w_th=self.meta_w_th)
             os.replace(tmp_path, binary_path)
             return {
                 'dim': self.dim,
                 'latent_dim': self.latent_dim,
                 'binary_codes': os.path.basename(binary_path),
                 'n_codes': len(cids),
+                'meta_b_lr': float(self.meta_b_lr),
+                'meta_b_th': float(self.meta_b_th),
             }
         return {
             'dim': self.dim,
             'latent_dim': self.latent_dim,
             'basis': self.basis.tolist(),
             'codes': {str(cid): c.tolist() for cid, c in self.codes.items()},
+            'meta_w_lr': self.meta_w_lr.tolist(),
+            'meta_w_th': self.meta_w_th.tolist(),
+            'meta_b_lr': float(self.meta_b_lr),
+            'meta_b_th': float(self.meta_b_th),
         }
 
     @classmethod
@@ -162,24 +280,30 @@ class FractalField:
         field = cls(dim=data['dim'], latent_dim=data['latent_dim'])
         binary_file = data.get('binary_codes')
         if binary_file and base_dir:
-            # Load codes from binary .npz
             path = os.path.join(base_dir, binary_file) if os.path.isdir(base_dir) else binary_file
             npz = np.load(path)
             field.basis = npz['basis'].astype(np.float32)
             cids = npz['cids']
             codes_arr = npz['codes']
             field.codes = {int(cid): codes_arr[i].copy() for i, cid in enumerate(cids)}
+            # Backward compat: meta-weights added in v2
+            field.meta_w_lr = npz.get('meta_w_lr', np.zeros(field.l_m, dtype=np.float32))
+            field.meta_w_th = npz.get('meta_w_th', np.zeros(field.l_m, dtype=np.float32))
         else:
             field.basis = np.array(data['basis'], dtype=np.float32)
             field.codes = {int(cid): np.array(c, dtype=np.float32)
                             for cid, c in data['codes'].items()}
+            field.meta_w_lr = np.array(data.get('meta_w_lr', np.zeros(field.l_m)), dtype=np.float32)
+            field.meta_w_th = np.array(data.get('meta_w_th', np.zeros(field.l_m)), dtype=np.float32)
 
-        # Verify basis orthogonality: JSON round-trip (float64→float32) drifts
+        field.meta_b_lr = np.float32(data.get('meta_b_lr', 0.0))
+        field.meta_b_th = np.float32(data.get('meta_b_th', 0.0))
+
+        # Verify basis orthogonality
         QtQ = field.basis.T @ field.basis
         err = np.max(np.abs(QtQ - np.eye(field.dim, dtype=np.float32)))
         if err > 1e-5:
             Q, _ = np.linalg.qr(field.basis, mode='reduced')
-            # Recompute all codes under new basis to maintain v = normalize(code @ basis)
             old_basis = field.basis
             for cid in list(field.codes.keys()):
                 v = field.codes[cid] @ old_basis.T
@@ -311,8 +435,8 @@ class ConceptSpace:
     def _apply_vector_update(self, cid, v_new, max_shift=0.5):
         """Set concept_vector[cid] and project delta back into fractal code.
 
-        Maintains the invariant: normalize(code @ basis) == concept_vector[cid]
-        by rescaling code so |code @ basis| = 1 after each update.
+        Maintains the invariant: normalize(code @ basis) == concept_vector[cid].
+        Uses subspace-aware update (z_c, z_a, z_m with different plasticity).
 
         Args:
             cid: concept ID
@@ -322,7 +446,6 @@ class ConceptSpace:
         v_old = self.concept_vectors.get(cid)
         code = self.fractal.codes.get(cid)
 
-        # Ensure fractal code exists before updating
         if code is None:
             if v_old is not None:
                 init_code = v_new @ self.fractal.basis.T
@@ -336,7 +459,6 @@ class ConceptSpace:
         delta_v = v_new - v_old
         shift = float(np.linalg.norm(delta_v))
 
-        # Clamp shift to prevent explosive updates
         if shift > max_shift:
             delta_v = delta_v / shift * max_shift
             v_new = v_old + delta_v
@@ -349,25 +471,15 @@ class ConceptSpace:
         self._total_shift += shift
         self._update_count += 1
 
+        # Subspace-aware code update via FractalField
         delta_code = delta_v @ self.fractal.basis.T
-        code_new = code + delta_code
-
-        # Rescale so |code_new @ basis| = 1
-        v_unscaled = code_new @ self.fractal.basis
-        scale = 1.0 / (np.linalg.norm(v_unscaled) + 1e-10)
-        code_new *= scale
-
-        # Clamp code values to prevent unbounded growth
-        code_new = np.clip(code_new, -10.0, 10.0)
+        self.fractal.apply_code_update(cid, delta_code)
 
         # Recompute vector from code to ensure perfect consistency
-        v_recomp = code_new @ self.fractal.basis
-        nvr = np.linalg.norm(v_recomp)
-        if nvr > 1e-10:
-            v_recomp /= nvr
+        v_recomp = self.fractal.compute_vector(cid)
+        if v_recomp is not None:
             self.concept_vectors[cid] = v_recomp
 
-        self.fractal.codes[cid] = code_new
         self._matrix_dirty = True
 
     def fractal_stdp(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0,

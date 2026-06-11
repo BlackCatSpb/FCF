@@ -4,8 +4,15 @@
 
 ### Context
 - Full 145K training completed: PPL=25926, vecPPL=27990, acc@1=0.106, vacc@1=0.000
-- 21 bugs from ARCHITECTURE_REVIEW.md fixed and pushed (170c1cd)
+- 21 bugs from ARCHITECTURE_REVIEW.md fixed and pushed (170c1cd, 0468197, e6bd7a6)
 - User wants me to act as lead developer, execute autonomously, think deeply
+- **New architecture direction**: Finite anchor matrix + BMSSP hierarchical field mask
+  instead of STDP-only training. Mask = binary field activation + shift, not separate attention.
+- QWEN3-4B OpenVINO model analyzed (config.json, OpenVINO XML, tokenizer) for insights:
+  - 146K vocab, 36 layers, GQA, RoPE, SwiGLU, RMSNorm
+  - Key insight: 36 sequential layers → 3 parallel subspaces (z_c, z_a, z_m)
+  - RoPE → z_a rotation for position encoding
+  - GQA → anchor field sharing (N_a=1024 anchors)
 
 ### Core Problem
 Vacc@1=0.000 because vectors remain a "random gas" (cos=0.0003±0.0532).
@@ -58,3 +65,10 @@ Root cause: STDP is purely Hebbian (pull together) with no effective repulsion:
 ### Next
 - Phase 3: Train with books data (500K+ rows) using new params
 - Evaluate gen quality, vacc@1 improvement
+- **→ New direction: Implement hierarchical FractalField with BMSSP field mask**
+  - Stop current validation run (confirmed: old architecture can't separate vectors)
+  - Spec defined in HIERARCHICAL_SPEC.md + QWEN_ANALYSIS.md
+  - Code split: z → [z_c | z_a | z_m]
+  - Finite anchor matrix H[1024×1024] built from PMI
+  - BMSSP for hierarchical field computation
+  - RoPE-like position in z_a subspace

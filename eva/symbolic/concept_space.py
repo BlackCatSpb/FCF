@@ -136,11 +136,14 @@ class FractalField:
             binary_path: if set, save codes+basis as .npz and return lightweight dict.
         """
         if binary_path:
-            # Save codes as numpy binary
+            # Save codes as numpy binary (atomic via .tmp + replace)
+            # NOTE: numpy.savez_compressed appends .npz if missing — keep it in tmp name
+            tmp_path = binary_path.replace('.npz', '.tmp.npz')
             cids = np.array(list(self.codes.keys()), dtype=np.int32)
             codes_arr = np.array([self.codes[cid] for cid in cids], dtype=np.float32)
-            np.savez_compressed(binary_path,
+            np.savez_compressed(tmp_path,
                                 codes=codes_arr, cids=cids, basis=self.basis)
+            os.replace(tmp_path, binary_path)
             return {
                 'dim': self.dim,
                 'latent_dim': self.latent_dim,
@@ -233,6 +236,7 @@ class ConceptSpace:
                 v = self.rng.randn(self.dim).astype(np.float32)
                 v /= max(np.linalg.norm(v), 1e-10)
                 self.concept_vectors[cid] = v
+        self._all_cids = list(self.concept_vectors.keys())
         print(f"  Initialized {len(self.concept_vectors)} concepts via fractal")
 
     def _sync_concept_vectors_from_fractal(self):
@@ -351,15 +355,12 @@ class ConceptSpace:
         self.fractal.codes[cid] = code_new
         self._matrix_dirty = True
 
-    def fractal_stdp(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0):
+    def fractal_stdp(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0,
+                     inh_strength=0.05, inh_threshold=0.35):
         """STDP on fractal latent codes — self-organisation through code projection.
 
         Same Riemannian geometry as svd_shift(), but the vector update
         is projected back into fractal code space via basis.T.
-
-        This preserves the fractal coordinate system: the column-space
-        components (384 dims) carry the learned update, while the null
-        space (128 dims) is untouched — available for autonomous drift.
 
         Args:
             prev_cid: context concept (pre-synaptic)
@@ -367,6 +368,8 @@ class ConceptSpace:
             expected_cid: target concept (from training data), or None
             lr: learning rate
             word_num: position in sentence (theta-rhythm modulates learning)
+            inh_strength: lateral inhibition strength multiplier
+            inh_threshold: cosine threshold for lateral inhibition
         """
         theta_gate = math.exp(-word_num / 15.0)
         effective_lr = lr * max(theta_gate, 0.1)
@@ -404,17 +407,19 @@ class ConceptSpace:
             v_new /= nv
         self._apply_vector_update(gen_cid, v_new)
 
-        self._lateral_inhibition_fractal(gen_cid, strength=0.05 * effective_lr, threshold=0.35)
+        self._lateral_inhibition_fractal(gen_cid, strength=inh_strength * effective_lr, threshold=inh_threshold)
         self.mark_matrix_dirty()
 
-    def _lateral_inhibition_fractal(self, winner_cid, strength=0.01, threshold=0.35):
-        """Lateral inhibition with correct Riemannian gradient.
+    def _lateral_inhibition_fractal(self, winner_cid, strength=0.01, threshold=0.35, sample_size=None):
+        """Lateral inhibition with correct Riemannian gradient, vectorised.
 
         The negative Riemannian gradient of sim = dot(v, v_win) is:
             -grad_R = sim * v - v_win
         which is tangent at v and maximally decreases alignment with winner.
         The Euclidean chord (v - v_win) used previously has a radial component
         and does not follow the geodesic — fixed.
+
+        Inner loop over sampled concepts is vectorised (numpy batch ops).
         """
         v_win = self.concept_vectors.get(winner_cid)
         if v_win is None:
@@ -422,30 +427,40 @@ class ConceptSpace:
         vw_n = v_win / max(np.linalg.norm(v_win), 1e-10)
 
         n_total = len(self.concept_vectors)
-        sample_size = min(200, n_total)
+        if sample_size is None:
+            sample_size = min(200, n_total)
 
         rng = np.random.RandomState(winner_cid + self._inhibition_step)
         self._inhibition_step += 1
-        candidates = list(self.concept_vectors.keys())
-        sampled = rng.choice(candidates, size=min(sample_size, len(candidates)), replace=False)
+        cids = self._all_cids
+        n_cids = len(cids)
+        perm = rng.permutation(n_cids)
+        sampled_cids = [cids[i] for i in perm[:min(sample_size, n_cids)] if cids[i] != winner_cid][:sample_size]
+        if not sampled_cids:
+            return
 
-        for cid in sampled:
-            if cid == winner_cid:
-                continue
-            v = self.concept_vectors[cid]
-            vn = v / max(np.linalg.norm(v), 1e-10)
-            sim = float(np.dot(vw_n, vn))
-            if sim > threshold:
-                # Riemannian direction away from winner on the sphere
-                inhibit = sim * vn - vw_n
-                d = np.linalg.norm(inhibit)
-                if d > 1e-10:
-                    inhibit /= d
-                    v_new = v - inhibit * strength * sim
-                    nv = np.linalg.norm(v_new)
-                    if nv > 1e-10:
-                        v_new /= nv
-                    self._apply_vector_update(cid, v_new)
+        # Batch: gather all sampled vectors, compute sims, threshold, repel
+        sampled_vecs = np.array([self.concept_vectors[c] for c in sampled_cids], dtype=np.float32)
+        sims = np.dot(sampled_vecs, vw_n)
+        mask = sims > threshold
+        if not np.any(mask):
+            return
+
+        affected = sampled_vecs[mask]
+        sims_k = sims[mask]
+        # Neg Riemannian gradient: sim*affected - vw_n (tangent to sphere)
+        inhibit = sims_k[:, None] * affected - vw_n
+        norms = np.linalg.norm(inhibit, axis=1)
+        norms[norms < 1e-10] = 1.0
+        inhibit /= norms[:, None]
+
+        v_new = affected + inhibit * strength * sims_k[:, None]
+        vnorms = np.linalg.norm(v_new, axis=1)
+        vnorms[vnorms < 1e-10] = 1.0
+        v_new /= vnorms[:, None]
+
+        for idx, cid in enumerate([sc for sc, m in zip(sampled_cids, mask) if m]):
+            self._apply_vector_update(cid, v_new[idx])
         self._matrix_dirty = True
 
     def init_homeostasis(self):
@@ -1022,6 +1037,7 @@ class ConceptSpace:
             obj.concept_fitness = {int(c): f for c, f in saved_fitness.items()}
         else:
             obj.init_homeostasis()
+        obj._all_cids = list(obj.concept_vectors.keys())
         pq_note = ' (PQ)' if data.get('pq') else ''
         print(f"  Loaded ConceptSpace: {len(obj.concept_vectors)} concepts @ {obj.dim}D{pq_note}")
         return obj

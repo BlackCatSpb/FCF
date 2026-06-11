@@ -391,7 +391,7 @@ class CrystalGenerator:
 
     # ── PMI-gated STDP ─────────────────────────────────────────
 
-    def _pmi_weight(self, prev_cid, next_cid, distance=1):
+    def _pmi_weight(self, prev_cid, next_cid, distance=1, total_freq=None):
         """Pointwise Mutual Information weight for STDP pull strength.
 
         PMI = log(P(next|prev) / P(next))
@@ -402,9 +402,13 @@ class CrystalGenerator:
         Uses adjacent ngrams for |i-j|=1, skip2 dict for |i-j|=2.
 
         Maps to [0.05, 2.0] multiplier on learning rate.
+
+        Args:
+            total_freq: cached sum(concept_freq.values()), computed once per line
         """
-        total = sum(self.lattice.concept_freq.values())
-        if total < 1:
+        if total_freq is None:
+            total_freq = sum(self.lattice.concept_freq.values())
+        if total_freq < 1:
             return 0.1
 
         if distance == 1:
@@ -428,7 +432,7 @@ class CrystalGenerator:
             return 0.1
 
         p_next_given_prev = count_pair / count_prev
-        p_next = count_next / total
+        p_next = count_next / total_freq
         pmi = math.log(p_next_given_prev / max(p_next, 1e-10))
 
         # PMI=0 → 0.2, PMI=2 → 1.0, PMI=5 → 2.0, negative → 0.05
@@ -436,58 +440,112 @@ class CrystalGenerator:
 
     # ── Training ───────────────────────────────────────────────
 
-    def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, neg_samples=0):
-        """Train via PMI-gated context-window STDP with optional negative sampling.
+    def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, neg_samples=0,
+                        inh_strength=0.05, inh_threshold=0.35):
+        """Train via PMI-gated context-window STDP, batched by unique gen_cid.
+
+        Batch optimisation: groups all STDP updates for the same generator
+        concept into a single combined gradient + code projection + lateral
+        inhibition call. Preserves directional forward-only STDP and PMI
+        gating; only the per-cid update batching changes from sequential
+        (online) to summed (mini-batch) within each line — O(lr^2) difference.
 
         Each token pulls toward nearby tokens weighted by exponential
         distance decay AND pointwise mutual information. Generic
         transitions (low PMI) get minimal pull — only specific,
         statistically surprising co-occurrences shape the vectors.
-
-        Args:
-            text: input line
-            base_lr: learning rate override
-            context_window: max distance for STDP pull (1 = adjacent only)
-            pmi_gate: if True, weight STDP by PMI
-            neg_samples: number of negative samples per positive pair
         """
         ids = self._encode_input(text)
         if len(ids) < 2:
             return 0
 
         base_lr = base_lr if base_lr is not None else getattr(self, 'train_lr', 0.01)
-        vocab_size = max(ids) + 100  # rough upper bound for negative sampling
+        vocab_size = max(ids) + 100
+        total_freq = sum(self.lattice.concept_freq.values())
+        cs = self.cs
+        T = len(ids)
 
-        for i in range(len(ids)):
+        # ── Build pairs, group by gen_cid ──
+        from collections import defaultdict
+        gen_updates = defaultdict(list)  # gen_cid -> [(prev_cid, lr), ...]
+
+        for i in range(T):
             start = max(0, i - context_window)
-            end = min(len(ids), i + context_window + 1)
+            end = min(T, i + context_window + 1)
             for j in range(start, end):
-                if j <= i:  # only forward: later tokens learn from earlier context
+                if j <= i:
                     continue
                 dist = abs(j - i)
                 dist_weight = math.exp(-dist / 2.0)
 
-                freq_a = self.lattice.concept_freq.get(ids[i], 0)
-                freq_b = self.lattice.concept_freq.get(ids[j], 0)
-                freq = max(freq_a, freq_b)
-                freq_weight = 1.0 / (1.0 + math.log(max(freq, 1)) * 0.15)
+                fa = self.lattice.concept_freq.get(ids[i], 0)
+                fb = self.lattice.concept_freq.get(ids[j], 0)
+                freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
 
-                pmi_w = self._pmi_weight(ids[i], ids[j], distance=dist) if pmi_gate else 1.0
+                pmi_w = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq) if pmi_gate else 1.0
 
                 lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w
 
-                self.cs.fractal_stdp(ids[i], ids[j],
-                    expected_cid=ids[j], lr=lr)
+                # Theta rhythm modulates by position (word_num=j)
+                theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
+                gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
-                # Negative sampling: push random tokens away from context
-                if neg_samples > 0:
-                    neg_lr = lr * 0.1  # weaker push than pull
+        # ── One combined STDP update per unique gen_cid ──
+        for gen_cid, updates in gen_updates.items():
+            v_gen = cs.concept_vectors.get(gen_cid)
+            if v_gen is None:
+                continue
+
+            total_delta = np.zeros(cs.dim, dtype=np.float32)
+            total_elr = 0.0  # sum of effective lr for lateral inhibition scaling
+            for prev_cid, elr in updates:
+                v_ctx = cs.concept_vectors.get(prev_cid)
+                if v_ctx is None:
+                    continue
+                y = max(float(np.dot(v_gen, v_ctx)), 0.05)
+                total_delta += (v_ctx - y * v_gen) * elr
+                total_elr += elr
+
+            v_new = v_gen + total_delta
+            nv = np.linalg.norm(v_new)
+            if nv > 1e-10:
+                v_new /= nv
+
+            cs._apply_vector_update(gen_cid, v_new)
+            # Lateral inhibition once per gen_cid, with total cumulative
+            # strength matching original per-pair calls: inh_strength * sum(elr)
+            cs._lateral_inhibition_fractal(
+                gen_cid,
+                strength=inh_strength * total_elr,
+                threshold=inh_threshold,
+                sample_size=min(200 * min(len(updates), 5), len(cs.concept_vectors)),
+            )
+            cs.mark_matrix_dirty()
+
+        # ── Negative sampling (fixed: push random token AWAY from context) ──
+        # Original fractal_stdp had a bug: Step 1 pulled neg_cid toward ctx at 20x
+        # the strength of Step 2's push-away — net pull at 95%.  Now does one
+        # clean push-away via the negative Riemannian gradient.
+        if neg_samples > 0:
+            for gen_cid, updates in gen_updates.items():
+                for prev_cid, elr in updates:
+                    neg_elr = elr * 0.1
+                    v_ctx = cs.concept_vectors.get(prev_cid)
+                    if v_ctx is None:
+                        continue
                     for _ in range(neg_samples):
-                        neg_cid = self.cs.rng.randint(0, vocab_size)
-                        if neg_cid not in self.cs.concept_vectors:
+                        neg_cid = cs.rng.randint(0, vocab_size)
+                        v_neg = cs.concept_vectors.get(neg_cid)
+                        if v_neg is None:
                             continue
-                        self.cs.fractal_stdp(ids[i], neg_cid,
-                            expected_cid=ids[i], lr=neg_lr)
+                        # Push away from context via negative Riemannian gradient
+                        y = max(float(np.dot(v_neg, v_ctx)), 0.05)
+                        shift = (y * v_neg - v_ctx) * neg_elr  # -∇_R = -(v_ctx - y*v_neg)
+                        v_new = v_neg + shift
+                        nv = np.linalg.norm(v_new)
+                        if nv > 1e-10:
+                            v_new /= nv
+                        cs._apply_vector_update(neg_cid, v_new)
 
         self.lattice.update(ids)
         return 1
@@ -504,8 +562,7 @@ class CrystalGenerator:
           - 0.15 × vector cosine similarity
           - 0.02 × frequency prior
 
-        The vector similarity + prior form a smooth background over
-        the full 32K vocabulary; ngram and PMI boost only seen tokens.
+        Optimised: ngram+PMI boost precomputed once per eval, not per position.
         """
         import time
 
@@ -541,6 +598,31 @@ class CrystalGenerator:
             freq = self.lattice.concept_freq.get(c, 0)
             prior_arr[i] = 0.02 / (K + 1) * (1.0 - min(freq / 1000, 1.0))
 
+        # ── Precompute ngram+PMI boost per prev_cid ──
+        # Inlines PMI to avoid redundant dict lookups on 2M entries
+        ngram_boost = {}
+        for (prev_cid,), counter in self.lattice.ngrams[2].items():
+            total_ng = sum(counter.values())
+            if total_ng < 1:
+                continue
+            boost_map = {}
+            for ncid, ncount in counter.items():
+                idx = cid_to_idx.get(ncid)
+                if idx is None:
+                    continue
+                prob = ncount / total_ng
+                # Inline _pmi_weight with precomputed count_prev/count_pair
+                count_next = self.lattice.concept_freq.get(ncid, 0)
+                if count_next < 1:
+                    pmi_w = 0.1
+                else:
+                    p_next_given_prev = ncount / total_ng
+                    p_next = count_next / total_freq
+                    pmi = math.log(p_next_given_prev / max(p_next, 1e-10))
+                    pmi_w = max(min(pmi / 2.0 + 0.2, 2.0), 0.05)
+                boost_map[ncid] = (0.25 * prob + 0.5 * pmi_w) / (K + 1)
+            ngram_boost[prev_cid] = boost_map
+
         total_log_prob = 0.0
         vec_log_prob = 0.0
         correct_top1 = 0
@@ -573,19 +655,13 @@ class CrystalGenerator:
                 scores = prior_arr.copy()
                 scores += 0.15 * sims[pos] / (K + 1)
 
-                # Ngram: boost only seen successors
-                counter = self.lattice.ngrams[2].get((prev_cid,))
-                if counter:
-                    total_ng = sum(counter.values())
-                    if total_ng > 0:
-                        for ncid, ncount in counter.items():
-                            idx = cid_to_idx.get(ncid)
-                            if idx is not None:
-                                prob = ncount / total_ng
-                                scores[idx] += 0.25 * prob / (K + 1)
-                            # PMI boost via _pmi_weight
-                            pmi_w = self._pmi_weight(prev_cid, ncid, distance=1)
-                            scores[idx] += 0.5 * pmi_w / (K + 1)
+                # Ngram+PMI boost: fast lookup of precomputed values
+                boost = ngram_boost.get(prev_cid)
+                if boost:
+                    for ncid, bval in boost.items():
+                        idx = cid_to_idx.get(ncid)
+                        if idx is not None:
+                            scores[idx] += bval
 
                 # Softmax
                 scores -= scores.max()

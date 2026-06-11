@@ -293,9 +293,11 @@ class SyntaxLattice:
         for c in list(self.concept_freq.keys()):
             self.concept_freq[c] = max(self.concept_freq[c] * self.decay, min_freq)
 
-        # Decay skip2
-        for k, v in self.skip2.items():
-            self.skip2[k] = max(v * self.decay, 0.1)
+        # Decay skip2 (Counter of Counter)
+        for k in list(self.skip2.keys()):
+            inner = self.skip2[k]
+            for tgt in list(inner.keys()):
+                inner[tgt] = max(inner[tgt] * self.decay, 0.1)
 
     def decay_connections(self, cutoff=0.1):
         """Decay and prune connections (call periodically)."""
@@ -513,17 +515,20 @@ class SyntaxLattice:
             npz_data['conn_typ_idx'] = np.array(conn_typ_idx, dtype=np.uint8)
             npz_data['conn_typ_cnt'] = np.array(conn_typ_cnt, dtype=np.int32)
             npz_data['conn_typ_splits'] = np.array(conn_typ_splits, dtype=np.int64)
-        np.savez_compressed(binary_path, **npz_data)
+        tmp_bin = binary_path.replace('.npz', '.tmp.npz')
+        np.savez_compressed(tmp_bin, **npz_data)
+        os.replace(tmp_bin, binary_path)
 
-        # Minimal metadata → compact JSON
+        # Minimal metadata → compact JSON (also write to path for resume checks)
         meta = {'decay': self.decay, 'max_n': self.max_n}
         meta_path = path.replace('.json', '.meta.json')
-        with open(meta_path + '.tmp', 'w', encoding='utf-8') as f:
-            json.dump(meta, f, ensure_ascii=False, separators=(',', ':'))
-        os.replace(meta_path + '.tmp', meta_path)
+        for p in (meta_path, path):
+            with open(p + '.tmp', 'w', encoding='utf-8') as f:
+                json.dump(meta, f, ensure_ascii=False, separators=(',', ':'))
+            os.replace(p + '.tmp', p)
 
         npz_kb = os.path.getsize(binary_path) / 1024
-        meta_kb = os.path.getsize(meta_path) / 1024
+        meta_kb = os.path.getsize(path) / 1024
         print(f"  Saved SyntaxLattice ({npz_kb/1024:.0f}MB npz + {meta_kb/1024:.1f}MB meta) to {path}")
 
     def load(self, path):

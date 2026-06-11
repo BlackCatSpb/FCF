@@ -1,13 +1,23 @@
 """Full training (32K BPE). Process line-by-line. Checkpoints overwrite."""
 
+import os
+# Prevent numpy/BLAS thread contention on single-CPU workloads
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
-import time, json, os, shutil, argparse
+import time, json, os, shutil, argparse, glob
 import numpy as np
 import sentencepiece as spm
 from sklearn.decomposition import PCA
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
+from eva.symbolic.parameter_optimizer import ParameterOptimizer
+from eva.symbolic.vector_health import check_antonym_collapse
 
 # Redirect stdout to UTF-8 log file (terminal cp1251 can't print ▁)
 LOG_FILE = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\train_log.txt'
@@ -32,7 +42,38 @@ CORPUS = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\full_corpus_ru.txt'
 BPE_MODEL = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\bpe_ru_32k.model'
 CS_PATH = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\concept_space.json'
 LATTICE_PATH = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\syntax_lattice.json'
+CKPT_STATE_PATH = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\checkpoint_state.json'
 
+def save_checkpoint_state(line_idx):
+    """Write a tiny JSON tracking current training line."""
+    with open(CKPT_STATE_PATH + '.tmp', 'w', encoding='utf-8') as f:
+        json.dump({'line': line_idx, 'timestamp': time.time()}, f)
+    os.replace(CKPT_STATE_PATH + '.tmp', CKPT_STATE_PATH)
+
+def load_checkpoint_state():
+    """Return line number from checkpoint_state.json, or None."""
+    if os.path.exists(CKPT_STATE_PATH):
+        with open(CKPT_STATE_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f).get('line')
+    return None
+
+def cleanup_old_checkpoints(keep=2):
+    """Delete old numbered checkpoint files, keeping the `keep` most recent."""
+    import re
+    base_dir = os.path.dirname(CS_PATH)
+    files = sorted(glob.glob(os.path.join(base_dir, 'concept_space_*k.json')),
+                   key=lambda p: int(re.search(r'_(\d+)k\.json$', os.path.basename(p)).group(1)),
+                   reverse=True)
+    for f in files[keep:]:
+        stem = re.search(r'_(\d+k)\.json$', os.path.basename(f)).group(1)
+        for ext in ['.json', '.codes.npz', '.opt.json']:
+            p = os.path.join(base_dir, f'concept_space_{stem}{ext}')
+            if os.path.exists(p):
+                os.remove(p)
+        for ext in ['.json', '.lattice.npz', '.meta.json']:
+            p = os.path.join(base_dir, f'syntax_lattice_{stem}{ext}')
+            if os.path.exists(p):
+                os.remove(p)
 sp = spm.SentencePieceProcessor(model_file=BPE_MODEL)
 V = sp.vocab_size()
 print(f"vocab_size = {V}")
@@ -40,7 +81,8 @@ print(f"vocab_size = {V}")
 # ── Parse args ──────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--resume', '-r', help='resume from checkpoint (e.g. 2k)')
+parser.add_argument('--resume', '-r', nargs='?', const='', default=None,
+                    help='resume from checkpoint. With no arg: auto from checkpoint_state.json. With Nk: load numbered (e.g. 6k)')
 parser.add_argument('--fast', '-f', action='store_true', help='fast mode: higher lr + negative sampling')
 args = parser.parse_args()
 RESUME = args.resume
@@ -48,21 +90,53 @@ FAST = args.fast
 if FAST:
     print("FAST mode: base_lr=0.15, neg_samples=3, pmi_gate=off, decay_every=250, eval_every=1000")
 
-if RESUME:
-    # Parse resume line number
-    r = RESUME.lower().rstrip('k')
-    try:
-        resume_line = int(r) * 1000
-    except ValueError:
-        print(f"Invalid resume value: {RESUME}")
-        sys.exit(1)
-    print(f"\nResuming from checkpoint '{RESUME}' (line {resume_line})")
+if RESUME is not None:
+    # --resume without arg: auto from checkpoint_state + numbered checkpoint
+    if RESUME == '':
+        rl = load_checkpoint_state()
+        if rl is None:
+            print("No checkpoint_state.json found. Use --resume Nk to pick a numbered checkpoint.")
+            sys.exit(1)
+        resume_line = rl
+        # Map line number to checkpoint name (e.g. 9000 -> '9k')
+        ckpt_k = resume_line // 1000
+        resume_tag = f"{ckpt_k}k"
+        print(f"\nAuto-resuming from line {resume_line} (checkpoint_state.json) — loading {resume_tag}")
 
-    cs_path = CS_PATH.replace('.json', f'_{RESUME}.json')
-    lat_path = LATTICE_PATH.replace('.json', f'_{RESUME}.json')
-    if not os.path.exists(cs_path) or not os.path.exists(lat_path):
-        print(f"Checkpoint not found: {cs_path} or {lat_path}")
-        sys.exit(1)
+        cs_path = CS_PATH.replace('.json', f'_{resume_tag}.json')
+        lat_path = LATTICE_PATH.replace('.json', f'_{resume_tag}.json')
+        lat_npz = lat_path.replace('.json', '.lattice.npz')
+        lat_ok = os.path.exists(lat_path) or os.path.exists(lat_npz)
+        if not os.path.exists(cs_path) or not lat_ok:
+            print(f"Checkpoint {resume_tag} not found: {cs_path} / {lat_npz}")
+            # Fallback: try base paths
+            cs_path = CS_PATH
+            lat_path = LATTICE_PATH
+            lat_npz = lat_path.replace('.json', '.lattice.npz')
+            if not os.path.exists(cs_path) or not (os.path.exists(lat_path) or os.path.exists(lat_npz)):
+                print(f"Base checkpoint also not found. Giving up.")
+                sys.exit(1)
+            resume_tag = 'base'
+            print(f"  (fallback to base paths)")
+    else:
+        # --resume Nk: numbered checkpoint (backward compat)
+        resume_tag = RESUME
+        r = RESUME.lower().rstrip('k')
+        try:
+            resume_line = int(r) * 1000
+        except ValueError:
+            print(f"Invalid resume value: {RESUME}")
+            sys.exit(1)
+        print(f"\nResuming from numbered checkpoint '{RESUME}' (line {resume_line})")
+
+        cs_path = CS_PATH.replace('.json', f'_{RESUME}.json')
+        lat_path = LATTICE_PATH.replace('.json', f'_{RESUME}.json')
+        lat_npz = lat_path.replace('.json', '.lattice.npz')
+        lat_ok = os.path.exists(lat_path) or os.path.exists(lat_npz)
+        cs_ok = os.path.exists(cs_path)
+        if not cs_ok or not lat_ok:
+            print(f"Checkpoint not found: {cs_path} / {lat_npz} (cs_ok={cs_ok}, lat_ok={lat_ok})")
+            sys.exit(1)
 
     cs = ConceptSpace.load(cs_path)
     lattice = SyntaxLattice()
@@ -127,8 +201,7 @@ def pair_sim(cs, sp, a, b):
 
 # ── Baseline ────────────────────────────────────────────────────
 
-if not RESUME:
-    print("\n--- Baseline diagnostics ---")
+if RESUME is None:
     mean_sim, std_sim = mean_cosine_sim(cs)
     print(f"  mean cosine sim: {mean_sim:.4f} ± {std_sim:.4f}")
     ok, total = check_consistency(cs)
@@ -145,58 +218,37 @@ else:
     pairs_to_track = [('соба', 'ка'), ('человек', 'война'),
                       ('князь', 'Андрей'), ('любовь', 'смерть')]
 
-# ── Adaptive parameter control ────────────────────────────────
+# ── Parameter Optimizer (auto-tuning with feasibility corridors) ──
 
-TARGET_STD = 1.0 / np.sqrt(384)  # 0.051 — random uniform on sphere
-prev_mean_cos = 0.0
-
-repel_strength = 0.08
-base_lr = 0.15 if FAST else 0.03
-noise_scale = 0.001
-decay_rate = 0.9998
-neg_samples = 3 if FAST else 0
-pmi_gate = not FAST
-# LR warmup
 LR_WARMUP_LINES = 1000  # linear ramp from 0 to full_lr
-full_lr = base_lr
+
+base_lr = 0.15 if FAST else 0.03
+opt = ParameterOptimizer()
+opt.p['full_lr'].set(base_lr)
 if FAST:
-    print(f"  lr={base_lr}, neg_samples={neg_samples}, pmi_gate={pmi_gate}")
+    opt.p['neg_samples'].set(3)
+
+# Restore optimizer state from checkpoint (metric buffers + adapted params)
+if RESUME is not None:
+    opt_path = CS_PATH.replace('.json', f'_{resume_tag}.opt.json')
+    if not os.path.exists(opt_path):
+        opt_path = CS_PATH.replace('.json', '.opt.json')
+    if os.path.exists(opt_path):
+        with open(opt_path, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+        opt.load_state(saved)
+        print(f"  Loaded optimizer state: {opt.summary()}")
+
+# Override PMI gate for FAST mode (handled separately)
+pmi_gate = not FAST
+
+if FAST:
+    print(f"  FAST: lr={base_lr}, neg_samples={opt.p['neg_samples'].current}, pmi_gate={pmi_gate}")
 
 def get_lr(line_idx):
-    """LR warmup: linear ramp over first LR_WARMUP_LINES."""
     if line_idx < LR_WARMUP_LINES:
-        return full_lr * (line_idx + 1) / LR_WARMUP_LINES
-    return full_lr
-
-def adapt_params(mean_cos, std_cos):
-    global repel_strength, base_lr, noise_scale, prev_mean_cos, full_lr
-    changes = []
-
-    if mean_cos > 0.01:
-        repel_strength = min(repel_strength * 1.10, 0.20)
-        changes.append(f"repel={repel_strength:.3f}")
-    elif mean_cos < -0.005:
-        repel_strength = max(repel_strength * 0.90, 0.01)
-        changes.append(f"repel={repel_strength:.3f}")
-
-    if std_cos < TARGET_STD * 0.80:
-        noise_scale = min(noise_scale * 1.15, 0.01)
-        changes.append(f"noise={noise_scale:.4f}")
-    elif std_cos > TARGET_STD * 1.30:
-        noise_scale = max(noise_scale * 0.90, 0.0002)
-        changes.append(f"noise={noise_scale:.4f}")
-
-    cos_trend = mean_cos - prev_mean_cos
-    if cos_trend > 0.001 and mean_cos > 0.005:
-        full_lr = max(full_lr * 0.95, 0.003)
-        changes.append(f"lr={full_lr:.4f}")
-    elif cos_trend < -0.001 and mean_cos < -0.005:
-        full_lr = min(full_lr * 1.05, 0.02)
-        changes.append(f"lr={full_lr:.4f}")
-
-    gen.train_lr = full_lr
-    prev_mean_cos = mean_cos
-    return changes
+        return opt.p['full_lr'].current * (line_idx + 1) / LR_WARMUP_LINES
+    return opt.p['full_lr'].current
 
 
 # ── Train/val split ──────────────────────────────────────────────
@@ -212,10 +264,10 @@ train_lines = all_lines[:-n_val]
 val_lines = all_lines[-n_val:]
 
 print(f"\n  Train lines: {len(train_lines)}, Val lines: {len(val_lines)}")
-if not RESUME:
-    with open(VAL_CORPUS, 'w', encoding='utf-8') as f:
-        for l in val_lines:
-            f.write(l + '\n')
+if RESUME is None:
+        with open(VAL_CORPUS, 'w', encoding='utf-8') as f:
+            for l in val_lines:
+                f.write(l + '\n')
 
 # ── STDP Training (line by line) ────────────────────────────────
 
@@ -224,7 +276,7 @@ COS_REFRESH = 5.0   # seconds between cos/pair recomputation
 
 print("\n--- STDP training (fractal self-organisation) ---")
 gen = CrystalGenerator(cs, sp, lattice)
-gen.train_lr = full_lr
+gen.train_lr = opt.p['full_lr'].current
 t_start = time.time()
 
 total_lines = len(train_lines)
@@ -241,6 +293,8 @@ last_stat_time = 0.0
 last_cos_time = 0.0
 last_cos_sim = (0.0, 0.0)
 last_pair_strs = ''
+last_antonym_time = 0.0
+last_antonym_str = ''
 last_fluct_lines = 0
 last_decay_lines = 0
 
@@ -415,7 +469,7 @@ main();
         f.write(html)
 
 # Determine starting line
-start_line = resume_line if RESUME else 0
+start_line = resume_line if RESUME is not None else 0
 
 try:
     for idx, line in enumerate(train_lines[start_line:], start=start_line):
@@ -425,15 +479,20 @@ try:
         # LR warmup
         gen.train_lr = get_lr(idx)
 
-        gen.train_from_text(line, pmi_gate=pmi_gate, neg_samples=neg_samples)
+        gen.train_from_text(line, pmi_gate=pmi_gate,
+            neg_samples=int(round(opt.p['neg_samples'].current)),
+            context_window=int(round(opt.p['context_window'].current)),
+            inh_strength=opt.p['inh_strength'].current,
+            inh_threshold=opt.p['inh_threshold'].current)
         n_trained += 1
         now = time.time()
         elapsed = now - t_start
 
         # ── Periodic tasks (line-based) ──
         if idx > 0 and idx - last_fluct_lines >= FLUCTUATE_EVERY:
-            cs.fluctuate_fractal(noise_scale=noise_scale, decay=decay_rate,
-                                 repel_strength=repel_strength)
+            cs.fluctuate_fractal(noise_scale=opt.p['noise_scale'].current,
+                                 decay=opt.p['decay_rate'].current,
+                                 repel_strength=opt.p['repel_strength'].current)
             last_fluct_lines = idx
 
         if idx > 0 and idx - last_decay_lines >= DECAY_EVERY:
@@ -458,9 +517,14 @@ try:
                 last_cos_sim = mean_cosine_sim(cs)
                 last_pair_strs = get_pair_strs()
                 last_cos_time = now
+            if now - last_antonym_time >= 3 * COS_REFRESH:
+                ant_res = check_antonym_collapse(cs, sp)
+                parts = [f"{k}={v:.2f}" for k, v in ant_res.items()]
+                last_antonym_str = ' '.join(parts) if parts else ''
+                last_antonym_time = now
 
             mean_sim, std_sim = last_cos_sim
-            tail = f" cos={mean_sim:.4f}±{std_sim:.4f} | {last_pair_strs} | repel={repel_strength:.2f} lr={full_lr:.3f}"
+            tail = f" cos={mean_sim:.4f}±{std_sim:.4f} | {last_pair_strs} | {last_antonym_str} | {opt.summary()}"
             live_status(f"[{pct:4.1f}%] {idx:6d}L | {rate:4.0f} L/s | {eta_s} | "
                         f"{elapsed/60:.0f}min{tail}")
             last_stat_time = now
@@ -479,25 +543,26 @@ try:
             ok, total_c = check_consistency(cs)
             pair_strs = get_pair_strs()
 
-            # Adaptive params
-            param_changes = adapt_params(mean_sim, std_sim)
-            param_str = f"repel={repel_strength:.2f} lr={full_lr:.4f} noise={noise_scale:.4f}"
-            if param_changes:
-                param_str = ' '.join(param_changes)
-
             # Ngram growth
             ng_total = sum(len(v) for v in lattice.ngrams.values())
             ng_new = ng_total - ngram_last_total
             ngram_last_total = ng_total
 
-            # Save checkpoint
+            # Save checkpoint (numbered + state; base paths saved only at final/interrupt)
             ckpt_name = f"{idx // 1000}k"
             cs_num = CS_PATH.replace('.json', f'_{ckpt_name}.json')
             lat_num = LATTICE_PATH.replace('.json', f'_{ckpt_name}.json')
             print()  # clear live status line before save messages
             cs.save(cs_num)
             lattice.save(lat_num)
+            opt_state_path = CS_PATH.replace('.json', f'_{ckpt_name}.opt.json')
+            with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
+                json.dump(opt.save_state(), f, ensure_ascii=False)
+            os.replace(opt_state_path + '.tmp', opt_state_path)
+            save_checkpoint_state(idx)
+            cleanup_old_checkpoints(keep=2)
 
+            param_str = opt.summary()
             print(f"\n[{pct:5.1f}%] {idx:7d}L | {rate:4.0f} L/s | {eta_s} | {param_str}")
             # Shift stats
             n_upd = cs._update_count
@@ -516,9 +581,13 @@ try:
             print(f"  cos={mean_sim:.4f}\u00b1{std_sim:.4f} | con={ok}/{total_c} | "
                   f"ng={ng_total} (+{ng_new}) | {shift_str}{drift_warn} | {pair_strs}")
 
+            # Adaptive params (after metrics are available)
+            opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new)
+            gen.train_lr = opt.p['full_lr'].current
+
             # Test generation
             seed = np.random.choice(['князь', 'человек', 'война', 'любовь', 'дом', 'жизнь'])
-            result = gen.generate(seed_word=seed, max_words=8)
+            result = gen.generate(seed_word=seed, max_words=25)
             txt = result['text'].replace('\n', ' ').strip()
             print(f"  gen({seed}): {txt[:70]}")
 
@@ -536,18 +605,32 @@ try:
                     d = ppl - ppl_history[-2][1]
                     ppl_trend = f" {'+' if d > 0 else ''}{d:.0f} vs prev"
                 print(f"  PPL={ppl:.0f}{ppl_trend} | acc@1={acc1:.3f} | vPPL={vppl:.0f} | vacc@1={vacc1:.3f}")
+                opt.step(vec_ppl=vppl, acc1=acc1, vacc1=vacc1)
+                gen.train_lr = opt.p['full_lr'].current
             print()
 
 except KeyboardInterrupt:
     print("\n\n[EVA] Training interrupted — saving checkpoint...")
     cs.save(CS_PATH)
     lattice.save(LATTICE_PATH)
+    opt_state_path = CS_PATH.replace('.json', '.opt.json')
+    with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
+        json.dump(opt.save_state(), f, ensure_ascii=False)
+    os.replace(opt_state_path + '.tmp', opt_state_path)
+    save_checkpoint_state(idx)
+    cleanup_old_checkpoints(keep=2)
     print("[EVA] Checkpoint saved. Exiting.")
     sys.exit(0)
 
 # Final save
 cs.save(CS_PATH)
 lattice.save(LATTICE_PATH)
+opt_state_path = CS_PATH.replace('.json', '.opt.json')
+with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
+    json.dump(opt.save_state(), f, ensure_ascii=False)
+os.replace(opt_state_path + '.tmp', opt_state_path)
+save_checkpoint_state(idx)
+cleanup_old_checkpoints(keep=2)
 
 # ── Final diagnostics ───────────────────────────────────────────
 
@@ -564,7 +647,7 @@ for a, b in pairs_to_track:
 
 print("\n--- Generation tests ---")
 for seed in ['князь', 'человек', 'война', 'любовь']:
-    result = gen.generate(seed_word=seed, max_words=10)
+    result = gen.generate(seed_word=seed, max_words=25)
     txt = result['text']
     print(f"  [{seed}] {txt[:60]}  (score={result['score']:.2f})")
 
@@ -573,6 +656,12 @@ print(f"\nTotal: {n_trained} lines in {t_total:.0f}s ({n_trained/t_total:.0f} l/
 print("Saving...")
 cs.save(CS_PATH)
 lattice.save(LATTICE_PATH)
+opt_state_path = CS_PATH.replace('.json', '.opt.json')
+with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
+    json.dump(opt.save_state(), f, ensure_ascii=False)
+os.replace(opt_state_path + '.tmp', opt_state_path)
+save_checkpoint_state(idx)
+cleanup_old_checkpoints(keep=2)
 print("Done.")
 
 

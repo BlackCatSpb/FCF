@@ -195,27 +195,20 @@ text → предложения → для каждого предложения
 
 ## Запуск
 
-**Обычный запуск:**
+**Обычное обучение:**
 ```
-train_live.py --corpus real_data/full_corpus_ru.txt
+train.bat
 ```
 
-**С ограничением по строкам (для теста):**
+**Fast mode (lr=0.15, neg_samples=3):**
 ```
-train_live.py --max-lines 100 --test-every 20
+train_fast.bat
 ```
 
 **Ярлыки на рабочем столе:**
-- `EVA_Training` — полный запуск на всём корпусе
-- `EVA_Training_Quick` — быстрый тест на 100 строках
+- `EVA_Training` — полный запуск (train.bat → train_full.py)
 
-**Live-дашборд показывает в реальном времени:**
-- [PROGRESS] — сколько строк обработано, скорость, ETA
-- [MEMORY] — сколько connections, role_memory записей, n-грамм
-- [GATE] — уверенность core, размер modifier field, топ cores
-- [TEST GEN] — сгенерированный текст для 5 тестовых запросов
-
-Чекпоинты автоматически сохраняются каждые N строк.
+Чекпоинты автоматически сохраняются каждые 500 строк в бинарном формате (.npz).
 
 ---
 
@@ -246,8 +239,9 @@ FCF/
 │   ├── full_corpus_ru.txt         # Корпус для тренировки (54MB, 153K строк)
 │   └── conceptnet/
 │       └── conceptnet_ru.txt      # ConceptNet Russian
-├── train_live.py                  # Live training скрипт с дашбордом
-├── run_training.ps1              # Запуск в новом окне терминала
+├── train_full.py                 # Тренировка: STDP, PPMI-gate, drift safeguards
+├── train.bat                     # Запуск train_full.py (обычный режим)
+├── train_fast.bat                # Запуск train_full.py --fast
 ├── checkpoints/                   # Сохранённые модели
 └── ARCHITECTURE.md                # Этот файл
 ```

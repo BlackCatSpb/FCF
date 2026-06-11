@@ -252,6 +252,65 @@ class SyntaxLattice:
         scored = [(result[i][0], probs[i]) for i in range(min(top_k, len(result)))]
         return scored
 
+    def build_anchor_matrix(self, n_anchors=1024, min_pmi=0.1):
+        """Build anchor matrix H from PMI between top concepts.
+
+        H[i,j] = PMI(anchor_i, anchor_j) based on 2-gram co-occurrence.
+        Returns (H, anchor_ids) where H is sparse CSR (n_anchors × n_anchors).
+
+        Args:
+            n_anchors: number of anchor concepts (must be power of 2 for BMSSP)
+            min_pmi: minimum PMI threshold — zero out weaker connections
+
+        Returns:
+            H: scipy.sparse.csr_matrix (n_anchors, n_anchors)
+            anchor_ids: list of concept IDs for each row/col
+        """
+        from scipy.sparse import csr_matrix
+
+        # Select anchors: top N by concept_freq
+        sorted_cids = sorted(self.concept_freq.keys(),
+                             key=lambda c: -self.concept_freq[c])
+        anchor_ids = sorted_cids[:min(n_anchors, len(sorted_cids))]
+        n = len(anchor_ids)
+        anchor_set = set(anchor_ids)
+        anchor_idx = {cid: i for i, cid in enumerate(anchor_ids)}
+
+        total_freq = max(sum(self.concept_freq.values()), 1)
+        rows, cols, data = [], [], []
+
+        n2 = self.ngrams.get(2, {})
+        for prefix, counter in n2.items():
+            if len(prefix) != 1:
+                continue
+            prev = prefix[0]
+            if prev not in anchor_set:
+                continue
+            i = anchor_idx[prev]
+            count_prev = sum(counter.values())
+            if count_prev < 1:
+                continue
+            p_prev = count_prev / total_freq
+            for next_cid, count_pair in counter.items():
+                if next_cid not in anchor_set:
+                    continue
+                if count_pair < 1:
+                    continue
+                j = anchor_idx[next_cid]
+                count_next = self.concept_freq.get(next_cid, 0)
+                if count_next < 1:
+                    continue
+                p_next = count_next / total_freq
+                p_pair = count_pair / total_freq
+                pmi = math.log(p_pair / max(p_prev * p_next, 1e-10))
+                if pmi > min_pmi:
+                    rows.append(i)
+                    cols.append(j)
+                    data.append(pmi)
+
+        H = csr_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float32)
+        return H, anchor_ids
+
     def update(self, concept_sequence):
         """Increment n-gram counts + connections from a concept sequence.
 

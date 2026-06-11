@@ -92,7 +92,7 @@ class FractalField:
 
         z = np.zeros(self.latent_dim, dtype=np.float32)
 
-        # z_c: sparse identity (as before)
+        # z_c: sparse identity
         n_active = max(self.l_c // 8, 16)
         idxs = rng.choice(self.l_c, n_active, replace=False)
         vals = rng.randn(n_active).astype(np.float32)
@@ -112,6 +112,51 @@ class FractalField:
         self.codes[cid] = z
         self._matrix_dirty = True
         return self.compute_vector(cid)
+
+    # ── Field bits ───────────────────────────────────────────
+
+    def init_fields(self, n_anchors=1024):
+        """Initialize binary field bit arrays for all concepts.
+
+        field_bits[cid] = np.uint8 array of n_anchors/8 bytes.
+        """
+        self.field_bits = {}
+        n_bytes = (n_anchors + 7) // 8
+        for cid in self.codes:
+            self.field_bits[cid] = np.zeros(n_bytes, dtype=np.uint8)
+
+    def get_field_bits(self, cid):
+        """Get binary field vector for a concept."""
+        return self.field_bits.get(cid)
+
+    def set_field_bit(self, cid, anchor_idx, value=1):
+        """Set a single bit in the concept's field vector."""
+        bits = self.field_bits.get(cid)
+        if bits is None:
+            return
+        byte_idx = anchor_idx // 8
+        bit_idx = anchor_idx % 8
+        if value:
+            bits[byte_idx] |= (1 << bit_idx)
+        else:
+            bits[byte_idx] &= ~(1 << bit_idx)
+
+    def check_field_bit(self, cid, anchor_idx):
+        """Test a single bit in the concept's field vector."""
+        bits = self.field_bits.get(cid)
+        if bits is None:
+            return False
+        byte_idx = anchor_idx // 8
+        bit_idx = anchor_idx % 8
+        return bool(bits[byte_idx] & (1 << bit_idx))
+
+    def field_overlap(self, cid_a, cid_b):
+        """Count overlapping field bits between two concepts."""
+        ba = self.field_bits.get(cid_a)
+        bb = self.field_bits.get(cid_b)
+        if ba is None or bb is None or len(ba) != len(bb):
+            return 0
+        return int(np.bitwise_and(ba, bb).sum())
 
     # ── Vector computation ───────────────────────────────────
 
@@ -255,6 +300,16 @@ class FractalField:
                                 codes=codes_arr, cids=cids, basis=self.basis,
                                 meta_w_lr=self.meta_w_lr,
                                 meta_w_th=self.meta_w_th)
+            # Save field bits if present
+            if hasattr(self, 'field_bits') and self.field_bits:
+                fb_cids = np.array(list(self.field_bits.keys()), dtype=np.int32)
+                fb_arr = np.array([self.field_bits[cid] for cid in fb_cids], dtype=np.uint8)
+                # Add to existing npz
+                with np.load(tmp_path) as f:
+                    kw = dict(f)
+                kw['fb_cids'] = fb_cids
+                kw['fb_arr'] = fb_arr
+                np.savez_compressed(tmp_path, **kw)
             os.replace(tmp_path, binary_path)
             return {
                 'dim': self.dim,
@@ -289,6 +344,10 @@ class FractalField:
             # Backward compat: meta-weights added in v2
             field.meta_w_lr = npz.get('meta_w_lr', np.zeros(field.l_m, dtype=np.float32))
             field.meta_w_th = npz.get('meta_w_th', np.zeros(field.l_m, dtype=np.float32))
+            # Backward compat: field bits added in v2
+            if 'fb_cids' in npz.files:
+                field.field_bits = {int(cid): npz['fb_arr'][i].copy()
+                                     for i, cid in enumerate(npz['fb_cids'])}
         else:
             field.basis = np.array(data['basis'], dtype=np.float32)
             field.codes = {int(cid): np.array(c, dtype=np.float32)
@@ -385,6 +444,120 @@ class ConceptSpace:
         self.fractal.reinitialize_all(cids)
         self._sync_concept_vectors_from_fractal()
         print(f"  Reinitialized {len(cids)} concepts via fractal field")
+
+    # ── H matrix + BMSSP ────────────────────────────────────
+
+    def build_anchor_matrix(self, lattice, n_anchors=1024, min_pmi=0.1):
+        """Build anchor matrix H from SyntaxLattice PMI and store anchors.
+
+        Args:
+            lattice: SyntaxLattice instance
+            n_anchors: number of anchor concepts
+            min_pmi: minimum PMI threshold
+
+        Sets:
+            self.H: scipy.sparse.csr_matrix (n, n) of PMI values
+            self.anchor_ids: list of concept IDs
+            self.anchor_idx: dict {cid: index}
+        """
+        self.H, self.anchor_ids = lattice.build_anchor_matrix(n_anchors, min_pmi)
+        self.anchor_idx = {cid: i for i, cid in enumerate(self.anchor_ids)}
+        self.n_anchors = len(self.anchor_ids)
+        print(f"  H matrix: {self.n_anchors}×{self.n_anchors} anchors, "
+              f"{self.H.nnz} non-zero ({100*self.H.nnz/self.n_anchors**2:.1f}%)")
+
+    def build_fields_from_lattice(self, lattice, min_pmi=4.5):
+        """Compute binary field bits via direct PMI connections.
+
+        Each concept's field = itself + anchors connected by PMI > threshold.
+
+        Args:
+            lattice: SyntaxLattice instance
+            min_pmi: minimum PMI for anchor connection
+        """
+        if not hasattr(self, 'H'):
+            raise ValueError("Call build_anchor_matrix() first")
+
+        self.fractal.init_fields(self.n_anchors)
+        seen_cids = set(lattice.concept_freq.keys()) & set(self.fractal.codes.keys())
+
+        # Build concept→anchor co-occurrence index from 2-grams
+        # For each bigram (a→b), record b in cooc[a] and a in cooc[b]
+        import math
+        from collections import defaultdict, Counter
+        n2 = lattice.ngrams.get(2, {})
+        total_freq = max(sum(lattice.concept_freq.values()), 1)
+        anchor_set = set(self.anchor_ids)
+        cooc = defaultdict(Counter)  # cid → {anchor_cid: total_count}
+
+        for prefix, counter in n2.items():
+            a = prefix[0]
+            for b, cnt in counter.items():
+                if a in anchor_set:
+                    cooc[b][a] = cooc[b].get(a, 0) + cnt
+                if b in anchor_set:
+                    cooc[a][b] = cooc[a].get(b, 0) + cnt
+
+        for cid in seen_cids:
+            bits = self._compute_pmi_field_fast(cid, lattice, total_freq,
+                                                cooc, min_pmi)
+            self.fractal.field_bits[cid] = bits
+
+        active_counts = []
+        for bs in self.fractal.field_bits.values():
+            c = int(sum(1 for b in bs for i in range(8) if b & (1 << i)))
+            active_counts.append(c)
+        if active_counts:
+            import numpy as np
+            a = np.array(active_counts)
+            print(f"  PMI fields: {len(seen_cids)}/{len(self.fractal.codes)} concepts, "
+                  f"sizes: min={a.min()} max={a.max()} mean={a.mean():.1f}")
+
+    def _compute_pmi_field_fast(self, cid, lattice, total_freq,
+                                 cooc, min_pmi=4.5):
+        """Field = self + anchors with PMI > threshold.
+
+        Uses precomputed concept→anchor co-occurrence index.
+
+        Returns packed uint8 array of n_anchors bits.
+        """
+        import math
+        n_bytes = (self.n_anchors + 7) // 8
+        bits = bytearray(n_bytes)
+
+        def set_bit(ai):
+            bits[ai >> 3] |= 1 << (ai & 7)
+
+        if cid in self.anchor_idx:
+            start_idx = self.anchor_idx[cid]
+            set_bit(start_idx)
+            row = self.H.getrow(start_idx)
+            for dst, pmi in zip(row.indices, row.data):
+                if pmi > min_pmi:
+                    set_bit(dst)
+            return np.frombuffer(bytes(bits), dtype=np.uint8).copy()
+
+        # Non-anchor: use precomputed co-occurrence index
+        count_c = lattice.concept_freq.get(cid, 0)
+        if count_c < 2:
+            return np.frombuffer(bytes(bits), dtype=np.uint8).copy()
+        p_c = count_c / total_freq
+        cid_cooc = cooc.get(cid, {})
+
+        for aidx, anchor_id in enumerate(self.anchor_ids):
+            count_anchor = lattice.concept_freq.get(anchor_id, 0)
+            if count_anchor < 1:
+                continue
+            count_pair = cid_cooc.get(anchor_id, 0)
+            if count_pair < 2:
+                continue
+            p_a = count_anchor / total_freq
+            p_pair = count_pair / total_freq
+            pmi = math.log(p_pair / max(p_c * p_a, 1e-10))
+            if pmi > min_pmi:
+                set_bit(aidx)
+
+        return np.frombuffer(bytes(bits), dtype=np.uint8).copy()
 
     def fluctuate_fractal(self, noise_scale=0.003, decay=0.9995, repel_strength=0.0):
         """Autonomous drift + optional centroid repulsion."""

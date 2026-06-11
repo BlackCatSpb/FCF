@@ -369,6 +369,25 @@ class CrystalGenerator:
             if len(seq) >= 4 and cid == seq[-2] and seq[-1] == seq[-3]:
                 combined.pop(cid, None)
 
+        # 8. Field mask bonus: prefer candidates sharing field bits with context
+        if hasattr(self.cs.fractal, 'field_bits') and len(self.cs.fractal.field_bits) > 0:
+            ctx_cids = seq[-3:] if len(seq) >= 3 else seq
+            ctx_field = None
+            for cc in ctx_cids:
+                fb = self.cs.fractal.get_field_bits(cc)
+                if fb is not None:
+                    if ctx_field is None:
+                        ctx_field = fb.copy()
+                    else:
+                        ctx_field = np.bitwise_or(ctx_field, fb)
+            if ctx_field is not None:
+                for cid in list(combined.keys()):
+                    fb_c = self.cs.fractal.get_field_bits(cid)
+                    if fb_c is not None:
+                        overlap = int(np.bitwise_and(ctx_field, fb_c).sum())
+                        field_bonus = 1.0 + math.log(overlap + 1) * 0.1
+                        combined[cid] *= field_bonus
+
         if not combined:
             return []
 
@@ -509,7 +528,7 @@ class CrystalGenerator:
                 continue
 
             total_delta = np.zeros(cs.dim, dtype=np.float32)
-            total_elr = 0.0  # sum of effective lr for lateral inhibition scaling
+            total_elr = 0.0
             for prev_cid, elr in updates:
                 v_ctx = cs.concept_vectors.get(prev_cid)
                 if v_ctx is None:
@@ -523,13 +542,27 @@ class CrystalGenerator:
             if nv > 1e-10:
                 v_new /= nv
 
-            cs._apply_vector_update(gen_cid, v_new)
-            # Lateral inhibition once per gen_cid, with total cumulative
-            # strength matching original per-pair calls: inh_strength * sum(elr)
+            # Project vector delta back to latent for subspace-aware update
+            code = cs.fractal.codes.get(gen_cid)
+            if code is not None:
+                delta_v = v_new - v_gen
+                delta_z = delta_v @ cs.fractal.basis.T
+                z_c, z_a, z_m = cs.fractal.split_code(code)
+                lr_mod, th_mod = cs.fractal.meta_gate(z_m)
+                cs.fractal.apply_code_update(gen_cid, delta_z,
+                                              lr_c=0.01 * lr_mod,
+                                              lr_a=1.0 * lr_mod,
+                                              lr_m=0.1 * lr_mod)
+            else:
+                cs.concept_vectors[gen_cid] = v_new
+                lr_mod = 1.0; th_mod = 0.0
+
+            # Lateral inhibition with meta-modulated threshold
+            eff_th = inh_threshold * (1.0 + th_mod * 0.5)
             cs._lateral_inhibition_fractal(
                 gen_cid,
                 strength=inh_strength * total_elr,
-                threshold=inh_threshold,
+                threshold=max(eff_th, 0.01),
                 sample_size=min(200 * min(len(updates), 5), len(cs.concept_vectors)),
             )
             cs.mark_matrix_dirty()

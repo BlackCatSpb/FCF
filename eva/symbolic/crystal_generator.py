@@ -468,7 +468,7 @@ class CrystalGenerator:
     # ── Training ───────────────────────────────────────────────
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, pmi_gate_min=0.20, neg_samples=1,
-                        inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5):
+                        inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True):
         """Train via PMI-gated context-window STDP, batched by unique gen_cid.
 
         Batch optimisation: groups all STDP updates for the same generator
@@ -515,7 +515,16 @@ class CrystalGenerator:
                 if pmi_gate and pmi_w <= pmi_gate_min:
                     continue
 
-                lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w
+                # Field gate: modulate learning rate by field overlap
+                field_weight = 1.0
+                if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
+                    overlap = cs.fractal.field_overlap(ids[i], ids[j])
+                    if overlap > 0:
+                        field_weight = 1.0 + math.log(overlap + 1) * 2.0
+                    else:
+                        field_weight = 0.1  # low but non-zero — allows new connections to form
+
+                lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
 
                 # Theta rhythm modulates by position (word_num=j)
                 theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
@@ -583,6 +592,11 @@ class CrystalGenerator:
                         v_neg = cs.concept_vectors.get(neg_cid)
                         if v_neg is None:
                             continue
+                        # Field gate: don't push away if they share field bits
+                        if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
+                            neg_overlap = cs.fractal.field_overlap(prev_cid, neg_cid)
+                            if neg_overlap > 0:
+                                continue  # same semantic field — allow similarity
                         # Push away from context via negative Riemannian gradient
                         y = max(float(np.dot(v_neg, v_ctx)), 0.05)
                         shift = (y * v_neg - v_ctx) * neg_elr  # -∇_R = -(v_ctx - y*v_neg)

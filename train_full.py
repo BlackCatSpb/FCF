@@ -506,7 +506,7 @@ try:
             context_window=int(round(opt.p['context_window'].current)),
             inh_strength=opt.p['inh_strength'].current,
             inh_threshold=opt.p['inh_threshold'].current,
-            neg_lr_ratio=0.5)
+            neg_lr_ratio=0.5, field_gate=True)
         n_trained += 1
         now = time.time()
         elapsed = now - t_start

@@ -14,7 +14,7 @@ Root cause: STDP is purely Hebbian (pull together) with no effective repulsion:
 - inh_threshold=0.35 (default) — at cos_std=0.053, est_frac=0.0004 (0.04% pairs inhibited)
 - PMI gate only weights, doesn't filter — noise pairs still contribute
 
-### Phase 1: Architecture fixes (IN PROGRESS)
+### Phase 1: Architecture fixes (DONE, pushed in Phase 2 commit)
 
 #### Done
 1. **parameter_optimizer.py** — changed defaults:
@@ -29,18 +29,32 @@ Root cause: STDP is purely Hebbian (pull together) with no effective repulsion:
 
 3. **gen_quick.bat + gen_quick.py** — interactive gen script with Russian UTF-8 output
 
-#### Remaining
-- Fix reset_fractal.py (dead code, wrong attributes)
-- Fix requirements.txt (wrong packages, missing sentencepiece)
-- Add lazy n-gram loading to SyntaxLattice (25s→<2s load)
-- Update ARCHITECTURE.md or mark as obsolete
+### Phase 2: Technical debt (DONE, pushed)
+
+#### Done
+1. **reset_fractal.py** — rewrote entirely:
+   - Removed dead code (cid_list, word_to_cid, concept_transitions)
+   - Uses `list(cs.concept_vectors.keys())` for cids
+   - Added cleanup of checkpoint_state.json, numbered checkpoints, optimizer state
+   - Atomic file overwrite via `.tmp_reset` + `os.replace`
+
+2. **requirements.txt** — removed unused packages (transformers, fastapi, uvicorn, pydantic);
+   added `sentencepiece>=0.1.99`
+
+3. **syntax_lattice.py** — added `load_ngrams=False` param to `load()`:
+   - Skips n-gram array loading (lines 584-601) when False
+   - Skips skip2 loading (lines 607-617) when False
+   - Still loads connections and concept_freq (needed for generation)
+   - Predict() returns [] when n-grams are empty dicts → generator falls back to graph+vector
+
+4. **gen_quick.py** — uses `lattice.load(..., load_ngrams=False)` for fast startup
 
 ### Key Decisions
 - PMI filter: pairs with PMI ≤ 0 are noise → skip entirely. Only PMI-positive pairs contribute.
 - inh_threshold=0.10 targets ~5% of pairs at current cos_std=0.053
 - neg_samples=1 at 10% of pull LR — gentle but persistent repulsion
+- Lazy n-gram load: connections+concept_freq still needed for generation; n-grams only needed for training
 
 ### Next
-- Push Phase 1 changes to git
-- Phase 2: Technical debt (reset_fractal.py, requirements.txt, lazy load)
-- Phase 3: Train with books data (500K+ rows)
+- Phase 3: Train with books data (500K+ rows) using new params
+- Evaluate gen quality, vacc@1 improvement

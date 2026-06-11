@@ -43,6 +43,7 @@ BPE_MODEL = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\bpe_ru_32k.model'
 CS_PATH = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\concept_space.json'
 LATTICE_PATH = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\syntax_lattice.json'
 CKPT_STATE_PATH = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\checkpoint_state.json'
+STATUS_JSON = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\_train_status.json'
 
 def save_checkpoint_state(line_idx):
     """Write a tiny JSON tracking current training line."""
@@ -58,26 +59,31 @@ def load_checkpoint_state():
     return None
 
 def cleanup_old_checkpoints(keep=2):
-    """Delete old numbered checkpoint files, keeping the `keep` most recent."""
+    """Delete old numbered checkpoint files, keeping the `keep` most recent by mtime."""
     import re
     base_dir = os.path.dirname(CS_PATH)
     files = []
     for p in glob.glob(os.path.join(base_dir, 'concept_space_*k.json')):
         m = re.search(r'_(\d+)k\.json$', os.path.basename(p))
         if m:
-            files.append((p, int(m.group(1))))
+            files.append((p, os.path.getmtime(p), int(m.group(1))))
+    # Sort by mtime descending — keep most recently saved
     files.sort(key=lambda x: -x[1])
-    files = [p for p, _ in files]
-    for f in files[keep:]:
-        stem = re.search(r'_(\d+k)\.json$', os.path.basename(f)).group(1)
-        for ext in ['.json', '.codes.npz', '.opt.json']:
-            p = os.path.join(base_dir, f'concept_space_{stem}{ext}')
-            if os.path.exists(p):
-                os.remove(p)
-        for ext in ['.json', '.lattice.npz', '.meta.json']:
-            p = os.path.join(base_dir, f'syntax_lattice_{stem}{ext}')
-            if os.path.exists(p):
-                os.remove(p)
+    files = files[:keep]
+    keep_ks = set(f[2] for f in files)  # k values to keep
+    for p in glob.glob(os.path.join(base_dir, 'concept_space_*k.json')):
+        m = re.search(r'_(\d+)k\.json$', os.path.basename(p))
+        if m and int(m.group(1)) not in keep_ks:
+            stem = m.group(0)  # e.g. '12k.json'
+            k_label = stem.replace('.json', '')  # '12k'
+            for ext in ['.json', '.codes.npz', '.opt.json']:
+                fp = os.path.join(base_dir, f'concept_space_{k_label}{ext}')
+                if os.path.exists(fp):
+                    os.remove(fp)
+            for ext in ['.json', '.lattice.npz', '.meta.json']:
+                fp = os.path.join(base_dir, f'syntax_lattice_{k_label}{ext}')
+                if os.path.exists(fp):
+                    os.remove(fp)
 sp = spm.SentencePieceProcessor(model_file=BPE_MODEL)
 V = sp.vocab_size()
 print(f"vocab_size = {V}")
@@ -487,7 +493,8 @@ try:
             neg_samples=int(round(opt.p['neg_samples'].current)),
             context_window=int(round(opt.p['context_window'].current)),
             inh_strength=opt.p['inh_strength'].current,
-            inh_threshold=opt.p['inh_threshold'].current)
+            inh_threshold=opt.p['inh_threshold'].current,
+            neg_lr_ratio=0.5)
         n_trained += 1
         now = time.time()
         elapsed = now - t_start
@@ -531,6 +538,17 @@ try:
             tail = f" cos={mean_sim:.4f}±{std_sim:.4f} | {last_pair_strs} | {last_antonym_str} | {opt.summary()}"
             live_status(f"[{pct:4.1f}%] {idx:6d}L | {rate:4.0f} L/s | {eta_s} | "
                         f"{elapsed/60:.0f}min{tail}")
+            # Write machine-readable status for external monitoring
+            try:
+                with open(STATUS_JSON + '.tmp', 'w', encoding='utf-8') as _sf:
+                    json.dump({'line': idx, 'total': total_lines, 'pct': pct,
+                               'rate': rate, 'eta_s': eta_s, 'elapsed_min': elapsed/60,
+                               'cos_mean': mean_sim, 'cos_std': std_sim,
+                               'pairs': last_pair_strs, 'antonym': last_antonym_str,
+                               'opt': opt.summary()}, _sf)
+                os.replace(STATUS_JSON + '.tmp', STATUS_JSON)
+            except Exception:
+                pass
             last_stat_time = now
 
         # ── Line-based checkpoint + full report ──
@@ -552,7 +570,7 @@ try:
             ng_new = ng_total - ngram_last_total
             ngram_last_total = ng_total
 
-            # Save checkpoint (numbered + state; base paths saved only at final/interrupt)
+            # Save checkpoint (numbered + state; base paths saved every 5K)
             ckpt_name = f"{idx // 1000}k"
             cs_num = CS_PATH.replace('.json', f'_{ckpt_name}.json')
             lat_num = LATTICE_PATH.replace('.json', f'_{ckpt_name}.json')
@@ -565,6 +583,10 @@ try:
             os.replace(opt_state_path + '.tmp', opt_state_path)
             save_checkpoint_state(idx)
             cleanup_old_checkpoints(keep=2)
+            # Periodic base save every 5K lines (crash recovery)
+            if idx % 5000 == 0:
+                cs.save(CS_PATH)
+                lattice.save(LATTICE_PATH)
 
             param_str = opt.summary()
             print(f"\n[{pct:5.1f}%] {idx:7d}L | {rate:4.0f} L/s | {eta_s} | {param_str}")

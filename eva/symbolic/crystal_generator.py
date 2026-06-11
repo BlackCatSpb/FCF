@@ -449,7 +449,7 @@ class CrystalGenerator:
     # ── Training ───────────────────────────────────────────────
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, pmi_gate_min=0.20, neg_samples=1,
-                        inh_strength=0.05, inh_threshold=0.10):
+                        inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5):
         """Train via PMI-gated context-window STDP, batched by unique gen_cid.
 
         Batch optimisation: groups all STDP updates for the same generator
@@ -468,9 +468,9 @@ class CrystalGenerator:
             return 0
 
         base_lr = base_lr if base_lr is not None else getattr(self, 'train_lr', 0.01)
+        cs = self.cs
         vocab_size = cs.vocab_size
         total_freq = sum(self.lattice.concept_freq.values())
-        cs = self.cs
         T = len(ids)
 
         # ── Build pairs, group by gen_cid ──
@@ -541,7 +541,7 @@ class CrystalGenerator:
         if neg_samples > 0:
             for gen_cid, updates in gen_updates.items():
                 for prev_cid, elr in updates:
-                    neg_elr = elr * 0.1
+                    neg_elr = elr * neg_lr_ratio
                     v_ctx = cs.concept_vectors.get(prev_cid)
                     if v_ctx is None:
                         continue

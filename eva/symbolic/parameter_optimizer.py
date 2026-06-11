@@ -114,7 +114,7 @@ class ParameterOptimizer:
             'inh_sample':     Param('inh_sample',     100,    600,    200,    100),
             'context_window': Param('context_window', 1,      4,      2,      0.5),
             'theta_tau':      Param('theta_tau',      5,      30,     15,     2.0),
-            'neg_samples':    Param('neg_samples',    0,      5,      1,      0.5),
+            'neg_samples':    Param('neg_samples',    0,      5,      2,      0.5),
             'pmi_gate_min':   Param('pmi_gate_min',   0.05,   0.5,    0.20,   0.02),
             'decay_rate':     Param('decay_rate',      0.998,  0.9999, 0.9998, 0.00005),
         }

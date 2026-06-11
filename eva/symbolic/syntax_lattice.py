@@ -534,8 +534,13 @@ class SyntaxLattice:
         meta_kb = os.path.getsize(path) / 1024
         print(f"  Saved SyntaxLattice ({npz_kb/1024:.0f}MB npz + {meta_kb/1024:.1f}MB meta) to {path}")
 
-    def load(self, path):
-        """Load from hybrid binary+JSON format (also reads old monolithic JSON)."""
+    def load(self, path, load_ngrams=True):
+        """Load from hybrid binary+JSON format (also reads old monolithic JSON).
+
+        Args:
+            path: path to .json meta file
+            load_ngrams: if False, skip n-gram/skip2 loading (faster, for generation-only use)
+        """
         binary_path = path.replace('.json', '.lattice.npz')
         meta_path = path.replace('.json', '.meta.json')
 
@@ -581,30 +586,31 @@ class SyntaxLattice:
         # New binary format
         if os.path.exists(binary_path):
             npz = np.load(binary_path)
-            # N-grams
-            for n_str in [k for k in npz.files if k.startswith('prefixes_')]:
-                n = int(n_str.split('_')[1])
-                p_arr = npz[f'prefixes_{n}']
-                nexts = npz[f'nexts_{n}']
-                counts = npz[f'counts_{n}']
-                splits = npz[f'splits_{n}']
-                N = len(p_arr)
-                ng = {}
-                for i in range(N):
-                    pref = tuple(p_arr[i].tolist())
-                    start, end = splits[i], splits[i + 1]
-                    if end > start:
-                        ng[pref] = Counter(dict(zip(nexts[start:end].tolist(),
-                                                     counts[start:end].tolist())))
-                    else:
-                        ng[pref] = Counter()
-                self.ngrams[n] = ng
+            # N-grams (skip for generation-only mode)
+            if load_ngrams:
+                for n_str in [k for k in npz.files if k.startswith('prefixes_')]:
+                    n = int(n_str.split('_')[1])
+                    p_arr = npz[f'prefixes_{n}']
+                    nexts = npz[f'nexts_{n}']
+                    counts = npz[f'counts_{n}']
+                    splits = npz[f'splits_{n}']
+                    N = len(p_arr)
+                    ng = {}
+                    for i in range(N):
+                        pref = tuple(p_arr[i].tolist())
+                        start, end = splits[i], splits[i + 1]
+                        if end > start:
+                            ng[pref] = Counter(dict(zip(nexts[start:end].tolist(),
+                                                         counts[start:end].tolist())))
+                        else:
+                            ng[pref] = Counter()
+                    self.ngrams[n] = ng
             # concept_freq
             if 'cf_cids' in npz.files:
                 self.concept_freq = Counter(dict(zip(npz['cf_cids'].tolist(),
                                                      npz['cf_counts'].tolist())))
             # skip2
-            if 'sk_a' in npz.files:
+            if load_ngrams and 'sk_a' in npz.files:
                 sk_a = npz['sk_a']
                 sk_n = npz['sk_n']
                 sk_c = npz['sk_c']

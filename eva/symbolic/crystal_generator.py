@@ -448,8 +448,8 @@ class CrystalGenerator:
 
     # ── Training ───────────────────────────────────────────────
 
-    def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, pmi_gate_min=0.05, neg_samples=0,
-                        inh_strength=0.05, inh_threshold=0.35):
+    def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, pmi_gate_min=0.20, neg_samples=1,
+                        inh_strength=0.05, inh_threshold=0.10):
         """Train via PMI-gated context-window STDP, batched by unique gen_cid.
 
         Batch optimisation: groups all STDP updates for the same generator
@@ -491,6 +491,10 @@ class CrystalGenerator:
                 freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
 
                 pmi_w = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq, min_weight=pmi_gate_min) if pmi_gate else 1.0
+
+                # PMI filter: skip pairs with weak or negative PMI
+                if pmi_gate and pmi_w <= pmi_gate_min:
+                    continue
 
                 lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w
 

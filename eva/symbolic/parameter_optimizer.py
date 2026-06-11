@@ -109,13 +109,13 @@ class ParameterOptimizer:
             'full_lr':        Param('full_lr',        0.003,  0.15,   0.03,   0.10),
             'repel_strength': Param('repel_strength', 0.01,   0.20,   0.08,   0.05),
             'noise_scale':    Param('noise_scale',    0.0002, 0.01,   0.001,  0.05),
-            'inh_threshold':  Param('inh_threshold',  0.20,   0.60,   0.35,   0.05),
+            'inh_threshold':  Param('inh_threshold',  0.05,   0.30,   0.10,   0.05),
             'inh_strength':   Param('inh_strength',   0.01,   0.15,   0.05,   0.05),
             'inh_sample':     Param('inh_sample',     100,    600,    200,    100),
             'context_window': Param('context_window', 1,      4,      2,      0.5),
             'theta_tau':      Param('theta_tau',      5,      30,     15,     2.0),
-            'neg_samples':    Param('neg_samples',    0,      5,      0,      0.5),
-            'pmi_gate_min':   Param('pmi_gate_min',   0.05,   0.5,    0.1,    0.02),
+            'neg_samples':    Param('neg_samples',    0,      5,      1,      0.5),
+            'pmi_gate_min':   Param('pmi_gate_min',   0.05,   0.5,    0.20,   0.02),
             'decay_rate':     Param('decay_rate',      0.998,  0.9999, 0.9998, 0.00005),
         }
 
@@ -250,7 +250,7 @@ class ParameterOptimizer:
             if est_frac > 0.15:
                 p.shift(0.02)
                 changes['inh_threshold'] = p.current
-            elif est_frac < 0.01 and p.current > 0.25:
+            elif est_frac < 0.01 and p.current > 0.06:
                 p.shift(-0.02)
                 changes['inh_threshold'] = p.current
 

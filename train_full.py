@@ -153,6 +153,11 @@ if RESUME is not None:
     lattice.load(lat_path)
     print(f"  Loaded ConceptSpace ({len(cs.concept_vectors)} vectors)")
     print(f"  Loaded SyntaxLattice ({len(lattice.concept_freq)} concepts)")
+    # Rebuild H matrix + fields from loaded lattice
+    if not hasattr(cs, 'H') or cs.H is None:
+        print("  Rebuilding H matrix + PMI fields from loaded lattice...")
+        cs.build_anchor_matrix(lattice, n_anchors=1024, min_pmi=4.5)
+        cs.build_fields_from_lattice(lattice, min_pmi=4.5)
 
 else:
     print("\nInitializing ConceptSpace (32K fractal vectors @ 384D)...")
@@ -168,6 +173,13 @@ else:
     print(f"  done in {t1-t0:.1f}s")
     print(f"  n-gram prefixes: {[len(v) for v in lattice.ngrams.values()]}")
     print(f"  unique concepts: {len(lattice.concept_freq)}")
+
+    print("\nBuilding H matrix + PMI fields...")
+    t0 = time.time()
+    cs.build_anchor_matrix(lattice, n_anchors=1024, min_pmi=4.5)
+    cs.build_fields_from_lattice(lattice, min_pmi=4.5)
+    t1 = time.time()
+    print(f"  done in {t1-t0:.1f}s")
 
     # ── Diagnostics ────────────────────────────────────────────────
     # (functions defined unconditionally below; baseline run once)

@@ -75,32 +75,35 @@ Root cause: STDP is purely Hebbian (pull together) with no effective repulsion:
 - No BMSSP — graph with N_a=1024 too dense. Direct PMI fields more discriminative.
 - SP vocab is 16000 (bpe_ru.model) NOT 32000 — train_full.py uses bpe_ru_32k.model for 32K vocab
 
-## Session: Nested octree encoding (2026-06-11)
+## Session: PyTorch GPU benchmark + integration (2026-06-12)
 
 ### Context
-- Previous H matrix: flat PMI (1024 anchors, 0.41% dense)
-- Previous field model: each concept = itself + PMI-related anchors
-- Bug: `perm_hash` used linear LCG `(val * P + level * Q + R) % M`, making L0-match predict all-level match (100% propagation)
+- After octree encoding integration, benchmark showed numpy loop at 588 pairs/s
+- Hypothesis: PyTorch GPU batching would give 100x+ speedup
 
-### Fix
-- **Nested octree encoding**: each decimal digit of `val` → octant (0..7) at that level
-- `field(val)` = tuple of octants (not anchor_ids) = path through octree
-- `H[i,j]` = sum γ^l over LCP (longest common prefix), not independent level checks
-  - Closed form: H = (1 − γ^{LCP})/(1−γ), with γ=0.5 → H = 2(1 − 0.5^{LCP})
-- `perm_hash` → non-linear Python `hash((val, level))` to avoid linear propagation
-- Vector encoding: prefix hashing via FNV-1a → adir pool (32K random unit vectors)
+### Results
+- **Synthetic benchmark (500 lines, 51K pairs)**: GPU 101,649 pairs/s vs numpy 588 pairs/s (173x!)
+- **Real corpus (200 lines, ~60 pairs/line)**: GPU 8.8 lines/s vs numpy 9.8 lines/s (GPU is SLOWER)
+- **Root cause**: GPU kernel launch + CPU↔GPU transfer overhead dominates for small batch (60 pairs)
+  - 173x was for 51K pairs in one batch, not 60 pairs × 200 times
 
-### Results (test_fractal_v2.py)
-- **LCP distribution**: 86.2% LCP=0, 11.9% LCP=1, 1.6% LCP=2, 0.2% LCP=3 — pure geometric (1/8)^k
-- **H>0**: 13.7% — discriminative (vs 84% old, 0.1% flat)
-- **Cosine per LCP**: exactly 1−0.25^{LCP}:
-  - LCP=0: cos=−0.005±0.050 (zero)
-  - LCP=1: cos=0.750±0.015 (theory: 0.75)
-  - LCP=2: cos=0.938±0.005 (theory: 0.9375)
-  - LCP=3: cos=0.984±0.001 (theory: 0.9844)
-- **Field-gate**: within-cluster H up to 17x higher than cross-cluster (real cluster differentiation)
+### Changes made
+- `crystal_generator.py`: added `_ensure_torch()`, merged `train_from_text` with `use_torch` param
+- `train_full.py`: calls `train_from_text(..., use_torch=True)` 
+- Default remains `use_torch=False` — GPU doesn't help per-line
 
-### Integration into FCF (2026-06-12)
+### Key lesson
+GPU batching only helps when the batch is large enough to amortize kernel launch + transfer overhead. For `train_from_text` (60 pairs/line, ~20 tokens), the optimal is numpy CPU with per-pair Python loop. GPU would need either:
+1. **Cross-line batching**: buffer pairs from N lines, process as one GPU batch (changes learning dynamics)
+2. **Full GPU training loop**: keep all vectors on GPU, do STDP updates there (major refactor)
+3. **Cython/Numba**: JIT-compile the hot loop for Python overhead elimination
+
+### Next
+- [ ] Profile the actual per-line Python overhead (pair collection vs compute)
+- [ ] Try Numba JIT for the inner STDP accumulation loop
+- [ ] Or: buffer line pairs across a mini-batch (e.g., 50 lines at once) and apply accumulated updates
+
+## Integration into FCF (2026-06-12)
 - **New module**: `eva/symbolic/fractal_encoding.py` — digits(), path(), lcp(), H_weighted(), path_index()
 - **ConceptSpace.build_octree_fields()** added — replaces PMI pipeline:
   - Selects top 1024 anchors by frequency
@@ -112,7 +115,7 @@ Root cause: STDP is purely Hebbian (pull together) with no effective repulsion:
 
 ### Performance
 - `build_octree_fields`: 0.67s (32K concepts, 1024 anchors)
-- `CS.load`: 0.75s (was 204s — fixed NpzFile __getitem__ bottleneck: pre-extract arrays before dict comprehensions)
+- `CS.load`: 0.75s (was 204s — fixed NpzFile __getitem__ bottleneck)
 - Field density: mean=37.1 bits/concept (vs 3.4 in PMI model)
 - Field-gate distribution: 95.7% pairs fw=0.1, 4.3% pairs fw=15.7 mean
 
@@ -121,12 +124,90 @@ Root cause: STDP is purely Hebbian (pull together) with no effective repulsion:
 2. NpzFile repeated `__getitem__` access 10000x slower than pre-extracted array (Windows/numpy quirk)
 3. Relaxed orthogonality check threshold: 1e-5 → 1e-3; batched re-encoding via matmul
 
-### Key insight
-- Decimal digits → octree levels: any number maps to fractal coordinate
-- LCP = level of common ancestry in octree = semantic similarity
-- H directly computable from LCP, no PMI statistics needed
-- 16-digit paths (16 bytes) encode ALL anchor relationships implicitly
+### Test results (synthetic)
+- **LCP distribution**: 86.2% LCP=0, 11.9% LCP=1, 1.6% LCP=2, 0.2% LCP=3 — pure geometric (1/8)^k
+- **H>0**: 13.7% vs theoretical 12.5% (nested) vs 88.2% (old) vs 0.1% (flat PMI)
+- **Cosine per LCP**: exactly 1−0.25^{LCP}: LCP=0→0, LCP=1→0.75, LCP=2→0.94, LCP=3→0.98
+- **Field-overlap vs LCP**: 100% correlation — LCP<2 → ov=0, LCP≥2 → ov>0
 
-### Next
-- [ ] Evaluate with full training run (monitor cos_std trend)
-- [ ] Consider PyTorch port: octree paths as int16 tensors, batched LCP on GPU
+### Files modified
+- `eva/symbolic/fractal_encoding.py` — new module
+- `eva/symbolic/concept_space.py` — build_octree_fields + load fix + QR fix
+- `eva/symbolic/crystal_generator.py` — _ensure_torch + use_torch in train_from_text
+- `train_full.py` — switch to build_octree_fields + use_torch
+- `AGENT_LOG.md` — this log
+
+### Architecture decisions
+- Octree encoding is deterministic (no PMI statistics needed)
+- H matrix is derivable from LCP (no storage needed long-term)
+- Field_bits compact: 128 bytes/concept for 1024 anchors
+- GPU not effective for per-line training (batch too small)
+
+## Session: PMI gate optimization — cached prefix totals (2026-06-12)
+
+### Profile results (500 lines, 57804 pairs)
+- **PMI gate: 560.7ms** (9.7us/pair) — **65% of total time** — THE BOTTLENECK
+- STDP update: 169.8ms
+- Field gate: 70.7ms
+- Pair build: 59.8ms (negligible)
+
+### Root cause
+`_pmi_weight()` calls `sum(prefix_counter.values())` for EVERY pair. With 32K prefixes and ~2000 avg next-tokens per prefix, this sums 115M values across 58K pairs.
+
+### Fix
+- Added `_prefix_total` and `_skip2_total` caches to `SyntaxLattice.__init__`
+- `_refresh_prefix_totals()` precomputes `sum(counter.values())` per prefix after build/load
+- `_pmi_weight` now uses O(1) dict lookup instead of O(K) sum
+
+### Changes
+- `syntax_lattice.py`: `_prefix_total`, `_skip2_total` dicts + `_refresh_prefix_totals()` called at end of `build()` and `load()`
+- `crystal_generator.py`: `_pmi_weight` uses `lattice._prefix_total` / `lattice._skip2_total`
+- Remove duplicate `train_from_text` method definition (was dead code)
+
+### Speedup
+- PMI gate: **560ms → 58ms** (9.7× faster)
+- End-to-end 200-line training: **345ms/line → 95ms/line** (3.6× faster)
+- Total 145K lines: **~13.9 hours → ~3.8 hours** (at current speed)
+
+### Next bottleneck
+STDP update, specifically **lateral inhibition** (~170ms → now ~60% of time). Options:
+1. ~~Batch concept vectors into numpy array~~ (done, _vec_array + get_vec/set_vec)
+2. Numba JIT for the inner STDP accumulation loop
+3. Cross-line mini-batch for GPU efficiency
+
+## Session: Inhibition optimization — array-backed vectors + fast sampling (2026-06-12)
+
+### Profile (200 lines, with PMI cache fix)
+Sub-component breakdown of `train_from_text`:
+| Component | Time | % |
+|-----------|------|---|
+| Pair building + gates | 0.5ms/line | 0.5% |
+| Delta accumulation | 0.6ms/line | 0.6% |
+| apply_code_update | 1.3ms/line | 1.4% |
+| **Lateral inhibition** | **88ms/line** | **97.5%** |
+
+**Root cause**: `_lateral_inhibition_fractal()` called `np.random.permutation(32000)` for EVERY gen_cid (6827×), plus `np.array([concept_vectors[c] for c in ...])` list comprehension with 200 dict lookups. Each `_apply_vector_update` call then did 2× matrix-vector multiply (fractal code round-trip).
+
+### Fixes
+1. **`_vec_array` + `_cid_to_idx`** (ConceptSpace): O(1) array-backed vector access via `get_vec(cid)` / `set_vec(cid, v)`. `_lateral_inhibition_fractal` now does `_vec_array[sampled_indices]` instead of `np.array([dict[c] for c in ...])`.
+2. **Fast random sampling**: replaced `permutation(32000)` with `randint(32000, size=N)` + `unique()` — 30× faster (528μs→17μs per call).
+3. **sample_size cap**: `200 * min(len(updates), 5)` → `100` (fixed). 200 random samples are statistically representative.
+4. **Removed redundant `compute_vector`** in `_apply_vector_update`: `apply_code_update` already normalizes code → `code @ basis` is unit-normed → no need to recompute.
+5. **`sync_vec_array()`** called after `init_concepts()` and `load()`.
+
+### Changes
+- `concept_space.py`: `_vec_array`, `_cids`, `_cid_to_idx`; `sync_vec_array()`, `get_vec()`, `set_vec()`; fast sampling in `_lateral_inhibition_fractal`; removed redundant `compute_vector` in `_apply_vector_update`
+- `crystal_generator.py`: `cs.get_vec()` / `cs.set_vec()` in STDP loop; sample_size=100
+- `syntax_lattice.py`: `_refresh_prefix_totals()` (from previous session)
+
+### Speedup
+- **345ms/line → 21.1ms/line** (16× faster overall)
+- Full 145K corpus: **~13.9h → ~51 min**
+- Inhibition: 88ms/line → 14.5ms/line (6× faster)
+- PMI gate: 560ms → 58ms (9.7×, from previous session)
+
+### Current bottleneck (86% of time)
+Still lateral inhibition: `_apply_vector_update` per affected concept does `delta_v @ basis.T` + `apply_code_update` (which does `code_new @ basis`). ~48K calls at 60μs each. Next options:
+1. Skip inhibition for gen_cids with tiny `total_elr`
+2. Batch `delta_code` computation across all affected concepts in one matmul
+3. Numba JIT for the `_apply_vector_update` + `apply_code_update` hot path

@@ -405,6 +405,11 @@ class ConceptSpace:
         # Concept vectors (cid → np.array)
         self.concept_vectors = {}
 
+        # Array-backed vector access for O(1) lookups
+        self._vec_array = None      # (N, dim) float32
+        self._cids = []             # list of cids matching _vec_array rows
+        self._cid_to_idx = {}       # cid → row index in _vec_array
+
         # Random state
         self.rng = np.random.RandomState(42)
         self._inhibition_step = 0
@@ -438,6 +443,7 @@ class ConceptSpace:
                 v /= max(np.linalg.norm(v), 1e-10)
                 self.concept_vectors[cid] = v
         self._all_cids = list(self.concept_vectors.keys())
+        self.sync_vec_array()
         print(f"  Initialized {len(self.concept_vectors)} concepts via fractal")
 
     def _sync_concept_vectors_from_fractal(self):
@@ -447,6 +453,26 @@ class ConceptSpace:
             if v is not None:
                 self.concept_vectors[cid] = v
         self.mark_matrix_dirty()
+
+    def sync_vec_array(self):
+        """Build _vec_array from concept_vectors dict for O(1) array access."""
+        self._cids = list(self.concept_vectors.keys())
+        self._cid_to_idx = {cid: i for i, cid in enumerate(self._cids)}
+        self._vec_array = np.array([self.concept_vectors[cid] for cid in self._cids], dtype=np.float32)
+
+    def get_vec(self, cid):
+        """O(1) vector access via array index, fall back to dict."""
+        idx = self._cid_to_idx.get(cid)
+        if idx is not None:
+            return self._vec_array[idx]
+        return self.concept_vectors.get(cid)
+
+    def set_vec(self, cid, v):
+        """Update vector in both dict and array."""
+        self.concept_vectors[cid] = v
+        idx = self._cid_to_idx.get(cid)
+        if idx is not None:
+            self._vec_array[idx] = v
 
     def reinit_fractal(self, cid_list=None):
         """Reinitialize all fractal latent codes (resets all vectors)."""
@@ -571,7 +597,7 @@ class ConceptSpace:
 
     # ── Octree encoding ──────────────────────────────────────
 
-    def build_octree_fields(self, lattice, n_anchors=1024, min_lcp=2, gamma=0.5):
+    def build_octree_fields(self, lattice, n_anchors=1024, min_lcp=2, gamma=0.5, path_overrides=None):
         """Build H matrix and field_bits from nested octree encoding.
 
         Replaces PMI-based build_anchor_matrix + build_fields_from_lattice.
@@ -585,6 +611,8 @@ class ConceptSpace:
             n_anchors: number of anchor concepts (top by frequency)
             min_lcp: minimum LCP for field_bits (2 → only LCP≥2 anchors)
             gamma: octree weight decay
+            path_overrides: dict {cid: tuple_path} for custom octree paths
+                           (e.g. from MorphVocab for morphological encoding)
 
         Sets:
             self.H: scipy.sparse.csr_matrix (n, n) of H values
@@ -594,7 +622,12 @@ class ConceptSpace:
         import numpy as np
         from scipy.sparse import csr_matrix
         from collections import defaultdict
-        from eva.symbolic.fractal_encoding import path as octree_path, H_weighted
+        from eva.symbolic.fractal_encoding import path as octree_path_default, H_weighted
+
+        def get_path(cid):
+            if path_overrides and cid in path_overrides:
+                return path_overrides[cid]
+            return octree_path_default(cid)
 
         # 1. Select anchors (top by frequency)
         sorted_cids = sorted(lattice.concept_freq.keys(),
@@ -605,7 +638,7 @@ class ConceptSpace:
         self.n_anchors = n_anchors
 
         # 2. Precompute octree paths for anchors
-        anchor_paths = [octree_path(cid) for cid in anchor_ids]
+        anchor_paths = [get_path(cid) for cid in anchor_ids]
 
         # 3. Build H matrix (CSR) from H_weighted
         rows, cols, vals = [], [], []
@@ -636,7 +669,7 @@ class ConceptSpace:
 
         active_counts = []
         for cid in seen_cids:
-            cp = octree_path(cid)
+            cp = get_path(cid)
             prefix = cp[:min_lcp]
             indices = prefix_to_anchors.get(prefix, [])
             bits = bytearray(n_bytes)
@@ -715,10 +748,10 @@ class ConceptSpace:
             if v_old is not None:
                 init_code = v_new @ self.fractal.basis.T
                 self.fractal.codes[cid] = init_code
-            self.concept_vectors[cid] = v_new
+            self.set_vec(cid, v_new)
             return
         if v_old is None:
-            self.concept_vectors[cid] = v_new
+            self.set_vec(cid, v_new)
             return
 
         delta_v = v_new - v_old
@@ -730,20 +763,15 @@ class ConceptSpace:
             nv = np.linalg.norm(v_new)
             if nv > 1e-10:
                 v_new /= nv
-            self.concept_vectors[cid] = v_new
+            self.set_vec(cid, v_new)
             shift = max_shift
 
         self._total_shift += shift
         self._update_count += 1
 
-        # Subspace-aware code update via FractalField
+        # Subspace-aware code update via FractalField (code normalized internally)
         delta_code = delta_v @ self.fractal.basis.T
         self.fractal.apply_code_update(cid, delta_code)
-
-        # Recompute vector from code to ensure perfect consistency
-        v_recomp = self.fractal.compute_vector(cid)
-        if v_recomp is not None:
-            self.concept_vectors[cid] = v_recomp
 
         self._matrix_dirty = True
 
@@ -812,35 +840,33 @@ class ConceptSpace:
         and does not follow the geodesic — fixed.
 
         Inner loop over sampled concepts is vectorised (numpy batch ops).
+        Uses _vec_array for O(1) array-backed gather.
         """
         v_win = self.concept_vectors.get(winner_cid)
         if v_win is None:
             return
         vw_n = v_win / max(np.linalg.norm(v_win), 1e-10)
 
-        n_total = len(self.concept_vectors)
         if sample_size is None:
-            sample_size = min(200, n_total)
+            sample_size = min(200, len(self.concept_vectors))
 
-        cids = self._all_cids
+        cids = self._cids if hasattr(self, '_cids') and self._cids else self._all_cids
         n_cids = len(cids)
         if n_cids <= 1:
             return
 
         if not hasattr(self, '_inhibit_rng'):
             self._inhibit_rng = np.random.RandomState(42)
-        perm = self._inhibit_rng.permutation(n_cids)
-        sampled_cids = []
-        for i in perm:
-            if cids[i] != winner_cid:
-                sampled_cids.append(cids[i])
-                if len(sampled_cids) >= sample_size:
-                    break
-        if not sampled_cids:
+        # Fast: randint + unique avoids full permutation (30x faster)
+        raw = self._inhibit_rng.randint(0, n_cids, size=sample_size + 50)
+        u_idxs = np.unique(raw)
+        sampled_indices = [i for i in u_idxs if cids[i] != winner_cid][:sample_size]
+        if len(sampled_indices) < 1:
             return
 
-        # Batch: gather all sampled vectors, compute sims, threshold, repel
-        sampled_vecs = np.array([self.concept_vectors[c] for c in sampled_cids], dtype=np.float32)
+        # Array-backed gather: O(sample_size) instead of dict lookups + array creation
+        sampled_vecs = self._vec_array[sampled_indices]  # (S, dim)
+        sampled_cids = [cids[i] for i in sampled_indices]
         sims = np.dot(sampled_vecs, vw_n)
         mask = sims > threshold
         if not np.any(mask):
@@ -1425,6 +1451,7 @@ class ConceptSpace:
         else:
             obj.init_homeostasis()
         obj._all_cids = list(obj.concept_vectors.keys())
+        obj.sync_vec_array()
         pq_note = ' (PQ)' if data.get('pq') else ''
         print(f"  Loaded ConceptSpace: {len(obj.concept_vectors)} concepts @ {obj.dim}D{pq_note}")
         return obj

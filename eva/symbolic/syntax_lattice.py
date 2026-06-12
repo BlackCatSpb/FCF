@@ -89,6 +89,10 @@ class SyntaxLattice:
         # PPMI cache (lazy, built on first use_ppmi=True call)
         self._ppmi_cache = None
 
+        # Prefix total caches: sum(prefix_counter.values()) O(1) instead of O(K)
+        self._prefix_total = {}  # prefix_tuple -> int (total count)
+        self._skip2_total = {}   # prev_cid -> int (total count)
+
     def build(self, corpus_path, sp, max_n=4, min_count=2):
         """Build n-gram model from corpus via SentencePiece.
 
@@ -133,7 +137,17 @@ class SyntaxLattice:
             n_unique = sum(len(counter) for counter in self.ngrams[n].values())
             print(f"    {n}-grams: {len(self.ngrams[n])} prefixes, {n_unique} unique transitions")
         print(f"    connections: {len(self.connections)}")
+        self._refresh_prefix_totals()
         return self
+
+    def _refresh_prefix_totals(self):
+        """Precompute sum(counter.values()) for each prefix for O(1) PMI denominator."""
+        self._prefix_total = {}
+        for prefix, counter in self.ngrams[2].items():
+            self._prefix_total[prefix] = sum(counter.values())
+        self._skip2_total = {}
+        for cid, counter in self.skip2.items():
+            self._skip2_total[cid] = sum(counter.values())
 
     def predict(self, context_concepts: List[int], n_orders=None) -> List:
         """Predict next concept from n-gram lattice.
@@ -716,6 +730,7 @@ class SyntaxLattice:
 
         print(f"  Loaded SyntaxLattice: {[len(v) for v in self.ngrams.values()]} prefixes, "
               f"{len(self.connections)} connections")
+        self._refresh_prefix_totals()
         return self
 
 

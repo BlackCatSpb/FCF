@@ -27,3 +27,4 @@ real_data/gen_*.py
 real_data/conceptnet/
 checkpoints/
 *.npy
+eva/real_data/

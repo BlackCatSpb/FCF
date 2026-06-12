@@ -15,6 +15,7 @@ Key simplifications vs old architecture:
 import math, random
 import numpy as np
 from collections import Counter
+import torch
 
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.hormonal_system import HormonalSystem
@@ -27,11 +28,12 @@ _EOS_ID = 2
 class CrystalGenerator:
     """Generation as semantic navigation through BPE-token concept space."""
 
-    def __init__(self, cs, sp, lattice, config=None):
+    def __init__(self, cs, sp, lattice, config=None, morph_vocab=None):
         self.cs = cs
         self.sp = sp
         self.lattice = lattice
         self.config = config or {}
+        self.morph_vocab = morph_vocab
 
         self.beam_width = self.config.get('beam_width', 5)
         self.max_words = self.config.get('max_words', 30)
@@ -45,6 +47,50 @@ class CrystalGenerator:
         self.cs.init_homeostasis()
         self.branch_rngs = {}
         self.hormones = HormonalSystem()
+
+        # Torch state (lazy init)
+        self._torch_device = None
+        self._torch_cid_order = []
+        self._torch_cid_to_idx = {}
+        self._vecs_t = None
+        self._fb_t = None
+        self._basis_t = None
+
+    def _ensure_torch(self, device=None):
+        """Precompute GPU tensors for batched training."""
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if self._torch_device == torch.device(device) and self._vecs_t is not None:
+            return
+
+        cs = self.cs
+        if getattr(cs.fractal, 'codes', None) is None:
+            return
+
+        cids = sorted(cs.fractal.codes.keys())
+        self._torch_cid_order = cids
+        self._torch_cid_to_idx = {cid: i for i, cid in enumerate(cids)}
+        self._torch_device = torch.device(device)
+
+        codes = np.stack([cs.fractal.codes[cid] for cid in cids])
+        vecs = codes @ cs.fractal.basis
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        vecs /= norms
+
+        self._vecs_t = torch.from_numpy(vecs.astype(np.float32)).to(device)
+        self._basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(device)
+
+        # Field bits
+        n_bytes = (getattr(cs, 'n_anchors', 1024) + 7) // 8
+        fb_list = []
+        for cid in cids:
+            fb = cs.fractal.field_bits.get(cid)
+            if fb is None:
+                fb_list.append(np.zeros(n_bytes, dtype=np.uint8))
+            else:
+                fb_list.append(fb)
+        self._fb_t = torch.from_numpy(np.stack(fb_list)).to(device)
 
     # ── Temperature ────────────────────────────────────────────
 
@@ -76,7 +122,10 @@ class CrystalGenerator:
         return self.sp.decode(token_ids)
 
     def _token_text(self, cid):
-        return self.sp.IdToPiece(cid)
+        try:
+            return self.sp.IdToPiece(cid)
+        except IndexError:
+            return f'[CID{cid}]'
 
     def _is_semantic_token(self, cid):
         """Filter function words and punctuation that dominate graph connections."""
@@ -439,18 +488,17 @@ class CrystalGenerator:
             return 0.1
 
         if distance == 1:
-            n2 = self.lattice.ngrams[2]
-            prefix_counter = n2.get((prev_cid,))
+            prefix_counter = self.lattice.ngrams[2].get((prev_cid,))
             if not prefix_counter:
                 return 0.1
             count_pair = prefix_counter.get(next_cid, 0)
-            count_prev = sum(prefix_counter.values())
+            count_prev = self.lattice._prefix_total.get((prev_cid,), 0)
         elif distance == 2:
             skip2 = self.lattice.skip2.get(prev_cid)
             if not skip2:
                 return 0.1
             count_pair = skip2.get(next_cid, 0)
-            count_prev = sum(skip2.values())
+            count_prev = self.lattice._skip2_total.get(prev_cid, 0)
         else:
             return 0.1
 
@@ -468,33 +516,36 @@ class CrystalGenerator:
     # ── Training ───────────────────────────────────────────────
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, pmi_gate_min=0.20, neg_samples=1,
-                        inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True):
-        """Train via PMI-gated context-window STDP, batched by unique gen_cid.
+                        inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=False):
+        """Train via PMI-gated context-window STDP with optional GPU batching.
 
-        Batch optimisation: groups all STDP updates for the same generator
-        concept into a single combined gradient + code projection + lateral
-        inhibition call. Preserves directional forward-only STDP and PMI
-        gating; only the per-cid update batching changes from sequential
-        (online) to summed (mini-batch) within each line — O(lr^2) difference.
-
-        Each token pulls toward nearby tokens weighted by exponential
-        distance decay AND pointwise mutual information. Generic
-        transitions (low PMI) get minimal pull — only specific,
-        statistically surprising co-occurrences shape the vectors.
+        Same STDP logic as train_from_text, but with GPU batched compute
+        for the hot path (dot products, field overlaps, negative sampling checks).
         """
+        if use_torch:
+            self._ensure_torch()
+            if self._vecs_t is None:
+                use_torch = False  # fallback to numpy
+
         ids = self._encode_input(text)
         if len(ids) < 2:
             return 0
 
         base_lr = base_lr if base_lr is not None else getattr(self, 'train_lr', 0.01)
         cs = self.cs
-        vocab_size = cs.vocab_size
-        total_freq = sum(self.lattice.concept_freq.values())
+        total_freq = max(sum(self.lattice.concept_freq.values()), 1)
         T = len(ids)
+        device = self._torch_device if use_torch else None
+        cid_to_idx = self._torch_cid_to_idx if use_torch else {}
 
         # ── Build pairs, group by gen_cid ──
         from collections import defaultdict
-        gen_updates = defaultdict(list)  # gen_cid -> [(prev_cid, lr), ...]
+        gen_updates = defaultdict(list)
+
+        # Collect indices for GPU batch
+        gpu_ctx_l = []   # tensor indices for GPU
+        gpu_tgt_l = []
+        gpu_meta_l = []  # (i, j, pmi_w, dist_weight, freq_weight) for STDP
 
         for i in range(T):
             start = max(0, i - context_window)
@@ -509,26 +560,59 @@ class CrystalGenerator:
                 fb = self.lattice.concept_freq.get(ids[j], 0)
                 freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
 
-                pmi_w = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq, min_weight=pmi_gate_min) if pmi_gate else 1.0
+                pmi_w = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq,
+                                         min_weight=pmi_gate_min) if pmi_gate else 1.0
 
-                # PMI filter: skip pairs with weak or negative PMI
                 if pmi_gate and pmi_w <= pmi_gate_min:
                     continue
 
-                # Field gate: modulate learning rate by field overlap
-                field_weight = 1.0
-                if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
-                    overlap = cs.fractal.field_overlap(ids[i], ids[j])
-                    if overlap > 0:
-                        field_weight = 1.0 + math.log(overlap + 1) * 2.0
-                    else:
-                        field_weight = 0.1  # low but non-zero — allows new connections to form
+                if use_torch:
+                    ci = cid_to_idx.get(ids[i])
+                    cj = cid_to_idx.get(ids[j])
+                    if ci is None or cj is None:
+                        continue
+                    gpu_ctx_l.append(ci)
+                    gpu_tgt_l.append(cj)
+                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight))
+                else:
+                    # Field gate
+                    field_weight = 1.0
+                    if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
+                        overlap = cs.fractal.field_overlap(ids[i], ids[j])
+                        field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
 
-                lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
+                    lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
+                    theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
+                    gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
-                # Theta rhythm modulates by position (word_num=j)
-                theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
-                gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
+        # ── GPU batch: compute sims + field_overlaps ──
+        if use_torch and gpu_ctx_l:
+            ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
+            tgt_t = torch.tensor(gpu_tgt_l, dtype=torch.long, device=device)
+
+            with torch.no_grad():
+                v_ctx = self._vecs_t[ctx_t]
+                v_tgt = self._vecs_t[tgt_t]
+                sims = (v_ctx * v_tgt).sum(dim=1)
+
+                if field_gate and self._fb_t is not None:
+                    ctx_fb = self._fb_t[ctx_t]
+                    tgt_fb = self._fb_t[tgt_t]
+                    ovs = (ctx_fb & tgt_fb).sum(dim=1).cpu().numpy()
+                else:
+                    ovs = np.zeros(len(gpu_ctx_l), dtype=np.int64)
+
+                if base_lr is None:
+                    base_lr_val = 0.01
+                else:
+                    base_lr_val = base_lr
+
+                for pi, (i, j, pmi_w, dw, fw) in enumerate(gpu_meta_l):
+                    overlap = int(ovs[pi])
+                    field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
+                    lr = base_lr_val * max(fw, 0.05) * dw * pmi_w * field_weight
+                    theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
+                    gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
         # ── One combined STDP update per unique gen_cid ──
         for gen_cid, updates in gen_updates.items():
@@ -551,7 +635,6 @@ class CrystalGenerator:
             if nv > 1e-10:
                 v_new /= nv
 
-            # Project vector delta back to latent for subspace-aware update
             code = cs.fractal.codes.get(gen_cid)
             if code is not None:
                 delta_v = v_new - v_gen
@@ -563,43 +646,85 @@ class CrystalGenerator:
                                               lr_a=1.0 * lr_mod,
                                               lr_m=0.1 * lr_mod)
             else:
-                cs.concept_vectors[gen_cid] = v_new
+                cs.set_vec(gen_cid, v_new)
                 lr_mod = 1.0; th_mod = 0.0
 
-            # Lateral inhibition with meta-modulated threshold
             eff_th = inh_threshold * (1.0 + th_mod * 0.5)
             cs._lateral_inhibition_fractal(
                 gen_cid,
                 strength=inh_strength * total_elr,
                 threshold=max(eff_th, 0.01),
-                sample_size=min(200 * min(len(updates), 5), len(cs.concept_vectors)),
+                sample_size=min(100, len(cs.concept_vectors)),
             )
             cs.mark_matrix_dirty()
 
-        # ── Negative sampling (fixed: push random token AWAY from context) ──
-        # Original fractal_stdp had a bug: Step 1 pulled neg_cid toward ctx at 20x
-        # the strength of Step 2's push-away — net pull at 95%.  Now does one
-        # clean push-away via the negative Riemannian gradient.
-        if neg_samples > 0:
-            for gen_cid, updates in gen_updates.items():
-                for prev_cid, elr in updates:
-                    neg_elr = elr * neg_lr_ratio
-                    v_ctx = cs.concept_vectors.get(prev_cid)
+        # ── Negative sampling ──
+        if neg_samples > 0 and use_torch and self._vecs_t is not None and gpu_ctx_l:
+            # GPU batched negative sampling
+            n_pairs = len(gpu_ctx_l)
+            n_total = n_pairs * neg_samples
+
+            ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
+            tgt_t = torch.tensor(gpu_tgt_l, dtype=torch.long, device=device)
+
+            with torch.no_grad():
+                neg_idxs = torch.randint(0, len(self._torch_cid_order),
+                                         (n_pairs, neg_samples), device=device)
+
+                if field_gate and self._fb_t is not None:
+                    ctx_fb = self._fb_t[ctx_t]  # (n_pairs, 128)
+                    neg_fb = self._fb_t[neg_idxs]  # (n_pairs, neg_samples, 128)
+                    neg_ovs = (ctx_fb.unsqueeze(1) & neg_fb).sum(dim=2)  # (n_pairs, neg_samples)
+                    neg_ovs_cpu = neg_ovs.cpu().numpy()
+                else:
+                    neg_ovs_cpu = np.zeros((n_pairs, neg_samples), dtype=np.int64)
+
+                for pi, (i, j, pmi_w, dw, fw) in enumerate(gpu_meta_l):
+                    neg_elr = base_lr * max(fw, 0.05) * dw * pmi_w * neg_lr_ratio
+                    theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
+                    neg_elr *= max(theta_gate, 0.1)
+
+                    v_ctx = cs.concept_vectors.get(ids[i])
                     if v_ctx is None:
                         continue
-                    for _ in range(neg_samples):
-                        neg_cid = cs.rng.randint(0, vocab_size)
+
+                    for ni in range(neg_samples):
+                        if field_gate and neg_ovs_cpu[pi, ni] > 0:
+                            continue  # same field — allow similarity
+
+                        neg_idx = int(neg_idxs[pi, ni].item())
+                        neg_cid = self._torch_cid_order[neg_idx]
                         v_neg = cs.concept_vectors.get(neg_cid)
                         if v_neg is None:
                             continue
-                        # Field gate: don't push away if they share field bits
+
+                        y = max(float(np.dot(v_neg, v_ctx)), 0.05)
+                        shift = (y * v_neg - v_ctx) * neg_elr
+                        v_new = v_neg + shift
+                        nv = np.linalg.norm(v_new)
+                        if nv > 1e-10:
+                            v_new /= nv
+                        cs._apply_vector_update(neg_cid, v_new)
+
+        elif neg_samples > 0:
+            # Original negative sampling (non-torch path)
+            for gen_cid, updates in gen_updates.items():
+                for prev_cid, elr in updates:
+                    neg_elr = elr * neg_lr_ratio
+                    v_ctx = cs.get_vec(prev_cid)
+                    if v_ctx is None:
+                        continue
+                    for _ in range(neg_samples):
+                        neg_cid = cs.rng.randint(0, cs.vocab_size)
+                        v_neg = cs.get_vec(neg_cid)
+                        if v_neg is None:
+                            continue
                         if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
                             neg_overlap = cs.fractal.field_overlap(prev_cid, neg_cid)
                             if neg_overlap > 0:
-                                continue  # same semantic field — allow similarity
-                        # Push away from context via negative Riemannian gradient
+                                continue
                         y = max(float(np.dot(v_neg, v_ctx)), 0.05)
-                        shift = (y * v_neg - v_ctx) * neg_elr  # -∇_R = -(v_ctx - y*v_neg)
+                        shift = (y * v_neg - v_ctx) * neg_elr
                         v_new = v_neg + shift
                         nv = np.linalg.norm(v_new)
                         if nv > 1e-10:

@@ -18,9 +18,15 @@ from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 from eva.symbolic.parameter_optimizer import ParameterOptimizer
 from eva.symbolic.vector_health import check_antonym_collapse
+from eva.symbolic.fcf_config import FCFConfig, MetricPair
+
+# ── Config ──────────────────────────────────────────────────────
+CFG = FCFConfig()
+os.makedirs(CFG.data_dir, exist_ok=True)
+os.makedirs(CFG.vis_dir, exist_ok=True)
 
 # Redirect stdout to UTF-8 log file (terminal cp1251 can't print ▁)
-LOG_FILE = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\train_log.txt'
+LOG_FILE = CFG.log_path
 _log_fh = open(LOG_FILE, 'w', encoding='utf-8')
 
 class TeeOut:
@@ -38,54 +44,45 @@ class TeeOut:
 
 sys.stdout = TeeOut()
 
-CORPUS = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\full_corpus_ru.txt'
-BPE_MODEL = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\bpe_ru_32k.model'
-CS_PATH = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\concept_space.json'
-LATTICE_PATH = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\syntax_lattice.json'
-CKPT_STATE_PATH = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\checkpoint_state.json'
-STATUS_JSON = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\_train_status.json'
+sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
+V = sp.vocab_size()
+
+# ── Helpers ─────────────────────────────────────────────────────
 
 def save_checkpoint_state(line_idx):
-    """Write a tiny JSON tracking current training line."""
-    with open(CKPT_STATE_PATH + '.tmp', 'w', encoding='utf-8') as f:
+    with open(CFG.ckpt_state_path + '.tmp', 'w', encoding='utf-8') as f:
         json.dump({'line': line_idx, 'timestamp': time.time()}, f)
-    os.replace(CKPT_STATE_PATH + '.tmp', CKPT_STATE_PATH)
+    os.replace(CFG.ckpt_state_path + '.tmp', CFG.ckpt_state_path)
 
 def load_checkpoint_state():
-    """Return line number from checkpoint_state.json, or None."""
-    if os.path.exists(CKPT_STATE_PATH):
-        with open(CKPT_STATE_PATH, 'r', encoding='utf-8') as f:
+    if os.path.exists(CFG.ckpt_state_path):
+        with open(CFG.ckpt_state_path, 'r', encoding='utf-8') as f:
             return json.load(f).get('line')
     return None
 
-def cleanup_old_checkpoints(keep=2):
-    """Delete old numbered checkpoint files, keeping the `keep` most recent by mtime."""
+def cleanup_old_checkpoints(keep=None):
+    if keep is None:
+        keep = CFG.cleanup_keep
     import re
-    base_dir = os.path.dirname(CS_PATH)
+    base_dir = CFG.data_dir
     files = []
     for p in glob.glob(os.path.join(base_dir, 'concept_space_*k.json')):
         m = re.search(r'_(\d+)k\.json$', os.path.basename(p))
         if m:
             files.append((p, os.path.getmtime(p), int(m.group(1))))
-    # Sort by mtime descending — keep most recently saved
     files.sort(key=lambda x: -x[1])
     files = files[:keep]
-    keep_ks = set(f[2] for f in files)  # k values to keep
+    keep_ks = set(f[2] for f in files)
     for p in glob.glob(os.path.join(base_dir, 'concept_space_*k.json')):
         m = re.search(r'_(\d+)k\.json$', os.path.basename(p))
         if m and int(m.group(1)) not in keep_ks:
-            stem = m.group(0)  # e.g. '12k.json'
-            k_label = stem.replace('.json', '')  # '12k'
+            k_label = m.group(0).replace('.json', '')
             for ext in ['.json', '.codes.npz', '.opt.json']:
                 fp = os.path.join(base_dir, f'concept_space_{k_label}{ext}')
-                if os.path.exists(fp):
-                    os.remove(fp)
+                if os.path.exists(fp): os.remove(fp)
             for ext in ['.json', '.lattice.npz', '.meta.json']:
                 fp = os.path.join(base_dir, f'syntax_lattice_{k_label}{ext}')
-                if os.path.exists(fp):
-                    os.remove(fp)
-sp = spm.SentencePieceProcessor(model_file=BPE_MODEL)
-V = sp.vocab_size()
+                if os.path.exists(fp): os.remove(fp)
 print(f"vocab_size = {V}")
 
 # ── Parse args ──────────────────────────────────────────────────
@@ -101,81 +98,84 @@ if FAST:
     print("FAST mode: base_lr=0.15, neg_samples=3, pmi_gate=off, decay_every=250, eval_every=1000")
 
 if RESUME is not None:
-    # --resume without arg: auto from checkpoint_state + numbered checkpoint
     if RESUME == '':
         rl = load_checkpoint_state()
         if rl is None:
             print("No checkpoint_state.json found. Use --resume Nk to pick a numbered checkpoint.")
             sys.exit(1)
         resume_line = rl
-        # Map line number to checkpoint name (e.g. 9000 -> '9k')
         ckpt_k = resume_line // 1000
         resume_tag = f"{ckpt_k}k"
         print(f"\nAuto-resuming from line {resume_line} (checkpoint_state.json) — loading {resume_tag}")
-
-        cs_path = CS_PATH.replace('.json', f'_{resume_tag}.json')
-        lat_path = LATTICE_PATH.replace('.json', f'_{resume_tag}.json')
-        lat_npz = lat_path.replace('.json', '.lattice.npz')
-        lat_ok = os.path.exists(lat_path) or os.path.exists(lat_npz)
+        cs_path = CFG.cs_path.replace('.json', f'_{resume_tag}.json')
+        lat_path = CFG.lattice_path.replace('.json', f'_{resume_tag}.json')
+        lat_ok = os.path.exists(lat_path) or os.path.exists(lat_path.replace('.json', '.lattice.npz'))
         if not os.path.exists(cs_path) or not lat_ok:
-            print(f"Checkpoint {resume_tag} not found: {cs_path} / {lat_npz}")
-            # Fallback: try base paths
-            cs_path = CS_PATH
-            lat_path = LATTICE_PATH
-            lat_npz = lat_path.replace('.json', '.lattice.npz')
-            if not os.path.exists(cs_path) or not (os.path.exists(lat_path) or os.path.exists(lat_npz)):
+            print(f"Checkpoint {resume_tag} not found: {cs_path} / {lat_path}")
+            cs_path = CFG.cs_path
+            lat_path = CFG.lattice_path
+            if not os.path.exists(cs_path) or not os.path.exists(lat_path.replace('.json', '.lattice.npz')):
                 print(f"Base checkpoint also not found. Giving up.")
                 sys.exit(1)
             resume_tag = 'base'
             print(f"  (fallback to base paths)")
     else:
-        # --resume Nk: numbered checkpoint (backward compat)
         resume_tag = RESUME
         r = RESUME.lower().rstrip('k')
-        try:
-            resume_line = int(r) * 1000
+        try: resume_line = int(r) * 1000
         except ValueError:
             print(f"Invalid resume value: {RESUME}")
             sys.exit(1)
         print(f"\nResuming from numbered checkpoint '{RESUME}' (line {resume_line})")
-
-        cs_path = CS_PATH.replace('.json', f'_{RESUME}.json')
-        lat_path = LATTICE_PATH.replace('.json', f'_{RESUME}.json')
-        lat_npz = lat_path.replace('.json', '.lattice.npz')
-        lat_ok = os.path.exists(lat_path) or os.path.exists(lat_npz)
-        cs_ok = os.path.exists(cs_path)
-        if not cs_ok or not lat_ok:
-            print(f"Checkpoint not found: {cs_path} / {lat_npz} (cs_ok={cs_ok}, lat_ok={lat_ok})")
+        cs_path = CFG.cs_path.replace('.json', f'_{RESUME}.json')
+        lat_path = CFG.lattice_path.replace('.json', f'_{RESUME}.json')
+        if not os.path.exists(cs_path) or not (os.path.exists(lat_path) or os.path.exists(lat_path.replace('.json', '.lattice.npz'))):
+            print(f"Checkpoint not found: {cs_path} / {lat_path}")
             sys.exit(1)
 
     cs = ConceptSpace.load(cs_path)
     lattice = SyntaxLattice()
-    lattice.load(lat_path)
+    load_ng = not FAST
+    lattice.load(lat_path, load_ngrams=load_ng)
+    ng_info = f" ({[len(v) for v in lattice.ngrams.values()]} prefixes)" if load_ng else " (ngrams skipped)"
     print(f"  Loaded ConceptSpace ({len(cs.concept_vectors)} vectors)")
-    print(f"  Loaded SyntaxLattice ({len(lattice.concept_freq)} concepts)")
-    # Rebuild H matrix + fields from loaded lattice
+    print(f"  Loaded SyntaxLattice ({len(lattice.concept_freq)} concepts{ng_info})")
+
+    from eva.symbolic.morph_vocab import MorphVocab
+    mv = MorphVocab.load(CFG.morph_vocab_path, sp_model_path=CFG.bpe_model_path)
+    path_overrides = mv.get_path_overrides()
     if not hasattr(cs, 'H') or cs.H is None:
         print("  Rebuilding H matrix + octree fields from loaded lattice...")
-        cs.build_octree_fields(lattice, n_anchors=1024, min_lcp=2, gamma=0.5)
+        cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
+                               gamma=CFG.octree_gamma, path_overrides=path_overrides)
 
 else:
-    print("\nInitializing ConceptSpace (32K fractal vectors @ 384D)...")
-    cs = ConceptSpace(vocab_size=V, dim=384)
+    print(f"\nInitializing ConceptSpace ({V} fractal vectors @ {CFG.dim}D)...")
+    cs = ConceptSpace(vocab_size=V, dim=CFG.dim)
     cs.init_concepts()
     cs.init_homeostasis()
+
+    from eva.symbolic.morph_vocab import MorphVocab
+    print("\nLoading MorphVocab...")
+    t0 = time.time()
+    mv = MorphVocab.load(CFG.morph_vocab_path, sp_model_path=CFG.bpe_model_path)
+    t1 = time.time()
+    path_overrides = mv.get_path_overrides()
+    print(f"  loaded in {t1-t0:.1f}s: {len(mv.word_cache)} words, {len(path_overrides)} path overrides")
 
     print("\nBuilding SyntaxLattice from full corpus...")
     lattice = SyntaxLattice()
     t0 = time.time()
-    lattice.build(CORPUS, sp, max_n=4)
+    lattice.build(CFG.corpus_path, sp, max_n=CFG.max_n)
     t1 = time.time()
     print(f"  done in {t1-t0:.1f}s")
     print(f"  n-gram prefixes: {[len(v) for v in lattice.ngrams.values()]}")
     print(f"  unique concepts: {len(lattice.concept_freq)}")
 
-    print("\nBuilding H matrix + octree fields...")
+    print("\nBuilding H matrix + octree fields (morph-aware)...")
     t0 = time.time()
-    cs.build_octree_fields(lattice, n_anchors=1024, min_lcp=2, gamma=0.5)
+    cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
+                           gamma=CFG.octree_gamma, path_overrides=path_overrides)
     t1 = time.time()
     print(f"  done in {t1-t0:.1f}s")
 
@@ -221,73 +221,63 @@ def pair_sim(cs, sp, a, b):
 
 # ── Baseline ────────────────────────────────────────────────────
 
+# ── Metric pairs (from config) ──────────────────────────────────
+CFG.build_metric_pairs(morph_vocab=mv, lattice=lattice, sp=sp)
+pairs_to_track = [(p.a, p.b) for p in CFG.eval_pairs if p.label in ('antonym', 'morph')]
+_live_pairs = [(p.a, p.b) for p in CFG.live_pairs]
+
 if RESUME is None:
     mean_sim, std_sim = mean_cosine_sim(cs)
     print(f"  mean cosine sim: {mean_sim:.4f} ± {std_sim:.4f}")
     ok, total = check_consistency(cs)
     print(f"  code-vector consistency: {ok}/{total}")
-    pairs_to_track = [('соба', 'ка'), ('ко', 'шка'), ('человек', 'а'),
-                      ('человек', 'война'), ('князь', 'Андрей')]
-    for a, b in pairs_to_track:
+    for a, b in pairs_to_track[:5]:
         s = pair_sim(cs, sp, '▁' + a if not a.startswith('▁') else a,
                      '▁' + b if not b.startswith('▁') else b)
         if s is not None:
             print(f"  sim({a:12s}, {b:12s}) = {s:.4f}")
 
-else:
-    pairs_to_track = [('соба', 'ка'), ('человек', 'война'),
-                      ('князь', 'Андрей'), ('любовь', 'смерть')]
+# ── Parameter Optimizer (auto-tuning with config-driven rules) ──
 
-# ── Parameter Optimizer (auto-tuning with feasibility corridors) ──
-
-LR_WARMUP_LINES = 1000  # linear ramp from 0 to full_lr
-
-base_lr = 0.15 if FAST else 0.03
-opt = ParameterOptimizer()
-opt.p['full_lr'].set(base_lr)
+opt = ParameterOptimizer(CFG)
 if FAST:
-    opt.p['neg_samples'].set(3)
+    opt.p['full_lr'].set(CFG.fast_lr)
+    opt.p['neg_samples'].set(CFG.fast_neg_samples)
+    print(f"  FAST: lr={CFG.fast_lr}, neg_samples={CFG.fast_neg_samples}, pmi_gate=off")
 
 # Restore optimizer state from checkpoint (metric buffers + adapted params)
 if RESUME is not None:
-    opt_path = CS_PATH.replace('.json', f'_{resume_tag}.opt.json')
+    opt_path = CFG.cs_path.replace('.json', f'_{resume_tag}.opt.json')
     if not os.path.exists(opt_path):
-        opt_path = CS_PATH.replace('.json', '.opt.json')
+        opt_path = CFG.cs_path.replace('.json', '.opt.json')
     if os.path.exists(opt_path):
         with open(opt_path, 'r', encoding='utf-8') as f:
             saved = json.load(f)
         opt.load_state(saved)
         print(f"  Loaded optimizer state: {opt.summary()}")
 
-# Override PMI gate for FAST mode (handled separately)
 pmi_gate = not FAST
 
-if FAST:
-    print(f"  FAST: lr={base_lr}, neg_samples={opt.p['neg_samples'].current}, pmi_gate={pmi_gate}")
-
 def get_lr(line_idx):
-    if line_idx < LR_WARMUP_LINES:
-        return opt.p['full_lr'].current * (line_idx + 1) / LR_WARMUP_LINES
+    if line_idx < CFG.lr_warmup_lines:
+        return opt.p['full_lr'].current * (line_idx + 1) / CFG.lr_warmup_lines
     return opt.p['full_lr'].current
 
 
 # ── Train/val split ──────────────────────────────────────────────
 
-VAL_CORPUS = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\val_corpus.txt'
-VAL_PCT = 0.05
-
-with open(CORPUS, 'r', encoding='utf-8') as f:
+with open(CFG.corpus_path, 'r', encoding='utf-8') as f:
     all_lines = [l.strip() for l in f if l.strip()]
 
-n_val = max(1, int(len(all_lines) * VAL_PCT))
+n_val = max(1, int(len(all_lines) * CFG.val_pct))
 train_lines = all_lines[:-n_val]
 val_lines = all_lines[-n_val:]
 
 print(f"\n  Train lines: {len(train_lines)}, Val lines: {len(val_lines)}")
 if RESUME is None:
-        with open(VAL_CORPUS, 'w', encoding='utf-8') as f:
-            for l in val_lines:
-                f.write(l + '\n')
+    with open(CFG.val_corpus_path, 'w', encoding='utf-8') as f:
+        for l in val_lines:
+            f.write(l + '\n')
 
 # ── STDP Training (line by line) ────────────────────────────────
 
@@ -295,15 +285,15 @@ LIVE_REFRESH = 1.0  # seconds between live status updates
 COS_REFRESH = 5.0   # seconds between cos/pair recomputation
 
 print("\n--- STDP training (fractal self-organisation) ---")
-gen = CrystalGenerator(cs, sp, lattice)
+gen = CrystalGenerator(cs, sp, lattice, morph_vocab=mv)
 gen.train_lr = opt.p['full_lr'].current
 t_start = time.time()
 
 total_lines = len(train_lines)
-CHECKPOINT_EVERY = 500      # save checkpoint (lines)
-EVAL_EVERY = 1000 if FAST else 2000  # full eval (lines)
-FLUCTUATE_EVERY = 2000       # fluctuation + centroid repel (lines)
-DECAY_EVERY = 2000 if FAST else 3000  # lattice decay sweep (lines)
+CHECKPOINT_EVERY = CFG.checkpoint_every
+EVAL_EVERY_F = CFG.eval_every_fast if FAST else CFG.eval_every_slow
+FLUCTUATE_EVERY = CFG.fluctuate_every
+DECAY_EVERY = CFG.decay_every_fast if FAST else CFG.decay_every_slow
 
 n_trained = 0
 ngram_last_total = 0
@@ -317,9 +307,6 @@ last_antonym_time = 0.0
 last_antonym_str = ''
 last_fluct_lines = 0
 last_decay_lines = 0
-
-_live_pairs = [('соба', 'ка'), ('человек', 'война'),
-               ('князь', 'Андрей'), ('любовь', 'смерть')]
 
 def live_status(text):
     """Write one-line status to terminal only — \r updates in place."""
@@ -339,9 +326,7 @@ def get_pair_strs():
     return ' '.join(parts)
 
 def save_3d_vis(cs, sp, checkpoint_name):
-    """SVD 384D → 3D, save JSON + write HTML viewer."""
-    vis_dir = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\vis'
-    os.makedirs(vis_dir, exist_ok=True)
+    vis_dir = CFG.vis_dir
 
     cids = sorted(cs.concept_vectors.keys())
     if len(cids) == 0:
@@ -504,7 +489,7 @@ try:
             context_window=int(round(opt.p['context_window'].current)),
             inh_strength=opt.p['inh_strength'].current,
             inh_threshold=opt.p['inh_threshold'].current,
-            neg_lr_ratio=0.5, field_gate=True)
+            neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate, use_torch=CFG.use_torch)
         n_trained += 1
         now = time.time()
         elapsed = now - t_start
@@ -550,13 +535,13 @@ try:
                         f"{elapsed/60:.0f}min{tail}")
             # Write machine-readable status for external monitoring
             try:
-                with open(STATUS_JSON + '.tmp', 'w', encoding='utf-8') as _sf:
+                with open(CFG.status_path + '.tmp', 'w', encoding='utf-8') as _sf:
                     json.dump({'line': idx, 'total': total_lines, 'pct': pct,
                                'rate': rate, 'eta_s': eta_s, 'elapsed_min': elapsed/60,
                                'cos_mean': mean_sim, 'cos_std': std_sim,
                                'pairs': last_pair_strs, 'antonym': last_antonym_str,
                                'opt': opt.summary()}, _sf)
-                os.replace(STATUS_JSON + '.tmp', STATUS_JSON)
+                os.replace(CFG.status_path + '.tmp', CFG.status_path)
             except Exception:
                 pass
             last_stat_time = now
@@ -580,23 +565,21 @@ try:
             ng_new = ng_total - ngram_last_total
             ngram_last_total = ng_total
 
-            # Save checkpoint (numbered + state; base paths saved every 5K)
             ckpt_name = f"{idx // 1000}k"
-            cs_num = CS_PATH.replace('.json', f'_{ckpt_name}.json')
-            lat_num = LATTICE_PATH.replace('.json', f'_{ckpt_name}.json')
-            print()  # clear live status line before save messages
+            cs_num = CFG.cs_path.replace('.json', f'_{ckpt_name}.json')
+            lat_num = CFG.lattice_path.replace('.json', f'_{ckpt_name}.json')
+            print()
             cs.save(cs_num)
             lattice.save(lat_num)
-            opt_state_path = CS_PATH.replace('.json', f'_{ckpt_name}.opt.json')
+            opt_state_path = CFG.cs_path.replace('.json', f'_{ckpt_name}.opt.json')
             with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
                 json.dump(opt.save_state(), f, ensure_ascii=False)
             os.replace(opt_state_path + '.tmp', opt_state_path)
             save_checkpoint_state(idx)
-            cleanup_old_checkpoints(keep=2)
-            # Periodic base save every 5K lines (crash recovery)
-            if idx % 5000 == 0:
-                cs.save(CS_PATH)
-                lattice.save(LATTICE_PATH)
+            cleanup_old_checkpoints(keep=CFG.cleanup_keep)
+            if idx % CFG.periodic_save_every == 0:
+                cs.save(CFG.cs_path)
+                lattice.save(CFG.lattice_path)
 
             param_str = opt.summary()
             print(f"\n[{pct:5.1f}%] {idx:7d}L | {rate:4.0f} L/s | {eta_s} | {param_str}")
@@ -607,11 +590,10 @@ try:
             cs._update_count = 0
             shift_str = f"\u03b4={avg_delta:.2f}m" if n_upd > 0 else "\u03b4=?"
 
-            # Drift diagnostics
-            n_code_out, max_code_abs = cs.check_code_range(bound=10.0)
+            n_code_out, max_code_abs = cs.check_code_range(bound=CFG.code_bound)
             vec_ok, vec_total, vec_max_dev = cs.validate_vector_norms()
             drift_warn = ""
-            if n_code_out > 0 or vec_max_dev > 0.01:
+            if n_code_out > 0 or vec_max_dev > CFG.vec_dev_warn:
                 drift_warn = f" CODE_DRIFT(n_out={n_code_out} max|code|={max_code_abs:.1f} vec_dev={vec_max_dev:.6f})"
 
             print(f"  cos={mean_sim:.4f}\u00b1{std_sim:.4f} | con={ok}/{total_c} | "
@@ -621,15 +603,13 @@ try:
             opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new)
             gen.train_lr = opt.p['full_lr'].current
 
-            # Test generation
-            seed = np.random.choice(['князь', 'человек', 'война', 'любовь', 'дом', 'жизнь'])
-            result = gen.generate(seed_word=seed, max_words=25)
+            seed = np.random.choice(CFG.test_seeds)
+            result = gen.generate(seed_word=seed, max_words=CFG.gen_max_words)
             txt = result['text'].replace('\n', ' ').strip()
             print(f"  gen({seed}): {txt[:70]}")
 
-            # Eval
-            if idx > 0 and idx % EVAL_EVERY == 0:
-                eval_result = gen.evaluate(VAL_CORPUS, max_lines=100)
+            if idx > 0 and idx % EVAL_EVERY_F == 0:
+                eval_result = gen.evaluate(CFG.val_corpus_path, max_lines=CFG.eval_max_lines)
                 ppl = eval_result['perplexity']
                 vppl = eval_result['vec_perplexity']
                 acc1 = eval_result['accuracy_top1']
@@ -647,26 +627,26 @@ try:
 
 except KeyboardInterrupt:
     print("\n\n[EVA] Training interrupted — saving checkpoint...")
-    cs.save(CS_PATH)
-    lattice.save(LATTICE_PATH)
-    opt_state_path = CS_PATH.replace('.json', '.opt.json')
+    cs.save(CFG.cs_path)
+    lattice.save(CFG.lattice_path)
+    opt_state_path = CFG.cs_path.replace('.json', '.opt.json')
     with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
         json.dump(opt.save_state(), f, ensure_ascii=False)
     os.replace(opt_state_path + '.tmp', opt_state_path)
     save_checkpoint_state(idx)
-    cleanup_old_checkpoints(keep=2)
+    cleanup_old_checkpoints(keep=CFG.cleanup_keep)
     print("[EVA] Checkpoint saved. Exiting.")
     sys.exit(0)
 
 # Final save
-cs.save(CS_PATH)
-lattice.save(LATTICE_PATH)
-opt_state_path = CS_PATH.replace('.json', '.opt.json')
+cs.save(CFG.cs_path)
+lattice.save(CFG.lattice_path)
+opt_state_path = CFG.cs_path.replace('.json', '.opt.json')
 with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
     json.dump(opt.save_state(), f, ensure_ascii=False)
 os.replace(opt_state_path + '.tmp', opt_state_path)
 save_checkpoint_state(idx)
-cleanup_old_checkpoints(keep=2)
+cleanup_old_checkpoints(keep=CFG.cleanup_keep)
 
 # ── Final diagnostics ───────────────────────────────────────────
 
@@ -682,22 +662,22 @@ for a, b in pairs_to_track:
         print(f"  sim({a:12s}, {b:12s}) = {s:.4f}")
 
 print("\n--- Generation tests ---")
-for seed in ['князь', 'человек', 'война', 'любовь']:
-    result = gen.generate(seed_word=seed, max_words=25)
+for seed in CFG.test_seeds:
+    result = gen.generate(seed_word=seed, max_words=CFG.gen_max_words)
     txt = result['text']
     print(f"  [{seed}] {txt[:60]}  (score={result['score']:.2f})")
 
 t_total = time.time() - t_start
 print(f"\nTotal: {n_trained} lines in {t_total:.0f}s ({n_trained/t_total:.0f} l/s)")
 print("Saving...")
-cs.save(CS_PATH)
-lattice.save(LATTICE_PATH)
-opt_state_path = CS_PATH.replace('.json', '.opt.json')
+cs.save(CFG.cs_path)
+lattice.save(CFG.lattice_path)
+opt_state_path = CFG.cs_path.replace('.json', '.opt.json')
 with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
     json.dump(opt.save_state(), f, ensure_ascii=False)
 os.replace(opt_state_path + '.tmp', opt_state_path)
 save_checkpoint_state(idx)
-cleanup_old_checkpoints(keep=2)
+cleanup_old_checkpoints(keep=CFG.cleanup_keep)
 print("Done.")
 
 

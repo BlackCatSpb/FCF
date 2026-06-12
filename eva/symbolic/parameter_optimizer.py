@@ -3,11 +3,15 @@
 Each parameter has a [min, max] corridor and drifts toward default when
 the metric that pushed it away normalises.  Rule-based adaptation uses
 metric trends and plateau detection, not gradients.
+
+Rules are loaded from FCFConfig — no hardcoded if/elif chains.
 """
 
 import math
 import numpy as np
 from collections import deque
+from typing import Optional
+from eva.symbolic.fcf_config import FCFConfig, AdaptRule, ParamDef
 
 
 class Param:
@@ -22,6 +26,10 @@ class Param:
         self.default = default
         self.current = default
         self.step_scale = step_scale
+
+    @classmethod
+    def from_def(cls, d: ParamDef) -> 'Param':
+        return cls(d.name, d.min_val, d.max_val, d.default, d.step_scale)
 
     def set(self, value):
         self.current = max(self.min, min(self.max, value))
@@ -90,34 +98,29 @@ class MetricBuffer:
 
 
 class ParameterOptimizer:
-    """Auto-optimiser with feasibility corridors.
+    """Auto-optimiser with config-driven rules.
 
-    Usage in training loop::
+    Usage::
 
-        opt = ParameterOptimizer()
+        opt = ParameterOptimizer(config)
         ...
-        # at each checkpoint:
-        changes = opt.step(mean_cos=m, std_cos=s, vec_ppl=vp, ...)
-        for name, val in changes.items():
-            setattr(locals(), name, val)  # or apply explicitly
+        opt.step(mean_cos=m, std_cos=s, vec_ppl=vp, ...)
     """
 
     TARGET_STD = 1.0 / math.sqrt(384)  # ~0.051 — uniform random d-sphere
 
-    def __init__(self):
-        self.p = {
-            'full_lr':        Param('full_lr',        0.003,  0.15,   0.03,   0.10),
-            'repel_strength': Param('repel_strength', 0.01,   0.20,   0.08,   0.05),
-            'noise_scale':    Param('noise_scale',    0.0002, 0.01,   0.001,  0.05),
-            'inh_threshold':  Param('inh_threshold',  0.05,   0.30,   0.10,   0.05),
-            'inh_strength':   Param('inh_strength',   0.01,   0.15,   0.05,   0.05),
-            'inh_sample':     Param('inh_sample',     100,    600,    200,    100),
-            'context_window': Param('context_window', 1,      4,      2,      0.5),
-            'theta_tau':      Param('theta_tau',      5,      30,     15,     2.0),
-            'neg_samples':    Param('neg_samples',    0,      5,      2,      0.5),
-            'pmi_gate_min':   Param('pmi_gate_min',   0.05,   0.5,    0.20,   0.02),
-            'decay_rate':     Param('decay_rate',      0.998,  0.9999, 0.9998, 0.00005),
-        }
+    def __init__(self, config: Optional[FCFConfig] = None):
+        if config is None:
+            from eva.symbolic.fcf_config import FCFConfig
+            config = FCFConfig()
+
+        self.config = config
+        self._rules = []  # (trigger_fn, param_name, action, value, rate)
+
+        # Build params from config
+        self.p = {}
+        for pd in config.params:
+            self.p[pd.name] = Param.from_def(pd)
 
         self.m = {
             'mean_cos': MetricBuffer(10),
@@ -134,147 +137,165 @@ class ParameterOptimizer:
         self._vacc1_stuck = 0
         self._step = 0
 
+    def _eval_trigger(self, trigger: str, ctx: dict) -> bool:
+        """Evaluate a trigger string against context dict of metrics."""
+        try:
+            # Plateau triggers
+            if trigger == 'vec_ppl_plateau':
+                return self.m['vec_ppl'].plateau(patience=3, rel_thresh=0.002)
+            if trigger == 'acc1_plateau':
+                return self.m['acc1'].plateau(patience=3, rel_thresh=0.02)
+
+            # vacc1 stuck
+            if trigger.startswith('vacc1_stuck >= '):
+                n = int(trigger.split('>=')[1].strip())
+                return self._vacc1_stuck >= n
+
+            # est_frac > X
+            if trigger.startswith('est_frac > '):
+                thresh = float(trigger.split('>')[1].strip())
+                std_cos = ctx.get('std_cos')
+                if std_cos is None or std_cos <= 0:
+                    return False
+                t = ctx.get('inh_threshold', 0.1)
+                est_frac = math.erfc(t / (std_cos * math.sqrt(2)))
+                ctx['_est_frac'] = est_frac
+                return est_frac > thresh
+
+            if trigger.startswith('est_frac < '):
+                thresh = float(trigger.split('<')[1].strip())
+                std_cos = ctx.get('std_cos')
+                if std_cos is None or std_cos <= 0:
+                    return False
+                t = ctx.get('inh_threshold', 0.1)
+                est_frac = math.erfc(t / (std_cos * math.sqrt(2)))
+                ctx['_est_frac'] = est_frac
+                return est_frac < thresh
+
+            # cos_trend condition
+            if trigger.startswith('cos_trend > '):
+                parts = trigger.split(' and ')
+                trend_thresh = float(parts[0].split('>')[1].strip())
+                mean_thresh = float(parts[1].split('>')[1].strip()) if '>' in parts[1] else -999
+                cos_trend = ctx.get('mean_cos', 0) - self._prev_mean_cos
+                return cos_trend > trend_thresh and ctx.get('mean_cos', 0) > mean_thresh
+
+            if trigger.startswith('cos_trend < '):
+                parts = trigger.split(' and ')
+                trend_thresh = float(parts[0].split('<')[1].strip())
+                mean_thresh = float(parts[1].split('<')[1].strip()) if '<' in parts[1] else 999
+                cos_trend = ctx.get('mean_cos', 0) - self._prev_mean_cos
+                return cos_trend < trend_thresh and ctx.get('mean_cos', 0) < mean_thresh
+
+            # Simple comparisons
+            for op in ['>=', '<=', '>', '<']:
+                if op in trigger:
+                    parts = trigger.split(op)
+                    lhs = parts[0].strip()
+                    rhs = parts[1].strip()
+
+                    # TARGET reference
+                    if rhs == '0.80*TARGET':
+                        rhs_val = self.TARGET_STD * 0.80
+                    elif rhs == '1.30*TARGET':
+                        rhs_val = self.TARGET_STD * 1.30
+                    else:
+                        rhs_val = float(rhs)
+
+                    lhs_val = ctx.get(lhs)
+                    if lhs_val is None:
+                        return False
+
+                    if op == '>':
+                        return lhs_val > rhs_val
+                    elif op == '<':
+                        return lhs_val < rhs_val
+                    elif op == '>=':
+                        return lhs_val >= rhs_val
+                    elif op == '<=':
+                        return lhs_val <= rhs_val
+
+            return False
+        except Exception:
+            return False
+
     def ingest(self, **kw):
         for k, v in kw.items():
             if v is not None and k in self.m:
                 self.m[k].push(v)
 
     def step(self, **kw):
-        """Run one param-adjustment step.  Returns dict {name: value} of changes."""
+        """Run one param-adjustment step. Returns dict {name: value} of changes."""
         self.ingest(**kw)
         self._step += 1
         changes = {}
 
-        mean_cos = kw.get('mean_cos', self._prev_mean_cos)
-        std_cos = kw.get('std_cos')
-        vec_ppl = kw.get('vec_ppl')
-        vacc1 = kw.get('vacc1')
-        acc1 = kw.get('acc1')
-        delta = kw.get('delta')
-        ng_new = kw.get('ng_new')
+        # Build context for rule evaluation
+        ctx = dict(kw)
+        for name, p in self.p.items():
+            ctx[name] = p.current
 
-        # ── 1. Repel ← mean_cos ─────────────────────────────────
-        p = self.p['repel_strength']
-        if mean_cos > 0.01:
-            p.scale(1.10)
-            changes['repel_strength'] = p.current
-        elif mean_cos < -0.005:
-            p.scale(0.90)
-            changes['repel_strength'] = p.current
-        else:
-            old = p.current
-            p.toward_default(0.02)
-            if abs(p.current - old) > 1e-6:
-                changes['repel_strength'] = p.current
+        cos_trend = kw.get('mean_cos', self._prev_mean_cos) - self._prev_mean_cos
+        ctx['cos_trend'] = cos_trend
 
-        # ── 2. Noise ← std_cos vs TARGET_STD ────────────────────
-        p = self.p['noise_scale']
-        if std_cos is not None:
-            if std_cos < self.TARGET_STD * 0.80:
-                p.scale(1.15)
-                changes['noise_scale'] = p.current
-            elif std_cos > self.TARGET_STD * 1.30:
-                p.scale(0.90)
-                changes['noise_scale'] = p.current
-            else:
+        # Apply rules from config
+        for pd in self.config.params:
+            p = self.p.get(pd.name)
+            if p is None or not pd.rules:
+                continue
+
+            rule_applied = False
+            for rule in pd.rules:
+                if self._eval_trigger(rule.trigger, ctx):
+                    old = p.current
+                    if rule.action == 'scale':
+                        p.scale(rule.value)
+                    elif rule.action == 'shift':
+                        p.shift(rule.value)
+                    elif rule.action == 'set':
+                        p.set(rule.value)
+                    elif rule.action == 'toward_default':
+                        p.toward_default(rule.rate)
+
+                    if abs(p.current - old) > 1e-8:
+                        changes[pd.name] = p.current
+                    rule_applied = True
+
+            # Drift to default if no rule fired
+            has_drift = any(r.action == 'toward_default' for r in pd.rules)
+            if not rule_applied and has_drift:
                 old = p.current
                 p.toward_default(0.02)
-                if abs(p.current - old) > 1e-6:
-                    changes['noise_scale'] = p.current
+                if abs(p.current - old) > 1e-8:
+                    changes[pd.name] = p.current
 
-        # ── 3. LR ← cos_trend + vecPPL plateau ──────────────────
-        cos_trend = mean_cos - self._prev_mean_cos
-        p_lr = self.p['full_lr']
-        lr_changed = False
+        # Special: clamp neg_samples to int
+        if 'neg_samples' in changes:
+            p = self.p['neg_samples']
+            p.current = int(round(p.current))
 
-        if cos_trend > 0.001 and mean_cos > 0.005:
-            p_lr.scale(0.95)
-            lr_changed = True
-        elif cos_trend < -0.001 and mean_cos < -0.005:
-            p_lr.scale(1.05)
-            lr_changed = True
+        # Special: clamp context_window to int
+        if 'context_window' in changes:
+            p = self.p['context_window']
+            p.current = int(round(p.current))
 
-        if vec_ppl is not None and self.m['vec_ppl'].plateau(patience=3, rel_thresh=0.002):
-            if p_lr.current < 0.10:
-                p_lr.scale(1.08)
-                lr_changed = True
-            # Widen context window on plateau
-            p_ctx = self.p['context_window']
-            old_ctx = p_ctx.current
-            p_ctx.shift(0.5)
-            if p_ctx.current > old_ctx:
-                changes['context_window'] = int(round(p_ctx.current))
+        # Special: theta_tau to int
+        if 'theta_tau' in changes:
+            p = self.p['theta_tau']
+            p.current = int(round(p.current))
 
-        # Taper LR toward default if all quiet
-        if not lr_changed:
-            old = p_lr.current
-            p_lr.toward_default(0.01)
-            if abs(p_lr.current - old) > 1e-6:
-                lr_changed = True
-        if lr_changed:
-            changes['full_lr'] = p_lr.current
-
-        self._prev_mean_cos = mean_cos
-
-        # ── 4. decay_rate ← ng_new ──────────────────────────────
-        p = self.p['decay_rate']
-        if ng_new is not None:
-            if ng_new < 100:
-                p.shift(-0.0001)
-                changes['decay_rate'] = p.current
-            elif ng_new > 10000:
-                p.shift(0.00005)
-                changes['decay_rate'] = p.current
-
-        # ── 5. neg_samples ← vacc1 stuck ───────────────────────
-        p = self.p['neg_samples']
+        # Track vacc1 stuck counter
+        vacc1 = kw.get('vacc1')
         if vacc1 is not None:
             if vacc1 == 0.0:
                 self._vacc1_stuck += 1
             else:
                 self._vacc1_stuck = 0
-            if self._vacc1_stuck >= 3 and p.current < 1:
-                p.shift(1)
-                changes['neg_samples'] = int(round(p.current))
-            elif vacc1 > 0.01 and p.current > 0:
-                p.shift(-1)
-                if p.current < 0.5:
-                    p.set(0)
-                changes['neg_samples'] = int(round(p.current))
 
-        # ── 6. inh_threshold ← estimated repel fraction ────────
-        p = self.p['inh_threshold']
-        if std_cos is not None and std_cos > 0:
-            t = p.current
-            est_frac = math.erfc(t / (std_cos * math.sqrt(2)))
-            if est_frac > 0.15:
-                p.shift(0.02)
-                changes['inh_threshold'] = p.current
-            elif est_frac < 0.01 and p.current > 0.06:
-                p.shift(-0.02)
-                changes['inh_threshold'] = p.current
-
-        # ── 7. pmi_gate_min ← δ ────────────────────────────────
-        p = self.p['pmi_gate_min']
-        if delta is not None:
-            if delta < 2.0 and p.current > 0.05:
-                p.shift(-0.01)
-                changes['pmi_gate_min'] = p.current
-            elif delta > 20.0 and p.current < 0.3:
-                p.shift(0.01)
-                changes['pmi_gate_min'] = p.current
-
-        # ── 8. theta_tau ← acc1 plateau ─────────────────────────
-        p = self.p['theta_tau']
-        if acc1 is not None and self.m['acc1'].plateau(patience=3, rel_thresh=0.02):
-            if p.current < 25:
-                p.shift(2)
-                changes['theta_tau'] = int(round(p.current))
-
+        self._prev_mean_cos = kw.get('mean_cos', self._prev_mean_cos)
         return changes
 
     def save_state(self):
-        """Return serialisable dict of all param values, metric buffers, and internal state."""
         return {
             'params': {name: {'current': p.current, 'min': p.min, 'max': p.max,
                               'default': p.default, 'step_scale': p.step_scale}
@@ -286,7 +307,6 @@ class ParameterOptimizer:
         }
 
     def load_state(self, state):
-        """Restore state from a dict produced by save_state()."""
         for name, pd in state.get('params', {}).items():
             if name in self.p:
                 p = self.p[name]

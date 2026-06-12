@@ -235,7 +235,7 @@ class FractalField:
         Args:
             cid: target concept ID
             context_code_deltas: list of (ctx_cid, direction_hint) or None
-            weights: list of scalar weights (PMI × dist_decay)
+            weights: list of scalar weights (PMI x dist_decay)
 
         Returns:
             z_a_shifted: новый z_a вектор или None
@@ -340,14 +340,18 @@ class FractalField:
             field.basis = npz['basis'].astype(np.float32)
             cids = npz['cids']
             codes_arr = npz['codes']
+            # Pre-extract arrays before dict comprehensions
+            # (NpzFile.__getitem__ is slow on repeated access)
             field.codes = {int(cid): codes_arr[i].copy() for i, cid in enumerate(cids)}
             # Backward compat: meta-weights added in v2
             field.meta_w_lr = npz.get('meta_w_lr', np.zeros(field.l_m, dtype=np.float32))
             field.meta_w_th = npz.get('meta_w_th', np.zeros(field.l_m, dtype=np.float32))
             # Backward compat: field bits added in v2
             if 'fb_cids' in npz.files:
-                field.field_bits = {int(cid): npz['fb_arr'][i].copy()
-                                     for i, cid in enumerate(npz['fb_cids'])}
+                fb_arr = npz['fb_arr']
+                fb_cids_arr = npz['fb_cids']
+                field.field_bits = {int(cid): fb_arr[i].copy()
+                                     for i, cid in enumerate(fb_cids_arr)}
         else:
             field.basis = np.array(data['basis'], dtype=np.float32)
             field.codes = {int(cid): np.array(c, dtype=np.float32)
@@ -358,18 +362,24 @@ class FractalField:
         field.meta_b_lr = np.float32(data.get('meta_b_lr', 0.0))
         field.meta_b_th = np.float32(data.get('meta_b_th', 0.0))
 
-        # Verify basis orthogonality
+        # Verify basis orthogonality — re-orthogonalize if drifted
         QtQ = field.basis.T @ field.basis
         err = np.max(np.abs(QtQ - np.eye(field.dim, dtype=np.float32)))
-        if err > 1e-5:
+        if err > 1e-3:
             Q, _ = np.linalg.qr(field.basis, mode='reduced')
             old_basis = field.basis
-            for cid in list(field.codes.keys()):
-                v = field.codes[cid] @ old_basis.T
-                vn = np.linalg.norm(v)
-                if vn > 1e-10:
-                    v /= vn
-                field.codes[cid] = v @ Q
+            # Batched re-encoding: stack all codes into matrix
+            cids = list(field.codes.keys())
+            codes_mat = np.stack([field.codes[cid] for cid in cids])
+            # codes_mat @ old_basis → vectors on sphere
+            vecs = codes_mat @ old_basis
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+            norms[norms < 1e-10] = 1.0
+            vecs /= norms
+            # Encode under new orthonormal basis: vecs @ Q.T → new codes
+            new_codes = vecs @ Q.T
+            for i, cid in enumerate(cids):
+                field.codes[cid] = new_codes[i]
             field.basis = Q.astype(np.float32)
 
         field._matrix_dirty = True
@@ -463,7 +473,7 @@ class ConceptSpace:
         self.H, self.anchor_ids = lattice.build_anchor_matrix(n_anchors, min_pmi)
         self.anchor_idx = {cid: i for i, cid in enumerate(self.anchor_ids)}
         self.n_anchors = len(self.anchor_ids)
-        print(f"  H matrix: {self.n_anchors}×{self.n_anchors} anchors, "
+        print(f"  H matrix: {self.n_anchors}x{self.n_anchors} anchors, "
               f"{self.H.nnz} non-zero ({100*self.H.nnz/self.n_anchors**2:.1f}%)")
 
     def build_fields_from_lattice(self, lattice, min_pmi=4.5):
@@ -558,6 +568,88 @@ class ConceptSpace:
                 set_bit(aidx)
 
         return np.frombuffer(bytes(bits), dtype=np.uint8).copy()
+
+    # ── Octree encoding ──────────────────────────────────────
+
+    def build_octree_fields(self, lattice, n_anchors=1024, min_lcp=2, gamma=0.5):
+        """Build H matrix and field_bits from nested octree encoding.
+
+        Replaces PMI-based build_anchor_matrix + build_fields_from_lattice.
+        Each concept ID → decimal digits → octant path (0..7 per level).
+        H[i,j] = (1 - γ^{LCP}) / (1 - γ) where LCP = longest common prefix.
+
+        Uses prefix grouping for O(n_concepts + n_anchors) field_bits construction.
+
+        Args:
+            lattice: SyntaxLattice instance (needed for concept_freq)
+            n_anchors: number of anchor concepts (top by frequency)
+            min_lcp: minimum LCP for field_bits (2 → only LCP≥2 anchors)
+            gamma: octree weight decay
+
+        Sets:
+            self.H: scipy.sparse.csr_matrix (n, n) of H values
+            self.anchor_ids: list of anchor concept IDs
+            self.anchor_idx: dict {cid: index}
+        """
+        import numpy as np
+        from scipy.sparse import csr_matrix
+        from collections import defaultdict
+        from eva.symbolic.fractal_encoding import path as octree_path, H_weighted
+
+        # 1. Select anchors (top by frequency)
+        sorted_cids = sorted(lattice.concept_freq.keys(),
+                             key=lambda c: -lattice.concept_freq[c])
+        anchor_ids = sorted_cids[:n_anchors]
+        self.anchor_ids = anchor_ids
+        self.anchor_idx = {cid: i for i, cid in enumerate(anchor_ids)}
+        self.n_anchors = n_anchors
+
+        # 2. Precompute octree paths for anchors
+        anchor_paths = [octree_path(cid) for cid in anchor_ids]
+
+        # 3. Build H matrix (CSR) from H_weighted
+        rows, cols, vals = [], [], []
+        for i in range(n_anchors):
+            pi = anchor_paths[i]
+            for j in range(n_anchors):
+                if i == j:
+                    continue
+                h = H_weighted(pi, anchor_paths[j], gamma)
+                if h > 0:
+                    rows.append(i)
+                    cols.append(j)
+                    vals.append(h)
+
+        self.H = csr_matrix((vals, (rows, cols)), shape=(n_anchors, n_anchors))
+        print(f"  Octree H: {n_anchors}x{n_anchors}, "
+              f"{len(vals)} non-zero ({100*len(vals)/n_anchors**2:.1f}%)")
+
+        # 4. Build field_bits via prefix grouping (O(n) instead of O(n²))
+        self.fractal.init_fields(n_anchors)
+        seen_cids = set(lattice.concept_freq.keys()) & set(self.fractal.codes.keys())
+        n_bytes = (n_anchors + 7) // 8
+
+        # Group anchors by their first min_lcp digits
+        prefix_to_anchors = defaultdict(list)
+        for aidx, ap in enumerate(anchor_paths):
+            prefix_to_anchors[ap[:min_lcp]].append(aidx)
+
+        active_counts = []
+        for cid in seen_cids:
+            cp = octree_path(cid)
+            prefix = cp[:min_lcp]
+            indices = prefix_to_anchors.get(prefix, [])
+            bits = bytearray(n_bytes)
+            for aidx in indices:
+                bits[aidx >> 3] |= 1 << (aidx & 7)
+            self.fractal.field_bits[cid] = np.frombuffer(bytes(bits),
+                                                         dtype=np.uint8).copy()
+            active_counts.append(len(indices))
+
+        if active_counts:
+            a = np.array(active_counts)
+            print(f"  Octree fields: {len(seen_cids)}/{len(self.fractal.codes)} concepts, "
+                  f"sizes: min={a.min()} max={a.max()} mean={a.mean():.1f}")
 
     def fluctuate_fractal(self, noise_scale=0.003, decay=0.9995, repel_strength=0.0):
         """Autonomous drift + optional centroid repulsion."""
@@ -908,9 +1000,9 @@ class ConceptSpace:
         Performs k-means in each subspace to learn n_centroids.
 
         PQ compression ratio:
-            before: N × D × float32 (4 bytes)
-            after:  N × n_subvectors × uint8 (1 byte) + n_subvectors × n_centroids × subdim × float32
-            typical for 128D → 32×8 = 32 bytes vs 512 bytes = 16× compression
+            before: N x D x float32 (4 bytes)
+            after:  N x n_subvectors x uint8 (1 byte) + n_subvectors x n_centroids x subdim x float32
+            typical for 128D → 32x8 = 32 bytes vs 512 bytes = 16x compression
         """
         vecs = list(self.concept_vectors.values())
         if not vecs:

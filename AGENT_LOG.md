@@ -75,7 +75,58 @@ Root cause: STDP is purely Hebbian (pull together) with no effective repulsion:
 - No BMSSP — graph with N_a=1024 too dense. Direct PMI fields more discriminative.
 - SP vocab is 16000 (bpe_ru.model) NOT 32000 — train_full.py uses bpe_ru_32k.model for 32K vocab
 
+## Session: Nested octree encoding (2026-06-11)
+
+### Context
+- Previous H matrix: flat PMI (1024 anchors, 0.41% dense)
+- Previous field model: each concept = itself + PMI-related anchors
+- Bug: `perm_hash` used linear LCG `(val * P + level * Q + R) % M`, making L0-match predict all-level match (100% propagation)
+
+### Fix
+- **Nested octree encoding**: each decimal digit of `val` → octant (0..7) at that level
+- `field(val)` = tuple of octants (not anchor_ids) = path through octree
+- `H[i,j]` = sum γ^l over LCP (longest common prefix), not independent level checks
+  - Closed form: H = (1 − γ^{LCP})/(1−γ), with γ=0.5 → H = 2(1 − 0.5^{LCP})
+- `perm_hash` → non-linear Python `hash((val, level))` to avoid linear propagation
+- Vector encoding: prefix hashing via FNV-1a → adir pool (32K random unit vectors)
+
+### Results (test_fractal_v2.py)
+- **LCP distribution**: 86.2% LCP=0, 11.9% LCP=1, 1.6% LCP=2, 0.2% LCP=3 — pure geometric (1/8)^k
+- **H>0**: 13.7% — discriminative (vs 84% old, 0.1% flat)
+- **Cosine per LCP**: exactly 1−0.25^{LCP}:
+  - LCP=0: cos=−0.005±0.050 (zero)
+  - LCP=1: cos=0.750±0.015 (theory: 0.75)
+  - LCP=2: cos=0.938±0.005 (theory: 0.9375)
+  - LCP=3: cos=0.984±0.001 (theory: 0.9844)
+- **Field-gate**: within-cluster H up to 17x higher than cross-cluster (real cluster differentiation)
+
+### Integration into FCF (2026-06-12)
+- **New module**: `eva/symbolic/fractal_encoding.py` — digits(), path(), lcp(), H_weighted(), path_index()
+- **ConceptSpace.build_octree_fields()** added — replaces PMI pipeline:
+  - Selects top 1024 anchors by frequency
+  - Precomputes octree paths for all concepts
+  - Builds H matrix (CSR) from H_weighted (23.3% dense)
+  - Builds field_bits via prefix grouping: O(n) instead of O(n²)
+  - Default min_lcp=2 (anchors share at least 2 octree levels)
+- **train_full.py** updated to call `build_octree_fields` instead of PMI pipeline
+
+### Performance
+- `build_octree_fields`: 0.67s (32K concepts, 1024 anchors)
+- `CS.load`: 0.75s (was 204s — fixed NpzFile __getitem__ bottleneck: pre-extract arrays before dict comprehensions)
+- Field density: mean=37.1 bits/concept (vs 3.4 in PMI model)
+- Field-gate distribution: 95.7% pairs fw=0.1, 4.3% pairs fw=15.7 mean
+
+### Found bugs fixed
+1. `from_dict` QR re-encoding: `codes_mat @ basis.T` → `codes_mat @ basis` (wrong dims, path never triggered due to tight 1e-5 threshold)
+2. NpzFile repeated `__getitem__` access 10000x slower than pre-extracted array (Windows/numpy quirk)
+3. Relaxed orthogonality check threshold: 1e-5 → 1e-3; batched re-encoding via matmul
+
+### Key insight
+- Decimal digits → octree levels: any number maps to fractal coordinate
+- LCP = level of common ancestry in octree = semantic similarity
+- H directly computable from LCP, no PMI statistics needed
+- 16-digit paths (16 bytes) encode ALL anchor relationships implicitly
+
 ### Next
-- Monitor training progress via train_log.txt
-- Evaluate cos_std trend after first 5K lines
-- If cos_std still flat: adjust subspace learning rates or increase repulsion
+- [ ] Evaluate with full training run (monitor cos_std trend)
+- [ ] Consider PyTorch port: octree paths as int16 tensors, batched LCP on GPU

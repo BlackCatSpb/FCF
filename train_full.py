@@ -155,9 +155,8 @@ if RESUME is not None:
     print(f"  Loaded SyntaxLattice ({len(lattice.concept_freq)} concepts)")
     # Rebuild H matrix + fields from loaded lattice
     if not hasattr(cs, 'H') or cs.H is None:
-        print("  Rebuilding H matrix + PMI fields from loaded lattice...")
-        cs.build_anchor_matrix(lattice, n_anchors=1024, min_pmi=4.5)
-        cs.build_fields_from_lattice(lattice, min_pmi=4.5)
+        print("  Rebuilding H matrix + octree fields from loaded lattice...")
+        cs.build_octree_fields(lattice, n_anchors=1024, min_lcp=2, gamma=0.5)
 
 else:
     print("\nInitializing ConceptSpace (32K fractal vectors @ 384D)...")
@@ -174,10 +173,9 @@ else:
     print(f"  n-gram prefixes: {[len(v) for v in lattice.ngrams.values()]}")
     print(f"  unique concepts: {len(lattice.concept_freq)}")
 
-    print("\nBuilding H matrix + PMI fields...")
+    print("\nBuilding H matrix + octree fields...")
     t0 = time.time()
-    cs.build_anchor_matrix(lattice, n_anchors=1024, min_pmi=4.5)
-    cs.build_fields_from_lattice(lattice, min_pmi=4.5)
+    cs.build_octree_fields(lattice, n_anchors=1024, min_lcp=2, gamma=0.5)
     t1 = time.time()
     print(f"  done in {t1-t0:.1f}s")
 

@@ -484,12 +484,15 @@ try:
         # LR warmup
         gen.train_lr = get_lr(idx)
 
+        destab_pct = min(idx / max(CFG.destab_decay_lines, 1), 1.0)
+        destab_scale = CFG.destab_scale_start + (CFG.destab_scale_end - CFG.destab_scale_start) * destab_pct
         gen.train_from_text(line, pmi_gate=pmi_gate, pmi_gate_min=opt.p['pmi_gate_min'].current,
             neg_samples=int(round(opt.p['neg_samples'].current)),
             context_window=int(round(opt.p['context_window'].current)),
             inh_strength=opt.p['inh_strength'].current,
             inh_threshold=opt.p['inh_threshold'].current,
-            neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate, use_torch=CFG.use_torch)
+            neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate, use_torch=CFG.use_torch,
+            destab_scale=destab_scale)
         n_trained += 1
         now = time.time()
         elapsed = now - t_start

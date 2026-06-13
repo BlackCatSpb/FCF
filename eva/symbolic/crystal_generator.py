@@ -516,7 +516,8 @@ class CrystalGenerator:
     # ── Training ───────────────────────────────────────────────
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, pmi_gate_min=0.20, neg_samples=1,
-                        inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=False):
+                        inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=False,
+                        destab_scale=0.0):
         """Train via PMI-gated context-window STDP with optional GPU batching.
 
         Same STDP logic as train_from_text, but with GPU batched compute
@@ -532,6 +533,7 @@ class CrystalGenerator:
             return 0
 
         base_lr = base_lr if base_lr is not None else getattr(self, 'train_lr', 0.01)
+        base_lr_val = base_lr
         cs = self.cs
         total_freq = max(sum(self.lattice.concept_freq.values()), 1)
         T = len(ids)
@@ -602,11 +604,6 @@ class CrystalGenerator:
                 else:
                     ovs = np.zeros(len(gpu_ctx_l), dtype=np.int64)
 
-                if base_lr is None:
-                    base_lr_val = 0.01
-                else:
-                    base_lr_val = base_lr
-
                 for pi, (i, j, pmi_w, dw, fw) in enumerate(gpu_meta_l):
                     overlap = int(ovs[pi])
                     field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
@@ -620,6 +617,7 @@ class CrystalGenerator:
             if v_gen is None:
                 continue
 
+            n_updates = len(updates)
             total_delta = np.zeros(cs.dim, dtype=np.float32)
             total_elr = 0.0
             for prev_cid, elr in updates:
@@ -630,20 +628,41 @@ class CrystalGenerator:
                 total_delta += (v_ctx - y * v_gen) * elr
                 total_elr += elr
 
-            v_new = v_gen + total_delta
+            # Normalise gradient by count — step size ≠ f(window size)
+            if n_updates > 0 and total_elr > 0:
+                grad = total_delta / max(n_updates, 1)
+
+                # PPMI noise injection: destabilise toward a random
+                # PPMI-neighbour to break the symmetric plateau.
+                if destab_scale > 0 and self.main_rng.random() < destab_scale * 0.3:
+                    ppmi_candidates = self.lattice.connections_of(
+                        gen_cid, top_k=20, use_ppmi=True)
+                    if ppmi_candidates:
+                        ppmi_cid = ppmi_candidates[self.main_rng.randint(0, len(ppmi_candidates) - 1)][0]
+                        v_ppmi = cs.concept_vectors.get(ppmi_cid)
+                        if v_ppmi is not None:
+                            y_ppmi = max(float(np.dot(v_gen, v_ppmi)), 0.05)
+                            noise = (v_ppmi - y_ppmi * v_gen)
+                            nlen = float(np.linalg.norm(noise))
+                            if nlen > 1e-10:
+                                noise /= nlen
+                                mix = min(destab_scale, 0.5)
+                                grad = grad * (1 - mix) + noise * mix
+
+                v_new = v_gen + grad * base_lr_val
+            else:
+                v_new = v_gen
+
             nv = np.linalg.norm(v_new)
             if nv > 1e-10:
                 v_new /= nv
 
-            lr_mod = 1.0
-            th_mod = 0.0
             cs._apply_vector_update(gen_cid, v_new)
 
-            eff_th = inh_threshold * (1.0 + th_mod * 0.5)
             cs._lateral_inhibition_fractal(
                 gen_cid,
                 strength=inh_strength * total_elr,
-                threshold=max(eff_th, 0.01),
+                threshold=max(inh_threshold, 0.01),
                 sample_size=min(100, len(cs.concept_vectors)),
             )
             cs.mark_matrix_dirty()

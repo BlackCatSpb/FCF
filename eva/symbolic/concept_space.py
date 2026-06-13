@@ -731,10 +731,12 @@ class ConceptSpace:
     # ---- STDP: Spike-Timing-Dependent Plasticity on fractal codes ----
 
     def _apply_vector_update(self, cid, v_new, max_shift=0.5):
-        """Set concept_vector[cid] and project delta back into fractal code.
+        """Set concept_vector[cid] directly, then sync fractal code.
 
-        Maintains the invariant: normalize(code @ basis) == concept_vector[cid].
-        Uses subspace-aware update (z_c, z_a, z_m with different plasticity).
+        Vector is the canonical representation — fractal code is
+        re-computed as projection: code = normalize(v_new @ basis.T).
+        Bypasses the subspace-LR bottleneck (lr_c=0.01 was freezing
+        50 % of code capacity).
 
         Args:
             cid: concept ID
@@ -744,39 +746,29 @@ class ConceptSpace:
         v_old = self.concept_vectors.get(cid)
         code = self.fractal.codes.get(cid)
 
-        if code is None:
-            if v_old is not None:
-                init_code = v_new @ self.fractal.basis.T
-                self.fractal.codes[cid] = init_code
-            self.set_vec(cid, v_new)
-            return
-        if v_old is None:
-            self.set_vec(cid, v_new)
-            return
+        if v_old is not None:
+            delta_v = v_new - v_old
+            shift = float(np.linalg.norm(delta_v))
+            if shift > max_shift:
+                delta_v = delta_v / shift * max_shift
+                v_new = v_old + delta_v
+                nv = np.linalg.norm(v_new)
+                if nv > 1e-10:
+                    v_new /= nv
+                shift = max_shift
+            self._total_shift += shift
+            self._update_count += 1
 
-        delta_v = v_new - v_old
-        shift = float(np.linalg.norm(delta_v))
+        # Store the actual vector (canonical representation)
+        self.set_vec(cid, v_new)
 
-        if shift > max_shift:
-            delta_v = delta_v / shift * max_shift
-            v_new = v_old + delta_v
-            nv = np.linalg.norm(v_new)
-            if nv > 1e-10:
-                v_new /= nv
-            self.set_vec(cid, v_new)
-            shift = max_shift
-
-        self._total_shift += shift
-        self._update_count += 1
-
-        # Subspace-aware code update via FractalField (code normalized internally)
-        delta_code = delta_v @ self.fractal.basis.T
-        self.fractal.apply_code_update(cid, delta_code)
-
-        # Re-derive vector from updated code to maintain invariant
-        v_code = self.fractal.compute_vector(cid)
-        if v_code is not None:
-            self.set_vec(cid, v_code)
+        # Sync fractal code to match — no subspace LR filtering
+        if code is not None or v_old is not None:
+            new_code = v_new @ self.fractal.basis.T
+            nv_code = np.linalg.norm(new_code @ self.fractal.basis)
+            if nv_code > 1e-10:
+                new_code /= nv_code
+            self.fractal.codes[cid] = new_code
 
         self._matrix_dirty = True
 

@@ -213,6 +213,11 @@ class FCFConfig:
     # ── Val split ─────────────────────────────
     val_pct: float = 0.05
 
+    # ── Destabilisation (PPMI noise) ──────────
+    destab_scale_start: float = 0.6
+    destab_scale_end: float = 0.02
+    destab_decay_lines: int = 30000
+
     # ── Drift guard ───────────────────────────
     code_bound: float = 10.0
     vec_dev_warn: float = 0.01

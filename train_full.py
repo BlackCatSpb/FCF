@@ -1,4 +1,4 @@
-"""Full training (32K BPE). Process line-by-line. Checkpoints overwrite."""
+"""Full training (146K BPE). Process line-by-line. Checkpoints overwrite."""
 
 import os
 # Prevent numpy/BLAS thread contention on single-CPU workloads

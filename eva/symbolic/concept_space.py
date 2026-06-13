@@ -773,6 +773,11 @@ class ConceptSpace:
         delta_code = delta_v @ self.fractal.basis.T
         self.fractal.apply_code_update(cid, delta_code)
 
+        # Re-derive vector from updated code to maintain invariant
+        v_code = self.fractal.compute_vector(cid)
+        if v_code is not None:
+            self.set_vec(cid, v_code)
+
         self._matrix_dirty = True
 
     def fractal_stdp(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0,

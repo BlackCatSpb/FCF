@@ -116,7 +116,7 @@ class CrystalGenerator:
     # ── Encode / Decode ────────────────────────────────────────
 
     def _encode_input(self, text):
-        return self.sp.encode(text)
+        return self.sp.encode(text, add_bos=True, add_eos=True)
 
     def _decode_tokens(self, token_ids):
         return self.sp.decode(token_ids)
@@ -635,19 +635,9 @@ class CrystalGenerator:
             if nv > 1e-10:
                 v_new /= nv
 
-            code = cs.fractal.codes.get(gen_cid)
-            if code is not None:
-                delta_v = v_new - v_gen
-                delta_z = delta_v @ cs.fractal.basis.T
-                z_c, z_a, z_m = cs.fractal.split_code(code)
-                lr_mod, th_mod = cs.fractal.meta_gate(z_m)
-                cs.fractal.apply_code_update(gen_cid, delta_z,
-                                              lr_c=0.01 * lr_mod,
-                                              lr_a=1.0 * lr_mod,
-                                              lr_m=0.1 * lr_mod)
-            else:
-                cs.set_vec(gen_cid, v_new)
-                lr_mod = 1.0; th_mod = 0.0
+            lr_mod = 1.0
+            th_mod = 0.0
+            cs._apply_vector_update(gen_cid, v_new)
 
             eff_th = inh_threshold * (1.0 + th_mod * 0.5)
             cs._lateral_inhibition_fractal(
@@ -732,6 +722,7 @@ class CrystalGenerator:
                         cs._apply_vector_update(neg_cid, v_new)
 
         self.lattice.update(ids)
+        self._graph_cache.clear()
         return 1
 
     # ── Evaluation ────────────────────────────────────────────

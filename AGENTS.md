@@ -28,12 +28,17 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - **MMI re-ranking** in `generate()`: per-token `-lambda * log P(cid)` penalty (default 0.2)
 - All exposed via CLI in `inference.py`: `--top-p`, `--len-norm-alpha`, `--block-ngram`, `--mmi-lambda`
 
-### [2026-06-14] Curriculum learning (commit pending)
+### [2026-06-14] Curriculum learning (commit 66c3b53)
 - **Length-based curriculum**: train lines sorted by BPE token count (short → long)
 - **Epoch-dependent max length**: epoch 1 = 32 tokens, epoch 2 = 128, epoch 3 = unlimited
 - **Pre-filtered per epoch**: each epoch only trains on lines ≤ its max length
 - Progress percentages and ETAs use epoch-relative line counts
-- Sorted lines + precomputed lengths for efficiency (no re-encoding per epoch)
+
+### [2026-06-14] RAG query conditioning (commit pending)
+- `inference.py --retrieve "query"`: explicit retrieval step — query → centroid → top-k nearest concepts
+- `inference.py --query "term1,term2" --prompt "..."` — query words steer generation via intent centroid bonus
+- `inference.py --neighbours "word"` — single-token nearest-neighbours (restored)
+- `generate()` in CrystalGenerator already supports `query_words` → centroid → _branch intent bonus — now wired through inference.py CLI
 
 ## Current State
 - Training live (PID 15496), epoch 2 at ~21000L

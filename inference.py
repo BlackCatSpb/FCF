@@ -25,6 +25,10 @@ BASE = CFG.data_dir
 sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
 
 
+def clean_sp(s):
+    return s.replace('\u2581', ' ').strip()
+
+
 class InferenceEngine:
     """Read-only generation engine. Copies checkpoints to temp to avoid
     file-lock conflicts with live training."""
@@ -82,19 +86,43 @@ class InferenceEngine:
         self.lattice = SyntaxLattice()
         self.lattice.load(self.lat_path)
 
-    def generate(self, prompt, max_words=30, beam_width=5):
+    def generate(self, prompt, max_words=30, beam_width=5, query_words=None):
         t0 = time.time()
         result = self.gen.generate(
-            seed_word=prompt, max_words=max_words, beam_width=beam_width)
+            seed_word=prompt, max_words=max_words, beam_width=beam_width,
+            query_words=query_words if query_words is not None else prompt.split())
         result['time'] = round(time.time() - t0, 2)
         return result
+
+    def retrieve(self, query, k=10):
+        """Query → centroid → top-k nearest concepts (RAG retrieval step)."""
+        ids = self.sp.encode(query)
+        vecs = [self.cs.concept_vector(cid) for cid in ids
+                if self.cs.concept_vector(cid) is not None]
+        if not vecs:
+            return []
+        centroid = np.mean(vecs, axis=0).astype(np.float32)
+        n = np.linalg.norm(centroid)
+        if n > 1e-10:
+            centroid /= n
+
+        valid = self.cs.concept_vectors._valid
+        data = self.cs.concept_vectors._data[valid]
+        sims = data @ centroid
+        top_k = min(k, len(sims))
+        idx = np.argpartition(-sims, top_k)[:top_k]
+        idx = idx[np.argsort(-sims[idx])]
+        cids = np.where(valid)[0][idx]
+
+        return [(int(cid), clean_sp(self.sp.IdToPiece(int(cid))) if int(cid) < self.sp.vocab_size() else f'[ID{cid}]',
+                 float(sims[idx[i]])) for i, cid in enumerate(cids)]
 
     def neighbours(self, word, k=10):
         cid = self.sp.PieceToId(word)
         if cid < 0 or not self.cs.concept_vectors._valid[cid]:
             return []
         top = self.cs.topk_similar_concepts(cid, k=k)
-        return [(int(c), self.sp.IdToPiece(c) if c < self.sp.vocab_size() else f'[ID{c}]',
+        return [(int(c), clean_sp(self.sp.IdToPiece(int(c))) if int(c) < self.sp.vocab_size() else f'[ID{c}]',
                  float(s)) for c, s in top]
 
     def concept_info(self, word):
@@ -169,6 +197,8 @@ def main():
     parser.add_argument('--block-ngram', type=int, default=4, help='Block repeating n-grams')
     parser.add_argument('--mmi-lambda', type=float, default=0.2, help='MMI penalty strength (0=disable)')
     parser.add_argument('--neighbours', help='Show top-10 neighbours for word')
+    parser.add_argument('--retrieve', help='RAG: retrieve top-10 concepts for query')
+    parser.add_argument('--query', help='RAG: query words to steer generation (comma-sep)')
     parser.add_argument('--batch', action='store_true', help='Interactive batch mode')
     parser.add_argument('--eval', action='store_true', help='Run full evaluation')
     args = parser.parse_args()
@@ -190,8 +220,9 @@ def main():
             return
 
         if args.prompt:
+            qw = args.query.split(',') if args.query else None
             r = eng.generate(args.prompt, max_words=args.max_words,
-                             beam_width=args.beam_width)
+                             beam_width=args.beam_width, query_words=qw)
             print(r['text'].replace('\n', ' ').strip())
             print(f"  [{r['word_count']}w, score={r['score']:.2f}, "
                   f"time={r['time']}s]", flush=True)
@@ -202,6 +233,12 @@ def main():
             for cid, name, sim in top:
                 print(f"  {name} (CID {cid}): {sim:.4f}")
 
+        if args.retrieve:
+            top = eng.retrieve(args.retrieve)
+            print(f"RAG retrieve top-{len(top)} for '{args.retrieve}':")
+            for cid, name, sim in top:
+                print(f"  {name} (CID {cid}): {sim:.4f}")
+
         if args.batch:
             print("Interactive mode. Enter prompts (empty line to quit):")
             while True:
@@ -209,8 +246,9 @@ def main():
                     line = input('> ').strip()
                     if not line:
                         break
+                    qw = args.query.split(',') if args.query else None
                     r = eng.generate(line, max_words=args.max_words,
-                                     beam_width=args.beam_width)
+                                     beam_width=args.beam_width, query_words=qw)
                     print(r['text'].replace('\n', ' ').strip())
                     print(f"  [{r['word_count']}w, score={r['score']:.2f}]", flush=True)
                 except (EOFError, KeyboardInterrupt):

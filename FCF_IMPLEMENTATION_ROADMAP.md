@@ -1246,13 +1246,33 @@ Phase 6:   HDC + Active Inference (6 days)
 
 ## Supplemental Observations (2026-06-14)
 
-### 1. `use_torch=True` — dead flag
-`_ensure_torch()` in `crystal_generator.py` panics on CPU if `_torch_cid_to_idx` is incomplete, silently falls back to `use_torch=False`. Config still says `True`.
+### 1. GPU path — fixed (2026-06-14)
+**GPU available:** NVIDIA GeForce MX550, 2.15 GB VRAM, PyTorch 2.5.1+cu121.
 
-**Fix:** Either:
-- Remove torch path entirely (no GPU available anyway)
-- Set `use_torch=False` in default config (`crystal_generator.py:34` or config file)
-- Or properly fix: build full `_torch_cid_to_idx` = `np.arange(vocab_size)`, move all 146K vectors to GPU
+**Diagnostic** (50 lines from epoch 2, same checkpoint, `field_gate=True`):
+| Metric | Before fix | After fix |
+|--------|-----------|-----------|
+| GPU speed | 1.33 L/s | 5.32 L/s |
+| CPU speed | 1.30 L/s | 6.52 L/s |
+| Vector diff (GPU vs CPU) | 66/5000 (max 1e-4) | 62/5000 (max 1e-4) |
+| Pair count diff | 0 | 0 |
+| VRAM peak | 268 MB | 267 MB |
+
+**Fixes applied:**
+1. `_ensure_torch()` — builds tensors for ALL 146K CIDs (not just fractal-code CIDs), with zero-fill for missing codes
+2. `_invalidate_torch()` — marks GPU tensors stale; called after `fluctuate_fractal()` via `train_full.py`
+3. Dead sims computation removed (lines 596-598 computed but never read)
+4. GPU-batched STDP gradient added (flat scatter_add for all gen_cids), gated at `_GPU_MIN_PAIRS=500` because scatter_add + CPU transfer overhead dominates at small batch sizes
+5. Negative sampling GPU path still uses per-pair CPU `np.dot` (same as CPU path)
+
+**Key insight:** GPU path is now correct (identical to CPU within float32 rounding) but NOT faster at current batch sizes (~120 flat pairs/line). The bottleneck is the per-gen_cid CPU loop (vector write + lateral inhibition), which runs on CPU regardless of `use_torch`. Real GPU speedup requires moving lateral inhibition to GPU (~53% of time per old profiling).
+
+### 5a. Future: GPU-batched lateral inhibition
+`_lateral_inhibition_fractal()` at `concept_space.py:915` — ~48K calls × 60μs = 2.88s per 200 lines. Moving this to GPU requires:
+1. Flat tensor of all gen_cid vector pairs with cos > threshold
+2. Batched push-apart on GPU (`v_new = v - lr * (v - sim * other_v)`)
+3. Synchronize back to CPU vectors
+Not implemented — requires restructuring `_apply_vector_update` for GPU batch write.
 
 ### 2. `_branch` weights — vector_score too weak
 Current: `graph*0.5 + ngram*0.3 + vector*0.15 + field*0.05`

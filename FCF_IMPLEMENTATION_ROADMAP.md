@@ -37,6 +37,57 @@ Instead of agent's checklist, based on verified current state:
 5. **Add retrieval bonus in `_branch()`** — ~10 lines using existing PQ `pq_adc_search`
 6. **Verify training bottleneck** — needs profiling after current optimizations
 
+### Additional observations (lead developer)
+
+#### 1. Training speed bottleneck — needs re-profiling
+Agent claims "lateral inhibition = 86% of time" from old FAST-mode log. After batched numpy + centroid pull + field_gate=False, the bottleneck **may have shifted**. Before implementing any features, profile current training:
+```python
+# In train_full.py, add timer around:
+# (a) pair collection + field_overlap (line 552-588)
+# (b) STDP gradient (line 614-670)  
+# (c) centroid pull (line 753-776)
+# (d) lateral inhibition (line 662-667)
+# (e) lattice.update (line 778)
+```
+Without fixing the bottleneck first, every feature adds latency. Target: **10+ L/s** for practical iteration.
+
+#### 2. Circular convolution at 384D — FFT overhead may dominate
+At d=384, `np.fft.rfft` + `np.fft.irfft` overhead (~5µs) may exceed O(d²) direct convolution (~384² = 147K ops ≈ 1µs). **Test both approaches** before committing to FFT-based SPA. Also: unbinding via circular correlation is **lossy** at any dimension — recovered vector is approximate, not exact. For reliable memory retrieval, consider **bipolar HDC vectors** (sign(cos) → ±1) where XOR gives exact unbinding.
+
+#### 3. RAG shows results only after cos > 0.05
+At cos=0.024, top-K retrieval returns near-random results. Build the RAG pipeline now for **architecture readiness**, but set expectations: real query-specific generation begins when vectors separate. Meanwhile, cosine thresholding in retrieval (`only return if sim > 0.1`) prevents garbage contamination.
+
+#### 4. Missing: evaluation methodology
+Roadmap doesn't define **success criteria** for each feature:
+- RAG: do different query words → different continuations? (qualitative)
+- FIFO: does same query after different contexts → different answers?
+- SPA: does `unbind(bind(a,b), a) ≈ b` at 384D? (quantitative: cos > 0.9)
+- Predictive Coding: does prediction error decrease over time? (vPPL trend)
+- Centroid pull: do within-sentence vectors cluster? (within-cos per sentence)
+
+#### 5. Theta-gate kills learning for late tokens
+`theta_gate = exp(-j / theta_tau)` at line 588 modulates LR by token position. With `theta_tau=30`:
+- Position 0: gate = 1.0 (full LR)
+- Position 30: gate = 0.37 (37% LR)
+- Position 60: gate = 0.13 (13% LR)
+
+Last third of long sentences barely learns. This explains why `"В настоящее территории"` dominates generation — these are early-position high-LR tokens. **Consider position-relative theta**, not absolute: `theta_gate = exp(-min(j, 5) / theta_tau)` — only the first 5 tokens get reduced LR, not the entire tail.
+
+#### 6. Centroid pull vs STDP competition
+Both modify the same vectors:
+- **Centroid pull**: all tokens → sentence mean (isotropic attraction)
+- **STDP**: target → context (directional, pairwise)
+
+If centroid `sent_lr` is too high, it washes out STDP structure. The current 0.1× ratio was conservative for this reason. If we increase to 0.3× (agent's suggestion), monitor whether pairwise separation (cos_std) decreases.
+
+#### 7. Lattice moving target problem
+Lattice (n-gram frequencies, PPMI, connections) is updated every line during epoch 2 via `lattice.update(ids)`. This means:
+- PPMI values shift as the model encounters the same data again
+- `connections_of()` returns different results every checkpoint
+- n-gram decay (`decay_all()` every 2000 lines) gradually erases epoch 1 statistics
+
+The STDP vectors are chasing a moving target. Consider **freezing lattice after epoch 1** and only updating vectors in subsequent epochs, or use a separate validation lattice for evaluation.
+
 ### Corrected dependency graph
 
 ```

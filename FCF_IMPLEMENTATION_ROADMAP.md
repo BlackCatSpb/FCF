@@ -924,3 +924,49 @@ Phase 2: SPA on shared dims (2 days, not 3)
 Build in order: **RAG → FIFO → SPA → Compression → Predictive → HDC → Active Inference**.
 
 But first: **fix the vector space** — increase neg_samples to 8, inh_strength to 0.15, centroid pull LR to 0.3×. Without separated vectors, all 7 features operate on "random gas" and underperform their potential.
+
+---
+
+## Supplemental Observations (2026-06-14)
+
+### 1. `use_torch=True` — dead flag
+`_ensure_torch()` in `crystal_generator.py` panics on CPU if `_torch_cid_to_idx` is incomplete, silently falls back to `use_torch=False`. Config still says `True`.
+
+**Fix:** Either:
+- Remove torch path entirely (no GPU available anyway)
+- Set `use_torch=False` in default config (`crystal_generator.py:34` or config file)
+- Or properly fix: build full `_torch_cid_to_idx` = `np.arange(vocab_size)`, move all 146K vectors to GPU
+
+### 2. `_branch` weights — vector_score too weak
+Current: `graph*0.5 + ngram*0.3 + vector*0.15 + field*0.05`
+
+At current cos=0.024, vector_score contributes ~0.004 to final score vs graph's 0.5. Even at target cos=0.2, vector contributes only 0.03 — 6× less than graph.
+
+**Fix:** Dynamic weighting:
+```python
+w_vec = min(0.5, max(0.05, cos_mean))
+w_ngram = (1 - w_vec) * 0.375  # 0.3/(0.5+0.3+0.05) normalized
+w_graph = (1 - w_vec) * 0.625
+w_field = (1 - w_vec) * 0.0625
+```
+
+### 3. Checkpoint save blocks training ~15 min/epoch
+`cs.save()` writes 270 MB `.codes.npz` synchronously every 500 lines. At ~3s/write × 290 checkpoints/epoch = 15 min.
+
+**Fix:** Async save via thread:
+```python
+import threading
+def _save_async(cs, path):
+    t = threading.Thread(target=cs.save, args=(path,), daemon=True)
+    t.start()
+```
+
+### 4. `lattice.decay_all()` mutates concept_freq during epoch 2
+Every 2000 lines, `decay_all()` decays co-occurrence frequencies. This shifts `freq_weight` in STDP and centroid pull — model learns on a moving target.
+
+**Fix:** Disable decay during epoch 2+:
+```python
+# train_full.py: before decay_all call
+if epoch > 1:
+    continue  # skip decay in fine-tuning epochs
+```

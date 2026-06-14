@@ -524,7 +524,7 @@ class CrystalGenerator:
 
         p_next_given_prev = count_pair / count_prev
         p_next = count_next / total_freq
-        pmi = math.log(p_next_given_prev / max(p_next, 1e-10))
+        pmi = math.log(max(p_next_given_prev, 1e-10) / max(p_next, 1e-10))
 
         # PMI=0 → 0.2, PMI=2 → 1.0, PMI=5 → 2.0, negative → min_weight
         return max(min(pmi / 2.0 + 0.2, 2.0), min_weight)
@@ -976,7 +976,7 @@ class CrystalGenerator:
                 else:
                     p_next_given_prev = ncount / total_ng
                     p_next = count_next / total_freq
-                    pmi = math.log(p_next_given_prev / max(p_next, 1e-10))
+                    pmi = math.log(max(p_next_given_prev, 1e-10) / max(p_next, 1e-10))
                     pmi_w = max(min(pmi / 2.0 + 0.2, 2.0), 0.05)
                 boost_map[ncid] = (0.25 * prob + 0.5 * pmi_w) / (K + 1)
             ngram_boost[prev_cid] = boost_map

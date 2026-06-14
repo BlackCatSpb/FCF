@@ -29,8 +29,9 @@ class InferenceEngine:
     """Read-only generation engine. Copies checkpoints to temp to avoid
     file-lock conflicts with live training."""
 
-    def __init__(self, tag='latest'):
+    def __init__(self, tag='latest', config=None):
         self.tag = self._resolve_checkpoint(tag)
+        self.config = config or {}
         self.tmpdir = tempfile.mkdtemp(prefix=f'inf_{self.tag}_')
         self.sp = sp
         print(f"InferenceEngine: checkpoint {self.tag}", flush=True)
@@ -38,7 +39,7 @@ class InferenceEngine:
         t0 = time.time()
         self._copy_checkpoint()
         self._load()
-        self.gen = CrystalGenerator(self.cs, self.sp, self.lattice)
+        self.gen = CrystalGenerator(self.cs, self.sp, self.lattice, config=self.config)
         print(f"  Loaded in {time.time()-t0:.1f}s", flush=True)
 
     def _resolve_checkpoint(self, tag):
@@ -163,6 +164,10 @@ def main():
     parser.add_argument('--prompt', help='Single generation prompt')
     parser.add_argument('--max-words', type=int, default=30)
     parser.add_argument('--beam-width', type=int, default=5)
+    parser.add_argument('--top-p', type=float, default=0.9, help='Nucleus sampling threshold (1.0=disable)')
+    parser.add_argument('--len-norm-alpha', type=float, default=0.7, help='Length normalization exponent')
+    parser.add_argument('--block-ngram', type=int, default=4, help='Block repeating n-grams')
+    parser.add_argument('--mmi-lambda', type=float, default=0.2, help='MMI penalty strength (0=disable)')
     parser.add_argument('--neighbours', help='Show top-10 neighbours for word')
     parser.add_argument('--batch', action='store_true', help='Interactive batch mode')
     parser.add_argument('--eval', action='store_true', help='Run full evaluation')
@@ -172,8 +177,14 @@ def main():
         parser.print_help()
         return
 
-    print(f"  DEBUG main: args.checkpoint={args.checkpoint!r}, args.eval={args.eval}", flush=True)
-    with InferenceEngine(args.checkpoint) as eng:
+    config = {k: v for k, v in [
+        ('top_p', args.top_p),
+        ('len_norm_alpha', args.len_norm_alpha),
+        ('block_ngram', args.block_ngram),
+        ('mmi_lambda', args.mmi_lambda),
+    ] if v is not None}
+
+    with InferenceEngine(args.checkpoint, config=config) as eng:
         if args.eval:
             eng.run_eval()
             return

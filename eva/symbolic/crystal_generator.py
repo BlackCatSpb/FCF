@@ -43,6 +43,12 @@ class CrystalGenerator:
         self.theta_tau = self.config.get('theta_tau', 12.0)
         self.base_learning_rate = self.config.get('learning_rate', 0.1)
 
+        # Token diversity
+        self.top_p = self.config.get('top_p', 0.9)
+        self.len_norm_alpha = self.config.get('len_norm_alpha', 0.7)
+        self.block_ngram = self.config.get('block_ngram', 4)
+        self.mmi_lambda = self.config.get('mmi_lambda', 0.2)
+
         self.main_rng = random.Random(42)
         self.cs.init_homeostasis()
         self.branch_rngs = {}
@@ -229,6 +235,12 @@ class CrystalGenerator:
                     if count > 0:
                         new_score += -0.3 * count
 
+                    # MMI: penalize high-frequency (generic) continuations
+                    if self.mmi_lambda > 0:
+                        total_freq = max(sum(self.lattice.concept_freq.values()), 1)
+                        p_cid = max(self.lattice.concept_freq.get(cid, 0) / total_freq, 1e-10)
+                        new_score -= self.mmi_lambda * math.log(p_cid)
+
                     conf = 1.0 / (1.0 + ci * 0.5)
                     is_match = (expected_cid is not None and cid == expected_cid)
 
@@ -243,7 +255,7 @@ class CrystalGenerator:
                     new_beam.append((new_seq, new_score, next_branch_id))
                     next_branch_id += 1
 
-            new_beam.sort(key=lambda x: -x[1])
+            new_beam.sort(key=lambda x: -x[1] / (len(x[0]) ** self.len_norm_alpha))
             beam = new_beam[:effective_beam]
             all_chains.extend([(s, sc) for s, sc, _ in new_beam])
 
@@ -260,7 +272,7 @@ class CrystalGenerator:
                 break
 
         if finished:
-            best_seq, best_score, wn = max(finished, key=lambda x: x[1])
+            best_seq, best_score, wn = max(finished, key=lambda x: x[1] / (len(x[0]) ** self.len_norm_alpha))
         elif beam:
             best_seq, best_score, _ = beam[0]
         else:
@@ -417,19 +429,19 @@ class CrystalGenerator:
                     intent_bonus = max(0, sim_to_query * (1.0 - sim_to_query)) * 0.3
                     combined[cid] *= (1.0 + intent_bonus)
 
-        # 7. Anti-repetition
+        # 7. Anti-repetition + n-gram blocking
         recent = seq[-6:] if len(seq) >= 6 else seq
-        trigram_set = set()
-        if len(seq) >= 3:
-            for i in range(len(seq) - 2):
-                trigram_set.add((seq[i], seq[i + 1], seq[i + 2]))
+        ngram_set = set()
+        if len(seq) >= self.block_ngram - 1:
+            for i in range(len(seq) - (self.block_ngram - 2)):
+                ngram_set.add(tuple(seq[i:i + self.block_ngram - 1]))
         for cid in list(combined.keys()):
             count = recent.count(cid)
             if count > 0:
                 combined[cid] *= math.exp(-0.3 * count)
-            if len(seq) >= 2:
-                candidate_trigram = (seq[-2], seq[-1], cid)
-                if candidate_trigram in trigram_set:
+            if len(seq) >= self.block_ngram - 2:
+                candidate_ngram = tuple(seq[-(self.block_ngram - 2):] + [cid])
+                if candidate_ngram in ngram_set:
                     combined.pop(cid, None)
             if len(seq) >= 4 and cid == seq[-2] and seq[-1] == seq[-3]:
                 combined.pop(cid, None)
@@ -475,9 +487,22 @@ class CrystalGenerator:
                     break
             probs /= probs.sum()
 
-        n_candidates = min(15 + int(15 * theta_temp), len(result))
-        scored = [(result[i][0], math.log(probs[i] + 1e-10))
-                  for i in range(n_candidates)]
+        # Top-p (nucleus) sampling
+        if self.top_p < 1.0 and theta_temp > 0.05:
+            order = np.argsort(probs)[::-1]
+            sorted_probs = probs[order]
+            cumsum = np.cumsum(sorted_probs)
+            cut = min(int((cumsum <= self.top_p).sum()) + 1, len(sorted_probs))
+            cut = max(1, cut)
+            truncated = sorted_probs[:cut].copy()
+            truncated /= truncated.sum()
+            n_candidates = min(15 + int(15 * theta_temp), cut)
+            idx = np.random.choice(cut, size=n_candidates, replace=False, p=truncated)
+            scored = [(result[order[i]][0], math.log(sorted_probs[i] + 1e-10)) for i in idx]
+        else:
+            n_candidates = min(15 + int(15 * theta_temp), len(result))
+            scored = [(result[i][0], math.log(probs[i] + 1e-10))
+                      for i in range(n_candidates)]
         return scored
 
     # ── PMI-gated STDP ─────────────────────────────────────────

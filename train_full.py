@@ -513,6 +513,8 @@ try:
                                      decay=opt.p['decay_rate'].current,
                                      repel_strength=opt.p['repel_strength'].current)
                 last_fluct_lines = idx
+                if hasattr(gen, '_invalidate_torch'):
+                    gen._invalidate_torch()
 
             if idx > 0 and idx - last_decay_lines >= DECAY_EVERY:
                 lattice.decay_all()

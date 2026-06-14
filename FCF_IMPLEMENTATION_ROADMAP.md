@@ -6,6 +6,51 @@
 
 ---
 
+## Corrigendum (2026-06-14, after code verification)
+
+The AI Architect analysis below contains several inaccuracies that were verified against the actual codebase. This corrigendum corrects them.
+
+### Verified facts from code
+
+| Claim in roadmap | Actual code | Correction |
+|---|---|---|
+| `neg_samples=2 typical` | `neg_samples=8` at epoch 1 end (adapted by cos_flat≥5 trigger) | Already optimal, no change needed |
+| `inh_strength=0.05` | `inh_strength=0.05` in opt.json — confirmed | Increasing to 0.15 is valid but **may over-push** at current cos=0.024 (std=0.097, so very few pairs exceed threshold 0.10) |
+| `inh_threshold=0.10` | `inh_threshold=0.14` in opt.json | Slightly higher than agent assumed |
+| `full_lr=0.15` | `full_lr=0.27` (adapted) | Agent assumed FAST-mode default |
+| `topk_similar_concepts_by_vec missing` | Confirmed — only `topk_similar_concepts(cid)` exists | ✅ **Valid addition needed** |
+| `PQ codes don't exist` | `pq_adc_search()` method DOES exist in ConceptSpace | ❌ Agent missed this. PQ-based retrieval is ready |
+| `RAG pipeline = 80% ready` | Centroid + _branch bonus already works at `crystal_generator.py:391-401`. Missing: explicit retrieved-set bonus | **Actually 95% ready** — minimal addition needed |
+| `z_a subspace dead` | `_apply_vector_update()` at `concept_space.py:751` bypasses subspace-LR — confirmed | ✅ Correct, but intentional (see docstring: "lr_c=0.01 was freezing 50% of code capacity") |
+| `Lateral inhibition = 86% of time` | This was measured in FAST mode (old log). With batched numpy + centroid pull, bottleneck has likely shifted | **Needs re-measurement** |
+| `SPA via SVO triples` | PPMI bigrams don't extract SVO relations reliably | ❌ SPA should use **PPMI connections with relation types** from `syntax_lattice.connections_of()` |
+| `HDC low priority` | HDC XOR binding gives **exact unbinding** for bipolar vectors — more reliable than circular convolution | Deserves higher priority, especially for memory retrieval |
+
+### Corrected quick-start checklist
+
+Instead of agent's checklist, based on verified current state:
+
+1. ~~Increase neg_samples to 8~~ → **Already 8**, skip
+2. ~~Increase inh_strength to 0.15~~ → **Risky at current cos** — monitor first, vectors need separation before stronger inhibition helps
+3. **Increase centroid pull LR** (`crystal_generator.py:761`): `sent_lr = base_lr_val * 0.1` → `0.3` — ✅ Valid
+4. **Add `topk_similar_concepts_by_vec`** to ConceptSpace — ~30 lines
+5. **Add retrieval bonus in `_branch()`** — ~10 lines using existing PQ `pq_adc_search`
+6. **Verify training bottleneck** — needs profiling after current optimizations
+
+### Corrected dependency graph
+
+```
+FIFO (1d) ──┐
+             ├──→ RAG (1d, not 2 — 95% code exists) ──→ Predictive Coding (5d)
+             │
+             └──→ SPA via PPMI connections (2d, not 3) ──→ HDC (1d)
+                                                          │
+                                      Hierarchical        ┘
+                                      Compression (4d)
+```
+
+---
+
 ## 0. Critical Precondition: The Vector Space Problem
 
 Before any of the 7 features can deliver their full value, a fundamental issue must be acknowledged:

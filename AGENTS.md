@@ -21,13 +21,19 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - Both copy checkpoints to temp dir (no file-lock conflicts with training)
 - math.log guard fix in evaluate()
 
-### [2026-06-14] Token diversity (commit pending)
-- **Top-p (nucleus) sampling** in `_branch()`: configurable via `top_p` (default 0.9), samples from truncated distribution instead of deterministic argmax. 1.0 = disabled (original behavior).
-- **Length normalization** in `generate()`: beam sort and final selection normalized by `len^alpha` (default alpha=0.7). Prevents short-sequence bias.
-- **N-gram blocking** in `_branch()`: configurable n (default 4), extended from hardcoded trigram. Blocks any candidate completing an existing n-gram.
-- **MMI re-ranking** in `generate()`: per-token `-lambda * log P(cid)` penalty (default lambda=0.2). Favors informative/surprising tokens over generic ones.
+### [2026-06-14] Token diversity (commit 75851c7)
+- **Top-p (nucleus) sampling** in `_branch()`: configurable via `top_p` (default 0.9)
+- **Length normalization** in `generate()`: beam sort + final normalized by `len^alpha` (default 0.7)
+- **N-gram blocking** in `_branch()`: configurable n (default 4), extended from hardcoded trigram
+- **MMI re-ranking** in `generate()`: per-token `-lambda * log P(cid)` penalty (default 0.2)
 - All exposed via CLI in `inference.py`: `--top-p`, `--len-norm-alpha`, `--block-ngram`, `--mmi-lambda`
-- **21k baseline (pre-fixes)**: output is diverse but still nonsensical — expected before vector space improvements take effect in epoch 3
+
+### [2026-06-14] Curriculum learning (commit pending)
+- **Length-based curriculum**: train lines sorted by BPE token count (short → long)
+- **Epoch-dependent max length**: epoch 1 = 32 tokens, epoch 2 = 128, epoch 3 = unlimited
+- **Pre-filtered per epoch**: each epoch only trains on lines ≤ its max length
+- Progress percentages and ETAs use epoch-relative line counts
+- Sorted lines + precomputed lengths for efficiency (no re-encoding per epoch)
 
 ## Current State
 - Training live (PID 15496), epoch 2 at ~21000L
@@ -35,10 +41,9 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - Baseline eval at 21k shows cos=0.0124, vac@1=0 — need post-epoch-3 comparison
 
 ## Priority Queue
-1. ⬜ Data pipeline: curriculum learning schedule
-2. ⬜ Visualization: t-SNE concept space
-3. ⬜ RAG: centroid + _branch bonus (95% ready)
-4. ⬜ GPU acceleration: batched lateral inhibition via CUDA
+1. ⬜ Visualization: t-SNE concept space
+2. ⬜ RAG: centroid + _branch bonus (95% ready)
+3. ⬜ GPU acceleration: batched lateral inhibition via CUDA
 
 ## Key Decisions
 - **Centroid pull LR 0.3** — boost clustering speed (from 0.1)

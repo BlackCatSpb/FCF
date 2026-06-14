@@ -272,7 +272,18 @@ n_val = max(1, int(len(all_lines) * CFG.val_pct))
 train_lines = all_lines[:-n_val]
 val_lines = all_lines[-n_val:]
 
+# ── Curriculum: sort train lines by BPE length (short → easy first) ──
+train_lens = [len(sp.encode(l)) for l in train_lines]
+train_pairs = sorted(zip(train_lens, train_lines), key=lambda x: x[0])
+train_lens = [p[0] for p in train_pairs]
+train_lines = [p[1] for p in train_pairs]
+
+# Per-epoch max length filter
+EPOCH_MAX_LEN = {1: 32, 2: 128, 3: 10**9}
+
 print(f"  {len(train_lines)} train, {len(val_lines)} val")
+print(f"  Shortest: {train_lens[0]} BPE tokens, Longest: {train_lens[-1]} BPE tokens")
+print(f"  Median: {train_lens[len(train_lens)//2]} BPE tokens")
 if RESUME is None:
     with open(CFG.val_corpus_path, 'w', encoding='utf-8') as f:
         for l in val_lines:
@@ -487,7 +498,16 @@ try:
             # Re-read corpus with fresh decay
             destab_pct = 0.0  # fresh destab for new epoch
 
-        for idx, line in enumerate(train_lines[start_line:], start=start_line):
+        max_len = EPOCH_MAX_LEN.get(epoch, 10**9)
+        # Pre-filter lines by curriculum max length
+        epoch_mask = [l <= max_len for l in train_lens]
+        epoch_train = [l for l, ok in zip(train_lines, epoch_mask) if ok]
+        epoch_lines = len(epoch_train)
+        if epoch_lines != total_lines:
+            print(f"  Curriculum epoch {epoch}: {epoch_lines}/{total_lines} lines "
+                  f"(max {max_len} BPE tokens)")
+
+        for idx, line in enumerate(epoch_train[start_line:], start=start_line):
             if not line:
                 continue
 
@@ -525,9 +545,9 @@ try:
             # ---- Live status (every ~1 second on terminal) ----
             if now - last_stat_time >= LIVE_REFRESH:
                 rate = idx / max(elapsed, 0.1)
-                pct = 100 * idx / total_lines
+                pct = 100 * idx / epoch_lines
                 if rate >= 0.1:
-                    eta = (total_lines - idx) / rate
+                    eta = (epoch_lines - idx) / rate
                     eta_h, eta_m = int(eta // 3600), int((eta % 3600) // 60)
                     eta_s = f"ETA {eta_h}h{eta_m:02d}m"
                 else:
@@ -542,7 +562,7 @@ try:
                             f"{elapsed/60:.0f}min cos={mean_sim:.4f}±{std_sim:.4f}")
                 try:
                     with open(CFG.status_path + '.tmp', 'w', encoding='utf-8') as _sf:
-                        json.dump({'line': idx, 'total': total_lines, 'pct': pct,
+                        json.dump({'line': idx, 'total': epoch_lines, 'pct': pct,
                                    'rate': rate, 'eta_s': eta_s, 'elapsed_min': elapsed/60,
                                    'cos_mean': mean_sim, 'cos_std': std_sim}, _sf)
                     os.replace(CFG.status_path + '.tmp', CFG.status_path)
@@ -553,9 +573,9 @@ try:
             # ---- Line-based checkpoint + full report ----
             if idx > 0 and idx % CHECKPOINT_EVERY == 0:
                 rate = idx / max(elapsed, 0.1)
-                pct = 100 * idx / total_lines
+                pct = 100 * idx / epoch_lines
                 if rate >= 0.1:
-                    eta = (total_lines - idx) / rate
+                    eta = (epoch_lines - idx) / rate
                     eta_h, eta_m = int(eta // 3600), int((eta % 3600) // 60)
                     eta_s = f"ETA {eta_h}h{eta_m:02d}m"
                 else:

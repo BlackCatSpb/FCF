@@ -621,6 +621,10 @@ try:
                 txt = result['text'].replace('\n', ' ').strip()
                 print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} | gen({seed}): {txt}")
 
+                # 3D PCA visualization every 5th checkpoint
+                if idx % (CHECKPOINT_EVERY * 5) == 0:
+                    _quiet(save_3d_vis, cs, sp, ckpt_name)
+
                 if idx > 0 and idx % EVAL_EVERY_F == 0:
                     eval_result = _quiet(gen.evaluate, CFG.val_corpus_path, max_lines=CFG.eval_max_lines)
                     ppl = eval_result['perplexity']

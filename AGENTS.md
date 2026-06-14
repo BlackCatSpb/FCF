@@ -34,13 +34,19 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - **Pre-filtered per epoch**: each epoch only trains on lines ≤ its max length
 - Progress percentages and ETAs use epoch-relative line counts
 
-### [2026-06-14] GPU acceleration (commit pending)
-- **Vectorized LR computation**: field_weight, theta_gate, and composite LR computed
-  in one shot on GPU via tensor math — replaces Python per-pair loop bottleneck
-- **GPU batched lateral inhibition**: similarity matrix computed on GPU as (G × V)
-  matmul, top-k thresholding on device, batch application
+### [2026-06-14] GPU acceleration (commit 4be3d93)
+- **Vectorized LR computation**: field_weight, theta_gate, composite LR in one shot
+  on GPU via tensor math + scatter_add — replaces Python per-pair loop bottleneck
+- **GPU batched lateral inhibition**: similarity matrix on device (G × V matmul),
+  top-k thresholding, vectorized delta computation
 - **No 500-pair threshold**: GPU path fires for any pair count when `use_torch=True`
-- Changes only affect `train_from_text()` training path; inference unaffected
+
+### [2026-06-14] Visualization (commit pending)
+- `viz_tsne.py [tag] [--n 3000] [--perplexity 30]`: standalone t-SNE visualization,
+  samples concept vectors stratified by frequency, outputs Three.js interactive 3D viewer
+- `train_full.py`: wired PCA `save_3d_vis()` at every 5th checkpoint
+- `real_data/vis/`: created, viewer.html, Three.js-based interactive point cloud
+- Serve via `python serve_vis.py` → http://127.0.0.1:8080/viewer.html
 
 ## Current State
 - Training live (PID 15496), epoch 2 at ~21000L
@@ -48,9 +54,7 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - Baseline eval at 21k shows cos=0.0124, vac@1=0 — need post-epoch-3 comparison
 
 ## Priority Queue
-1. ⬜ Visualization: t-SNE concept space
-2. ⬜ RAG: centroid + _branch bonus (95% ready)
-3. ⬜ GPU acceleration: batched lateral inhibition via CUDA
+1. ✅ (all completed for this session)
 
 ## Key Decisions
 - **Centroid pull LR 0.3** — boost clustering speed (from 0.1)

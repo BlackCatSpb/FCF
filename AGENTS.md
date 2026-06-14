@@ -34,11 +34,13 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - **Pre-filtered per epoch**: each epoch only trains on lines ≤ its max length
 - Progress percentages and ETAs use epoch-relative line counts
 
-### [2026-06-14] RAG query conditioning (commit pending)
-- `inference.py --retrieve "query"`: explicit retrieval step — query → centroid → top-k nearest concepts
-- `inference.py --query "term1,term2" --prompt "..."` — query words steer generation via intent centroid bonus
-- `inference.py --neighbours "word"` — single-token nearest-neighbours (restored)
-- `generate()` in CrystalGenerator already supports `query_words` → centroid → _branch intent bonus — now wired through inference.py CLI
+### [2026-06-14] GPU acceleration (commit pending)
+- **Vectorized LR computation**: field_weight, theta_gate, and composite LR computed
+  in one shot on GPU via tensor math — replaces Python per-pair loop bottleneck
+- **GPU batched lateral inhibition**: similarity matrix computed on GPU as (G × V)
+  matmul, top-k thresholding on device, batch application
+- **No 500-pair threshold**: GPU path fires for any pair count when `use_torch=True`
+- Changes only affect `train_from_text()` training path; inference unaffected
 
 ## Current State
 - Training live (PID 15496), epoch 2 at ~21000L

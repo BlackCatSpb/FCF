@@ -588,7 +588,9 @@ class CrystalGenerator:
         # Collect indices for GPU batch
         gpu_ctx_l = []   # tensor indices for GPU
         gpu_tgt_l = []
-        gpu_meta_l = []  # (i, j, pmi_w, dist_weight, freq_weight) for STDP
+        gpu_meta_l = []  # (j_pos, pmi_w, dist_weight, freq_weight) for STDP
+        gpu_cid_ctx = []  # raw CID for context
+        gpu_cid_gen = []  # raw CID for generated
 
         for i in range(T):
             start = max(0, i - context_window)
@@ -616,7 +618,9 @@ class CrystalGenerator:
                         continue
                     gpu_ctx_l.append(ci)
                     gpu_tgt_l.append(cj)
-                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight))
+                    gpu_meta_l.append((j, pmi_w, dist_weight, freq_weight))
+                    gpu_cid_ctx.append(ids[i])
+                    gpu_cid_gen.append(ids[j])
                 else:
                     # Field gate
                     field_weight = 1.0
@@ -628,102 +632,131 @@ class CrystalGenerator:
                     theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
                     gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
-        # ── GPU batch: compute field_overlaps ──
+        # ── GPU batch: compute field_overlaps + LRs in one shot ──
         if use_torch and gpu_ctx_l:
             ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
             tgt_t = torch.tensor(gpu_tgt_l, dtype=torch.long, device=device)
+            N = len(gpu_ctx_l)
 
             with torch.no_grad():
+                # Field overlap on GPU
                 if field_gate and self._fb_t is not None:
                     ctx_fb = self._fb_t[ctx_t]
                     tgt_fb = self._fb_t[tgt_t]
-                    ovs = (ctx_fb & tgt_fb).sum(dim=1).cpu().numpy()
+                    ovs = (ctx_fb & tgt_fb).sum(dim=1).float()  # (N,) on GPU
                 else:
-                    ovs = np.zeros(len(gpu_ctx_l), dtype=np.int64)
+                    ovs = torch.zeros(N, device=device)
 
-                for pi, (i, j, pmi_w, dw, fw) in enumerate(gpu_meta_l):
-                    overlap = int(ovs[pi])
-                    field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
-                    lr = base_lr_val * max(fw, 0.05) * dw * pmi_w * field_weight
-                    theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
-                    gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
+                # Stack metadata tensors on GPU
+                meta_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
+                j_pos = meta_t[:, 0]
+                pmi_w_t = meta_t[:, 1]
+                dw_t = meta_t[:, 2]
+                fw_t = meta_t[:, 3]
 
-        # ── GPU batched STDP gradient (all gen_cids in one flat call) ──
-        # Only beneficial when flat pairs >> 500; otherwise CPU path is faster
-        _GPU_MIN_PAIRS = 500  # flat pairs; below this CPU numpy is faster
-        _n_flat = sum(len(v) for v in gen_updates.values()) if gen_updates else 0
-        if use_torch and gen_updates and _n_flat >= _GPU_MIN_PAIRS:
-            flat_gen = []
-            flat_ctx = []
-            flat_elr = []
-            for gen_cid, updates in gen_updates.items():
-                for ctx_cid, elr in updates:
-                    flat_gen.append(gen_cid)
-                    flat_ctx.append(ctx_cid)
-                    flat_elr.append(elr)
+                field_w = torch.where(
+                    ovs > 0,
+                    1.0 + torch.log(ovs + 1.0) * 2.0,
+                    torch.full_like(ovs, 0.1))
+                lr = base_lr_val * torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w
+                theta = torch.exp(-torch.clamp(j_pos, max=5.0) / max(self.theta_tau, 1.0))
+                effective_lr = lr * torch.clamp(theta, min=0.1)
 
-            gen_t = torch.tensor(flat_gen, dtype=torch.long, device=device)
-            ctx_t = torch.tensor(flat_ctx, dtype=torch.long, device=device)
-            elr_t = torch.tensor(flat_elr, dtype=torch.float32, device=device)
+                # Build gen_updates via scatter_add from flat arrays
+                # Map gen CIDs → unique indices
+                gen_cids_arr = np.array(gpu_cid_gen, dtype=np.int32)
+                unique_gen, inv_idx = np.unique(gen_cids_arr, return_inverse=True)
+                inv_t = torch.from_numpy(inv_idx).to(device)
 
-            unique_gen = list(gen_updates.keys())
-            gen_to_idx = {g: i for i, g in enumerate(unique_gen)}
-            idx_t = torch.tensor([gen_to_idx[g] for g in flat_gen], dtype=torch.long, device=device)
+                # Group effective LRs by gen_cid
+                elr_grouped = torch.zeros(len(unique_gen), device=device)
+                elr_grouped.scatter_add_(0, inv_t, effective_lr)
 
-            D = cs.dim
-            with torch.no_grad():
-                vg = self._vecs_t[gen_t]  # (N_flat, D)
-                vc = self._vecs_t[ctx_t]  # (N_flat, D)
-                y = torch.clamp((vg * vc).sum(dim=1), min=0.05)  # (N_flat,)
-                # pair_delta = elr * ctx - v_gen * (elr * y)
-                pair_delta = vc * elr_t[:, None] - vg * (y * elr_t)[:, None]  # (N_flat, D)
+                # Group STDP updates (context vectors weighted by effective_lr)
+                vc = self._vecs_t[ctx_t]  # (N, D)
+                vg = self._vecs_t[tgt_t]  # (N, D)
+                y = torch.clamp((vg * vc).sum(dim=1), min=0.05)  # (N,)
+                pair_delta = vc * effective_lr[:, None] - vg * (y * effective_lr)[:, None]  # (N, D)
 
+                D = cs.dim
                 acc = torch.zeros(len(unique_gen), D, dtype=torch.float32, device=device)
-                acc.scatter_add_(0, idx_t[:, None].expand(-1, D), pair_delta)
-                cnt = torch.zeros(len(unique_gen), dtype=torch.float32, device=device)
-                cnt.scatter_add_(0, idx_t, torch.ones_like(idx_t, dtype=torch.float32))
-                elr_total = torch.zeros(len(unique_gen), dtype=torch.float32, device=device)
-                elr_total.scatter_add_(0, idx_t, elr_t)
+                acc.scatter_add_(0, inv_t[:, None].expand(-1, D), pair_delta)
+                cnt = torch.zeros(len(unique_gen), device=device)
+                cnt.scatter_add_(0, inv_t, torch.ones(N, device=device))
 
             acc_cpu = acc.cpu().numpy()
             cnt_cpu = cnt.cpu().numpy()
-            elr_total_cpu = elr_total.cpu().numpy()
+            elr_cpu = elr_grouped.cpu().numpy()
 
+            # ── Apply updates + lateral inhibition (batched on GPU) ──
+            # Pre-fetch all gen vectors for batch inhibition
+            gen_vecs = []
+            gen_cids_list = []
             for gi, gen_cid in enumerate(unique_gen):
-                v_gen = cs.concept_vectors.get(gen_cid)
-                if v_gen is None or cnt_cpu[gi] < 0.5:
+                v = cs.concept_vectors.get(gen_cid)
+                if v is None or cnt_cpu[gi] < 0.5:
                     continue
-                total_elr = elr_total_cpu[gi]
-
-                grad = acc_cpu[gi] / max(cnt_cpu[gi], 1)
-
                 if destab_scale > 0 and self.main_rng.random() < destab_scale * 0.3:
                     ppmi_candidates = self.lattice.connections_of(
                         gen_cid, top_k=20, use_ppmi=True)
                     if ppmi_candidates:
-                        ppmi_cid = ppmi_candidates[self.main_rng.randint(0, len(ppmi_candidates) - 1)][0]
+                        ppmi_cid = ppmi_candidates[self.main_rng.randint(0, len(ppmi_candidates))][0]
                         v_ppmi = cs.concept_vectors.get(ppmi_cid)
                         if v_ppmi is not None:
-                            y_ppmi = max(float(np.dot(v_gen, v_ppmi)), 0.05)
-                            noise = (v_ppmi - y_ppmi * v_gen)
+                            y_ppmi = max(float(np.dot(v, v_ppmi)), 0.05)
+                            noise = (v_ppmi - y_ppmi * v)
                             nlen = float(np.linalg.norm(noise))
                             if nlen > 1e-10:
                                 noise /= nlen
                                 mix = min(destab_scale, 0.5)
-                                grad = grad * (1 - mix) + noise * mix
+                                acc_cpu[gi] = acc_cpu[gi] * (1 - mix) + noise * mix
 
-                v_new = v_gen + grad * base_lr_val
+                grad = acc_cpu[gi] / max(cnt_cpu[gi], 1)
+                v_new = v + grad * base_lr_val
                 nv = np.linalg.norm(v_new)
                 if nv > 1e-10:
                     v_new /= nv
                 cs._apply_vector_update(gen_cid, v_new)
+                gen_vecs.append(v_new)
+                gen_cids_list.append(gen_cid)
 
-                cs._lateral_inhibition_fractal(
-                    gen_cid,
-                    strength=inh_strength * total_elr,
-                    threshold=max(inh_threshold, 0.01),
-                    sample_size=min(100, len(cs.concept_vectors)),
-                )
+            # Batched lateral inhibition on GPU
+            if gen_vecs and inh_strength > 0:
+                gv_t = torch.from_numpy(np.array(gen_vecs, dtype=np.float32)).to(device)
+                gv_all = self._vecs_t  # (V, D)
+                # For each gen vector, find similar non-self vectors and repel
+                sims = gv_t @ gv_all.T  # (G, V)
+                for gi, gen_cid in enumerate(gen_cids_list):
+                    threshold = max(inh_threshold, 0.01)
+                    total_elr = float(elr_cpu[gi])
+                    str_val = inh_strength * total_elr
+                    if str_val < 1e-8:
+                        continue
+                    below = sims[gi] < -0.5
+                    above = sims[gi] > threshold
+                    inhibit = above & ~below
+                    if inhibit.sum() < 1:
+                        continue
+                    targets = torch.where(inhibit)[0]
+                    if len(targets) > 100:
+                        top_sim, top_idx = torch.topk(sims[gi], k=100)
+                        targets = top_idx[top_sim > threshold]
+                    if len(targets) < 1:
+                        continue
+                    v_self = gv_t[gi]
+                    v_opp = gv_all[targets]
+                    dot = (v_self * v_opp).sum(dim=1)
+                    delta = -str_val * (v_opp - dot[:, None] * v_self[None, :])
+                    # Apply inhibition via numpy
+                    delta_cpu = delta.cpu().numpy()
+                    for ti, tcid in enumerate(targets.cpu().numpy()):
+                        v_t = cs.concept_vectors.get(int(tcid))
+                        if v_t is not None:
+                            v_new_t = v_t + delta_cpu[ti]
+                            nt = np.linalg.norm(v_new_t)
+                            if nt > 1e-10:
+                                v_new_t /= nt
+                            cs._apply_vector_update(int(tcid), v_new_t)
 
         else:
             # ── One combined STDP update per unique gen_cid (batched numpy) ──

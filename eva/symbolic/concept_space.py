@@ -15,6 +15,52 @@ from collections import defaultdict, Counter
 import math, json, os
 
 
+class ConceptVectorStore:
+    """Dense ndarray-backed store with dict-like interface.
+
+    Supports .get(), .keys(), .items(), .values(), len(), 'in', iteration.
+    Internal: self._data[V, dim] float32, self._valid[V] bool.
+    """
+    __slots__ = ('_data', '_valid', '_V')
+
+    def __init__(self, V, dim):
+        self._V = V
+        self._data = np.zeros((V, dim), dtype=np.float32)
+        self._valid = np.zeros(V, dtype=bool)
+
+    def __getitem__(self, cid):
+        return self._data[cid]
+
+    def __setitem__(self, cid, v):
+        self._data[cid] = v
+        self._valid[cid] = True
+
+    def get(self, cid, default=None):
+        if 0 <= cid < self._V and self._valid[cid]:
+            return self._data[cid]
+        return default
+
+    def keys(self):
+        return np.where(self._valid)[0].tolist()
+
+    def items(self):
+        valid = np.where(self._valid)[0]
+        for cid in valid:
+            yield cid, self._data[cid]
+
+    def values(self):
+        return self._data[self._valid]
+
+    def __len__(self):
+        return int(self._valid.sum())
+
+    def __contains__(self, cid):
+        return 0 <= cid < self._V and self._valid[cid]
+
+    def __iter__(self):
+        return iter(np.where(self._valid)[0])
+
+
 class FractalField:
     """Fractal computation matrix for relative concept vector space.
 
@@ -402,13 +448,8 @@ class ConceptSpace:
         # Fractal field: latent codes → full vectors via shared basis
         self.fractal = FractalField(dim=self.dim, latent_dim=512)
 
-        # Concept vectors (cid → np.array)
-        self.concept_vectors = {}
-
-        # Array-backed vector access for O(1) lookups
-        self._vec_array = None      # (N, dim) float32
-        self._cids = []             # list of cids matching _vec_array rows
-        self._cid_to_idx = {}       # cid → row index in _vec_array
+        # Concept vectors: dense ndarray[V, dim] with dict-like convenience
+        self.concept_vectors = ConceptVectorStore(self.vocab_size, self.dim)
 
         # Random state
         self.rng = np.random.RandomState(42)
@@ -417,11 +458,6 @@ class ConceptSpace:
         # Shift tracking
         self._total_shift = 0.0
         self._update_count = 0
-
-        # Precomputed vector matrix for fast nearest-neighbor
-        self._vector_matrix = None
-        self._cid_order = []
-        self._matrix_dirty = True
 
         # Product Quantization (storage compression)
         self.pq_codebooks = None
@@ -442,44 +478,27 @@ class ConceptSpace:
                 v = self.rng.randn(self.dim).astype(np.float32)
                 v /= max(np.linalg.norm(v), 1e-10)
                 self.concept_vectors[cid] = v
-        self._all_cids = list(self.concept_vectors.keys())
-        self.sync_vec_array()
-        print(f"  Initialized {len(self.concept_vectors)} concepts via fractal")
 
-    def _sync_concept_vectors_from_fractal(self):
-        """Rebuild concept_vectors dict from fractal latent codes."""
+    def _sync_from_fractal(self):
+        """Sync concept_vectors from fractal latent codes."""
         for cid in list(self.fractal.codes.keys()):
             v = self.fractal.compute_vector(cid)
             if v is not None:
                 self.concept_vectors[cid] = v
-        self.mark_matrix_dirty()
-
-    def sync_vec_array(self):
-        """Build _vec_array from concept_vectors dict for O(1) array access."""
-        self._cids = list(self.concept_vectors.keys())
-        self._cid_to_idx = {cid: i for i, cid in enumerate(self._cids)}
-        self._vec_array = np.array([self.concept_vectors[cid] for cid in self._cids], dtype=np.float32)
 
     def get_vec(self, cid):
-        """O(1) vector access via array index, fall back to dict."""
-        idx = self._cid_to_idx.get(cid)
-        if idx is not None:
-            return self._vec_array[idx]
-        return self.concept_vectors.get(cid)
+        """O(1) vector access."""
+        return self.concept_vectors[cid] if cid in self.concept_vectors else None
 
     def set_vec(self, cid, v):
-        """Update vector in both dict and array."""
+        """Update vector in dense store."""
         self.concept_vectors[cid] = v
-        idx = self._cid_to_idx.get(cid)
-        if idx is not None:
-            self._vec_array[idx] = v
 
     def reinit_fractal(self, cid_list=None):
         """Reinitialize all fractal latent codes (resets all vectors)."""
         cids = cid_list if cid_list is not None else list(self.concept_vectors.keys())
         self.fractal.reinitialize_all(cids)
-        self._sync_concept_vectors_from_fractal()
-        print(f"  Reinitialized {len(cids)} concepts via fractal field")
+        self._sync_from_fractal()
 
     # ── H matrix + BMSSP ────────────────────────────────────
 
@@ -687,7 +706,7 @@ class ConceptSpace:
     def fluctuate_fractal(self, noise_scale=0.003, decay=0.9995, repel_strength=0.0):
         """Autonomous drift + optional centroid repulsion."""
         self.fractal.fluctuate(noise_scale=noise_scale, decay=decay)
-        self._sync_concept_vectors_from_fractal()
+        self._sync_from_fractal()
         if repel_strength > 0:
             self._repel_centroid(repel_strength)
 
@@ -726,7 +745,6 @@ class ConceptSpace:
             if nv > 1e-10:
                 v_new /= nv
             self._apply_vector_update(cid, v_new)
-        self._matrix_dirty = True
 
     # ---- STDP: Spike-Timing-Dependent Plasticity on fractal codes ----
 
@@ -769,8 +787,6 @@ class ConceptSpace:
             if nv_code > 1e-10:
                 new_code /= nv_code
             self.fractal.codes[cid] = new_code
-
-        self._matrix_dirty = True
 
     def fractal_stdp(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0,
                      inh_strength=0.05, inh_threshold=0.35):
@@ -825,7 +841,6 @@ class ConceptSpace:
         self._apply_vector_update(gen_cid, v_new)
 
         self._lateral_inhibition_fractal(gen_cid, strength=inh_strength * effective_lr, threshold=inh_threshold)
-        self.mark_matrix_dirty()
 
     def _lateral_inhibition_fractal(self, winner_cid, strength=0.01, threshold=0.35, sample_size=None):
         """Lateral inhibition with correct Riemannian gradient, vectorised.
@@ -837,7 +852,7 @@ class ConceptSpace:
         and does not follow the geodesic — fixed.
 
         Inner loop over sampled concepts is vectorised (numpy batch ops).
-        Uses _vec_array for O(1) array-backed gather.
+        Uses dense ndarray for O(1) gather.
         """
         v_win = self.concept_vectors.get(winner_cid)
         if v_win is None:
@@ -847,22 +862,20 @@ class ConceptSpace:
         if sample_size is None:
             sample_size = min(200, len(self.concept_vectors))
 
-        cids = self._cids if hasattr(self, '_cids') and self._cids else self._all_cids
+        cids = self.concept_vectors.keys()
         n_cids = len(cids)
         if n_cids <= 1:
             return
 
         if not hasattr(self, '_inhibit_rng'):
             self._inhibit_rng = np.random.RandomState(42)
-        # Fast: randint + unique avoids full permutation (30x faster)
         raw = self._inhibit_rng.randint(0, n_cids, size=sample_size + 50)
         u_idxs = np.unique(raw)
         sampled_indices = [i for i in u_idxs if cids[i] != winner_cid][:sample_size]
         if len(sampled_indices) < 1:
             return
 
-        # Array-backed gather: O(sample_size) instead of dict lookups + array creation
-        sampled_vecs = self._vec_array[sampled_indices]  # (S, dim)
+        sampled_vecs = self.concept_vectors._data[sampled_indices]
         sampled_cids = [cids[i] for i in sampled_indices]
         sims = np.dot(sampled_vecs, vw_n)
         mask = sims > threshold
@@ -884,7 +897,6 @@ class ConceptSpace:
 
         for idx, cid in enumerate([sc for sc, m in zip(sampled_cids, mask) if m]):
             self._apply_vector_update(cid, v_new[idx])
-        self._matrix_dirty = True
 
     def init_homeostasis(self):
         """Initialize homeostasis tracking for concepts."""
@@ -954,55 +966,31 @@ class ConceptSpace:
 
     # ---- Query API ----
 
-    def ensure_matrix(self):
-        """Build or rebuild the precomputed vector matrix for fast NN search."""
-        if not self._matrix_dirty and self._vector_matrix is not None:
-            return
-        cids = []
-        vecs = []
-        for cid, v in self.concept_vectors.items():
-            cids.append(cid)
-            vecs.append(v)
-        if not vecs:
-            self._vector_matrix = np.empty((0, self.dim), dtype=np.float32)
-            self._cid_order = []
-            self._matrix_dirty = False
-            return
-        mat = np.array(vecs, dtype=np.float32)
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        norms[norms < 1e-10] = 1.0
-        self._vector_matrix = mat / norms
-        self._cid_order = cids
-        self._matrix_dirty = False
-
-    def mark_matrix_dirty(self):
-        """Call after vector changes (STDP, new concepts)."""
-        self._matrix_dirty = True
-
     def concept_vector(self, cid):
         """Get concept centroid vector."""
         return self.concept_vectors.get(cid)
 
     def topk_similar_concepts(self, cid, k=10, sample_size=500):
-        """Top-k concepts closest to given concept (batched matrix NN)."""
+        """Top-k concepts closest to given concept (dense array NN)."""
         v = self.concept_vectors.get(cid)
         if v is None:
             return []
-        self.ensure_matrix()
-        mat = self._vector_matrix
+        valid = self.concept_vectors._valid
+        mat = self.concept_vectors._data[valid]
+        order = np.where(valid)[0]
         if mat.shape[0] == 0:
             return []
         vn = v / max(np.linalg.norm(v), 1e-10)
         sims = mat @ vn
         n = len(sims)
-        k_actual = min(k + 1, n)  # +1 to skip self
+        k_actual = min(k + 1, n)
         if k_actual <= 0:
             return []
         idx = np.argpartition(-sims, k_actual - 1)[:k_actual]
         idx = idx[np.argsort(-sims[idx])]
         result = []
         for i in idx:
-            c = self._cid_order[i]
+            c = int(order[i])
             if c == cid:
                 continue
             result.append((c, float(sims[i])))
@@ -1111,7 +1099,6 @@ class ConceptSpace:
         # Write back
         for i, cid in enumerate(self.pq_cid_order):
             self.concept_vectors[cid] = decoded[i]
-        self.mark_matrix_dirty()
 
     def pq_decode(self, cid):
         """Decode a single concept vector from PQ codes."""
@@ -1221,16 +1208,13 @@ class ConceptSpace:
 
         self.dim = new_dim
         self.fractal._matrix_dirty = True
-        self._sync_concept_vectors_from_fractal()
+        self._sync_from_fractal()
 
         # Invalidate caches
         self.pq_codebooks = None
         self.pq_codes = None
         self.pq_cid_order = []
-        self._vector_matrix = None
-        self._cid_order = []
-        self._matrix_dirty = True
-        print(f'  Done: {len(self.concept_vectors)} concepts @ {self.dim}D')
+        print(f'  Done: {self.vocab_size} concepts @ {self.dim}D')
 
     def normalize_vectors(self):
         """Center and normalize all concept vectors onto the unit sphere.
@@ -1263,10 +1247,7 @@ class ConceptSpace:
             self.fractal.codes[cid] = code_new
         self.fractal._matrix_dirty = True
 
-        # Invalidate caches
-        self._vector_matrix = None
-        self._cid_order = []
-        self._matrix_dirty = True
+        # Invalidate PQ caches
         self.pq_codebooks = None
         self.pq_codes = None
         self.pq_cid_order = []
@@ -1335,9 +1316,6 @@ class ConceptSpace:
                 p99 = np.percentile(sim_vals, 99)
                 print(f'    epoch {epoch+1}: pushed {n_pushed}, mean_sim={np.mean(sim_vals):.3f}, p99={p99:.3f}')
 
-        self._vector_matrix = None
-        self._cid_order = []
-        self._matrix_dirty = True
         print(f'  Done')
 
     def save(self, path, use_pq=False):
@@ -1397,6 +1375,8 @@ class ConceptSpace:
         obj.pq_n_subvectors = 0
         obj.pq_n_centroids = 0
 
+        obj.concept_vectors = ConceptVectorStore(obj.vocab_size, obj.dim)
+
         if data.get('pq'):
             n_sub = data['n_subvectors']
             n_cen = data['n_centroids']
@@ -1415,24 +1395,17 @@ class ConceptSpace:
             norms = np.linalg.norm(decoded, axis=1, keepdims=True)
             norms[norms < 1e-10] = 1.0
             decoded /= norms
-            obj.concept_vectors = {}
             for i, cid in enumerate(obj.pq_cid_order):
                 obj.concept_vectors[cid] = decoded[i]
-        else:
-            obj.concept_vectors = {}
 
         obj.rng = np.random.RandomState(42)
         obj._inhibition_step = 0
         obj._total_shift = 0.0
         obj._update_count = 0
-        obj._vector_matrix = None
-        obj._cid_order = []
-        obj._matrix_dirty = True
 
         if 'fractal' in data:
             base_dir = os.path.dirname(path)
             obj.fractal = FractalField.from_dict(data['fractal'], base_dir=base_dir)
-            obj.concept_vectors = {}
             for cid in list(obj.fractal.codes.keys()):
                 v = obj.fractal.compute_vector(cid)
                 if v is not None:
@@ -1447,8 +1420,6 @@ class ConceptSpace:
             obj.concept_fitness = {int(c): f for c, f in saved_fitness.items()}
         else:
             obj.init_homeostasis()
-        obj._all_cids = list(obj.concept_vectors.keys())
-        obj.sync_vec_array()
         pq_note = ' (PQ)' if data.get('pq') else ''
         print(f"  Loaded ConceptSpace: {len(obj.concept_vectors)} concepts @ {obj.dim}D{pq_note}")
         return obj

@@ -611,22 +611,33 @@ class CrystalGenerator:
                     theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
                     gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
-        # ── One combined STDP update per unique gen_cid ──
+        # ── One combined STDP update per unique gen_cid (batched numpy) ──
         for gen_cid, updates in gen_updates.items():
             v_gen = cs.concept_vectors.get(gen_cid)
-            if v_gen is None:
+            if v_gen is None or not updates:
                 continue
 
             n_updates = len(updates)
-            total_delta = np.zeros(cs.dim, dtype=np.float32)
-            total_elr = 0.0
-            for prev_cid, elr in updates:
-                v_ctx = cs.concept_vectors.get(prev_cid)
-                if v_ctx is None:
-                    continue
-                y = max(float(np.dot(v_gen, v_ctx)), 0.05)
-                total_delta += (v_ctx - y * v_gen) * elr
-                total_elr += elr
+            ctx_cids, elrs = zip(*updates)
+            valid_ctx = []
+            valid_elr = []
+            for cid, elr in zip(ctx_cids, elrs):
+                v = cs.concept_vectors.get(cid)
+                if v is not None:
+                    valid_ctx.append(v)
+                    valid_elr.append(elr)
+
+            if not valid_ctx:
+                continue
+
+            ctx_mat = np.array(valid_ctx, dtype=np.float32)
+            elr_arr = np.array(valid_elr, dtype=np.float32)
+            total_elr = float(elr_arr.sum())
+
+            # Batched: one matmul instead of per-pair np.dot
+            y = np.maximum(v_gen @ ctx_mat.T, 0.05)
+            total_delta = ((ctx_mat * elr_arr[:, None]).sum(axis=0) -
+                          v_gen * (y * elr_arr).sum())
 
             # Normalise gradient by count — step size ≠ f(window size)
             if n_updates > 0 and total_elr > 0:
@@ -665,7 +676,6 @@ class CrystalGenerator:
                 threshold=max(inh_threshold, 0.01),
                 sample_size=min(100, len(cs.concept_vectors)),
             )
-            cs.mark_matrix_dirty()
 
         # ── Negative sampling ──
         if neg_samples > 0 and use_torch and self._vecs_t is not None and gpu_ctx_l:
@@ -739,6 +749,28 @@ class CrystalGenerator:
                         if nv > 1e-10:
                             v_new /= nv
                         cs._apply_vector_update(neg_cid, v_new)
+
+        # ── Sentence-level centroid pull (CBOW-like, raw vectors only) ──
+        if len(ids) >= 3:
+            sent_vecs = [cs.concept_vectors.get(c) for c in ids]
+            sent_vecs = [v for v in sent_vecs if v is not None]
+            if len(sent_vecs) >= 3:
+                centroid = np.mean(sent_vecs, axis=0).astype(np.float32)
+                n_cent = np.linalg.norm(centroid)
+                if n_cent > 1e-10:
+                    centroid /= n_cent
+                    sent_lr = base_lr_val * 0.1
+                    for cid in ids:
+                        v = cs.concept_vectors.get(cid)
+                        if v is None:
+                            continue
+                        sim = float(np.dot(v, centroid))
+                        shift = (centroid - sim * v) * sent_lr
+                        v_new = v + shift
+                        nv = np.linalg.norm(v_new)
+                        if nv > 1e-10:
+                            v_new /= nv
+                        cs.concept_vectors[cid] = v_new
 
         self.lattice.update(ids)
         self._graph_cache.clear()

@@ -21,6 +21,7 @@ real_data/full_corpus_ru.txt
 real_data/val_corpus.txt
 real_data/train_log.txt
 real_data/vis/
+real_data/_train_status.json
 real_data/*.tmp
 real_data/gen_*.txt
 real_data/gen_*.py

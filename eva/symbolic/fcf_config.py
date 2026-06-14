@@ -121,7 +121,7 @@ class FCFConfig:
     # ── Архитектура ─────────────────────────
     dim: int = 384
     latent_dim: int = 512
-    n_anchors: int = 1024
+    n_anchors: int = 2048
     max_n: int = 4
     octree_levels: int = 16
 
@@ -139,10 +139,11 @@ class FCFConfig:
 
     # ── Параметры адаптации ──────────────────
     params: list = field(default_factory=lambda: [
-        ParamDef('full_lr',        0.003,  0.15,   0.03,   0.10, rules=[
+        ParamDef('full_lr',        0.003,  0.50,   0.03,   0.10, rules=[
             AdaptRule('cos_trend > 0.001 and mean_cos > 0.005', 'full_lr', 'scale', 0.95),
             AdaptRule('cos_trend < -0.001 and mean_cos < -0.005', 'full_lr', 'scale', 1.05),
             AdaptRule('vec_ppl_plateau', 'full_lr', 'scale', 1.08),
+            AdaptRule('cos_flat >= 3', 'full_lr', 'scale', 1.15),
         ]),
         ParamDef('repel_strength', 0.01,   0.20,   0.08,   0.05, rules=[
             AdaptRule('mean_cos > 0.01', 'repel_strength', 'scale', 1.10),
@@ -158,15 +159,17 @@ class FCFConfig:
         ]),
         ParamDef('inh_strength',   0.01,   0.15,   0.05,   0.05),
         ParamDef('inh_sample',     100,    600,    200,    100),
-        ParamDef('context_window', 1,      4,      2,      0.5, rules=[
+        ParamDef('context_window', 1,      6,      2,      0.5, rules=[
             AdaptRule('vec_ppl_plateau', 'context_window', 'shift', 0.5),
+            AdaptRule('cos_flat >= 5', 'context_window', 'shift', 0.5),
         ]),
         ParamDef('theta_tau',      5,      30,     15,     2.0, rules=[
             AdaptRule('acc1_plateau', 'theta_tau', 'shift', 2),
         ]),
-        ParamDef('neg_samples',    0,      5,      2,      0.5, rules=[
+        ParamDef('neg_samples',    0,      8,      2,      0.5, rules=[
             AdaptRule('vacc1_stuck >= 3', 'neg_samples', 'shift', 1),
             AdaptRule('vacc1 > 0.01', 'neg_samples', 'shift', -1),
+            AdaptRule('cos_flat >= 5', 'neg_samples', 'shift', 1),
         ]),
         ParamDef('pmi_gate_min',   0.05,   0.5,    0.20,   0.02, rules=[
             AdaptRule('delta < 2.0', 'pmi_gate_min', 'shift', -0.01),
@@ -175,6 +178,9 @@ class FCFConfig:
         ParamDef('decay_rate',     0.998,  0.9999, 0.9998, 0.00005, rules=[
             AdaptRule('ng_new < 100', 'decay_rate', 'shift', -0.0001),
             AdaptRule('ng_new > 10000', 'decay_rate', 'shift', 0.00005),
+        ]),
+        ParamDef('destab_decay_lines', 5000, 60000, 30000, 2000, rules=[
+            AdaptRule('cos_flat >= 3', 'destab_decay_lines', 'shift', 2000),
         ]),
     ])
 
@@ -216,7 +222,7 @@ class FCFConfig:
     # ── Destabilisation (PPMI noise) ──────────
     destab_scale_start: float = 0.6
     destab_scale_end: float = 0.02
-    destab_decay_lines: int = 30000
+    destab_decay_lines: int = 30000  # default, overridden by opt.p['destab_decay_lines'] in training
 
     # ── Drift guard ───────────────────────────
     code_bound: float = 10.0

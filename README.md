@@ -52,17 +52,24 @@
 - 146K концептов, каждый — точка на сфере в 384D
 - Код фрактала: z_c(256) + z_a(128) + z_m(128) = 512D
 - Проекция: v = code @ basis (384D)
-- Обучение: STDP (Spike-Timing-Dependent Plasticity):
+- Обучение — три механизма:
+
+**STDP (Spike-Timing-Dependent Plasticity):**
   - Токен A раньше B → вектор B сдвигается в сторону A
-  - Только вперёд, чтобы избежать коллапса
-  - PMI-gate (шаблонные пары — малый вес)
+  - Batched numpy: все контекстные пары — в матрицу, один `v_gen @ ctx_mat.T`
+  - PMI-gate (шаблонные пары — отсекаются), отключается на 2+ эпохе
   - Тета-ритм (позиция в предложении модулирует LR)
   - Frequency weighting (частые слова — низкий вес)
-- **Lateral inhibition**: до 100 случайных концептов с cos > threshold
+
+**Sentence centroid pull (CBOW-like):**
+  - Все токены предложения → к общему центроиду (LR × 0.1)
+  - Обновляются raw-векторы напрямую, без fractal encoding
+
+**Lateral inhibition**: до 100 случайных концептов с cos > threshold
   - Riemannian gradient: отталкивание по геодезической сферы
   - O(1) indexed access через `_vec_array`
 - **Fluctuation**: ланжевеновский дрейф в нуль-пространство
-- **Field gate**: активация через octree overlap (не отдельный attention)
+- **Field gate**: активация через octree overlap, отключается на 2+ эпохе
 
 ### 4. CrystalGenerator — генерация
 
@@ -81,43 +88,54 @@
 
 ---
 
-## Производительность (FAST mode)
+## Текущее состояние (2026‑06)
 
-| Метрика | Значение |
-|---|---|
-| Vocab | 146K |
-| Скорость | 32 L/s (было 3 L/s без оптимизаций) |
-| Память | 2.8 GB (было 5.1 GB) |
-| ETA (полный корпус) | ~1h13m (было ~13h) |
-| Checkpoint | 276 MB (4.8 MB JSON + 271 MB npz) |
+### 1-я эпоха (146K BPE, FAST mode, ~24ч)
 
-Оптимизации:
-- PMI gate: `_prefix_total` + `_skip2_total` кеши (9.7×)
-- `_vec_array` + `get_vec/set_vec` O(1) доступ
-- Lateral inhibition: `randint+unique` вместо `permutation` (30×)
-- В FAST mode: n-граммы не загружаются (pmi_gate=False)
+| Метрика | Старт | Финиш | Цель |
+|---|---|---|---|
+| cos | −0.0009 | **+0.0091±0.080** | >0.05 |
+| PPL | 119545 | **117372** | <32K |
+| vPPL | 143833 | **128237** | <32K |
+| con | 500/500 | 500/500 | 500/500 |
 
----
+### 2-я эпоха (в процессе)
 
-## Текущее состояние (2025‑06)
+Дополнительные механизмы:
+- **Sentence centroid pull** — токены внутри предложения притягиваются к общему центроиду (CBOW-like)
+- **pmi_gate=False** — все контекстные пары участвуют в обучении
+- **field_gate=False** — отключён octree overlap для ускорения
 
-| Метрика | Сейчас | Цель |
+Динамика (первые 10%):
+- cos: 0.0032 → **0.0236** (+7× за 11K строк)
+- vPPL: 120781 → **111602** (−8%)
+
+### Оптимизации скорости
+
+| Оптимизация | Ускорение | Где |
 |---|---|---|
-| cos_std | 0.066 (случайный) | 0.02–0.03 |
-| acc@1 | 2.7% | >25% |
-| PPL | 142K | <32K |
-| Тренировка | ~32 L/s @ 3000 строк | 145K строк |
+| Batched numpy STDP | 10–50× | `crystal_generator.py:636` — один matmul вместо per-pair dot |
+| PMI gate кеши | 9.7× | `_prefix_total` + `_skip2_total` |
+| `_vec_array` O(1) | 30× | Вместо dict lookup |
+| Lateral inhibition | 30× | `randint+unique` вместо `permutation` |
+| FAST mode (без n-gram) | 10× | pmi_gate=False, n-граммы не загружаются |
 
 ---
 
 ## Быстрый запуск
 
 ```bash
-# Быстрое обучение (lr=0.15, pmi_gate=off)
+# 1-я эпоха (быстрый старт)
 python train_full.py --fast
 
-# Продолжить с checkpoint
-python train_full.py --fast --resume
+# Полное обучение (2 эпохи, авто-подхват последнего чекпоинта)
+python train_full.py --epochs 2
+
+# Свежий старт (сбросить прогресс)
+python train_full.py --epochs 2 --fresh
+
+# Загрузка конкретного чекпоинта
+python train_full.py --epochs 2 --resume 145k
 
 # Интерактивная генерация (после обучения)
 python gen_quick.py

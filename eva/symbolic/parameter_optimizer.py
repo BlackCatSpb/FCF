@@ -7,7 +7,7 @@ metric trends and plateau detection, not gradients.
 Rules are loaded from FCFConfig — no hardcoded if/elif chains.
 """
 
-import math
+import math, time
 import numpy as np
 from collections import deque
 from typing import Optional
@@ -136,6 +136,9 @@ class ParameterOptimizer:
         self._prev_mean_cos = 0.0
         self._vacc1_stuck = 0
         self._step = 0
+        self._flat_thresh = 0.002    # |cos| below this = flat (symmetric plateau)
+        self._flat_steps = 0         # consecutive steps with |cos| below thresh
+        self._cos_trend_buffer = deque(maxlen=5)  # abs(cos) history for plateau detection
 
     def _eval_trigger(self, trigger: str, ctx: dict) -> bool:
         """Evaluate a trigger string against context dict of metrics."""
@@ -150,6 +153,11 @@ class ParameterOptimizer:
             if trigger.startswith('vacc1_stuck >= '):
                 n = int(trigger.split('>=')[1].strip())
                 return self._vacc1_stuck >= n
+
+            # cos_flat >= N — cos stuck in symmetric plateau
+            if trigger.startswith('cos_flat >= '):
+                n = int(trigger.split('>=')[1].strip())
+                return self._flat_steps >= n
 
             # est_frac > X
             if trigger.startswith('est_frac > '):
@@ -292,6 +300,15 @@ class ParameterOptimizer:
             else:
                 self._vacc1_stuck = 0
 
+        # Track symmetric-plateau (cos_flat) detection
+        mean_cos = kw.get('mean_cos')
+        if mean_cos is not None:
+            self._cos_trend_buffer.append(abs(mean_cos))
+            if abs(mean_cos) < self._flat_thresh:
+                self._flat_steps += 1
+            else:
+                self._flat_steps = 0
+
         self._prev_mean_cos = kw.get('mean_cos', self._prev_mean_cos)
         return changes
 
@@ -304,6 +321,8 @@ class ParameterOptimizer:
             '_prev_mean_cos': self._prev_mean_cos,
             '_vacc1_stuck': self._vacc1_stuck,
             '_step': self._step,
+            '_flat_steps': self._flat_steps,
+            '_cos_trend_buffer': list(self._cos_trend_buffer),
         }
 
     def load_state(self, state):
@@ -323,6 +342,9 @@ class ParameterOptimizer:
         self._prev_mean_cos = state.get('_prev_mean_cos', 0.0)
         self._vacc1_stuck = state.get('_vacc1_stuck', 0)
         self._step = state.get('_step', 0)
+        self._flat_steps = state.get('_flat_steps', 0)
+        buf = state.get('_cos_trend_buffer', [])
+        self._cos_trend_buffer = deque(buf, maxlen=5)
 
     def summary(self):
         return ' | '.join(f"{p.name}={p.current:.4g}" for p in self.p.values())

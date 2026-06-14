@@ -272,3 +272,67 @@ Still lateral inhibition: `_apply_vector_update` per affected concept does `delt
 3. Phrase chunking (384→64→384)
 4. Compositional binding (circular convolution)
 5. Predictive coding
+
+---
+
+## External ideas to integrate (2026-06-14)
+
+### What's unique in FCF
+1. **No gradient descent** — STDP + lateral inhibition + centroid pull, purely local rules
+2. **No backprop** — no global loss function, continuous online learning
+3. **Fully interpretable** — every vector readable, every link geometrically explainable
+4. **Fractal coordinate system** — Octree H where LCP = semantic proximity
+5. **Built-in morphology** — same-root words share octant prefix (geometry, not tags)
+6. **Ontogeny = learning** — no train/eval/inference split
+
+Closest academic analog: **Semantic Pointer Architecture** (Eliasmith, Spaun) — but SPA uses fixed vectors, FCF learns them. Closest industry analog: **HTM** (Numenta) — but HTM uses binary patterns, FCF uses continuous vector space.
+
+### What to borrow from outside
+
+#### 1. Predictive Coding (neuroscience + ML) — PRIORITY #1
+- Currently: co-occurrence drives learning
+- Target: each field region **predicts** next state, prediction error = learning signal
+- Why: co-occurrence → static statistics, predictive coding → causality
+- Integration: after each sentence, predict next field state, measure error, inject error as gradient back
+- STDP remains but modulated by prediction error
+
+#### 2. Semantic Pointer Architecture (SPA, Eliasmith) — PRIORITY #2
+- Circular convolution for composition
+  `cat ⊛ agent + catch ⊛ action + mouse ⊛ patient` → single vector
+- Unbinding: `bound ⊘ agent ≈ cat`
+- Why: currently bag-of-vectors ("black cat" ≈ "white cat"), SPA preserves structure
+- Vectors already on 384D sphere, circular convolution gives 384D, O(d log d) via FFT
+
+#### 3. Retrieval-Augmented Generation (RAG) — PRIORITY #3
+- Query → retrieve → generate, but memory is already inside concept_vectors (no external DB)
+- Why: instant query separation, "war" → retrieve (peace, battle, Napoleon) → conditioned generate
+
+#### 4. Active Inference (Friston) — philosophical foundation
+- Free Energy Principle: system minimizes surprise
+- Prediction error = free energy. Action (generation) also minimizes error
+- Why: single principle for learning, generation, attention, planning
+- FCF with predictive coding + STDP = already 80% Active Inference
+
+#### 5. Hyperdimensional Computing (HDC) — mathematical foundation
+- Vectors in 384D = hyperdimensional (HDC uses 1000-10000D)
+- HDC proven: bundling (+), binding (⊙), permutation (ρ) = complete cognitive algebra
+- Why: theoretical foundation. Random vectors in 10KD are quasi-orthogonal
+
+#### 6. World Models / Dreaming (Ha & Schmidhuber)
+- Generation as planning, not output
+- Model generates possible next field states, evaluates, picks best
+- Why: generation becomes internal simulation, answer is just a special case
+
+### Final philosophy
+```
+FCF is not a language model.
+FCF is an attempt to build a cognitive field
+where knowledge is not a set of parameters
+but geometry of a self-organizing space.
+```
+
+### Projects to monitor regularly
+- **Numenta HTM** — closest engineering system in spirit
+- **Spaun 2.0** (Eliasmith) — SPA at scale
+- **Active Inference Institute** — theoretical foundation
+- **HDC/VSA** (Vector Symbolic Architectures) — mathematical toolkit

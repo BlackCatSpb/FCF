@@ -211,3 +211,64 @@ Still lateral inhibition: `_apply_vector_update` per affected concept does `delt
 1. Skip inhibition for gen_cids with tiny `total_elr`
 2. Batch `delta_code` computation across all affected concepts in one matmul
 3. Numba JIT for the `_apply_vector_update` + `apply_code_update` hot path
+
+---
+
+## Cognitive Architecture Roadmap (2026-06-14)
+
+### Current capability
+- **STDP**: pairwise token proximity in ±2 window (bigram-level)
+- **Centroid pull**: sentence-level bag-of-tokens alignment
+- **Generation**: stateless beam continuation (always same output pattern)
+- **No query, no retrieval, no composition, no episodic memory**
+
+### What's missing for cognitive meta-structure
+
+#### 1. Query → Retrieval → Generation (separate processes)
+- Query-encoder: запрос → centroid vector
+- Retrieval: top-K ближайших concept_vectors по cos
+- Conditioned beam: найденные концепты как priors для генерации
+- *Сложность: ~2 дня*
+- *Эффект: разная генерация по разным запросам*
+
+#### 2. Episodic FIFO memory (context between sentences)
+- Буфер последних 5-10 предложений
+- Каждое новое предложение получает centroid не только своих токенов, но и summary предыдущих
+- Связность: «война→мир→Толстой→1869»
+- *Сложность: ~1 день*
+
+#### 3. Hierarchical compression (phrase chunking)
+- Фразы, клаузы, предложения → сжатые векторы (384→64→384 autoencoder)
+- Иерархический ConceptSpace (phrase_space, clause_space)
+- Композиция: «чёрный кот» ≠ «чёрный» + «кот»
+- *Сложность: ~3-4 дня*
+
+#### 4. Compositional binding (Semantic Pointer Architecture)
+- Circular convolution вместо bag-of-vectors
+- agent(кот) ⊛ action(ловит) ⊛ patient(мышь) → bound vector
+- Unbinding: bound ⊘ agent ≈ кот
+- *Сложность: ~2-3 дня*
+
+#### 5. Predictive coding (System 1 → System 2)
+- Вектор предсказывает следующее состояние поля
+- Ошибка предсказания = сигнал обучения (не co-occurrence)
+- Высокая ошибка → System 2 (планирование, поиск)
+- *Сложность: ~5 дней*
+
+#### 6. Generation becomes a reaction
+```
+Запрос → Query-encoder → retrieval (FIFO memory + concept space)
+                              ↓
+                    Reasoning (composition + binding)
+                              ↓
+                    Response generation (один из выходов)
+```
+- Обучение, флуктуация, inhibition работают фоном
+- Генерация — не главный процесс, а реакция на внутреннее состояние
+
+### Priority order
+1. Query → retrieve → conditioned beam
+2. Episodic FIFO (5-10 предложений)
+3. Phrase chunking (384→64→384)
+4. Compositional binding (circular convolution)
+5. Predictive coding

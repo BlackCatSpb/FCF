@@ -597,7 +597,7 @@ try:
                 seed = np.random.choice(CFG.test_seeds)
                 result = gen.generate(seed_word=seed, max_words=CFG.gen_max_words)
                 txt = result['text'].replace('\n', ' ').strip()
-                print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} | gen({seed}): {txt[:60]}")
+                print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} | gen({seed}): {txt}")
 
                 if idx > 0 and idx % EVAL_EVERY_F == 0:
                     eval_result = _quiet(gen.evaluate, CFG.val_corpus_path, max_lines=CFG.eval_max_lines)
@@ -650,7 +650,7 @@ print("--- Generation ---")
 for seed in CFG.test_seeds:
     result = gen.generate(seed_word=seed, max_words=CFG.gen_max_words)
     txt = result['text']
-    print(f"  [{seed}] {txt[:60]}  ({result['score']:.2f})")
+    print(f"  [{seed}] {txt}  ({result['score']:.2f})")
 
 t_total = time.time() - t_start
 print(f"  {n_trained} lines in {t_total:.0f}s ({n_trained/t_total:.0f} L/s)")

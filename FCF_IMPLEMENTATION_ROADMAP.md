@@ -751,7 +751,100 @@ FIFO (1d) ──┐
 
 ---
 
-## Major Architectural Gaps (Not Covered by 7 Features)
+## Dynamic Dimensionality
+
+### Problem
+146K × 384D = 224 MB fixed matrix. Every concept uses 384 float32 regardless of complexity. Token `the` and `антидисestablishmentarianism` consume identical memory and compute.
+
+### 4 approaches
+
+| Approach | Avg D | Memory | Clustering | FCF-native |
+|----------|-------|--------|------------|:----------:|
+| Current (fixed 384D) | 384 | 224 MB | No | — |
+| **Fractal (octree depth)** | **~24** | **~14 MB** | **Built-in via LCP** | **✅** |
+| Mixture-of-Dimensions (gate) | 160 | 93 MB | Via active blocks | ⚠️ |
+| Progressive (by frequency) | 100 | 58 MB | No | ❌ |
+
+### 1. Fractal dimensionality (recommended)
+
+**Idea:** Dimension = function of octree path length. Each octree level adds 3 dimensions (x, y, z):
+```
+Level 0 (1 digit):     3D  (x₀, y₀, z₀)
+Level 1 (2 digits):    6D  (3D level 0 + 3D subcube)
+Level 2 (4 digits):   12D
+Level n (2ⁿ digits):  3 × 2ⁿ D
+```
+
+**Key property:** Cosine similarity computes only over **shared dimensions** (LCP prefix):
+```python
+def fractal_dot(a_vec, b_vec, lcp):
+    """Dot product only over shared LCP dimensions."""
+    dims = min(len(a_vec), len(b_vec), 3 * 2**lcp)
+    return a_vec[:dims] @ b_vec[:dims]
+```
+
+Concepts with LCP=3 share 24D. With LCP=0 — only 3D. Their vectors are **naturally separated** by structure, not by inhibition.
+
+**Implementation path:**
+1. Redefine `concept_vectors` as ragged dict `{cid: np.array(dim)}` instead of fixed-size `_data` matrix
+2. `_vec_array` → `_vec_dict` (fallback to dict access for ragged shapes)
+3. `topk_similar_concepts` computes dot over shared prefix only
+4. `l2_dist` → `shared_dim_dist` (normalized by number of shared dims)
+5. STDP update only touches shared dims (but needs to extend dimensions for new LCP levels)
+
+**Memory:** 146K concepts × fractal dimensions (~12 on average by Zipf distribution) × 4 bytes ≈ **7 MB** for common concepts, ~30 MB total including rare ones.
+
+**Risks:**
+- Ragged tensor ops are not natively supported in numpy (per-concept loops)
+- `_vec_array` O(1) access loss → potential speed regression
+- STDP needs to handle variable-length vectors (trivial: slice to min dim)
+
+### 2. Mixture-of-Dimensions (MoD)
+
+**Idea:** 64 shared + 320 specialist dims in 10 blocks of 32. Each concept activates 2-3 blocks via meta-gate.
+
+```
+v = [shared_64 | block_act(0)*b0 | block_act(1)*b1 | ... | block_act(9)*b9]
+```
+
+Meta-gate (z_m from fractal code) selects active blocks:
+```python
+mask = z_m[10:]  # 10-bit gate from z_m subspace (128D → 10D → sigmoid)
+active_blocks = np.where(mask > 0.5)[0]
+v = np.concatenate([shared, *[blocks[b] for b in active_blocks]])
+```
+
+**Memory:** 146K × (64 + 3×32) = 146K × 160 = **93 MB** (2.4× reduction).
+**Clustering:** Concepts sharing active blocks are semantically near — natural clustering without k-means.
+
+### 3. Progressive (by frequency)
+
+**Idea:** dim = min(384, 64 + 8 × log₂(freq)):
+- freq=1: 64D
+- freq=10: 64 + 8×3.3 = 90D
+- freq=1000: 64 + 8×10 = 144D
+- freq=100K: 64 + 8×16.6 = 197D
+
+**Memory:** ~60% tokens have freq < 10 → 64D. ~5% have freq > 1000 → 384D. Average ~100D → **58 MB**.
+
+**Problem:** No natural clustering. Rare tokens near frequent tokens in semantic space but have fewer dims → asymmetric similarity computation.
+
+### Priority
+
+1. **Fractal dimensionality** — most FCF-native, gives clustering for free, biggest memory win
+2. MoD — fallback if ragged tensors are too slow
+3. Progressive — only if neither works
+
+### Integration with roadmap
+
+Fractal dimensionality should be implemented **after Phase 1 (RAG + FIFO)** but **before SPA**, because SPA's circular convolution needs fixed-dimensional vectors. If we go fractal, SPA operates on shared-prefix dimensions only.
+
+```
+Phase 1: RAG + FIFO (3 days)
+Phase 1.5: Fractal dimensionality (5 days) ← HERE
+Phase 2: SPA on shared dims (2 days, not 3)
+...
+```
 
 ### Gap 1: No vector separation mechanism (CRITICAL)
 **Problem**: cos=0.024 at epoch 2. The STDP + weak inhibition + weak negative sampling recipe does NOT create a clustered semantic space. All vectors are diffuse gas.

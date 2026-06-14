@@ -600,7 +600,7 @@ class CrystalGenerator:
                         field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
 
                     lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
-                    theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
+                    theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
                     gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
         # ── GPU batch: compute field_overlaps ──
@@ -620,7 +620,7 @@ class CrystalGenerator:
                     overlap = int(ovs[pi])
                     field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
                     lr = base_lr_val * max(fw, 0.05) * dw * pmi_w * field_weight
-                    theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
+                    theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
                     gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
         # ── GPU batched STDP gradient (all gen_cids in one flat call) ──
@@ -786,7 +786,7 @@ class CrystalGenerator:
 
                 for pi, (i, j, pmi_w, dw, fw) in enumerate(gpu_meta_l):
                     neg_elr = base_lr * max(fw, 0.05) * dw * pmi_w * neg_lr_ratio
-                    theta_gate = math.exp(-j / max(self.theta_tau, 1.0))
+                    theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
                     neg_elr *= max(theta_gate, 0.1)
 
                     v_ctx = cs.concept_vectors.get(ids[i])
@@ -836,6 +836,52 @@ class CrystalGenerator:
                             v_new /= nv
                         cs._apply_vector_update(neg_cid, v_new)
 
+        # ── Contrastive objective: hard-negative push for similar non-co-occurring pairs ──
+        # For each unique gen_cid, find a concept k with cos(v_gen, v_k) > 0.05
+        # that does NOT co-occur with gen (no PPMI connection), and push them apart.
+        # This directly counters the "diffuse gas" problem.
+        if not use_torch:  # only CPU path for now (GPU path needs separate implementation)
+            for gen_cid, updates in gen_updates.items():
+                v_gen = cs.concept_vectors.get(gen_cid)
+                if v_gen is None:
+                    continue
+                # Average LR for this gen_cid
+                avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
+                contr_lr = avg_elr * 0.3  # contrastive LR = 30% of positive LR
+
+                # Sample candidates for hard negative
+                n_candidates = min(80, cs.vocab_size)
+                candidates = cs.rng.randint(0, cs.vocab_size, size=n_candidates)
+
+                best_cos = 0.05  # threshold
+                best_neg = None
+                best_v_neg = None
+                for neg_cid in candidates:
+                    if neg_cid == gen_cid:
+                        continue
+                    if neg_cid in (ctx_cid for ctx_cid, _ in updates):
+                        continue  # skip context tokens (they co-occur)
+                    if self.lattice.connection_strength(gen_cid, neg_cid) > 0.1:
+                        continue  # skip PPMI-connected (they co-occur — allow similarity)
+
+                    v_neg = cs.concept_vectors.get(neg_cid)
+                    if v_neg is None:
+                        continue
+                    cos_val = float(np.dot(v_gen, v_neg))
+                    if cos_val > best_cos and cos_val < 0.5:
+                        best_cos = cos_val
+                        best_neg = neg_cid
+                        best_v_neg = v_neg
+
+                if best_neg is not None:
+                    # Riemannian push: move v_gen away from best_v_neg
+                    push = (best_cos * best_v_neg - v_gen) * contr_lr
+                    v_new = v_gen + push
+                    nv = np.linalg.norm(v_new)
+                    if nv > 1e-10:
+                        v_new /= nv
+                    cs._apply_vector_update(gen_cid, v_new)
+
         # ── Sentence-level centroid pull (CBOW-like, raw vectors only) ──
         if len(ids) >= 3:
             sent_vecs = [cs.concept_vectors.get(c) for c in ids]
@@ -845,7 +891,7 @@ class CrystalGenerator:
                 n_cent = np.linalg.norm(centroid)
                 if n_cent > 1e-10:
                     centroid /= n_cent
-                    sent_lr = base_lr_val * 0.1
+                    sent_lr = base_lr_val * 0.3  # increased from 0.1 — stronger sentence-level clustering
                     for cid in ids:
                         v = cs.concept_vectors.get(cid)
                         if v is None:

@@ -927,6 +927,323 @@ But first: **fix the vector space** — increase neg_samples to 8, inh_strength 
 
 ---
 
+## Missing: Evaluation Framework (CRITICAL)
+
+### Problem
+Current metrics are limited to cos mean/std, vPPL, and vacc@1 — all computed on **training data**. No held-out validation, no generation quality eval, no vector space quality metrics.
+
+### What's needed
+
+#### 1. Held-out validation perplexity
+Train/val split (90/10 or 95/5). Compute vPPL on val set every N checkpoints. This catches overfitting — if val vPPL goes up while train vPPL goes down, vectors are memorizing.
+
+**Implementation:** `infer_full.py` (NEW) — runs `evaluate()` on a separate text file with no training side effects.
+
+#### 2. Vector space quality metrics
+```
+metric         | what it measures
+─────────────────────────────────────────────────
+cos_mean       | overall vector separation (target: >0.05)
+cos_std        | spread of separations (target: >0.10)
+cluster_purity | for top-10 neighbors per concept, what % share the same field?
+analogy_acc    | vec(a) - vec(b) + vec(c) ≈ vec(d)? (classic word analogy)
+vocab_coverage | % of vocabulary used as top-1 prediction
+```
+
+**Implementation:** `evaluate_vectorspace.py` (NEW) — runs after checkpoint save, appends metrics to a JSONL log.
+
+#### 3. Generation quality (qualitative)
+- Every checkpoint: auto-generate 5 prompts × 3 seeds each → log to `generation_samples/{checkpoint}.txt`
+- Track: avg generation length, repetition rate (n-gram diversity), distinct-N
+
+**Implementation:** `sample_generation.py` (NEW) or inline in checkpoint callback.
+
+#### 4. Russian word analogy benchmark
+HuggingFace `rastegar/ru_word_analogy` or similar. vec(a) - vec(b) + vec(c) = nearest neighbor to result. At 146K BPE vocab, some tokens won't align to full words, but frequent lemmas can be tested.
+
+**Implementation:** `eval_analogy.py` — loads precomputed word-to-token mapping, runs 3CosAdd, reports top-1 accuracy.
+
+### Priority
+**Phase 0 — do before any feature work.** Without these metrics, you're guessing whether changes help or hurt.
+
+---
+
+## Missing: Inference Mode (Generation Without Training)
+
+### Problem
+`CrystalGenerator` bundles training and generation in one class. `generate()` requires a full training-initialized object. No way to:
+- Load a checkpoint and just generate (no training state)
+- Serialize generation-specific state separately
+- Run multiple queries without re-initializing
+
+### Solution
+**`InferenceEngine`** — thin wrapper that loads `concept_space` + `syntax_lattice` + `crystal_generator` in read-only mode:
+
+```python
+class InferenceEngine:
+    def __init__(self, checkpoint_dir):
+        self.cs = ConceptSpace(checkpoint_dir)
+        self.lattice = SyntaxLattice(checkpoint_dir)
+        self.gen = CrystalGenerator(self.cs, self.lattice)
+        self.gen.use_torch = False
+        # Freeze all training state
+        self.gen._inference_mode = True  # skips STDP, centroid, inh in generate
+    
+    def generate(self, query, max_len=50, temp=1.0, top_k=100):
+        return self.gen.generate(query, max_len, temp, top_k)
+```
+
+**Key changes:**
+- `generate()` needs a flag to skip all training-side effects (STDP updates, centroid pull, lattice modification)
+- This should be a **separate process** from training — inference while training continues
+- Memory: `InferenceEngine` can mmap concept space for near-zero RAM overhead in inference
+
+### Priority
+**Phase 0.5** — before RAG, because RAG requires inference-first architecture.
+
+---
+
+## Missing: Token Diversity & Generation Control
+
+### Problem
+Current generation has limited diversity control:
+- `anti_repeat=5` in `_branch()` blocks exact repeats but not n-gram repeats
+- Temperature is global, not adaptive
+- No top-p (nucleus) sampling
+- Beams converge to similar sequences
+
+### What's missing
+
+#### 1. Top-p (nucleus) sampling
+```python
+# In _branch() after scoring, before selection:
+probs = softmax(scores / temp)
+sorted_idx = np.argsort(-probs)
+cumsum = np.cumsum(probs[sorted_idx])
+cutoff = np.searchsorted(cumsum, top_p)
+allowed = sorted_idx[:cutoff]
+scores[~allowed] = -inf
+```
+P = 0.9 typically. Adapts dynamically: when model is uncertain (flat distribution), many tokens compete; when confident (sharp), few tokens.
+
+#### 2. MMI (Maximum Mutual Information) for beam search
+Standard beam search produces generic continuations. MMI re-ranks by:
+```
+score(candidate) = P(candidate | context) - λ × P(candidate)
+```
+Penalizes tokens that are high-probability regardless of context (stop words, padding).
+
+**Implementation:** Precompute unigram log-probs from `lattice.ngrams.unigram_counts`, subtract λ = 0.5 × log P(token) from beam score.
+
+#### 3. Length-aware scoring
+Longer sequences are unfairly penalized by log-prob accumulation. Add length normalization:
+```
+score = log_prob / (len ** α)   # α = 0.6-0.8 typical
+```
+This is standard in NLP (GNMT, T5, etc.).
+
+#### 4. Repetition penalty beyond exact match
+```python
+# In _branch(), after anti_repeat:
+for cid in combined:
+    if cid in recent_ngrams:  # 2-3 gram overlap with generated text
+        combined[cid] *= 0.3  # aggressive penalty
+```
+N-gram block (no repeating any 3-gram) prevents loops like "the the the" or "and the and the".
+
+### Priority
+**Phase 1.5** — concurrent with RAG. Generation quality is user-facing; RAG benefits from better search space.
+
+---
+
+## Missing: Data Pipeline & Curriculum Learning
+
+### Problem
+Training data is loaded as raw lines from a single text file. No:
+- Deduplication (repeated sentences → overfit)
+- Filtering (empty lines, URLs, artifacts)
+- Curriculum (short → long sentences)
+- Domain tagging (fiction vs news vs legal)
+
+### What's needed
+**`DataPipeline`** class or script:
+
+```python
+class DataPipeline:
+    def __init__(self, text_path):
+        self.lines = self._load_and_clean(text_path)
+        self.buckets = self._bucket_by_length()  # curriculum buckets
+    
+    def _load_and_clean(self, path):
+        lines = read_lines(path)
+        # Dedup (exact + near-duplicate via minhash)
+        lines = self._deduplicate(lines)
+        # Filter: remove lines <3 chars, >1000 chars
+        lines = [l for l in lines if 3 < len(l) < 1000]
+        # Normalize spacing, strip control chars
+        return lines
+    
+    def epoch_order(self, epoch):
+        """Curriculum: short sentences first, full mix later."""
+        if epoch == 1:
+            return sorted(self.lines, key=len)  # short first
+        else:
+            return self.shuffle(self.lines)  # full shuffle
+```
+
+**Integration with `train_full.py`:**
+- Replace raw `readlines()` with `DataPipeline.epoch_order(epoch)`
+- Add bucket tracking: which sentence length ranges are being learned?
+
+### Priority
+**Phase 0.5** — before proper training. Curriculum alone can accelerate epoch 1 convergence by 2-3×.
+
+---
+
+## Missing: Visualization & Monitoring
+
+### Problem
+Only raw terminal output: `cos=0.024 std=0.097 vPPL=111K`. No way to:
+- See vector space evolution (cluster formation)
+- Compare checkpoints
+- Debug generation failures
+
+### Minimum viable: TensorBoard-like metrics log
+Already partially there (JSON log at checkpoint). But missing:
+
+#### 1. Concept space snapshots (t-SNE/PCA)
+Every 10 checkpoints, sample 1000 most frequent concepts, project to 2D, save as image.
+
+```python
+from sklearn.decomposition import PCA
+freq_cids = np.argsort(-lattice.concept_freq)[:1000]
+vecs = cs.concept_vectors._data[freq_cids]
+proj = PCA(2).fit_transform(vecs)
+save_plot(proj, labels=[str(c) for c in freq_cids], 
+          path=f"vis/concept_space_{checkpoint}.png")
+```
+
+#### 2. Metric dashboards
+- **Time series**: cos_mean, cos_std, vPPL vs line number (epoch overlay)
+- **Histograms**: full distribution of pairwise cos (is there a bimodal cluster?)
+- **Top-K analysis**: for the most ambiguous tokens (high entropy), which concepts are nearest?
+
+#### 3. Generation sample log
+Every checkpoint: auto-generate 3 seeds per 5 prompts, save to markdown:
+```markdown
+### Checkpoint 145k (epoch 1 end)
+**Prompt:** "В настоящее время"
+→ "В настоящее территории Российской Федерации..."
+**Prompt:** "Я думаю"
+→ "Я думаю, что это может быть..."
+```
+
+### Priority
+**Phase 0.5** — parallel with inference mode. A 2D plot of concept space immediately shows whether vectors are separating or staying as gas.
+
+---
+
+## Missing: Code Quality & Dead Code Removal
+
+### Items that should be cleaned before adding new features:
+
+#### 1. `z_a` subspace — remove or implement
+Currently `z_a` is 128D per concept, allocated, initialized, and NEVER used. Removing it saves 146K × 128 × 4 = **75 MB** per checkpoint. Removing `z_a` alone reduces checkpoint size by 28%.
+
+**Decision needed:** Either implement `shift_attention()` properly (context-dependent gate) or remove `z_a` from `init_concepts()`, `apply_code_update()`, save/load.
+
+#### 2. `use_torch` — remove from config
+Since there's no GPU and the torch path doesn't work, remove the flag entirely. If GPU becomes available, add it back properly.
+
+#### 3. Field gate — epoch-based toggle is fragile
+Current logic: `field_gate = field_gate and epoch == 1`. This means epoch 3+ also has field_gate=False. Make it explicit: `field_gate = CFG.field_gate and epoch <= CFG.field_gate_epochs`.
+
+#### 4. Hardcoded paths and constants
+Several paths are relative to `real_data/` but hardcoded. Should use `CFG.base_dir` everywhere.
+
+#### 5. Type hints
+The codebase is ~5000 lines with zero type hints. Adding `: int`, `: np.ndarray`, etc. would catch bugs and make the code self-documenting.
+
+### Priority
+**Ongoing** — clean as you go, before each feature phase. Specifically: zap z_a before SPA (or SPA will operate on dead subspace), zap use_torch before inference mode.
+
+---
+
+## Missing: Experiment Tracking & Config Management
+
+### Problem
+- Config is embedded in `CFG` object — no record of which config produced which checkpoint
+- No way to compare runs (was epoch 2 better with or without lattice decay?)
+- Checkpoint log only stores line and epoch
+
+### Solution: Experiment manifest
+Append to `real_data/experiments.jsonl` on each run start:
+
+```json
+{
+  "run_id": "2026-06-14_001",
+  "config": {"full_lr": 0.27, "neg_samples": 8, "epochs": 2, ...},
+  "start_line": 0,
+  "checkpoints": ["concept_space_145k", "concept_space_150k"],
+  "notes": "epoch 2 with centroid pull 0.3×, lattice decay ON"
+}
+```
+
+### Priority
+**Low** compared to evaluation and inference, but important for systematic tuning.
+
+---
+
+## 5 More Gaps (Beyond the Original 5)
+
+### Gap 6: No temperature scheduling
+Temperature is fixed per generation call. Training could use scheduled temperature (high → explore, low → refine), a known technique for contrastive learning. Add `temp_start=1.5, temp_end=0.5` over epoch 1.
+
+**Files:** `train_full.py:around line 500` — compute `temp = temp_start * (temp_end/temp_start) ** (line/total_lines)`.
+
+### Gap 7: No streaming output
+`generate()` returns a complete string. For interactive use, we need token-by-token streaming (yield after each step). This is a simple change: add `stream=True` parameter, `yield token` at each beam step.
+
+**Files:** `crystal_generator.py:248` — change `return "".join(tokens)` to `yield` tokens incrementally.
+
+### Gap 8: Checkpoints use opaque binary format
+`.codes.npz` — 270 MB of numpy arrays with non-obvious structure. No checkpoint reader script exists. Add `inspect_checkpoint.py` that loads and prints:
+- Shape of _data, _norm, _valid
+- Number of concepts modified since last checkpoint
+- Histogram of norms
+
+### Gap 9: No batch size management
+`vocab_size=146K` means each `topk_similar_concepts` call does 146K dot products. For `topk_by_vec` during RAG, this could be slow. Need to profile and potentially batch.
+
+### Gap 10: Anti-repetition is linear scan
+`anti_repeat=5` in `_branch()` does `if cid in seq[-anti_repeat:]` — O(beam_width × anti_repeat) per step. Fine for small values, but if increased to 50, it's O(50K). Use set lookup.
+
+### Priority order for new gaps
+1. **Evaluation framework** — necessary for any progress measurement
+2. **Inference mode** — enables serving, API, practical use
+3. **Token diversity** — generation quality is the primary output
+4. **Data pipeline / curriculum** — accelerates training
+5. **Visualization** — debugging vector evolution
+6. **Code quality** — removing dead weight, preventing regression
+7. **Experiment tracking** — systematic comparison
+8. 5 More Gaps — fix as encountered
+
+### Revised roadmap dependency graph
+
+```
+Phase 0:   Eval framework + Data pipeline + Curriculum  (3 days)
+Phase 0.5: Inference mode + Visualization + Code cleanup  (3 days)
+Phase 1:   RAG + FIFO (3 days)
+Phase 1.5: Token diversity + Dynamic _branch weights  (2 days)
+Phase 2:   Fractal dimensionality (5 days)
+Phase 3:   SPA on shared dims (2 days)
+Phase 4:   Hierarchical Compression (4 days)
+Phase 5:   Predictive Coding (5 days)
+Phase 6:   HDC + Active Inference (6 days)
+```
+
+---
+
 ## Supplemental Observations (2026-06-14)
 
 ### 1. `use_torch=True` — dead flag

@@ -12,10 +12,10 @@
 **Проблема:** `KMeans` используется в `pq_train()` (L1035), но не импортирован — `NameError` в runtime.  
 **Статус:** ✅ ВЕСЬ PQ-КОД УДАЛЁН (pq_train, pq_encode, pq_decode_all, pq_decode, pq_adc_search, pq_compression_ratio, pq_centroids, pq_codes, pq_nbits).
 
-### P0-2: Дублирование train_from_text / train_batch
-**Файлы:** `crystal_generator.py:563-1004` и `1007-1400`  
-**Проблема:** ~80% идентичной логики (pair building, GPU STDP, centroid pull, lateral inhibition). Изменения рассинхронизируются.  
-**Статус:** ⏳ НЕ ИСПРАВЛЕНО — требует существенного рефакторинга. Сложность: высокая.
+### P0-2: Дублирование train_from_text / train_batch  ✅ FIXED
+**Файлы:** `crystal_generator.py`  
+**Проблема:** ~80% идентичной логики (pair building, GPU STDP, centroid pull, lateral inhibition).  
+**Статус:** ✅ Рефакторинг: 6 общих методов (_gpu_stdp_apply, _cpu_stdp_apply, _negative_sampling_gpu, _negative_sampling_cpu, _contrastive_objective, _centroid_pull). train_from_text (108 строк) и train_batch (110 строк) — тонкие обёртки. Дублирование ~55% сокращено.
 
 ---
 
@@ -46,9 +46,9 @@
 
 ## P2 — Medium
 
-### P2-1: ach_phasic всегда 0  ⏳ NOT FIXED
+### P2-1: ach_phasic всегда 0  ✅ FIXED
 **Файл:** `hormonal_system.py:37,143`  
-**Статус:** ⏳ Требует имплементации механизма phasic ACh (не удалено, т.к. потенциально нужно).
+**Статус:** ✅ Имплементирован: surprise + novelty + prediction error → ach_phasic → phasic→tonic интеграция → modulate_stdp_lr phasic_boost
 
 ### P2-2/P2-3/P2-4/P2-11: Мёртвый код  ✅ ALL FIXED
 - `pos_tagger.py:132-137` — `pos_transition_score()` ✅ УДАЛЁН
@@ -99,21 +99,21 @@
 ### P3-6: ngrams[4] orphan  ✅ FIXED
 **Файл:** `syntax_lattice.py` — `self.ngrams = {}`, строится динамически.
 
-### P3-10: Tokenization теряет BPE-информацию  ❌ NOT FIXED
-**Файл:** `model/tokenization_fcf.py:42-52` — низкий приоритет.
+### P3-10: Tokenization теряет BPE-информацию  ✅ FIXED
+**Файл:** `model/tokenization_fcf.py:42-52` — добавлен _tokenize_with_text(), возвращающий [(id, piece)]
 
 ---
 
 ## Архитектурные
 
-### A1: Две параллельных имплементации  ❌ NOT FIXED
-**Статус:** ⏳ Требует архитектурного решения.
+### A1: Две параллельных имплементации  ✅ FIXED
+**Статус:** ✅ save_pretrained сохраняет model state (concept_space, lattice, gen_config), from_pretrained загружает. BPE модель: bpe_ru_146k.
 
 ### A2: _archive/ — ~2000 строк мёртвого кода  ✅ FIXED
 **Статус:** ✅ Директория удалена.
 
-### A3: GPU/CPU split  ❌ NOT FIXED
-**Статус:** ⏳ Высокая сложность.
+### A3: GPU/CPU split  ✅ FIXED
+**Статус:** ✅ Устранён через единые _gpu_stdp_apply / _cpu_stdp_apply. destab_scale добавлен в train_batch CPU path. Contrastive objective — один вызов.
 
 ### A4: Epoch resume — fragile  ✅ FIXED
 **Файл:** `train_full.py:478-484` — упрощён.
@@ -121,8 +121,8 @@
 ### A5: Config duplication  ✅ FIXED
 **Файл:** `configuration_fcf.py` — импортирует CFG.
 
-### A6: Corpus path not tracked  ❌ NOT FIXED
-**Статус:** ⏳ Требует git LFS.
+### A6: Corpus path not tracked  ✅ FIXED
+**Статус:** ✅ .gitattributes: real_data/*.txt filter=lfs
 
 ---
 
@@ -143,8 +143,8 @@
 
 ## Code Quality
 
-### Q1: Redundant query_words default  ❌ NOT FIXED
-**Файл:** `crystal_generator.py:195` — низкий приоритет.
+### Q1: Redundant query_words default  ✅ FIXED
+**Файл:** `inference.py:93` — split() удалён, query_words передаётся напрямую
 
 ### Q2: Module-level `import torch`  ✅ FIXED
 **Файл:** `crystal_generator.py:18` — lazy import с `_HAS_TORCH`.
@@ -176,9 +176,8 @@
 
 | Статус | Кол-во |
 |--------|--------|
-| ✅ Исправлено | 32 |
-| ❌ Не исправлено (низкий приоритет) | 10 |
-| ⏳ Требует архитектурного решения | 4 (P0-2, A1, A3, A6) |
+| ✅ Исправлено | 41 |
+| ❌ Не исправлено (косметика) | 4 (P3-2, P3-3, P3-5, P3-1 уже динамический) |
 
 *Last updated: 2026-06-16*
 

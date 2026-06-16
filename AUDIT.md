@@ -354,8 +354,8 @@ n_out = int(np.sum(np.max(np.abs(all_codes), axis=1) > bound))
 - Всего Python-файлов: 24 (без `_archive/`)
 - Бат-файлов/скриптов: 5 (.bat, .ps1)
 - Документация: 5 файлов (README.md, ARCHITECTURE.md, AGENTS.md, AUDIT.md, PLAN.md)
-- Конфигурация: requirements.txt
-- Всего строк Python-кода (активных): ~5,800
+- Конфигурация: requirements.txt, .gitattributes
+- Всего строк Python-кода (активных): ~5,300
 - Размер корпуса: ~153K строк, 30M символов (~52MB)
 - Текущее состояние: 6000 линий, эпоха 1
 - Векторное пространство: 146K × 384D
@@ -387,7 +387,7 @@ n_out = int(np.sum(np.max(np.abs(all_codes), axis=1) > bound))
 | P2-11 | build_anchor_matrix/build_fields_from_lattice | ✅ Удалены |
 | P2-13 | Доступ к _data/_valid извне | ✅ Свойства `.data`/`.valid` + usage |
 | P3-6 | ngrams[4] orphan | ✅ `ngrams = {}`, строится динамически |
-| P3-1 | Stale comment "10K lines" | ✅ Оставлен (будет динамическим при след. запуске) |
+| P3-1 | Stale comment "10K lines" | ✅ Динамический из checkpoint_state.json |
 | E3 | _quiet swallows exceptions | ✅ Печатает в stderr |
 | E4 | rng.choice sample_k > valid | ✅ Guard `min(sample_k, len(valid))` |
 | E5 | inference empty data matmul | ✅ Guard `len(valid) == 0 → None` |
@@ -400,3 +400,11 @@ n_out = int(np.sum(np.max(np.abs(all_codes), axis=1) > bound))
 | A2 | _archive/ ~2000 строк dead code | ✅ Директория удалена |
 | A4 | Epoch resume fragile | ✅ Упрощён, без `>= len-1` |
 | A5 | Config duplication (8200/128 vs 146K/384D) | ✅ configuration_fcf.py импортирует CFG |
+| P0-2 | Дублирование train_from_text/train_batch | ✅ Рефакторинг: 6 общих методов, ~55% сокращение |
+| A3 | GPU/CPU split divergence | ✅ Устранён (единые _gpu_stdp_apply/_cpu_stdp_apply) |
+| A1 | modeling_fcf save/load stub | ✅ save_pretrained сохраняет model state, from_pretrained загружает |
+| P2-1 | ach_phasic всегда 0 (dead code) | ✅ Имплементирован: surprise + novelty + PE, phasic→tonic интеграция |
+| A6 | Git LFS для корпуса | ✅ .gitattributes: real_data/*.txt filter=lfs |
+| P3-4 | TARGET_STD хардкод 384D | ✅ Вычисляется из config.dim |
+| P3-10 | Tokenization теряет BPE info | ✅ Добавлен _tokenize_with_text() |
+| Q1 | Redundant query_words default | ✅ Убрано дублирование split() |

@@ -115,6 +115,27 @@ class HormonalSystem:
         intrinsic = da_curiosity + da_mastery + da_coherence
         self.da_phasic = da_extrinsic + intrinsic
 
+        # ---- Acetylcholine: phasic surprise/novelty signal ----
+        # Phasic ACh responds to prediction errors and novel stimuli,
+        # signaling 'this is important, learn from it'
+        ach_surprise = 0.0
+        ach_novelty = 0.0
+        ach_pe = 0.0
+
+        if expected_cid is not None:
+            # Supervised mode: prediction error drives ACh
+            if not is_match:
+                ach_surprise = surprise * 0.6       # unexpected outcome
+                ach_pe = (1.0 - confidence) * 0.5   # low confidence → high uncertainty
+            else:
+                ach_surprise = surprise * 0.15       # even matched outcomes carry surprise
+        else:
+            # Free generation: novelty-driven ACh
+            ach_novelty = novelty * 0.5              # novel transitions → learn
+
+        self.ach_phasic = ach_surprise + ach_novelty + ach_pe
+        self.ach_phasic = max(0.0, min(1.0, self.ach_phasic))  # clamp to [0,1]
+
         # ---- Serotonin: aversion / risk ----
         # Low match rate -> serotonin rises (aversion, caution)
         # High match rate -> serotonin drops (safety, exploration)
@@ -128,12 +149,15 @@ class HormonalSystem:
         self.noradrenaline = min(max(self.noradrenaline, 0.0), 1.0)
 
         # ---- Acetylcholine: plasticity gate ----
-        # Novel patterns -> ACh rises (learning enabled)
-        # Repetition -> ACh drops (consolidation)
         novelty_target = 0.3 + 0.5 * novelty
         if is_match and confidence > 0.8:
-            novelty_target = 0.2  # well-known pattern, low plasticity
+            novelty_target = 0.2  # well-known pattern → low plasticity
+
+        # Drift tonic toward target
         self.acetylcholine += (novelty_target - self.acetylcholine) * 0.15
+        # Integrate phasic ACh into tonic (mirrors DA phasic integration)
+        self.acetylcholine += self.ach_phasic * 0.1
+        self.acetylcholine = max(0.1, min(1.0, self.acetylcholine))
 
         # ---- Decay phasic signals ----
         self.da_phasic *= self.phasic_decay
@@ -154,7 +178,9 @@ class HormonalSystem:
         High ACh + High DA -> strong learning (novel correct pattern).
         Low ACh -> weak learning (consolidation, familiar)."""
         plasticity = self.acetylcholine * (0.5 + 0.5 * self.dopamine)
-        return base_lr * max(plasticity, 0.05)
+        # Phasic ACh provides immediate LR boost for surprising events
+        phasic_boost = 1.0 + self.ach_phasic * 1.5
+        return base_lr * max(plasticity * phasic_boost, 0.05)
 
     def modulate_temperature(self, base_temp):
         """Serotonin modulates risk-taking.
@@ -183,20 +209,28 @@ class HormonalSystem:
         return 0.3 + 0.4 * avg_m + 0.3 * self.dopamine
 
     def summary(self):
-        return (f"DA={self.dopamine:.2f} 5HT={self.serotonin:.2f} "
-                f"NA={self.noradrenaline:.2f} ACh={self.acetylcholine:.2f}")
+        return {
+            "da": self.dopamine,
+            "5ht": self.serotonin,
+            "na": self.noradrenaline,
+            "ach": self.acetylcholine,
+            "da_phasic": round(self.da_phasic, 3),
+            "ach_phasic": round(self.ach_phasic, 3),
+        }
 
     def save(self):
         return {
-            'dopamine': self.dopamine,
-            'serotonin': self.serotonin,
-            'noradrenaline': self.noradrenaline,
-            'acetylcholine': self.acetylcholine,
-            'step': self.step,
-            'recent_confidences': self.recent_confidences[-20:],
-            'recent_matches': self.recent_matches[-20:],
-            '_prev_avg_match': self._prev_avg_match,
-            '_last_few_cids': self._last_few_cids,
+            "dopamine": self.dopamine,
+            "serotonin": self.serotonin,
+            "noradrenaline": self.noradrenaline,
+            "acetylcholine": self.acetylcholine,
+            "da_phasic": self.da_phasic,
+            "ach_phasic": self.ach_phasic,
+            "step": self.step,
+            "recent_confidences": self.recent_confidences[-20:],
+            "recent_matches": self.recent_matches[-20:],
+            "_prev_avg_match": self._prev_avg_match,
+            "_last_few_cids": self._last_few_cids,
         }
 
     def load(self, data):
@@ -204,6 +238,8 @@ class HormonalSystem:
         self.serotonin = data.get('serotonin', 0.5)
         self.noradrenaline = data.get('noradrenaline', 0.3)
         self.acetylcholine = data.get('acetylcholine', 0.5)
+        self.da_phasic = data.get('da_phasic', 0.0)
+        self.ach_phasic = data.get('ach_phasic', 0.0)
         self.step = data.get('step', 0)
         self.recent_confidences = data.get('recent_confidences', [])
         self.recent_matches = data.get('recent_matches', [])

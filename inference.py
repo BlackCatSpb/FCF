@@ -90,7 +90,7 @@ class InferenceEngine:
         t0 = time.time()
         result = self.gen.generate(
             seed_word=prompt, max_words=max_words, beam_width=beam_width,
-            query_words=query_words if query_words is not None else prompt.split())
+            query_words=query_words)
         result['time'] = round(time.time() - t0, 2)
         return result
 

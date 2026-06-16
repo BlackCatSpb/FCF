@@ -1,7 +1,7 @@
 """Generation test from checkpoint — shows REAL text output."""
 import sys, os; sys.path.insert(0, os.path.dirname(__file__))
 sys.stdout.reconfigure(encoding='utf-8')
-import time
+import time, json
 import sentencepiece as spm
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
@@ -56,8 +56,17 @@ seeds = [
     ('собака', None),
 ]
 
+_ckpt_path = os.path.join(os.path.dirname(__file__), 'real_data', 'checkpoint_state.json')
+_total_lines = "?"
+if os.path.exists(_ckpt_path):
+    try:
+        with open(_ckpt_path) as _f:
+            _total_lines = json.load(_f).get('line', '?')
+    except Exception:
+        pass
+
 print(f"\n{'='*60}")
-print(f"GENERATION — 10K lines trained")
+print(f"GENERATION — {_total_lines} lines trained")
 print(f"{'='*60}")
 
 for seed, query in seeds:

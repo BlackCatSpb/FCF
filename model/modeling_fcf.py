@@ -79,10 +79,10 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         data_dir = self._data_dir
         space_path = os.path.join(data_dir, "concept_space.json")
         lattice_path = os.path.join(data_dir, "syntax_lattice.json")
-        bpe_path = os.path.join(data_dir, "bpe_ru.model")
+        bpe_path = os.path.join(data_dir, "bpe_ru_146k.model")
 
         if not os.path.exists(space_path):
-            raise FileNotFoundError(f"ConceptSpace not found at {space_path}. Run rebuild_v2.py first.")
+            raise FileNotFoundError(f"ConceptSpace not found at {space_path}. Ensure the model directory contains concept_space.json.")
 
         # Load tokenizer
         self._tok = _SPTokenizer(model_path=bpe_path)
@@ -251,12 +251,23 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
     # ── Save / Load ──
 
     def save_pretrained(self, save_directory: str, **kwargs):
-        """Save model + config."""
+        """Save model + config + model state."""
         os.makedirs(save_directory, exist_ok=True)
         self.config.save_pretrained(save_directory)
-        # config.json written by HF; no model weights to save (stateless)
+        self._load()  # ensure loaded
+        # Save model state
+        self._space.save(os.path.join(save_directory, "concept_space.json"))
+        self._lattice.save(os.path.join(save_directory, "syntax_lattice.json"))
+        # Save gen config
+        gen_config_path = os.path.join(save_directory, "gen_config.json")
+        with open(gen_config_path, 'w', encoding='utf-8') as f:
+            json.dump(self.generator.config, f, ensure_ascii=False)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         config = FCFConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        return cls(config)
+        model = cls(config)
+        # Load model state from the same directory
+        model._data_dir = pretrained_model_name_or_path
+        model._load()
+        return model

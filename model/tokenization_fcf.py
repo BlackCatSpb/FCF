@@ -45,6 +45,13 @@ class FCFTokenizer(PreTrainedTokenizer):
         ids = self.sp.encode(text)
         return [str(i) for i in ids]
 
+    def _tokenize_with_text(self, text: str) -> List[tuple]:
+        if not self.sp:
+            return [(c, c) for c in text]
+        pieces = self.sp.encode_as_pieces(text)
+        ids = self.sp.encode(text)
+        return list(zip([str(i) for i in ids], pieces))
+
     def _convert_token_to_id(self, token: str) -> int:
         return int(token)
 

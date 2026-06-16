@@ -107,14 +107,13 @@ class ParameterOptimizer:
         opt.step(mean_cos=m, std_cos=s, vec_ppl=vp, ...)
     """
 
-    TARGET_STD = 1.0 / math.sqrt(384)  # ~0.051 — uniform random d-sphere
-
     def __init__(self, config: Optional[FCFConfig] = None):
         if config is None:
             from eva.symbolic.fcf_config import FCFConfig
             config = FCFConfig()
 
         self.config = config
+        self.TARGET_STD = 1.0 / math.sqrt(self.config.dim)  # uniform random d-sphere
         self._rules = []  # (trigger_fn, param_name, action, value, rate)
 
         # Build params from config

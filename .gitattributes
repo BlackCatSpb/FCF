@@ -1,3 +1,4 @@
 real_data/concept_space.json filter=lfs diff=lfs merge=lfs -text
 real_data/syntax_lattice.json filter=lfs diff=lfs merge=lfs -text
 real_data/full_corpus_ru.txt filter=lfs diff=lfs merge=lfs -text
+real_data/*.txt filter=lfs diff=lfs merge=lfs -text

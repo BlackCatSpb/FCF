@@ -426,10 +426,11 @@ class FCFConfig:
         # Конвертировать dict-правила обратно в объекты при загрузке из JSON
         for i, p in enumerate(self.params):
             if isinstance(p, dict):
-                rules = p.pop('rules', [])
-                p = ParamDef(**p)
-                p.rules = [AdaptRule(**r) if isinstance(r, dict) else r for r in rules]
-                self.params[i] = p
+                pd = p.copy()
+                rules = pd.pop('rules', [])
+                p_def = ParamDef(**pd)
+                p_def.rules = [AdaptRule(**r) if isinstance(r, dict) else r for r in rules]
+                self.params[i] = p_def
         for i, p in enumerate(self.live_pairs):
             if isinstance(p, dict):
                 self.live_pairs[i] = MetricPair(**p)

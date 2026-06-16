@@ -30,14 +30,23 @@ class _SPTokenizer:
         if self._model_path:
             self.sp.load(self._model_path)
 
-    def encode(self, text):
-        return self.sp.encode(text)
+    def encode(self, text, add_bos=False, add_eos=False):
+        return self.sp.encode(text, add_bos=add_bos, add_eos=add_eos)
 
     def decode(self, ids):
         return self.sp.decode(ids)
 
+    def IdToPiece(self, cid):
+        return self.sp.IdToPiece(cid)
+
+    def PieceToId(self, piece):
+        return self.sp.PieceToId(piece)
+
     def word_to_cid(self, word):
         return self.sp.encode(word)[0]
+
+    def vocab_size(self):
+        return self.sp.vocab_size()
 
     def __len__(self):
         return self.sp.get_piece_size()

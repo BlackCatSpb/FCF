@@ -129,7 +129,7 @@ if FRESH:
     RESUME = None
 
 if FAST:
-    print("FAST mode: base_lr=0.15, neg_samples=3, pmi_strength=0, decay_every=250, eval_every=1000")
+    print("FAST mode: base_lr=0.15, neg_samples=3, decay_every=250, eval_every=1000")
 
 if RESUME is not None:
     if RESUME == '':
@@ -359,11 +359,11 @@ def save_3d_vis(cs, sp, checkpoint_name):
         proj = proj / scale
 
     # Build JSON
-    freq = cs.fractal.codes
+    codes = cs.fractal.codes
     tokens = []
     for i, cid in enumerate(cids):
         tok = sp.IdToPiece(cid) if cid < sp.vocab_size() else f'[ID{cid}]'
-        f = float(np.linalg.norm(freq.get(cid, np.zeros(384))))
+        f = float(np.linalg.norm(codes.get(cid, np.zeros(384))))
         tokens.append({
             't': tok, 'x': float(proj[i, 0]), 'y': float(proj[i, 1]), 'z': float(proj[i, 2]),
             'f': round(f, 1), 'id': int(cid)
@@ -400,6 +400,8 @@ def _final_save(cs, lattice, opt, epoch, total_lines):
     with open(CFG.ckpt_state_path, 'w', encoding='utf-8') as f:
         json.dump(ckpt, f)
     for f in glob.glob(os.path.join(CFG.data_dir, '*.html')):
+        if os.path.basename(f).lower() == 'viewer.html':
+            continue
         try: os.remove(f)
         except: pass
     cleanup_old_checkpoints(keep=CFG.cleanup_keep)
@@ -439,6 +441,7 @@ try:
         batch_lr = None
         batch_destab = 0.0
 
+        idx = start_line
         for idx, line in enumerate(epoch_train[start_line:], start=start_line):
             if not line:
                 continue
@@ -473,11 +476,11 @@ try:
                 use_torch=CFG.use_torch, destab_scale=batch_destab)
             _batch_ms = (time.time() - _bt) * 1000
             _n = len(batch_buffer)
-            if getattr(cs, '_batch_log', None) is None:
-                cs._batch_log = open(os.path.join(CFG.data_dir, '_batch_timing.csv'), 'w', encoding='utf-8')
-                cs._batch_log.write('idx,lines,batch_ms,speed_lps\n')
-            cs._batch_log.write(f'{idx},{_n},{_batch_ms:.0f},{_n/max(_batch_ms,1)*1000:.0f}\n')
-            cs._batch_log.flush()
+            if 'batch_log' not in locals() or batch_log is None:
+                batch_log = open(os.path.join(CFG.data_dir, '_batch_timing.csv'), 'w', encoding='utf-8')
+                batch_log.write('idx,lines,batch_ms,speed_lps\n')
+            batch_log.write(f'{idx},{_n},{_batch_ms:.0f},{_n/max(_batch_ms,1)*1000:.0f}\n')
+            batch_log.flush()
             n_trained += len(batch_buffer)
             batch_buffer = []
             now = time.time()
@@ -605,8 +608,8 @@ except KeyboardInterrupt:
     sys.exit(0)
 finally:
     try:
-        if hasattr(cs, '_batch_log') and cs._batch_log is not None:
-            cs._batch_log.close()
+        if 'batch_log' in locals() and batch_log is not None:
+            batch_log.close()
     except Exception:
         pass
     if hasattr(sys.stdout, 'close'):

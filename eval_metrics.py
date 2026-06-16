@@ -3,7 +3,7 @@ Usage: python eval_metrics.py [checkpoint_tag]
   checkpoint_tag defaults to 'latest' (auto from checkpoint_state.json)
   Examples: '145k', '21k', 'latest'
 """
-import sys; sys.path.insert(0, os.path.dirname(__file__))
+import sys, os; sys.path.insert(0, os.path.dirname(__file__))
 import os, json, time, glob, re, shutil, tempfile
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 os.environ['OMP_NUM_THREADS'] = '1'

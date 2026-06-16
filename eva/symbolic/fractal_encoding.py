@@ -10,9 +10,10 @@ hierarchical encoding that requires no corpus statistics.
 """
 
 try:
-    from eva.symbolic.fcf_config import CFG
-    LEVELS = CFG.octree_levels
-    GAMMA = CFG.octree_gamma
+    from eva.symbolic.fcf_config import FCFConfig as _FCFConfig
+    __cfg = _FCFConfig()
+    LEVELS = __cfg.octree_levels
+    GAMMA = __cfg.octree_gamma
 except (ImportError, AttributeError):
     LEVELS = 16
     GAMMA = 0.5

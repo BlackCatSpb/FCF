@@ -145,7 +145,7 @@ class FractalField:
         z_m: near zero (meta-gates start open)
         """
         seed = rng_seed if rng_seed is not None else cid * 137 + 42
-        rng = np.random.RandomState(seed % (2**31))
+        rng = np.random.RandomState(abs(seed) % (2**31))
 
         z = np.zeros(self.latent_dim, dtype=np.float32)
 
@@ -213,7 +213,7 @@ class FractalField:
         bb = self.field_bits.get(cid_b)
         if ba is None or bb is None or len(ba) != len(bb):
             return 0
-        return int(np.bitwise_and(ba, bb).sum())
+        return int(np.unpackbits(np.bitwise_and(ba, bb)).sum())
 
     # ── Vector computation ───────────────────────────────────
 
@@ -462,6 +462,7 @@ class ConceptSpace:
         # Random state
         self.rng = np.random.RandomState(42)
         self._inhibition_step = 0
+        self._inhibit_rng = np.random.RandomState(42)
 
         # Shift tracking
         self._total_shift = 0.0
@@ -500,12 +501,6 @@ class ConceptSpace:
         cids = cid_list if cid_list is not None else list(self.concept_vectors.keys())
         self.fractal.reinitialize_all(cids)
         self._sync_from_fractal()
-
-    # ── H matrix + BMSSP ────────────────────────────────────
-
-
-
-
 
     # ── Octree encoding ──────────────────────────────────────
 
@@ -706,8 +701,6 @@ class ConceptSpace:
         if n_cids <= 1:
             return
 
-        if not hasattr(self, '_inhibit_rng'):
-            self._inhibit_rng = np.random.RandomState(42)
         raw = self._inhibit_rng.randint(0, n_cids, size=sample_size + 50)
         u_idxs = np.unique(raw)
         sampled_indices = [i for i in u_idxs if cids[i] != winner_cid][:sample_size]

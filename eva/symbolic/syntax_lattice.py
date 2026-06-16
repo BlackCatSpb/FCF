@@ -360,7 +360,9 @@ class SyntaxLattice:
             for prefix in self.ngrams[order]:
                 counter = self.ngrams[order][prefix]
                 for ncid in list(counter.keys()):
-                    counter[ncid] = max(counter[ncid] * self.decay, 0.1)
+                    counter[ncid] = counter[ncid] * self.decay
+                    if counter[ncid] < 1e-6:
+                        del counter[ncid]
 
         # Decay concept frequency
         for c in list(self.concept_freq.keys()):
@@ -370,7 +372,9 @@ class SyntaxLattice:
         for k in list(self.skip2.keys()):
             inner = self.skip2[k]
             for tgt in list(inner.keys()):
-                inner[tgt] = max(inner[tgt] * self.decay, 0.1)
+                inner[tgt] = inner[tgt] * self.decay
+                if inner[tgt] < 1e-6:
+                    del inner[tgt]
 
         # Invalidate PPMI cache after ngram decay
         self._ppmi_cache = None

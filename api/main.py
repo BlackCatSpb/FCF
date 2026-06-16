@@ -14,6 +14,7 @@ from model.configuration_fcf import FCFConfig
 
 
 model: FCFModel = None
+_trained_lines = 0
 
 
 @asynccontextmanager
@@ -55,7 +56,7 @@ async def health(request: Request):
         status="ok",
         concepts=len(model.space.concept_vectors),
         dimensions=model.space.dim,
-        transitions=0,
+        transitions=_trained_lines,
     )
 
 
@@ -75,6 +76,8 @@ async def generate(req: GenerateRequest, request: Request):
         max_words=req.max_words,
         temperature=req.temperature,
     )
+    global _trained_lines
+    _trained_lines += len(result.text.split())
     return GenerateResponse(
         text=result.text,
         concept_path=result.concept_path,

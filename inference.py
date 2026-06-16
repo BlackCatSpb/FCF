@@ -5,7 +5,7 @@ Usage:
   python inference.py --neighbours "война"   (top-10 neighbours)
   python inference.py --eval                 (run full eval, save JSON)
 """
-import sys; sys.path.insert(0, os.path.dirname(__file__))
+import sys, os; sys.path.insert(0, os.path.dirname(__file__))
 import os, json, time, glob, re, shutil, tempfile, argparse
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -88,8 +88,17 @@ class InferenceEngine:
 
     def generate(self, prompt, max_words=30, beam_width=5, query_words=None):
         t0 = time.time()
+        words = prompt.strip().split()
+        if len(words) > 1:
+            seed_word = words[0]
+            if query_words is None:
+                query_words = words[1:]
+            else:
+                query_words = query_words + words[1:]
+        else:
+            seed_word = prompt
         result = self.gen.generate(
-            seed_word=prompt, max_words=max_words, beam_width=beam_width,
+            seed_word=seed_word, max_words=max_words, beam_width=beam_width,
             query_words=query_words)
         result['time'] = round(time.time() - t0, 2)
         return result

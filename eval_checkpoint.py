@@ -19,7 +19,7 @@ t0 = time.time()
 cs = ConceptSpace.load(CS_PATH)
 print(f"  {time.time()-t0:.1f}s — {len(cs.concept_vectors)} concepts")
 
-print("Loading SyntaxLattice (534MB)...")
+print("Loading SyntaxLattice...")
 t0 = time.time()
 lattice = SyntaxLattice()
 lattice.load(LATTICE_PATH)

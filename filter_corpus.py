@@ -125,7 +125,7 @@ def has_orphan_suffix(line: str) -> str | None:
     if not s:
         return None
 
-    for tld in ['.ru', '.com', '.am', '.by', '.kz', '.ua', '.su', '.reggi']:
+    for tld in ['.ru', '.com', '.am', '.by', '.kz', '.ua', '.su']:
         if s.lower().endswith(tld) and len(s) > len(tld) + 2:
             before_dot = s[:-len(tld)]
             if before_dot[-1].isalpha() and before_dot[-2].isalpha():

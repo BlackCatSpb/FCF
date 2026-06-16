@@ -145,7 +145,8 @@ class HormonalSystem:
         # ---- Noradrenaline: uncertainty / novelty ----
         # High surprise or low confidence -> NA rises (focus)
         # High confidence + low novelty -> NA drops (relaxed)
-        self.noradrenaline = 0.2 + 0.5 * surprise + 0.3 * (1.0 - confidence)
+        target_na = 0.2 + 0.5 * surprise + 0.3 * (1.0 - confidence)
+        self.noradrenaline += (target_na - self.noradrenaline) * 0.3
         self.noradrenaline = min(max(self.noradrenaline, 0.0), 1.0)
 
         # ---- Acetylcholine: plasticity gate ----

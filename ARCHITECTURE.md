@@ -59,10 +59,10 @@ Neuro-symbolic concept learning engine. No transformers. No gradient descent.
 - **Fractal fluctuation**: autonomous code drift with subspace-specific scaling
 - **Contrastive spread**: targeted repulsion of nearest-neighbor pairs
 
-## Bug Fixes (see AUDIT.md)
+## Issue Tracking
 
-B1 (GPU lateral inhibition direction), C2/C3 (LR-weighted averaging),
-B5 (centroid pull sync), B3 (contrastive_spread gradient), R1 (dependencies).
+Bug fixes and known issues are tracked in [`AUDIT.md`](AUDIT.md).  
+Development roadmap and future work in [`PLAN.md`](PLAN.md).
 
 ## Project Structure
 

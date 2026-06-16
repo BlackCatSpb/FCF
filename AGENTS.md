@@ -65,10 +65,10 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - **Inference:** wrapper around CrystalGenerator, not a reimplementation
 
 ## Relevant Files
-- `C:\Users\black\OneDrive\Desktop\FCF\eva\symbolic\crystal_generator.py`
-- `C:\Users\black\OneDrive\Desktop\FCF\eval_metrics.py`
-- `C:\Users\black\OneDrive\Desktop\FCF\inference.py`
-- `C:\Users\black\OneDrive\Desktop\FCF\train_full.py`
-- `C:\Users\black\OneDrive\Desktop\FCF\run_train.bat`
-- `C:\Users\black\OneDrive\Desktop\FCF\real_data\checkpoint_state.json`
-- `C:\Users\black\OneDrive\Desktop\FCF\FCF_IMPLEMENTATION_ROADMAP.md`
+- `eva/symbolic/crystal_generator.py`
+- `eval_metrics.py`
+- `inference.py`
+- `train_full.py`
+- `run_train.bat`
+- `real_data/checkpoint_state.json`
+- `FCF_IMPLEMENTATION_ROADMAP.md`

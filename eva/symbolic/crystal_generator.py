@@ -24,6 +24,9 @@ except ImportError:
 
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.hormonal_system import HormonalSystem
+from eva.symbolic.fcf_config import FCFConfig
+
+CFG = FCFConfig()
 
 
 _BOS_ID = 1
@@ -54,7 +57,8 @@ class CrystalGenerator:
         self.mmi_lambda = self.config.get('mmi_lambda', 0.2)
 
         self.main_rng = random.Random(42)
-        self.cs.init_homeostasis()
+        if not self.cs.concept_usage:
+            self.cs.init_homeostasis()
         self.branch_rngs = {}
         self.hormones = HormonalSystem()
 
@@ -187,11 +191,11 @@ class CrystalGenerator:
         src_ids = self._encode_input(' '.join(query_words)) if query_words else [seed_cid]
         query_vecs = [self.cs.concept_vector(cid)
                       for cid in src_ids if self.cs.concept_vector(cid) is not None]
-        self._centroid = np.mean(query_vecs, axis=0).astype(np.float32) if query_vecs else None
-        if self._centroid is not None:
-            n = np.linalg.norm(self._centroid)
+        centroid = np.mean(query_vecs, axis=0).astype(np.float32) if query_vecs else None
+        if centroid is not None:
+            n = np.linalg.norm(centroid)
             if n > 1e-10:
-                self._centroid /= n
+                centroid /= n
 
         effective_max = max_words or self.max_words
 
@@ -213,7 +217,7 @@ class CrystalGenerator:
                 prev_cid = seq[-1]
                 expected_cid = target_ids[wn] if wn < len(target_ids) else None
 
-                candidates = self._branch(seq, wn, h_temp, expected_cid, self._centroid)
+                candidates = self._branch(seq, wn, h_temp, expected_cid, centroid)
                 if not candidates:
                     self.hormones.update(confidence=0.0, is_match=False,
                         novelty=0.0, surprise=0.5, expected_cid=expected_cid)
@@ -549,6 +553,20 @@ class CrystalGenerator:
         # PMI=0 → 0.2, PMI=2 → 1.0, PMI=5 → 2.0, negative → min_weight
         return max(min(pmi / 2.0 + 0.2, 2.0), min_weight)
 
+    def _apply_pmi_gate(self, pmi_w_raw, pmi_strength, pmi_gate_min, cid):
+        """Apply PMI gate: returns (skip: bool, pmi_w: float)."""
+        if pmi_strength >= 0.01:
+            effective_min = pmi_gate_min * pmi_strength
+            per_cid_factor = max(0.25, 1.0 - self.concept_error.get(cid, 0.0) * 0.75)
+            per_cid_min = pmi_gate_min * per_cid_factor
+            use_min = min(effective_min, per_cid_min)
+            if pmi_w_raw <= use_min:
+                return True, 0.0
+            pmi_w = 1.0 + (pmi_w_raw - 1.0) * pmi_strength
+        else:
+            pmi_w = 1.0
+        return False, pmi_w
+
     # ── Training ───────────────────────────────────────────────
 
     def _gpu_stdp_apply(self, gpu_ctx_l, gpu_tgt_l, gpu_meta_l, gpu_cid_gen, base_lr_val,
@@ -580,7 +598,7 @@ class CrystalGenerator:
                 ovs > 0,
                 1.0 + torch.log(ovs + 1.0) * 2.0,
                 torch.full_like(ovs, 0.1))
-            lr = base_lr_val * torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w
+            lr = torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w
             theta = torch.exp(-torch.clamp(dist, max=5.0) / max(self.theta_tau, 1.0))
             effective_lr = lr * torch.clamp(theta, min=0.1)
 
@@ -703,6 +721,8 @@ class CrystalGenerator:
     def _cpu_stdp_apply(self, gen_updates, base_lr_val, destab_scale, inh_strength, inh_threshold):
         """One combined STDP update per unique gen_cid (batched numpy) with destab support."""
         cs = self.cs
+        best_gen_cid = None
+        best_total_elr = 0.0
         for gen_cid, updates in gen_updates.items():
             v_gen = cs.concept_vectors.get(gen_cid)
             if v_gen is None or not updates:
@@ -763,12 +783,20 @@ class CrystalGenerator:
 
             cs._apply_vector_update(gen_cid, v_new)
 
-            cs._lateral_inhibition_fractal(
-                gen_cid,
-                strength=inh_strength * total_elr,
-                threshold=max(inh_threshold, 0.01),
-                sample_size=min(100, len(cs.concept_vectors)),
-            )
+            if total_elr > best_total_elr:
+                best_total_elr = total_elr
+                best_gen_cid = gen_cid
+
+        # ── Lateral inhibition (single call, not per gen_cid) ──
+        if best_gen_cid is not None and inh_strength > 0:
+            str_val = inh_strength * best_total_elr
+            if str_val >= 1e-8:
+                cs._lateral_inhibition_fractal(
+                    best_gen_cid,
+                    strength=str_val,
+                    threshold=max(inh_threshold, 0.01),
+                    sample_size=min(100, len(cs.concept_vectors)),
+                )
 
     def _negative_sampling_gpu(self, gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, device, field_gate, base_lr_val, neg_lr_ratio, neg_samples):
         """GPU-vectorized negative sampling (fully batched)."""
@@ -930,13 +958,15 @@ class CrystalGenerator:
                         cs._apply_vector_update(cid, v_new)
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20, neg_samples=1,
-                        inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=False,
+                        inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=None,
                         destab_scale=0.0):
         """Train via PMI-gated context-window STDP with optional GPU batching.
 
         Same STDP logic as train_from_text, but with GPU batched compute
         for the hot path (dot products, field overlaps, negative sampling checks).
         """
+        if use_torch is None:
+            use_torch = CFG.use_torch
         if use_torch:
             self._ensure_torch()
             if self._vecs_t is None:
@@ -981,16 +1011,9 @@ class CrystalGenerator:
                 # ── Continuous PMI gate (Level 1) + per-concept error threshold (Level 2) ──
                 pmi_w_raw = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq,
                                               min_weight=pmi_gate_min)
-                if pmi_strength >= 0.01:
-                    effective_min = pmi_gate_min * pmi_strength
-                    per_cid_factor = max(0.25, 1.0 - self.concept_error.get(ids[j], 0.0) * 0.75)
-                    per_cid_min = pmi_gate_min * per_cid_factor
-                    use_min = min(effective_min, per_cid_min)  # more permissive (lower) wins
-                    if pmi_w_raw <= use_min:
-                        continue
-                    pmi_w = 1.0 + (pmi_w_raw - 1.0) * pmi_strength  # blend toward 1.0
-                else:
-                    pmi_w = 1.0
+                _skip, pmi_w = self._apply_pmi_gate(pmi_w_raw, pmi_strength, pmi_gate_min, ids[j])
+                if _skip:
+                    continue
 
                 if use_torch:
                     ci = cid_to_idx.get(ids[i])
@@ -1027,10 +1050,12 @@ class CrystalGenerator:
         elif neg_samples > 0:
             self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
 
+        # ── Mark torch as dirty (vectors modified via _apply_vector_update) ──
+        if use_torch:
+            self._torch_dirty = True
+
         # ── Contrastive objective ──
         self._contrastive_objective(gen_updates)
-
-        # ── Sentence-level centroid pull (CBOW-like, raw vectors only) ──
         self._centroid_pull(ids, base_lr_val)
 
         self.lattice.update(ids)
@@ -1039,12 +1064,14 @@ class CrystalGenerator:
 
     def train_batch(self, texts, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20,
                     neg_samples=1, inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5,
-                    field_gate=True, use_torch=False, destab_scale=0.0):
+                    field_gate=True, use_torch=None, destab_scale=0.0):
         """Process multiple texts in one GPU batch for higher throughput.
 
         Builds pairs from all texts, does a single GPU STDP call,
         then per-text centroid pull + lattice update.
         """
+        if use_torch is None:
+            use_torch = CFG.use_torch
         if use_torch:
             self._ensure_torch()
             if self._vecs_t is None:
@@ -1091,16 +1118,9 @@ class CrystalGenerator:
 
                     pmi_w_raw = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq,
                                                   min_weight=pmi_gate_min)
-                    if pmi_strength >= 0.01:
-                        effective_min = pmi_gate_min * pmi_strength
-                        per_cid_factor = max(0.25, 1.0 - self.concept_error.get(ids[j], 0.0) * 0.75)
-                        per_cid_min = pmi_gate_min * per_cid_factor
-                        use_min = min(effective_min, per_cid_min)
-                        if pmi_w_raw <= use_min:
-                            continue
-                        pmi_w = 1.0 + (pmi_w_raw - 1.0) * pmi_strength
-                    else:
-                        pmi_w = 1.0
+                    _skip, pmi_w = self._apply_pmi_gate(pmi_w_raw, pmi_strength, pmi_gate_min, ids[j])
+                    if _skip:
+                        continue
 
                     if use_torch:
                         ci = cid_to_idx.get(ids[i])
@@ -1135,6 +1155,10 @@ class CrystalGenerator:
                                          base_lr_val, neg_lr_ratio, neg_samples)
         elif neg_samples > 0:
             self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
+
+        # ── Mark torch as dirty (vectors modified via _apply_vector_update) ──
+        if use_torch:
+            self._torch_dirty = True
 
         # ── Contrastive objective (run ONCE, not per-text) ──
         self._contrastive_objective(gen_updates)
@@ -1334,7 +1358,7 @@ if __name__ == '__main__':
     sp = spm.SentencePieceProcessor(
         model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_146k.model'))
 
-    print("Initializing ConceptSpace (32K)...")
+    print("Initializing ConceptSpace (146K)...")
     cs = ConceptSpace(vocab_size=sp.vocab_size(), dim=384)
     cs.init_concepts()
     cs.init_homeostasis()

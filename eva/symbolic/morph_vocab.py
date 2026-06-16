@@ -9,6 +9,9 @@ except ImportError:
     Segmenter = NewsEmbedding = NewsMorphTagger = NatMorph = Doc = None
 
 
+_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # eva/symbolic -> FCF/
+
+
 class MorphVocab:
     """Morphological vocabulary with custom octree paths per concept.
 
@@ -22,7 +25,9 @@ class MorphVocab:
         BPE fallback:                     path = digits(cid)   [standard]
     """
 
-    def __init__(self, sp_model_path='real_data/bpe_ru_146k.model', vocab_size=146000):
+    def __init__(self, sp_model_path=None, vocab_size=146000):
+        if sp_model_path is None:
+            sp_model_path = os.path.join(_BASE, 'real_data', 'bpe_ru_146k.model')
         import sentencepiece as spm
         self._sp = spm.SentencePieceProcessor(model_file=sp_model_path)
         self.vocab_size = min(vocab_size, self._sp.vocab_size())
@@ -50,8 +55,12 @@ class MorphVocab:
     # ── Build from corpus ──────────────────────────────────────
 
     @classmethod
-    def build(cls, corpus_path='real_data/full_corpus_ru.txt',
-              sp_model_path='real_data/bpe_ru_146k.model'):
+    def build(cls, corpus_path=None,
+              sp_model_path=None):
+        if corpus_path is None:
+            corpus_path = os.path.join(_BASE, 'real_data', 'full_corpus_ru.txt')
+        if sp_model_path is None:
+            sp_model_path = os.path.join(_BASE, 'real_data', 'bpe_ru_146k.model')
         """Build morphological vocabulary: parse corpus, assign custom paths."""
         self = cls(sp_model_path=sp_model_path)
 

@@ -54,6 +54,10 @@ class CrystalGenerator:
         self.branch_rngs = {}
         self.hormones = HormonalSystem()
 
+        # Per-concept prediction error EMA (Level 2: error-based PMI gate)
+        self.concept_error = {}          # cid → EMA of (1 - cos(v_gen, v_ctx))
+        self.concept_error_decay = 0.9  # EMA decay
+
         # Torch state (lazy init, invalidated by fluctuate_fractal)
         self._torch_device = None
         self._torch_cid_order = []
@@ -556,7 +560,7 @@ class CrystalGenerator:
 
     # ── Training ───────────────────────────────────────────────
 
-    def train_from_text(self, text, base_lr=None, context_window=2, pmi_gate=True, pmi_gate_min=0.20, neg_samples=1,
+    def train_from_text(self, text, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20, neg_samples=1,
                         inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=False,
                         destab_scale=0.0):
         """Train via PMI-gated context-window STDP with optional GPU batching.
@@ -588,7 +592,7 @@ class CrystalGenerator:
         # Collect indices for GPU batch
         gpu_ctx_l = []   # tensor indices for GPU
         gpu_tgt_l = []
-        gpu_meta_l = []  # (j_pos, pmi_w, dist_weight, freq_weight) for STDP
+        gpu_meta_l = []  # (i, j_pos, pmi_w, dist_weight, freq_weight) for STDP
         gpu_cid_ctx = []  # raw CID for context
         gpu_cid_gen = []  # raw CID for generated
 
@@ -605,11 +609,19 @@ class CrystalGenerator:
                 fb = self.lattice.concept_freq.get(ids[j], 0)
                 freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
 
-                pmi_w = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq,
-                                         min_weight=pmi_gate_min) if pmi_gate else 1.0
-
-                if pmi_gate and pmi_w <= pmi_gate_min:
-                    continue
+                # ── Continuous PMI gate (Level 1) + per-concept error threshold (Level 2) ──
+                pmi_w_raw = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq,
+                                              min_weight=pmi_gate_min)
+                if pmi_strength >= 0.01:
+                    effective_min = pmi_gate_min * pmi_strength
+                    per_cid_factor = max(0.25, 1.0 - self.concept_error.get(ids[j], 0.0) * 0.75)
+                    per_cid_min = pmi_gate_min * per_cid_factor
+                    use_min = min(effective_min, per_cid_min)  # more permissive (lower) wins
+                    if pmi_w_raw <= use_min:
+                        continue
+                    pmi_w = 1.0 + (pmi_w_raw - 1.0) * pmi_strength  # blend toward 1.0
+                else:
+                    pmi_w = 1.0
 
                 if use_torch:
                     ci = cid_to_idx.get(ids[i])
@@ -618,7 +630,7 @@ class CrystalGenerator:
                         continue
                     gpu_ctx_l.append(ci)
                     gpu_tgt_l.append(cj)
-                    gpu_meta_l.append((j, pmi_w, dist_weight, freq_weight))
+                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight))
                     gpu_cid_ctx.append(ids[i])
                     gpu_cid_gen.append(ids[j])
                 else:
@@ -649,10 +661,11 @@ class CrystalGenerator:
 
                 # Stack metadata tensors on GPU
                 meta_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
-                j_pos = meta_t[:, 0]
-                pmi_w_t = meta_t[:, 1]
-                dw_t = meta_t[:, 2]
-                fw_t = meta_t[:, 3]
+                i_pos = meta_t[:, 0]  # context position (unused in STDP)
+                j_pos = meta_t[:, 1]  # gen position (theta gate)
+                pmi_w_t = meta_t[:, 2]
+                dw_t = meta_t[:, 3]
+                fw_t = meta_t[:, 4]
 
                 field_w = torch.where(
                     ovs > 0,
@@ -684,6 +697,13 @@ class CrystalGenerator:
                 cnt = torch.zeros(len(unique_gen), device=device)
                 cnt.scatter_add_(0, inv_t, torch.ones(N, device=device))
 
+                # ── Per-concept prediction error tracking (Level 2) ──
+                y_cpu = y.cpu().numpy()
+                for pi, gen_cid in enumerate(gpu_cid_gen):
+                    err = 1.0 - float(y_cpu[pi])
+                    old = self.concept_error.get(gen_cid, err)
+                    self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
+
             acc_cpu = acc.cpu().numpy()
             cnt_cpu = cnt.cpu().numpy()
             elr_cpu = elr_grouped.cpu().numpy()
@@ -700,7 +720,7 @@ class CrystalGenerator:
                     ppmi_candidates = self.lattice.connections_of(
                         gen_cid, top_k=20, use_ppmi=True)
                     if ppmi_candidates:
-                        ppmi_cid = ppmi_candidates[self.main_rng.randint(0, len(ppmi_candidates))][0]
+                        ppmi_cid = ppmi_candidates[self.main_rng.randint(0, len(ppmi_candidates) - 1)][0]
                         v_ppmi = cs.concept_vectors.get(ppmi_cid)
                         if v_ppmi is not None:
                             y_ppmi = max(float(np.dot(v, v_ppmi)), 0.05)
@@ -711,7 +731,7 @@ class CrystalGenerator:
                                 mix = min(destab_scale, 0.5)
                                 acc_cpu[gi] = acc_cpu[gi] * (1 - mix) + noise * mix
 
-                grad = acc_cpu[gi] / max(cnt_cpu[gi], 1)
+                grad = acc_cpu[gi] / max(elr_cpu[gi], 1e-10)
                 v_new = v + grad * base_lr_val
                 nv = np.linalg.norm(v_new)
                 if nv > 1e-10:
@@ -720,43 +740,54 @@ class CrystalGenerator:
                 gen_vecs.append(v_new)
                 gen_cids_list.append(gen_cid)
 
-            # Batched lateral inhibition on GPU
+            # Lateral inhibition: CPU (sampling) for small batches (<50 gen), GPU (full-V) for large
             if gen_vecs and inh_strength > 0:
-                gv_t = torch.from_numpy(np.array(gen_vecs, dtype=np.float32)).to(device)
-                gv_all = self._vecs_t  # (V, D)
-                # For each gen vector, find similar non-self vectors and repel
-                sims = gv_t @ gv_all.T  # (G, V)
-                for gi, gen_cid in enumerate(gen_cids_list):
-                    threshold = max(inh_threshold, 0.01)
-                    total_elr = float(elr_cpu[gi])
-                    str_val = inh_strength * total_elr
-                    if str_val < 1e-8:
-                        continue
-                    below = sims[gi] < -0.5
-                    above = sims[gi] > threshold
-                    inhibit = above & ~below
-                    if inhibit.sum() < 1:
-                        continue
-                    targets = torch.where(inhibit)[0]
-                    if len(targets) > 100:
-                        top_sim, top_idx = torch.topk(sims[gi], k=100)
-                        targets = top_idx[top_sim > threshold]
-                    if len(targets) < 1:
-                        continue
-                    v_self = gv_t[gi]
-                    v_opp = gv_all[targets]
-                    dot = (v_self * v_opp).sum(dim=1)
-                    delta = -str_val * (v_opp - dot[:, None] * v_self[None, :])
-                    # Apply inhibition via numpy
-                    delta_cpu = delta.cpu().numpy()
-                    for ti, tcid in enumerate(targets.cpu().numpy()):
-                        v_t = cs.concept_vectors.get(int(tcid))
-                        if v_t is not None:
-                            v_new_t = v_t + delta_cpu[ti]
-                            nt = np.linalg.norm(v_new_t)
-                            if nt > 1e-10:
-                                v_new_t /= nt
-                            cs._apply_vector_update(int(tcid), v_new_t)
+                if len(gen_vecs) < 50:
+                    for gi, gen_cid in enumerate(gen_cids_list):
+                        total_elr = float(elr_cpu[gi])
+                        str_val = inh_strength * total_elr
+                        if str_val < 1e-8:
+                            continue
+                        cs._lateral_inhibition_fractal(
+                            gen_cid,
+                            strength=str_val,
+                            threshold=max(inh_threshold, 0.01),
+                            sample_size=min(100, len(cs.concept_vectors)),
+                        )
+                else:
+                    gv_t = torch.from_numpy(np.array(gen_vecs, dtype=np.float32)).to(device)
+                    gv_all = self._vecs_t  # (V, D)
+                    sims = gv_t @ gv_all.T  # (G, V)
+                    for gi, gen_cid in enumerate(gen_cids_list):
+                        threshold = max(inh_threshold, 0.01)
+                        total_elr = float(elr_cpu[gi])
+                        str_val = inh_strength * total_elr
+                        if str_val < 1e-8:
+                            continue
+                        below = sims[gi] < -0.5
+                        above = sims[gi] > threshold
+                        inhibit = above & ~below
+                        if inhibit.sum() < 1:
+                            continue
+                        targets = torch.where(inhibit)[0]
+                        if len(targets) > 100:
+                            top_sim, top_idx = torch.topk(sims[gi], k=100)
+                            targets = top_idx[top_sim > threshold]
+                        if len(targets) < 1:
+                            continue
+                        v_self = gv_t[gi]
+                        v_opp = gv_all[targets]
+                        dot = (v_self * v_opp).sum(dim=1)
+                        delta = -str_val * (dot[:, None] * v_opp - v_self[None, :])
+                        delta_cpu = delta.cpu().numpy()
+                        for ti, tcid in enumerate(targets.cpu().numpy()):
+                            v_t = cs.concept_vectors.get(int(tcid))
+                            if v_t is not None:
+                                v_new_t = v_t + delta_cpu[ti]
+                                nt = np.linalg.norm(v_new_t)
+                                if nt > 1e-10:
+                                    v_new_t /= nt
+                                cs._apply_vector_update(int(tcid), v_new_t)
 
         else:
             # ── One combined STDP update per unique gen_cid (batched numpy) ──
@@ -783,11 +814,18 @@ class CrystalGenerator:
                 total_elr = float(elr_arr.sum())
 
                 y = np.maximum(v_gen @ ctx_mat.T, 0.05)
+
+                # ── Per-concept prediction error tracking (Level 2) ──
+                for yi in y:
+                    err = 1.0 - float(yi)
+                    old = self.concept_error.get(gen_cid, err)
+                    self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
+
                 total_delta = ((ctx_mat * elr_arr[:, None]).sum(axis=0) -
                               v_gen * (y * elr_arr).sum())
 
                 if n_updates > 0 and total_elr > 0:
-                    grad = total_delta / max(n_updates, 1)
+                    grad = total_delta / max(total_elr, 1e-10)
 
                     if destab_scale > 0 and self.main_rng.random() < destab_scale * 0.3:
                         ppmi_candidates = self.lattice.connections_of(
@@ -842,6 +880,8 @@ class CrystalGenerator:
                 else:
                     neg_ovs_cpu = np.zeros((n_pairs, neg_samples), dtype=np.int64)
 
+                neg_idxs_cpu = neg_idxs.cpu()  # avoid CUDA sync per .item()
+
                 for pi, (i, j, pmi_w, dw, fw) in enumerate(gpu_meta_l):
                     neg_elr = base_lr * max(fw, 0.05) * dw * pmi_w * neg_lr_ratio
                     theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
@@ -855,7 +895,7 @@ class CrystalGenerator:
                         if field_gate and neg_ovs_cpu[pi, ni] > 0:
                             continue  # same field — allow similarity
 
-                        neg_idx = int(neg_idxs[pi, ni].item())
+                        neg_idx = int(neg_idxs_cpu[pi, ni].item())
                         neg_cid = self._torch_cid_order[neg_idx]
                         v_neg = cs.concept_vectors.get(neg_cid)
                         if v_neg is None:
@@ -960,25 +1000,413 @@ class CrystalGenerator:
                         nv = np.linalg.norm(v_new)
                         if nv > 1e-10:
                             v_new /= nv
-                        cs.concept_vectors[cid] = v_new
+                        cs._apply_vector_update(cid, v_new)
 
         self.lattice.update(ids)
-        self._graph_cache.clear()
-        return 1
+
+    def train_batch(self, texts, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20,
+                    neg_samples=1, inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5,
+                    field_gate=True, use_torch=False, destab_scale=0.0):
+        """Process multiple texts in one GPU batch for higher throughput.
+
+        Builds pairs from all texts, does a single GPU STDP call,
+        then per-text centroid pull + lattice update.
+        """
+        if use_torch:
+            self._ensure_torch()
+            if self._vecs_t is None:
+                use_torch = False
+
+        all_ids = []
+        for text in texts:
+            ids = self._encode_input(text)
+            if len(ids) >= 2:
+                all_ids.append(ids)
+        if not all_ids:
+            return 0
+
+        base_lr = base_lr if base_lr is not None else getattr(self, 'train_lr', 0.01)
+        base_lr_val = base_lr
+        cs = self.cs
+        total_freq = max(sum(self.lattice.concept_freq.values()), 1)
+        device = self._torch_device if use_torch else None
+        cid_to_idx = self._torch_cid_to_idx if use_torch else {}
+
+        from collections import defaultdict
+        gen_updates = defaultdict(list)
+
+        gpu_ctx_l = []
+        gpu_tgt_l = []
+        gpu_meta_l = []
+        gpu_cid_ctx = []
+        gpu_cid_gen = []
+
+        for ids in all_ids:
+            T = len(ids)
+            for i in range(T):
+                start = max(0, i - context_window)
+                end = min(T, i + context_window + 1)
+                for j in range(start, end):
+                    if j <= i:
+                        continue
+                    dist = abs(j - i)
+                    dist_weight = math.exp(-dist / 2.0)
+
+                    fa = self.lattice.concept_freq.get(ids[i], 0)
+                    fb = self.lattice.concept_freq.get(ids[j], 0)
+                    freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
+
+                    pmi_w_raw = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq,
+                                                  min_weight=pmi_gate_min)
+                    if pmi_strength >= 0.01:
+                        effective_min = pmi_gate_min * pmi_strength
+                        per_cid_factor = max(0.25, 1.0 - self.concept_error.get(ids[j], 0.0) * 0.75)
+                        per_cid_min = pmi_gate_min * per_cid_factor
+                        use_min = min(effective_min, per_cid_min)
+                        if pmi_w_raw <= use_min:
+                            continue
+                        pmi_w = 1.0 + (pmi_w_raw - 1.0) * pmi_strength
+                    else:
+                        pmi_w = 1.0
+
+                    if use_torch:
+                        ci = cid_to_idx.get(ids[i])
+                        cj = cid_to_idx.get(ids[j])
+                        if ci is None or cj is None:
+                            continue
+                        gpu_ctx_l.append(ci)
+                        gpu_tgt_l.append(cj)
+                        gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight))
+                        gpu_cid_ctx.append(ids[i])
+                        gpu_cid_gen.append(ids[j])
+                    else:
+                        field_weight = 1.0
+                        if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
+                            overlap = cs.fractal.field_overlap(ids[i], ids[j])
+                            field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
+
+                        lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
+                        theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
+                        gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
+
+        # ── GPU STDP (single call for all pairs) ──
+        if use_torch and gpu_ctx_l:
+            ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
+            tgt_t = torch.tensor(gpu_tgt_l, dtype=torch.long, device=device)
+            N = len(gpu_ctx_l)
+
+            with torch.no_grad():
+                if field_gate and self._fb_t is not None:
+                    ctx_fb = self._fb_t[ctx_t]
+                    tgt_fb = self._fb_t[tgt_t]
+                    ovs = (ctx_fb & tgt_fb).sum(dim=1).float()
+                else:
+                    ovs = torch.zeros(N, device=device)
+
+                meta_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
+                i_pos = meta_t[:, 0]
+                j_pos = meta_t[:, 1]
+                pmi_w_t = meta_t[:, 2]
+                dw_t = meta_t[:, 3]
+                fw_t = meta_t[:, 4]
+
+                field_w = torch.where(
+                    ovs > 0,
+                    1.0 + torch.log(ovs + 1.0) * 2.0,
+                    torch.full_like(ovs, 0.1))
+                lr = base_lr_val * torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w
+                theta = torch.exp(-torch.clamp(j_pos, max=5.0) / max(self.theta_tau, 1.0))
+                effective_lr = lr * torch.clamp(theta, min=0.1)
+
+                gen_cids_arr = np.array(gpu_cid_gen, dtype=np.int32)
+                unique_gen, inv_idx = np.unique(gen_cids_arr, return_inverse=True)
+                inv_t = torch.from_numpy(inv_idx).to(device)
+
+                elr_grouped = torch.zeros(len(unique_gen), device=device)
+                elr_grouped.scatter_add_(0, inv_t, effective_lr)
+
+                vc = self._vecs_t[ctx_t]
+                vg = self._vecs_t[tgt_t]
+                y = torch.clamp((vg * vc).sum(dim=1), min=0.05)
+                pair_delta = vc * effective_lr[:, None] - vg * (y * effective_lr)[:, None]
+
+                D = cs.dim
+                acc = torch.zeros(len(unique_gen), D, dtype=torch.float32, device=device)
+                acc.scatter_add_(0, inv_t[:, None].expand(-1, D), pair_delta)
+                cnt = torch.zeros(len(unique_gen), device=device)
+                cnt.scatter_add_(0, inv_t, torch.ones(N, device=device))
+
+                # Per-concept error tracking
+                y_cpu = y.cpu().numpy()
+                for pi, gen_cid in enumerate(gpu_cid_gen):
+                    err = 1.0 - float(y_cpu[pi])
+                    old = self.concept_error.get(gen_cid, err)
+                    self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
+
+            acc_cpu = acc.cpu().numpy()
+            cnt_cpu = cnt.cpu().numpy()
+            elr_cpu = elr_grouped.cpu().numpy()
+
+            # Apply updates
+            gen_vecs = []
+            gen_cids_list = []
+            for gi, gen_cid in enumerate(unique_gen):
+                v = cs.concept_vectors.get(gen_cid)
+                if v is None or cnt_cpu[gi] < 0.5:
+                    continue
+                if destab_scale > 0 and self.main_rng.random() < destab_scale * 0.3:
+                    ppmi_candidates = self.lattice.connections_of(
+                        gen_cid, top_k=20, use_ppmi=True)
+                    if ppmi_candidates:
+                        ppmi_cid = ppmi_candidates[self.main_rng.randint(0, len(ppmi_candidates) - 1)][0]
+                        v_ppmi = cs.concept_vectors.get(ppmi_cid)
+                        if v_ppmi is not None:
+                            y_ppmi = max(float(np.dot(v, v_ppmi)), 0.05)
+                            noise = (v_ppmi - y_ppmi * v)
+                            nlen = float(np.linalg.norm(noise))
+                            if nlen > 1e-10:
+                                noise /= nlen
+                                mix = min(destab_scale, 0.5)
+                                acc_cpu[gi] = acc_cpu[gi] * (1 - mix) + noise * mix
+
+                grad = acc_cpu[gi] / max(elr_cpu[gi], 1e-10)
+                v_new = v + grad * base_lr_val
+                nv = np.linalg.norm(v_new)
+                if nv > 1e-10:
+                    v_new /= nv
+                cs._apply_vector_update(gen_cid, v_new)
+                gen_vecs.append(v_new)
+                gen_cids_list.append(gen_cid)
+
+            # Lateral inhibition
+            if gen_vecs and inh_strength > 0:
+                if len(gen_vecs) < 50:
+                    for gi, gen_cid in enumerate(gen_cids_list):
+                        total_elr = float(elr_cpu[gi])
+                        str_val = inh_strength * total_elr
+                        if str_val < 1e-8:
+                            continue
+                        cs._lateral_inhibition_fractal(
+                            gen_cid, strength=str_val,
+                            threshold=max(inh_threshold, 0.01),
+                            sample_size=min(100, len(cs.concept_vectors)),
+                        )
+                else:
+                    gv_t = torch.from_numpy(np.array(gen_vecs, dtype=np.float32)).to(device)
+                    gv_all = self._vecs_t
+                    sims = gv_t @ gv_all.T
+                    for gi, gen_cid in enumerate(gen_cids_list):
+                        threshold = max(inh_threshold, 0.01)
+                        total_elr = float(elr_cpu[gi])
+                        str_val = inh_strength * total_elr
+                        if str_val < 1e-8:
+                            continue
+                        below = sims[gi] < -0.5
+                        above = sims[gi] > threshold
+                        inhibit = above & ~below
+                        if inhibit.sum() < 1:
+                            continue
+                        targets = torch.where(inhibit)[0]
+                        if len(targets) > 100:
+                            top_sim, top_idx = torch.topk(sims[gi], k=100)
+                            targets = top_idx[top_sim > threshold]
+                        if len(targets) < 1:
+                            continue
+                        v_self = gv_t[gi]
+                        v_opp = gv_all[targets]
+                        dot = (v_self * v_opp).sum(dim=1)
+                        delta = -str_val * (dot[:, None] * v_opp - v_self[None, :])
+                        delta_cpu = delta.cpu().numpy()
+                        for ti, tcid in enumerate(targets.cpu().numpy()):
+                            v_t = cs.concept_vectors.get(int(tcid))
+                            if v_t is not None:
+                                v_new_t = v_t + delta_cpu[ti]
+                                nt = np.linalg.norm(v_new_t)
+                                if nt > 1e-10:
+                                    v_new_t /= nt
+                                cs._apply_vector_update(int(tcid), v_new_t)
+
+        else:
+            for gen_cid, updates in gen_updates.items():
+                v_gen = cs.concept_vectors.get(gen_cid)
+                if v_gen is None or not updates:
+                    continue
+                n_updates = len(updates)
+                ctx_cids, elrs = zip(*updates)
+                valid_ctx, valid_elr = [], []
+                for cid, elr in zip(ctx_cids, elrs):
+                    v = cs.concept_vectors.get(cid)
+                    if v is not None:
+                        valid_ctx.append(v)
+                        valid_elr.append(elr)
+                if not valid_ctx:
+                    continue
+                ctx_mat = np.array(valid_ctx, dtype=np.float32)
+                elr_arr = np.array(valid_elr, dtype=np.float32)
+                total_elr = float(elr_arr.sum())
+                y = np.maximum(v_gen @ ctx_mat.T, 0.05)
+
+                for yi in y:
+                    err = 1.0 - float(yi)
+                    old = self.concept_error.get(gen_cid, err)
+                    self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
+
+                total_delta = ((ctx_mat * elr_arr[:, None]).sum(axis=0) -
+                              v_gen * (y * elr_arr).sum())
+                if n_updates > 0 and total_elr > 0:
+                    grad = total_delta / max(total_elr, 1e-10)
+                    v_new = v_gen + grad * base_lr_val
+                else:
+                    v_new = v_gen
+                nv = np.linalg.norm(v_new)
+                if nv > 1e-10:
+                    v_new /= nv
+                cs._apply_vector_update(gen_cid, v_new)
+
+                cs._lateral_inhibition_fractal(
+                    gen_cid,
+                    strength=inh_strength * total_elr,
+                    threshold=max(inh_threshold, 0.01),
+                    sample_size=min(100, len(cs.concept_vectors)),
+                )
+
+        # ── Negative sampling (GPU, single call) ──
+        if neg_samples > 0 and use_torch and self._vecs_t is not None and gpu_ctx_l:
+            n_pairs = len(gpu_ctx_l)
+            n_total = n_pairs * neg_samples
+            ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
+            tgt_t = torch.tensor(gpu_tgt_l, dtype=torch.long, device=device)
+
+            with torch.no_grad():
+                neg_idxs = torch.randint(0, len(self._torch_cid_order),
+                                         (n_pairs, neg_samples), device=device)
+                if field_gate and self._fb_t is not None:
+                    ctx_fb = self._fb_t[ctx_t]
+                    neg_fb = self._fb_t[neg_idxs]
+                    neg_ovs = (ctx_fb.unsqueeze(1) & neg_fb).sum(dim=2)
+                    neg_ovs_cpu = neg_ovs.cpu().numpy()
+                else:
+                    neg_ovs_cpu = np.zeros((n_pairs, neg_samples), dtype=np.int64)
+
+                neg_idxs_cpu = neg_idxs.cpu()  # move to CPU once (avoids CUDA sync per .item())
+
+                for pi, (i, j, pmi_w, dw, fw) in enumerate(gpu_meta_l):
+                    neg_elr = base_lr * max(fw, 0.05) * dw * pmi_w * neg_lr_ratio
+                    theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
+                    neg_elr *= max(theta_gate, 0.1)
+                    v_ctx = cs.concept_vectors.get(gpu_cid_ctx[pi])
+                    if v_ctx is None:
+                        continue
+                    for ni in range(neg_samples):
+                        if field_gate and neg_ovs_cpu[pi, ni] > 0:
+                            continue
+                        neg_idx = int(neg_idxs_cpu[pi, ni].item())
+                        neg_cid = self._torch_cid_order[neg_idx]
+                        v_neg = cs.concept_vectors.get(neg_cid)
+                        if v_neg is None:
+                            continue
+                        y_val = max(float(np.dot(v_neg, v_ctx)), 0.05)
+                        shift = (y_val * v_neg - v_ctx) * neg_elr
+                        v_new = v_neg + shift
+                        nv = np.linalg.norm(v_new)
+                        if nv > 1e-10:
+                            v_new /= nv
+                        cs._apply_vector_update(neg_cid, v_new)
+
+        elif neg_samples > 0:
+            for gen_cid, updates in gen_updates.items():
+                for prev_cid, elr in updates:
+                    neg_elr = elr * neg_lr_ratio
+                    v_ctx = cs.get_vec(prev_cid)
+                    if v_ctx is None:
+                        continue
+                    for _ in range(neg_samples):
+                        neg_cid = cs.rng.randint(0, cs.vocab_size)
+                        v_neg = cs.get_vec(neg_cid)
+                        if v_neg is None:
+                            continue
+                        if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
+                            neg_overlap = cs.fractal.field_overlap(prev_cid, neg_cid)
+                            if neg_overlap > 0:
+                                continue
+                        y_val = max(float(np.dot(v_neg, v_ctx)), 0.05)
+                        shift = (y_val * v_neg - v_ctx) * neg_elr
+                        v_new = v_neg + shift
+                        nv = np.linalg.norm(v_new)
+                        if nv > 1e-10:
+                            v_new /= nv
+                        cs._apply_vector_update(neg_cid, v_new)
+
+        # ── Contrastive + centroid pull + lattice (per text) ──
+        for ids in all_ids:
+            if not use_torch:
+                for gen_cid, updates in gen_updates.items():
+                    v_gen = cs.concept_vectors.get(gen_cid)
+                    if v_gen is None:
+                        continue
+                    avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
+                    contr_lr = avg_elr * 0.3
+                    n_candidates = min(80, cs.vocab_size)
+                    candidates = cs.rng.randint(0, cs.vocab_size, size=n_candidates)
+                    best_cos = 0.05
+                    best_neg = None
+                    best_v_neg = None
+                    for neg_cid in candidates:
+                        if neg_cid == gen_cid:
+                            continue
+                        if neg_cid in (ctx_cid for ctx_cid, _ in updates):
+                            continue
+                        if self.lattice.connection_strength(gen_cid, neg_cid) > 0.1:
+                            continue
+                        v_neg = cs.concept_vectors.get(neg_cid)
+                        if v_neg is None:
+                            continue
+                        cos_val = float(np.dot(v_gen, v_neg))
+                        if cos_val > best_cos and cos_val < 0.5:
+                            best_cos = cos_val
+                            best_neg = neg_cid
+                            best_v_neg = v_neg
+                    if best_neg is not None:
+                        push = (best_cos * best_v_neg - v_gen) * contr_lr
+                        v_new = v_gen + push
+                        nv = np.linalg.norm(v_new)
+                        if nv > 1e-10:
+                            v_new /= nv
+                        cs._apply_vector_update(gen_cid, v_new)
+
+            # Centroid pull
+            if len(ids) >= 3:
+                sent_vecs = [cs.concept_vectors.get(c) for c in ids]
+                sent_vecs = [v for v in sent_vecs if v is not None]
+                if len(sent_vecs) >= 3:
+                    centroid = np.mean(sent_vecs, axis=0).astype(np.float32)
+                    n_cent = np.linalg.norm(centroid)
+                    if n_cent > 1e-10:
+                        centroid /= n_cent
+                        sent_lr = base_lr_val * 0.3
+                        for cid in ids:
+                            v = cs.concept_vectors.get(cid)
+                            if v is None:
+                                continue
+                            sim = float(np.dot(v, centroid))
+                            shift = (centroid - sim * v) * sent_lr
+                            v_new = v + shift
+                            nv = np.linalg.norm(v_new)
+                            if nv > 1e-10:
+                                v_new /= nv
+                            cs._apply_vector_update(cid, v_new)
+
+            self.lattice.update(ids)
+            self._graph_cache.clear()
+
+        return len(all_ids)
 
     # ── Evaluation ────────────────────────────────────────────
 
-    def evaluate(self, corpus_path, max_lines=None, batch_size=500):
+    def evaluate(self, corpus_path, max_lines=None, batch_size=500, use_gpu=True):
         """Compute perplexity and accuracy on held-out corpus.
 
-        Full softmax over vocabulary at each position.  Scoring uses
-        the same components as _branch():
-          - 0.5  × connection PMI weight
-          - 0.25 × ngram probability
-          - 0.15 × vector cosine similarity
-          - 0.02 × frequency prior
-
-        Optimised: ngram+PMI boost precomputed once per eval, not per position.
+        GPU-accelerated: uses _vecs_t for batch matmul when use_gpu=True.
         """
         import time
 
@@ -1000,22 +1428,23 @@ class CrystalGenerator:
 
         cids = sorted(self.cs.concept_vectors.keys())
         cid_to_idx = {c: i for i, c in enumerate(cids)}
-        V = np.array([self.cs.concept_vectors[c] for c in cids], dtype=np.float32)
-        norms = np.linalg.norm(V, axis=1, keepdims=True)
-        norms[norms < 1e-10] = 1.0
-        V /= norms
         vocab_size = len(cids)
         K = 3
 
-        # Precompute prior array for all tokens (shared across positions)
+        # CPU path: build V matrix, prior, ngram_boost (same as before)
+        if not use_gpu or self._vecs_t is None:
+            V = np.array([self.cs.concept_vectors[c] for c in cids], dtype=np.float32)
+            norms = np.linalg.norm(V, axis=1, keepdims=True)
+            norms[norms < 1e-10] = 1.0
+            V /= norms
+
         total_freq = sum(self.lattice.concept_freq.values()) or 1.0
         prior_arr = np.zeros(vocab_size, dtype=np.float32)
         for i, c in enumerate(cids):
             freq = self.lattice.concept_freq.get(c, 0)
             prior_arr[i] = 0.02 / (K + 1) * (1.0 - min(freq / 1000, 1.0))
 
-        # ── Precompute ngram+PMI boost per prev_cid ──
-        # Inlines PMI to avoid redundant dict lookups on 2M entries
+        # Ngram+PMI boost
         ngram_boost = {}
         for (prev_cid,), counter in self.lattice.ngrams[2].items():
             total_ng = sum(counter.values())
@@ -1027,7 +1456,6 @@ class CrystalGenerator:
                 if idx is None:
                     continue
                 prob = ncount / total_ng
-                # Inline _pmi_weight with precomputed count_prev/count_pair
                 count_next = self.lattice.concept_freq.get(ncid, 0)
                 if count_next < 1:
                     pmi_w = 0.1
@@ -1047,22 +1475,42 @@ class CrystalGenerator:
         n_eval = 0
         t0 = time.time()
 
+        use_cuda = use_gpu and self._vecs_t is not None
+        if use_cuda:
+            device = self._torch_device
+            V_gpu = self._vecs_t
+
         for start in range(0, n_positions, batch_size):
             end = min(start + batch_size, n_positions)
             batch_prev = all_ids[start:end]
             batch_next = all_ids[start + 1:end + 1]
             batch_n = len(batch_prev)
 
-            # Batch vector similarities: each context × all vocab
-            prev_vecs = np.array([
-                self.cs.concept_vectors.get(c, np.zeros(self.cs.dim, dtype=np.float32))
-                for c in batch_prev
-            ], dtype=np.float32)
-            pn = np.linalg.norm(prev_vecs, axis=1, keepdims=True)
-            pn[pn < 1e-10] = 1.0
-            prev_vecs /= pn
-            sims = prev_vecs @ V.T  # (batch, vocab_size)
-            sims = np.maximum(sims, 0)
+            if use_cuda:
+                # GPU matmul: build prev_vecs on CPU, transfer, compute sims, bring back
+                prev_vecs = np.array([
+                    self.cs.concept_vectors.get(c, np.zeros(self.cs.dim, dtype=np.float32))
+                    for c in batch_prev
+                ], dtype=np.float32)
+                pn = np.linalg.norm(prev_vecs, axis=1, keepdims=True)
+                pn[pn < 1e-10] = 1.0
+                prev_vecs /= pn
+                with torch.no_grad():
+                    pv_t = torch.from_numpy(prev_vecs).to(device, non_blocking=True)
+                    sims_t = pv_t @ V_gpu.T  # (batch, vocab_size)
+                    sims_t = torch.clamp(sims_t, min=0)
+                    sims = sims_t.cpu().numpy()
+            else:
+                # CPU matmul (original path)
+                prev_vecs = np.array([
+                    self.cs.concept_vectors.get(c, np.zeros(self.cs.dim, dtype=np.float32))
+                    for c in batch_prev
+                ], dtype=np.float32)
+                pn = np.linalg.norm(prev_vecs, axis=1, keepdims=True)
+                pn[pn < 1e-10] = 1.0
+                prev_vecs /= pn
+                sims = prev_vecs @ V.T
+                sims = np.maximum(sims, 0)
 
             for pos in range(batch_n):
                 prev_cid = batch_prev[pos]
@@ -1071,7 +1519,6 @@ class CrystalGenerator:
                 scores = prior_arr.copy()
                 scores += 0.15 * sims[pos] / (K + 1)
 
-                # Ngram+PMI boost: fast lookup of precomputed values
                 boost = ngram_boost.get(prev_cid)
                 if boost:
                     for ncid, bval in boost.items():
@@ -1079,7 +1526,6 @@ class CrystalGenerator:
                         if idx is not None:
                             scores[idx] += bval
 
-                # Softmax
                 scores -= scores.max()
                 scores = np.clip(scores, -50, 50)
                 exp_s = np.exp(scores)
@@ -1094,8 +1540,7 @@ class CrystalGenerator:
                     if next_cid in {cids[i] for i in np.argsort(-scores)[:5]}:
                         correct_top5 += 1
 
-                    # Vector-only PPL (cosine similarity, no ngram/PMI/prior)
-                    vec_scores = sims[pos]  # already clamped to ≥ 0
+                    vec_scores = sims[pos]
                     vec_scores -= vec_scores.max()
                     vec_scores = np.clip(vec_scores, -50, 50)
                     exp_v = np.exp(vec_scores)

@@ -1289,14 +1289,14 @@ class ConceptSpace:
                     j = sims.argmax()
                     vj = vecs[j]
                     # Correct Riemannian gradient: push vi away from vj
-                    # ∇_R sim(vi, vj) = vj - sim*vi  → negative = vi - sim*vj
-                    grad = vi - max_sim * vj
+                    # ∇_R sim(vi, vj) = vj - sim*vi  → -∇_R = sim*vi - vj
+                    grad = max_sim * vi - vj
                     new_vi = vi + lr * grad
                     nvi = np.linalg.norm(new_vi)
                     if nvi > 1e-10:
                         self.concept_vectors[cids[idx]] = new_vi / nvi
                     # Symmetric push for vj away from vi
-                    grad2 = vj - max_sim * vi
+                    grad2 = max_sim * vj - vi
                     new_vj = vj + lr * grad2
                     nvj = np.linalg.norm(new_vj)
                     if nvj > 1e-10:

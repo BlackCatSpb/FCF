@@ -80,7 +80,7 @@ class FCFConfig:
 
     @property
     def corpus_path(self) -> str:
-        return os.path.join(self.data_dir, 'full_corpus_ru.txt')
+        return os.path.join(self.data_dir, 'full_corpus_ru_clean.txt')
 
     @property
     def bpe_model_path(self) -> str:
@@ -171,6 +171,11 @@ class FCFConfig:
             AdaptRule('vacc1 > 0.01', 'neg_samples', 'shift', -1),
             AdaptRule('cos_flat >= 5', 'neg_samples', 'shift', 1),
         ]),
+        ParamDef('pmi_strength',   0.0,    1.0,    1.0,    0.02, rules=[
+            AdaptRule('cos_trend > 0.001 and mean_cos > 0.01', 'pmi_strength', 'shift', -0.02),
+            AdaptRule('cos_trend < -0.001 and mean_cos < 0.005', 'pmi_strength', 'shift', 0.02),
+            AdaptRule('cos_flat >= 3', 'pmi_strength', 'shift', 0.05),
+        ]),
         ParamDef('pmi_gate_min',   0.05,   0.5,    0.20,   0.02, rules=[
             AdaptRule('delta < 2.0', 'pmi_gate_min', 'shift', -0.01),
             AdaptRule('delta > 20.0', 'pmi_gate_min', 'shift', 0.01),
@@ -238,7 +243,7 @@ class FCFConfig:
 
     # ── Seeds для генерации на чекпоинтах ─────
     gen_max_words: int = 25
-    eval_max_lines: int = 100
+    eval_max_lines: int = 300
 
     # ── Manage ────────────────────────────────
     cleanup_keep: int = 5       # сколько чекпоинтов хранить

@@ -121,7 +121,7 @@ if FRESH:
     RESUME = None
 
 if FAST:
-    print("FAST mode: base_lr=0.15, neg_samples=3, pmi_gate=off, decay_every=250, eval_every=1000")
+    print("FAST mode: base_lr=0.15, neg_samples=3, pmi_strength=0, decay_every=250, eval_every=1000")
 
 if RESUME is not None:
     if RESUME == '':
@@ -254,8 +254,6 @@ if RESUME is not None:
             saved = json.load(f)
         opt.load_state(saved)
         print(f"Loaded optimizer state")
-
-pmi_gate = not FAST and args.epochs == 1
 
 def get_lr(line_idx):
     if line_idx < CFG.lr_warmup_lines:
@@ -507,6 +505,11 @@ try:
             print(f"  Curriculum epoch {epoch}: {epoch_lines}/{total_lines} lines "
                   f"(max {max_len} BPE tokens)")
 
+        BATCH_SIZE = 32
+        batch_buffer = []
+        batch_lr = None
+        batch_destab = 0.0
+
         for idx, line in enumerate(epoch_train[start_line:], start=start_line):
             if not line:
                 continue
@@ -516,14 +519,38 @@ try:
 
             destab_pct = min(idx / max(int(round(opt.p['destab_decay_lines'].current)), 1), 1.0)
             destab_scale = CFG.destab_scale_start + (CFG.destab_scale_end - CFG.destab_scale_start) * destab_pct
-            gen.train_from_text(line, pmi_gate=pmi_gate, pmi_gate_min=opt.p['pmi_gate_min'].current,
+
+            batch_buffer.append(line)
+            batch_lr = gen.train_lr
+            batch_destab = destab_scale
+
+            if len(batch_buffer) < BATCH_SIZE and idx < start_line + len(epoch_train) - 1:
+                # Check if periodic tasks are due — if so, flush early
+                next_fluct = idx + 1 > 0 and (idx + 1 - last_fluct_lines) >= FLUCTUATE_EVERY
+                next_decay = idx + 1 > 0 and (idx + 1 - last_decay_lines) >= DECAY_EVERY
+                if not next_fluct and not next_decay:
+                    continue
+
+            # Flush batch
+            _bt = time.time()
+            gen.train_batch(batch_buffer, pmi_strength=opt.p['pmi_strength'].current,
+                pmi_gate_min=opt.p['pmi_gate_min'].current,
+                base_lr=batch_lr,
                 neg_samples=int(round(opt.p['neg_samples'].current)),
                 context_window=int(round(opt.p['context_window'].current)),
                 inh_strength=opt.p['inh_strength'].current,
                 inh_threshold=opt.p['inh_threshold'].current,
-                neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate and epoch == 1, use_torch=CFG.use_torch,
-                destab_scale=destab_scale)
-            n_trained += 1
+                neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate and epoch == 1,
+                use_torch=CFG.use_torch, destab_scale=batch_destab)
+            _batch_ms = (time.time() - _bt) * 1000
+            _n = len(batch_buffer)
+            if getattr(cs, '_batch_log', None) is None:
+                cs._batch_log = open(os.path.join(CFG.data_dir, '_batch_timing.csv'), 'w', encoding='utf-8')
+                cs._batch_log.write('idx,lines,batch_ms,speed_lps\n')
+            cs._batch_log.write(f'{idx},{_n},{_batch_ms:.0f},{_n/max(_batch_ms,1)*1000:.0f}\n')
+            cs._batch_log.flush()
+            n_trained += len(batch_buffer)
+            batch_buffer = []
             now = time.time()
             elapsed = now - t_start
 

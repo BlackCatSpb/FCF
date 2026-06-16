@@ -748,7 +748,7 @@ if __name__ == '__main__':
     print("Building SyntaxLattice from full corpus via SentencePiece...")
     lattice = SyntaxLattice()
     lattice.build(
-        r'C:\Users\black\OneDrive\Desktop\FCF\real_data\full_corpus_ru.txt',
+        r'C:\Users\black\OneDrive\Desktop\FCF\real_data\full_corpus_ru_clean.txt',
         sp,
         max_n=4,
     )

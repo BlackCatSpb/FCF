@@ -18,14 +18,9 @@ from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 from eva.symbolic.fcf_config import FCFConfig
 
-try:
-    CFG = FCFConfig()
-    BASE = CFG.data_dir
-    sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
-except Exception:
-    CFG = None
-    BASE = '.'
-    sp = None
+CFG = FCFConfig()
+BASE = CFG.data_dir
+sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
 TEST_SEEDS = CFG.test_seeds if CFG is not None else ['князь', 'человек', 'война', 'любовь', 'дом', 'жизнь']
 GEN_MAX_WORDS = 25
 

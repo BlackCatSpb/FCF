@@ -37,6 +37,10 @@ class ConceptVectorStore:
     def valid(self):
         return self._valid
 
+    @property
+    def size(self):
+        return self._V
+
     def __getitem__(self, cid):
         if self._valid[cid]:
             return self._data[cid]
@@ -104,12 +108,6 @@ class FractalField:
         # Latent codes: cid → (latent_dim,) array
         self.codes = {}
 
-        # Meta-weights (trainable, modulate plasticity per concept)
-        self.meta_w_lr = np.zeros(self.l_m, dtype=np.float32)
-        self.meta_w_th = np.zeros(self.l_m, dtype=np.float32)
-        self.meta_b_lr = np.float32(0.0)
-        self.meta_b_th = np.float32(0.0)
-
         # Field bits (lazy init via init_fields())
         self.field_bits: Dict[int, np.ndarray] = {}
 
@@ -117,29 +115,6 @@ class FractalField:
         self._vector_matrix = None
         self._cid_order = []
         self._matrix_dirty = True
-
-    # ── Subspace ops ─────────────────────────────────────────
-
-    def split_code(self, z):
-        """Разделить код на подпространства: (z_c, z_a, z_m)."""
-        return (z[:self.l_c],
-                z[self.l_c:self.l_c + self.l_a],
-                z[self.l_c + self.l_a:])
-
-    def merge_code(self, z_c, z_a, z_m):
-        """Собрать код из подпространств."""
-        return np.concatenate([z_c, z_a, z_m])
-
-    def meta_gate(self, z_m):
-        """Вычислить мета-ворота из meta-подпространства.
-
-        Returns:
-            lr_mod: множитель learning rate [0, 1]
-            th_mod: сдвиг inhibition threshold [-1, 1]
-        """
-        lr_mod = 1.0 / (1.0 + np.exp(-(np.dot(z_m, self.meta_w_lr) + self.meta_b_lr)))
-        th_mod = np.tanh(np.dot(z_m, self.meta_w_th) + self.meta_b_th)
-        return lr_mod, th_mod
 
     # ── Init ─────────────────────────────────────────────────
 
@@ -254,60 +229,6 @@ class FractalField:
         self._matrix_dirty = False
         return self._vector_matrix, self._cid_order
 
-    # ── Concept updates ──────────────────────────────────────
-
-    def apply_code_update(self, cid, delta_code, lr_c=0.01, lr_a=1.0, lr_m=0.1):
-        """Apply subspace-aware STDP update to a latent code.
-
-        Args:
-            cid: concept ID
-            delta_code: full-dimensional delta (projected from vector delta)
-            lr_c: learning rate for identity subspace
-            lr_a: learning rate for attention subspace
-            lr_m: learning rate for meta subspace
-        """
-        code = self.codes.get(cid)
-        if code is None:
-            return
-
-        z_c, z_a, z_m = self.split_code(code)
-        d_c, d_a, d_m = self.split_code(delta_code)
-        lr_mod, _ = self.meta_gate(z_m)
-
-        # Apply updates with subspace-specific rates
-        z_c_new = z_c + d_c * lr_c * lr_mod
-        z_a_new = z_a + d_a * lr_a * lr_mod
-        z_m_new = z_m + d_m * lr_m * lr_mod
-
-        code_new = self.merge_code(z_c_new, z_a_new, z_m_new)
-
-        # Normalize so |code @ basis| = 1
-        v_raw = code_new @ self.basis
-        norm = np.linalg.norm(v_raw)
-        if norm > 1e-10:
-            code_new /= norm
-
-        self.codes[cid] = code_new.astype(np.float32)
-        self._matrix_dirty = True
-
-    # ── Fluctuation ──────────────────────────────────────────
-
-    def fluctuate(self, noise_scale=0.005, decay=0.999):
-        """Autonomous fluctuation: all latent codes drift.
-        Noise scaled by subspace: more for z_a, less for z_c, minimal for z_m."""
-        if not hasattr(self, '_fluct_rng'):
-            self._fluct_rng = np.random.RandomState(42)
-        for cid in list(self.codes.keys()):
-            c = self.codes[cid]
-            z_c, z_a, z_m = self.split_code(c)
-            noise = self._fluct_rng.randn(self.latent_dim).astype(np.float32) * noise_scale
-            # Subspace-specific noise scaling
-            noise[:self.l_c] *= 0.3           # identity: low drift
-            noise[self.l_c:self.l_c + self.l_a] *= 2.0   # attention: high drift
-            noise[self.l_c + self.l_a:] *= 0.1           # meta: minimal
-            c[:] = c * decay + noise
-        self._matrix_dirty = True
-
     def reinitialize_all(self, cid_list):
         """Reset all latent codes to random initialization."""
         self.codes = {}
@@ -325,11 +246,7 @@ class FractalField:
             tmp_path = binary_path.replace('.npz', '.tmp.npz')
             cids = np.array(list(self.codes.keys()), dtype=np.int32)
             codes_arr = np.array([self.codes[cid] for cid in cids], dtype=np.float32)
-            kw = dict(
-                codes=codes_arr, cids=cids, basis=self.basis,
-                meta_w_lr=self.meta_w_lr, meta_w_th=self.meta_w_th,
-                meta_b_lr=np.float32(self.meta_b_lr),
-                meta_b_th=np.float32(self.meta_b_th))
+            kw = dict(codes=codes_arr, cids=cids, basis=self.basis)
             # Save field bits if present
             if hasattr(self, 'field_bits') and self.field_bits:
                 fb_cids = np.array(list(self.field_bits.keys()), dtype=np.int32)
@@ -343,18 +260,12 @@ class FractalField:
                 'latent_dim': self.latent_dim,
                 'binary_codes': os.path.basename(binary_path),
                 'n_codes': len(cids),
-                'meta_b_lr': float(self.meta_b_lr),
-                'meta_b_th': float(self.meta_b_th),
             }
         return {
             'dim': self.dim,
             'latent_dim': self.latent_dim,
             'basis': self.basis.tolist(),
             'codes': {str(cid): c.tolist() for cid, c in self.codes.items()},
-            'meta_w_lr': self.meta_w_lr.tolist(),
-            'meta_w_th': self.meta_w_th.tolist(),
-            'meta_b_lr': float(self.meta_b_lr),
-            'meta_b_th': float(self.meta_b_th),
         }
 
     @classmethod
@@ -370,9 +281,6 @@ class FractalField:
             # Pre-extract arrays before dict comprehensions
             # (NpzFile.__getitem__ is slow on repeated access)
             field.codes = {int(cid): codes_arr[i].copy() for i, cid in enumerate(cids)}
-            # Backward compat: meta-weights added in v2
-            field.meta_w_lr = npz.get('meta_w_lr', np.zeros(field.l_m, dtype=np.float32))
-            field.meta_w_th = npz.get('meta_w_th', np.zeros(field.l_m, dtype=np.float32))
             # Backward compat: field bits added in v2
             # Partial checkpoint ok — fb_cids missing → empty field_bits
             if 'fb_cids' in npz.files:
@@ -384,12 +292,6 @@ class FractalField:
             field.basis = np.array(data['basis'], dtype=np.float32)
             field.codes = {int(cid): np.array(c, dtype=np.float32)
                             for cid, c in data['codes'].items()}
-            field.meta_w_lr = np.array(data.get('meta_w_lr', np.zeros(field.l_m)), dtype=np.float32)
-            field.meta_w_th = np.array(data.get('meta_w_th', np.zeros(field.l_m)), dtype=np.float32)
-
-        field.meta_b_lr = np.float32(data.get('meta_b_lr', 0.0))
-        field.meta_b_th = np.float32(data.get('meta_b_th', 0.0))
-
         # Verify basis orthogonality — re-orthogonalize if drifted
         QtQ = field.basis.T @ field.basis
         err = np.max(np.abs(QtQ - np.eye(field.dim, dtype=np.float32)))
@@ -543,7 +445,8 @@ class ConceptSpace:
         seen_cids = set(lattice.concept_freq.keys()) & set(self.fractal.codes.keys())
         n_bytes = (n_anchors + 7) // 8
 
-        # Group anchors by their first min_lcp digits
+        # Group anchors by their first min_lcp digits (default min_lcp=2:
+        # only LCP>=2 anchors are considered, giving ~16 groups from octal digits)
         prefix_to_anchors = defaultdict(list)
         for aidx, ap in enumerate(anchor_paths):
             prefix_to_anchors[ap[:min_lcp]].append(aidx)
@@ -708,9 +611,7 @@ class ConceptSpace:
     def init_homeostasis(self):
         """Initialize homeostasis tracking for concepts."""
         self.concept_usage = {cid: 0.0 for cid in self.concept_vectors}
-        self.concept_fitness = {cid: 1.0 for cid in self.concept_vectors}
-        self.concept_momentum = {cid: np.zeros(self.dim, dtype=np.float32)
-                                 for cid in self.concept_vectors}
+
         self._hboost_mean_cache = None
         self._hboost_std_cache = 0.0
         self._hboost_cache_step = 0
@@ -754,7 +655,7 @@ class ConceptSpace:
         usage = self.concept_usage.get(cid, 0.0)
         # Refresh cache every 1000 calls
         self._hboost_cache_step += 1
-        if self._hboost_cache_step % 1000 == 1 or self._hboost_mean_cache is None:
+        if self._hboost_cache_step % 1000 == 0 or self._hboost_mean_cache is None:
             vals = list(self.concept_usage.values())
             self._hboost_mean_cache = np.mean(vals) if vals else 1.0
             self._hboost_std_cache = np.std(vals) if vals and len(vals) > 1 else 0.0
@@ -789,9 +690,9 @@ class ConceptSpace:
             if len(all_cids) > sample_size:
                 rng = random.Random(cid)
                 sampled = rng.sample(all_cids, sample_size)
-                mask = np.zeros(self.concept_vectors._V, dtype=bool)
+                mask = np.zeros(self.concept_vectors.size, dtype=bool)
                 for sc in sampled:
-                    if self.concept_vectors._valid[sc]:
+                    if self.concept_vectors.valid[sc]:
                         mask[sc] = True
                 valid = mask
             else:
@@ -837,8 +738,7 @@ class ConceptSpace:
         concept_usage = getattr(self, 'concept_usage', None)
         if concept_usage is not None:
             data['concept_usage'] = {str(c): u for c, u in concept_usage.items()}
-            data['concept_fitness'] = {str(c): f for c, f in
-                                       getattr(self, 'concept_fitness', {}).items()}
+
 
         with open(path + '.tmp', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
@@ -876,12 +776,14 @@ class ConceptSpace:
             obj.fractal = FractalField(dim=obj.dim, latent_dim=512)
 
         saved_usage = data.get('concept_usage')
-        saved_fitness = data.get('concept_fitness')
         if saved_usage:
             obj.concept_usage = {int(c): u for c, u in saved_usage.items()}
-            obj.concept_fitness = {int(c): f for c, f in saved_fitness.items()}
         else:
             obj.init_homeostasis()
+        # Ensure all vocab CIDs have entries (P2-10)
+        for cid in range(obj.vocab_size):
+            if cid not in obj.concept_usage:
+                obj.concept_usage[cid] = 0
         print(f"  Loaded ConceptSpace: {len(obj.concept_vectors)} concepts @ {obj.dim}D")
         return obj
 

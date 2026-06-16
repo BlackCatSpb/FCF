@@ -119,6 +119,7 @@ class InferenceEngine:
         valid_idxs = np.where(self.cs.concept_vectors.valid)[0]
         if len(valid_idxs) == 0:
             return []
+        # valid_idxs are known-valid — direct ndarray access is OK
         data = self.cs.concept_vectors.data[valid_idxs]
         sims = data @ centroid
         top_k = min(k, len(sims))
@@ -163,7 +164,7 @@ class InferenceEngine:
         sampled = rng.choice([c for c in range(self.cs.vocab_size)
                               if self.cs.concept_vectors.valid[c]],
                              size=min(2000, n_valid), replace=False)
-        vecs = np.array([self.cs.concept_vectors.data[c] for c in sampled], dtype=np.float32)
+        vecs = np.array([self.cs.concept_vectors.get(c) for c in sampled], dtype=np.float32)
         triu = (vecs @ vecs.T)[np.triu_indices(len(sampled), k=1)]
         cos_mean, cos_std = float(triu.mean()), float(triu.std())
         results.update(vec_cos_mean=cos_mean, vec_cos_std=cos_std,

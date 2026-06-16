@@ -18,6 +18,11 @@ LATTICE_PATH = os.path.join(_BASE, 'real_data', 'syntax_lattice.json')
 if args.checkpoint:
     CS_PATH = os.path.join(_BASE, 'real_data', f'concept_space_{args.checkpoint}.json')
     LATTICE_PATH = os.path.join(_BASE, 'real_data', f'syntax_lattice_{args.checkpoint}.json')
+    if not os.path.exists(CS_PATH):
+        print(f"Checkpoint {args.checkpoint} not found, falling back to base")
+        args.checkpoint = None
+        CS_PATH = os.path.join(_BASE, 'real_data', 'concept_space.json')
+        LATTICE_PATH = os.path.join(_BASE, 'real_data', 'syntax_lattice.json')
 
 print("Loading SentencePiece...")
 sp = spm.SentencePieceProcessor(model_file=BPE_MODEL)

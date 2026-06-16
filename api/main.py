@@ -76,8 +76,6 @@ async def generate(req: GenerateRequest, request: Request):
         max_words=req.max_words,
         temperature=req.temperature,
     )
-    global _trained_lines
-    _trained_lines += len(result.text.split())
     return GenerateResponse(
         text=result.text,
         concept_path=result.concept_path,

@@ -46,6 +46,7 @@ class CrystalGenerator:
         self.min_words = self.config.get('min_words', 3)
         self._graph_cache = {}
         self.base_concept_temp = self.config.get('concept_temp', 0.5)
+        self.temperature = self.config.get('temperature', 1.0)
         self.theta_tau = self.config.get('theta_tau', 12.0)
         self.base_learning_rate = self.config.get('learning_rate', 0.1)
 
@@ -135,6 +136,7 @@ class CrystalGenerator:
 
     def _theta_temp(self, word_num):
         t = self.base_concept_temp * math.exp(-word_num / max(self.theta_tau, 1.0))
+        t *= self.temperature
         return max(t, self.base_concept_temp * 0.15)
 
     # ── Encode / Decode ────────────────────────────────────────
@@ -215,7 +217,7 @@ class CrystalGenerator:
             theta_temp = self._theta_temp(wn)
             h_temp = self.hormones.modulate_temperature(theta_temp)
             h_lr = self.hormones.modulate_stdp_lr(self.base_learning_rate)
-            effective_beam = max(1, beam_width)
+            effective_beam = max(1, self.hormones.modulate_beam_width(beam_width))
 
             for seq, score, branch_id in beam:
                 prev_cid = seq[-1]
@@ -827,8 +829,12 @@ class CrystalGenerator:
         ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
 
         with torch.no_grad():
-            neg_idxs = torch.randint(0, len(self._torch_cid_order),
-                                     (n_pairs, neg_samples), device=device)
+            # Filter to valid CIDs only
+            valid_idxs = [i for i, cid in enumerate(self._torch_cid_order) if self.cs.concept_vectors.valid[int(cid)]]
+            if len(valid_idxs) < 2:
+                return
+            valid_t = torch.tensor(valid_idxs, device=device)
+            neg_idxs = valid_t[torch.randint(0, len(valid_t), (n_pairs, neg_samples), device=device)]
 
             # Field overlap filter
             # When _fb_t is None (no field_bits loaded), all negatives pass as valid
@@ -1084,10 +1090,11 @@ class CrystalGenerator:
         self.lattice.update(ids)
         self._graph_cache.clear()
 
-        # Prune concept_error cache
+        # Prune concept_error cache (FIFO: keep most recently seen CIDs)
         if len(self.concept_error) > 50000:
-            pruned = dict(sorted(self.concept_error.items(), key=lambda x: -x[1])[:30000])
-            self.concept_error = pruned
+            cids_to_remove = list(self.concept_error.keys())[:-30000]
+            for c in cids_to_remove:
+                del self.concept_error[c]
 
         return 1
 
@@ -1199,10 +1206,11 @@ class CrystalGenerator:
             self.lattice.update(ids)
             self._graph_cache.clear()
 
-        # Prune concept_error cache
+        # Prune concept_error cache (FIFO: keep most recently seen CIDs)
         if len(self.concept_error) > 50000:
-            pruned = dict(sorted(self.concept_error.items(), key=lambda x: -x[1])[:30000])
-            self.concept_error = pruned
+            cids_to_remove = list(self.concept_error.keys())[:-30000]
+            for c in cids_to_remove:
+                del self.concept_error[c]
         if len(self._graph_cache) > 1000:
             self._graph_cache.clear()
 

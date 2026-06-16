@@ -243,6 +243,7 @@ class FCFConfig:
     vec_dev_warn: float = 0.01
 
     # ── Параметры max_shift для STDP ──────────
+    # Default 0.5 matches hardcoded max_shift in concept_space._apply_vector_update
     stdp_max_shift: float = 0.5
     neg_lr_ratio: float = 0.5
 
@@ -420,6 +421,7 @@ class FCFConfig:
         for k, v in data.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
+        cfg.__post_init__()  # Convert raw dicts back to ParamDef/MetricPair
         return cfg
 
     def __post_init__(self):

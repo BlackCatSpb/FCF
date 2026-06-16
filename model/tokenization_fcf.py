@@ -22,9 +22,12 @@ class FCFTokenizer(PreTrainedTokenizer):
 
         super().__init__(
             model_max_length=model_max_length,
-            pad_token="<|pad|>",
-            bos_token="<|word_open|>",
-            eos_token="<|sent_close|>",
+            pad_token="<pad>",
+            bos_token="<bos>",
+            eos_token="<eos>",
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
             **kwargs,
         )
 

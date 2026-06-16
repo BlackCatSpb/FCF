@@ -126,6 +126,9 @@ print(f"vocab_size = {V}")
 
 if FRESH:
     RESUME = None
+    ckpt = CFG.ckpt_state_path
+    if os.path.exists(ckpt):
+        os.remove(ckpt)
 
 if FAST:
     print("FAST mode: base_lr=0.15, neg_samples=3, decay_every=250, eval_every=1000")
@@ -213,7 +216,9 @@ def mean_cosine_sim(cs, sample=2000):
     all_cids = list(cs.concept_vectors.keys())
     rng_state = np.random.RandomState(42)
     cids = rng_state.choice(all_cids, size=min(sample, len(all_cids)), replace=False).tolist()
-    vecs = np.array([cs.concept_vectors[c] for c in cids], dtype=np.float32)
+    vecs_list = [cs.concept_vectors.get(c) for c in cids]
+    vecs_list = [v for v in vecs_list if v is not None]
+    vecs = np.array(vecs_list, dtype=np.float32)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms[norms < 1e-10] = 1.0
     vecs /= norms
@@ -301,10 +306,9 @@ if MAX_LINES > 0:
 print(f"  {len(train_lines)} train, {len(val_lines)} val")
 print(f"  Shortest: {train_lens[0]} BPE tokens, Longest: {train_lens[-1]} BPE tokens")
 print(f"  Median: {train_lens[len(train_lens)//2]} BPE tokens")
-if RESUME is None:
-    with open(CFG.val_corpus_path, 'w', encoding='utf-8') as f:
-        for l in val_lines:
-            f.write(l + '\n')
+with open(CFG.val_corpus_path, 'w', encoding='utf-8') as f:
+    for l in val_lines:
+        f.write(l + '\n')
 
 # ── STDP Training (line by line) ────────────────────────────────
 
@@ -398,8 +402,12 @@ def _write_viewer_html(path):
 
 def _final_save(cs, lattice, opt, epoch, total_lines):
     """Save all training state."""
-    _quiet(cs.save, CFG.cs_path)
-    _quiet(lattice.save, CFG.lattice_path)
+    try:
+        cs.save(CFG.cs_path)
+        lattice.save(CFG.lattice_path)
+    except Exception as e:
+        print(f"FATAL: Checkpoint save failed: {e}")
+        sys.exit(1)
     _quiet(opt.save_state, CFG.data_dir)
     ckpt = {'epoch': epoch, 'line': total_lines, 'timestamp': time.time()}
     with open(CFG.ckpt_state_path, 'w', encoding='utf-8') as f:
@@ -430,8 +438,6 @@ try:
             print(f"{'='*60}")
             # Reset start_line for new epoch
             start_line = 0
-            # Reset error-based PMI gate for new epoch
-            gen.concept_error.clear()
             # Re-read corpus with fresh decay
             destab_pct = 0.0  # fresh destab for new epoch
 
@@ -480,13 +486,15 @@ try:
                 context_window=int(round(opt.p['context_window'].current)),
                 inh_strength=opt.p['inh_strength'].current,
                 inh_threshold=opt.p['inh_threshold'].current,
-                neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate and epoch == 1,
+                neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate,
                 use_torch=CFG.use_torch, destab_scale=batch_destab)
             _batch_ms = (time.time() - _bt) * 1000
             _n = len(batch_buffer)
             if 'batch_log' not in locals() or batch_log is None:
-                batch_log = open(os.path.join(CFG.data_dir, '_batch_timing.csv'), 'a', encoding='utf-8')
-                batch_log.write('idx,lines,batch_ms,speed_lps\n')
+                csv_path = os.path.join(CFG.data_dir, '_batch_timing.csv')
+                batch_log = open(csv_path, 'a', encoding='utf-8')
+                if os.path.getsize(csv_path) == 0:
+                    batch_log.write('idx,lines,batch_ms,speed_lps\n')
             batch_log.write(f'{idx},{_n},{_batch_ms:.0f},{_n/max(_batch_ms,1)*1000:.0f}\n')
             batch_log.flush()
             n_trained += len(batch_buffer)
@@ -558,8 +566,12 @@ try:
                 cs_num = CFG.cs_path.replace('.json', f'_{ckpt_name}.json')
                 lat_num = CFG.lattice_path.replace('.json', f'_{ckpt_name}.json')
                 print()
-                _quiet(cs.save, cs_num)
-                _quiet(lattice.save, lat_num)
+                try:
+                    cs.save(cs_num)
+                    lattice.save(lat_num)
+                except Exception as e:
+                    print(f"FATAL: Checkpoint save failed: {e}")
+                    sys.exit(1)
                 opt_state_path = CFG.cs_path.replace('.json', f'_{ckpt_name}.opt.json')
                 with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
                     json.dump(opt.save_state(), f, ensure_ascii=False)
@@ -567,8 +579,12 @@ try:
                 save_checkpoint_state(idx, epoch=_ckpt_epoch)
                 cleanup_old_checkpoints(keep=CFG.cleanup_keep)
                 if idx % CFG.periodic_save_every == 0:
-                    _quiet(cs.save, CFG.cs_path)
-                    _quiet(lattice.save, CFG.lattice_path)
+                    try:
+                        cs.save(CFG.cs_path)
+                        lattice.save(CFG.lattice_path)
+                    except Exception as e:
+                        print(f"FATAL: Periodic save failed: {e}")
+                        sys.exit(1)
 
                 n_upd = cs._update_count
                 avg_delta = (cs._total_shift / max(n_upd, 1)) * 1e3

@@ -174,19 +174,16 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         """
         self._load()
 
-        gen_config = dict(self.generator.config)
         if max_words is not None:
-            gen_config["max_words"] = max_words
             self.generator.max_words = max_words
-        gen_config["temperature"] = temperature
-        self.generator.config = gen_config
+        self.generator.temperature = temperature
 
-        if prompt:
+        if seed_word:
+            query_words = [seed_word] if prompt else []
+        elif prompt:
             words = prompt.strip().split()
             seed_word = words[0]
             query_words = words[1:] if len(words) > 1 else []
-        elif seed_word:
-            query_words = [seed_word]
         else:
             seed_word = None
             query_words = ["человек"]

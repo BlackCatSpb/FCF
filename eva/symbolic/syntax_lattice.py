@@ -225,9 +225,8 @@ class SyntaxLattice:
         for i in range(len(concept_sequence) - 2):
             self.skip2[concept_sequence[i]][concept_sequence[i + 2]] += 1
 
-        # Invalidate prefix totals (rebuilt lazily on next PMI lookup)
-        self._prefix_total = {}
-        self._skip2_total = {}
+        # Rebuild prefix totals
+        self._refresh_prefix_totals()
 
     def decay_all(self, min_freq=0.01):
         """Sweep all ngrams, concept frequencies, and connections with decay factor.

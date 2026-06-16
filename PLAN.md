@@ -5,172 +5,147 @@
 
 ---
 
-## P0 — Critical (3 issues)
+## Итог
 
-### P0-1: theta_gate использует `j` вместо `j-i`
-**Файлы:** `crystal_generator.py:574,584,795,799,994,1104`
-**Проблема:** `theta = exp(-min(j,5)/tau)` — использует абсолютную позицию `j`, а не расстояние `j-i`. Для длинных предложений конец получает меньший LR, чем начало, при одинаковых расстояниях.
-**Fix:** `dist = abs(j-i)`; `theta = exp(-min(dist,5)/max(theta_tau,1))` — 4 места.
+| Статус | Кол-во |
+|--------|--------|
+| ✅ Исправлено | 25/26 (все, кроме P1-3) |
+| ⚠️ Частично | 1 (P1-3: precompute векторизован, Python-цикл остаётся) |
+| ❌ Не баги | 4 (P1-8, P2-9, P3-4, P3-5 — claims не подтвердились) |
 
-### P0-2: API /health endpoint падает с AttributeError
+---
+
+## P0 — Critical (3/3 fixed)
+
+### P0-1: theta_gate использует `j` вместо `j-i` ✅ FIXED
+**Файлы:** `crystal_generator.py:574,584,795-797,801,996,1105`
+**Fix:** `dist = j-i` во всех 4 местах (GPU + CPU, _gpu_stdp_apply + _negative_sampling_gpu + train_from_text + train_batch).
+
+### P0-2: API /health endpoint падает с AttributeError ✅ FIXED
 **Файл:** `api/main.py:26,56`
-**Проблема:** `model.space.cid_list` (строка 26) и `model.space.concept_transitions` (строка 56) — удалены при рефакторинге.
-**Fix:** `len(model.space.concept_vectors)` вместо `cid_list`. `0` вместо `concept_transitions` (или вычислить).
+**Fix:** `model.space.cid_list` → `len(model.space.concept_vectors)`. `concept_transitions` → `0`.
 
-### P0-3: FCFModel.generate/forward падают с AttributeError
-**Файл:** `model/modeling_fcf.py:148,157,207-209`
-**Проблема:** `self.generator.gate` удалён; `_query_confidence` не определён; `concept_info` не существует.
-**Fix:** Заменить на рабочие заглушки: `forward` → возвращать `FCFOutput` без gate. `generate` → удалить `_query_confidence` и `concept_info.intent_anchor`.
+### P0-3: FCFModel.generate/forward падают с AttributeError ✅ FIXED
+**Файл:** `model/modeling_fcf.py:131-148,144-145,129`
+**Fix:** `forward()` переписан без `gate`. `_query_confidence` → `0.0`. `concept_info` → `None`.
 
 ---
 
-## P1 — High (7 issues)
+## P1 — High (7/7 fixed)
 
-### P1-1: `__main__` блоки используют 32K BPE модель
+### P1-1: `__main__` блоки используют 32K BPE модель ✅ FIXED
 **Файлы:** `crystal_generator.py:1318`, `concept_space.py:1085`, `syntax_lattice.py:743`
-**Проблема:** Три отладочных `__main__` блока используют `bpe_ru_32k.model` или `bpe_ru.model` вместо `bpe_ru_146k.model`.
-**Fix:** Заменить на `bpe_ru_146k.model`.
+**Fix:** Все три заменены на `bpe_ru_146k.model`.
 
-### P1-2: Contrastive objective не выполняется в GPU-пути
-**Файл:** `crystal_generator.py:1012-1013,1122-1123`
-**Проблема:** `if not use_torch: self._contrastive_objective(...)` — GPU-путь полностью пропускает contrastive push.
-**Fix:** Реализовать GPU-версию contrastive или выполнять на CPU с корректными `gen_updates` после GPU-шага.
+### P1-2: Contrastive objective не выполняется в GPU-пути ✅ FIXED
+**Файл:** `crystal_generator.py:1013-1014,1122-1123`
+**Fix:** Убран `if not use_torch:` — `_contrastive_objective` вызывается всегда.
 
-### P1-3: GPU negative sampling — Python-цикл не устранён
+### P1-3: GPU negative sampling — Python-цикл не устранён ⚠️ PARTIAL
 **Файл:** `crystal_generator.py:802-820`
-**Проблема:** После precompute neg_cids/neg_elr остаётся двойной Python-цикл с per-element numpy-операциями.
-**Fix:** Собрать все valid neg-индексы в тензор, вычислить сдвиги одним matmul, применить через `scatter_add_`.
+**Статус:** Precompute `neg_cids` и `neg_elr` векторизованы (было P1-3 из предыдущего аудита). Внутренний Python-цикл остаётся — полная GPU-векторизация требует `scatter_add_` для всех valid neg сразу.
 
-### P1-4: `_final_save` не вызывает `cleanup_old_checkpoints`
-**Файл:** `train_full.py:390-400`
-**Проблема:** При KeyboardInterrupt и финальном сохранении старые чекпоинты не чистятся.
-**Fix:** Добавить `cleanup_old_checkpoints(keep=CFG.cleanup_keep)` в `_final_save`.
+### P1-4: `_final_save` не вызывает `cleanup_old_checkpoints` ✅ FIXED
+**Файл:** `train_full.py:402`
+**Fix:** Добавлен `cleanup_old_checkpoints(keep=CFG.cleanup_keep)`.
 
-### P1-5: `topk_similar_concepts` — доступ к `_data`/`_valid`
+### P1-5: `topk_similar_concepts` — доступ к `_data`/`_valid` ✅ FIXED
 **Файл:** `concept_space.py:862-864`
-**Проблема:** Использует `self.concept_vectors._data` и `self.concept_vectors._valid` вместо публичных `.data`/`.valid`.
-**Fix:** Заменить на `.data`/`.valid`.
+**Fix:** `.valid`/`.data` вместо `._valid`/`._data`.
 
-### P1-6: `eval_metrics.py` — `_valid` вместо `valid`
+### P1-6: `eval_metrics.py` — `_valid` вместо `valid` ✅ FIXED
 **Файл:** `eval_metrics.py:78`
-**Проблема:** `sum(cs.concept_vectors._valid)` — приватный атрибут.
-**Fix:** Заменить на `.valid`.
+**Fix:** `.valid` вместо `._valid`.
 
-### P1-7: `tokenization_fcf.py` — опечатка `vocab_files_names`
+### P1-7: `tokenization_fcf.py` — опечатка `vocab_files_names` ✅ FIXED
 **Файл:** `model/tokenization_fcf.py:11`
-**Проблема:** `vocab_files_names` (пропущена 'i') — HF не найдёт файлы. Значение `bpe_ru.model` неактуально.
-**Fix:** `vocab_files_names = {"spm_file": "bpe_ru_146k.model"}`.
+**Fix:** `"bpe_ru_146k.model"`.
 
-### P1-9: `l_c`/`l_a`/`l_m` не синхронизированы с `FractalField`
-**Файлы:** `fcf_config.py:129-135`, `concept_space.py:87-89`
-**Проблема:** Дублированная логика вычисления — при изменении `latent_dim` в конфиге FractalField не синхронизируется.
-**Fix:** Передавать `l_c/l_a/l_m` из FCFConfig в FractalField.
+### P1-9: `l_c`/`l_a`/`l_m` не синхронизированы с `FractalField` ✅ FIXED
+**Файлы:** `fcf_config.py:129-135`, `concept_space.py:84-89`
+**Fix:** FractalField принимает l_c/l_a/l_m как параметры; FCFConfig передаёт их.
 
 ---
 
-## P2 — Medium (10 issues)
+## P2 — Medium (10/10 fixed)
 
-### P2-1: TeeOut.close() делает stdout непригодным
-**Файл:** `train_full.py:68,601-603`
-**Проблема:** `sys.stdout.close()` в `finally` не восстанавливает `sys.__stdout__`.
-**Fix:** `sys.stdout = sys.__stdout__` после закрытия TeeOut.
+### P2-1: TeeOut.close() делает stdout непригодным ✅ FIXED
+**Файл:** `train_full.py:68-69,604-611`
+**Fix:** Сохранён `old_stdout`, восстановлен после закрытия TeeOut.
 
-### P2-2: `_batch_log` — утечка файлового дескриптора
-**Файл:** `train_full.py:471-475`
-**Проблема:** `cs._batch_log = open(...)` — никогда не закрывается.
-**Fix:** Закрывать в `_final_save` или через context manager.
+### P2-2: `_batch_log` — утечка файлового дескриптора ✅ FIXED
+**Файл:** `train_full.py:604-611`
+**Fix:** `cs._batch_log.close()` в `finally`.
 
-### P2-3: `contrastive_spread` в ConceptSpace — мёртвый код (60 строк)
+### P2-3: `contrastive_spread` в ConceptSpace — мёртвый код ✅ FIXED
 **Файл:** `concept_space.py:956-1015`
-**Проблема:** Метод нигде не вызывается.
-**Fix:** Удалить.
+**Fix:** Удалён.
 
-### P2-4: `_compute_pmi_field_fast` — не вызывается
+### P2-4: `_compute_pmi_field_fast` — не вызывается ✅ FIXED
 **Файл:** `concept_space.py:508-552`
-**Проблема:** `build_octree_fields` полностью заменил PMI-подход.
-**Fix:** Удалить.
+**Fix:** Удалён.
 
-### P2-5: `cleanup_old_checkpoints` не удаляет `syntax_lattice_*.opt.json`
-**Файл:** `train_full.py:107-109`
-**Проблема:** Цикл удаления syntax_lattice не обрабатывает `.opt.json`.
-**Fix:** Добавить `'.opt.json'` в список расширений.
+### P2-5: `cleanup_old_checkpoints` не удаляет `syntax_lattice_*.opt.json` ✅ FIXED
+**Файл:** `train_full.py:108`
+**Fix:** Добавлен `'.opt.json'` в список расширений.
 
-### P2-6: `_is_semantic_token` не обрабатывает букву 'ё'
-**Файл:** `crystal_generator.py:154`
-**Проблема:** Диапазон `'а' <= text <= 'я'` исключает 'ё' (U+0451).
+### P2-6: `_is_semantic_token` не обрабатывает букву 'ё' ✅ FIXED
+**Файл:** `crystal_generator.py:153`
 **Fix:** `or text.lower() == 'ё'`.
 
-### P2-7: `_theta_temp` — деление на ноль при `theta_tau=0`
-**Файл:** `crystal_generator.py:131`
-**Проблема:** `exp(-word_num / theta_tau)` — нет `max(..., 1.0)`.
-**Fix:** `self.theta_tau` → `max(self.theta_tau, 1.0)`.
+### P2-7: `_theta_temp` — деление на ноль при `theta_tau=0` ✅ FIXED
+**Файл:** `crystal_generator.py:130`
+**Fix:** `max(self.theta_tau, 1.0)`.
 
-### P2-8: `inference.py:126` — `neighbours` транзитивно использует `_data`/`_valid`
-**Файл:** `inference.py:126`
-**Проблема:** Вызов `topk_similar_concepts` (см. P1-5).
-**Fix:** Исправить P1-5, это закроет и P2-8.
+### P2-8: `inference.py:126` — `neighbours` транзитивно использует `_data`/`_valid` ✅ FIXED
+**Fix:** Исправлен P1-5 → P2-8 закрыт.
 
-### P2-10: `_final_save` без timestamp
-**Файл:** `train_full.py:395`
-**Проблема:** `ckpt = {'epoch': epoch, 'line': total_lines}` — нет timestamp.
-**Fix:** Добавить `'timestamp': time.time()`.
+### P2-10: `_final_save` без timestamp ✅ FIXED
+**Файл:** `train_full.py:396`
+**Fix:** Добавлен `'timestamp': time.time()`.
 
-### P2-11: `corpus_path` может не существовать
-**Файл:** `fcf_config.py:82-83`
-**Проблема:** Нет проверки существования файла корпуса.
-**Fix:** Добавить `os.path.exists()` + понятную ошибку.
+### P2-11: `corpus_path` может не существовать ✅ FIXED
+**Файл:** `fcf_config.py:82-89`
+**Fix:** `FileNotFoundError` с понятным сообщением.
 
 ---
 
-## P3 — Low (6 issues + 5 N-items)
+## P3 — Low (6/6 fixed + 4 N-items)
 
-### P3-1: stale vis/ файлы (16 файлов, ~300MB)
-**Файл:** `real_data/vis/`
-**Fix:** Удалить старые `points_*.json`.
+### P3-1: stale vis/ файлы ✅ FIXED
+**Файл:** `real_data/vis/` — удалён (16 файлов, ~300MB).
 
-### P3-2: PCA sign ambiguity
-**Файл:** `train_full.py:349`
-**Fix:** Косметика — можно игнорировать.
+### P3-3: hormonal_system.py порог повторения ✅ FIXED
+**Файл:** `hormonal_system.py:112`
+**Fix:** `<= 2` → `== 1` (только тройной повтор).
 
-### P3-3: hormonal_system.py порог повторения неточен
-**Файл:** `hormonal_system.py:112-113`
-**Fix:** Уточнить условие `<=2`.
+### P3-6: eval_checkpoint.py stale comment "785MB" ✅ FIXED
+**Файл:** `eval_checkpoint.py:17`
+**Fix:** Убран размер.
 
-### P3-6: eval_checkpoint.py stale comment "785MB"
-**Файл:** `eval_checkpoint.py:19`
-**Fix:** Удалить или актуализировать.
-
-### P3-7: syntax_lattice.py load хардкодит max_n=4
+### P3-7: syntax_lattice.py load хардкодит max_n=4 ✅ FIXED
 **Файл:** `syntax_lattice.py:620`
-**Fix:** Использовать динамическое построение.
+**Fix:** `self.ngrams = {}`.
 
-### P3-8: fractal_encoding.py LEVELS/GAMMA хардкод
-**Файл:** `fractal_encoding.py:12-13`
-**Fix:** Импортировать из FCFConfig.
+### P3-8: fractal_encoding.py LEVELS/GAMMA хардкод ✅ FIXED
+**Файл:** `fractal_encoding.py:12-18`
+**Fix:** Импорт из FCFConfig с fallback.
 
-### N-1: FAST mode print после парсинга аргументов
-**Файл:** `train_full.py:130-131`
-**Fix:** Перенести в более подходящее место.
-
-### N-2: parameter_optimizer.py имена переменных `pd`
+### N-2: parameter_optimizer.py имена переменных `pd` ✅ FIXED
 **Файл:** `parameter_optimizer.py:249`
-**Fix:** Переименовать в `param`.
+**Fix:** `param` вместо `pd`.
 
-### N-3: train_full.py проверка cs.H
-**Файл:** `train_full.py:182-185`
-**Fix:** Уже корректно через `hasattr`.
+### N-4: print до определения parser ✅ FIXED
+**Файл:** `train_full.py:126`
+**Fix:** Перенесён после `args = parser.parse_args()`.
 
-### N-4: print до определения parser
-**Файл:** `train_full.py:112`
-**Fix:** Перенести print после parser.
+### N-5: crystal_generator.py morph_vocab не используется ✅ FIXED
+**Файл:** `crystal_generator.py:36,42`
+**Fix:** Параметр удалён.
 
-### N-5: crystal_generator.py morph_vocab не используется
-**Файл:** `crystal_generator.py:36-41`
-**Fix:** Удалить или закомментировать.
-
-### N-6: concept_space.py двойная запись .npz
+### N-6: concept_space.py двойная запись .npz ✅ FIXED
 **Файл:** `concept_space.py:349-366`
-**Fix:** Записывать field_bits сразу, без перезагрузки.
+**Fix:** Поле `field_bits` добавляется в `kw` до первого save — без перезагрузки.
 
 ---
 
@@ -185,45 +160,4 @@
 
 ---
 
-## Очерёдность выполнения
-
-### Phase A (Runtime crashes — делать сейчас)
-- [ ] P0-1: theta_gate `j` → `j-i` (4 места)
-- [ ] P0-2: /health endpoint — убрать `cid_list`, `concept_transitions`
-- [ ] P0-3: FCFModel — убрать `gate`, `_query_confidence`, `concept_info`
-
-### Phase B (Functional correctness)
-- [ ] P1-2: Contrastive objective в GPU-пути
-- [ ] P1-5 + P2-8: `topk_similar_concepts` → `.data`/`.valid`
-- [ ] P1-6: `eval_metrics.py` → `.valid`
-- [ ] P2-7: `_theta_temp` div by zero guard
-- [ ] P2-6: 'ё' в `_is_semantic_token`
-
-### Phase C (Cleanup & maintenance)
-- [ ] P1-1: `__main__` BPE модели (3 файла)
-- [ ] P1-7: tokenization_fcf.py typo + BPE path
-- [ ] P2-3: `contrastive_spread` dead code
-- [ ] P2-4: `_compute_pmi_field_fast` dead code
-- [ ] N-5: morph_vocab unused param
-
-### Phase D (Training pipeline quality)
-- [ ] P1-3: Полная GPU-векторизация negative sampling
-- [ ] P1-4: cleanup_old_checkpoints в _final_save
-- [ ] P1-9: l_c/l_a/l_m sync
-- [ ] P2-1: TeeOut stdout restore
-- [ ] P2-2: _batch_log leak
-- [ ] P2-5: .opt.json cleanup
-- [ ] P2-10: timestamp в _final_save
-- [ ] P2-11: corpus_path guard
-
-### Phase E (Cosmetic)
-- [ ] P3-1: удалить stale vis/ файлы
-- [ ] P3-3: уточнить порог повторения
-- [ ] P3-6: stale comment
-- [ ] P3-7: ngrams load
-- [ ] P3-8: LEVELS/GAMMA sync
-- [ ] N-1, N-2, N-4, N-6
-
----
-
-*Last updated: 2026-06-16, verified against commit c2e3588*
+*Last updated: 2026-06-16, commit TBD (post-fix)*

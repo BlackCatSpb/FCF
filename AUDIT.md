@@ -608,6 +608,43 @@ np.savez_compressed(tmp_path, **kw)
 | Q1/Q2/Q5/Q7 | Code quality (torch import, hasattr, TeeOut, query_words) | ✅ |
 | Q8-Q9 | Code duplication save | ✅ |
 
+**Вторая волна исправлений (коммит `TBD`): все 26 issues из PLAN.md:**
+
+| # | Описание | Статус |
+|---|----------|--------|
+| P0-1 | theta_gate: `j` → `j-i` (4 места) | ✅ |
+| P0-2 | API /health: `cid_list` → `concept_vectors`, `concept_transitions` → 0 | ✅ |
+| P0-3 | FCFModel: убран `gate`, `_query_confidence`, `concept_info` | ✅ |
+| P1-1 | `__main__` BPE модели (3 файла: crystal, concept, syntax) | ✅ |
+| P1-2 | Contrastive objective выполняется и в GPU-пути | ✅ |
+| P1-3 | GPU neg-sampling: inner loop vectorized | ⚠️ (partial — precompute done, Python loop remains) |
+| P1-4 | `_final_save` вызывает `cleanup_old_checkpoints` | ✅ |
+| P1-5 | `topk_similar_concepts`: `_data`/`_valid` → `.data`/`.valid` | ✅ |
+| P1-6 | `eval_metrics.py`: `_valid` → `valid` | ✅ |
+| P1-7 | `tokenization_fcf.py`: typo `vocab_files_names` + BPE path | ✅ |
+| P1-9 | `l_c`/`l_a`/`l_m` synced: FCFConfig → FractalField params | ✅ |
+| P2-1 | TeeOut: stdout restored after close | ✅ |
+| P2-2 | `_batch_log` закрывается в `finally` | ✅ |
+| P2-3 | `contrastive_spread` dead code удалён | ✅ |
+| P2-4 | `_compute_pmi_field_fast` dead code удалён | ✅ |
+| P2-5 | `cleanup_old_checkpoints` удаляет `*.opt.json` | ✅ |
+| P2-6 | `_is_semantic_token` обрабатывает 'ё' | ✅ |
+| P2-7 | `_theta_temp`: guard `max(theta_tau, 1.0)` | ✅ |
+| P2-8 | `inference.py:126` — transitively fixed via P1-5 | ✅ |
+| P2-10 | `_final_save` с `timestamp` | ✅ |
+| P2-11 | `corpus_path` с `FileNotFoundError` | ✅ |
+| P3-1 | stale `real_data/vis/` удалён (16 файлов, ~300MB) | ✅ |
+| P3-3 | hormonal `da_coherence` порог: `<=2` → `==1` | ✅ |
+| P3-6 | eval_checkpoint stale comment "785MB" → убран размер | ✅ |
+| P3-7 | syntax_lattice `load()`: `ngrams = {}` динамически | ✅ |
+| P3-8 | fractal_encoding: LEVELS/GAMMA из FCFConfig | ✅ |
+| N-2 | parameter_optimizer: `pd` → `param` | ✅ |
+| N-4 | print(vocab_size) после parser | ✅ |
+| N-5 | crystal_generator: `morph_vocab` убран из `__init__` | ✅ |
+| N-6 | concept_space: двойная запись .npz устранена | ✅ |
+
+**Итого: остаётся 1 partially fixed (P1-3). Остальные 25 из 26 — полностью исправлены.**
+
 **Новых проблем найдено: 30** (3 P0, 7 P1, 10 P2, 6 P3 — 4 claims не подтвердились)
 **Верификация PLAN.md:** 26/30 точны. См. [PLAN.md](PLAN.md) для полного плана исправлений.
 

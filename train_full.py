@@ -65,6 +65,7 @@ class TeeOut:
             self._log_fh.close()
             self._log_fh = None
 
+old_stdout = sys.stdout
 sys.stdout = TeeOut()
 
 sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
@@ -104,11 +105,9 @@ def cleanup_old_checkpoints(keep=None):
             for ext in ['.json', '.codes.npz', '.opt.json']:
                 fp = os.path.join(base_dir, f'concept_space_{k_label}{ext}')
                 if os.path.exists(fp): os.remove(fp)
-            for ext in ['.json', '.lattice.npz', '.meta.json']:
+            for ext in ['.json', '.lattice.npz', '.meta.json', '.opt.json']:
                 fp = os.path.join(base_dir, f'syntax_lattice_{k_label}{ext}')
                 if os.path.exists(fp): os.remove(fp)
-print(f"vocab_size = {V}")
-
 # ── Parse args ──────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
@@ -123,6 +122,8 @@ RESUME = args.resume
 FAST = args.fast
 FRESH = args.fresh or FAST
 MAX_LINES = args.max_lines
+
+print(f"vocab_size = {V}")
 
 if FRESH:
     RESUME = None
@@ -392,12 +393,13 @@ def _final_save(cs, lattice, opt, epoch, total_lines):
     _quiet(cs.save, CFG.cs_path)
     _quiet(lattice.save, CFG.lattice_path)
     _quiet(opt.save_state, CFG.data_dir)
-    ckpt = {'epoch': epoch, 'line': total_lines}
+    ckpt = {'epoch': epoch, 'line': total_lines, 'timestamp': time.time()}
     with open(CFG.ckpt_state_path, 'w', encoding='utf-8') as f:
         json.dump(ckpt, f)
     for f in glob.glob(os.path.join(CFG.data_dir, '*.html')):
         try: os.remove(f)
         except: pass
+    cleanup_old_checkpoints(keep=CFG.cleanup_keep)
 
 # Determine starting line and epoch
 start_line = resume_line if RESUME is not None else 0
@@ -599,8 +601,14 @@ except KeyboardInterrupt:
     print("[EVA] Checkpoint saved. Exiting.")
     sys.exit(0)
 finally:
+    try:
+        if hasattr(cs, '_batch_log') and cs._batch_log is not None:
+            cs._batch_log.close()
+    except Exception:
+        pass
     if hasattr(sys.stdout, 'close'):
         sys.stdout.close()
+    sys.stdout = old_stdout
 
 # Final save
 _final_save(cs, lattice, opt, _ckpt_epoch, idx)

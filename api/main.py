@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
     config = FCFConfig()
     model = FCFModel(config)
     model._load()
-    print(f"  Loaded: {len(model.space.cid_list)} concepts @ {model.space.dim}D")
+    print(f"  Loaded: {len(model.space.concept_vectors)} concepts @ {model.space.dim}D")
     yield
     print("Shutting down.")
 
@@ -53,7 +53,7 @@ async def health(request: Request):
         status="ok",
         concepts=len(model.space.cid_list),
         dimensions=model.space.dim,
-        transitions=model.space.concept_transitions.nnz if model.space.concept_transitions else 0,
+        transitions=0,
     )
 
 

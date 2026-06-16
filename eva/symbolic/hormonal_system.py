@@ -109,7 +109,7 @@ class HormonalSystem:
             self._last_few_cids.append(gen_cid)
             if len(self._last_few_cids) > 5:
                 self._last_few_cids.pop(0)
-            if len(self._last_few_cids) >= 3 and len(set(self._last_few_cids)) <= 2:
+            if len(self._last_few_cids) >= 3 and len(set(self._last_few_cids)) == 1:
                 da_coherence -= 0.1  # boredom from repetition
 
         intrinsic = da_curiosity + da_mastery + da_coherence

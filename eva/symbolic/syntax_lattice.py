@@ -617,7 +617,7 @@ class SyntaxLattice:
         binary_path = path.replace('.json', '.lattice.npz')
         meta_path = path.replace('.json', '.meta.json')
 
-        self.ngrams = {n: {} for n in range(2, 5)}
+        self.ngrams = {}
         self.connections = defaultdict(lambda: {'count': 0, 'types': Counter()})
         self._connections_index = defaultdict(dict)
         self.skip2 = defaultdict(Counter)
@@ -740,7 +740,7 @@ if __name__ == '__main__':
     from eva.symbolic.concept_space import ConceptSpace
 
     sp = spm.SentencePieceProcessor(
-        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru.model'))
+        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_146k.model'))
 
     cs = ConceptSpace.load(
         os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'concept_space.json'))

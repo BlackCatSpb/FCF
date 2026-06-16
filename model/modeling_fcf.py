@@ -129,33 +129,11 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
     # ── HuggingFace interface ──
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
-        """HF-compatible forward pass.
-
-        If input_ids is provided, we encode them, extract concept intent,
-        and return a FCFOutput with the model's internal representation.
-
-        This allows HF pipelines to use the model.
-        """
         self._load()
         if input_ids is None:
             return FCFOutput(text="", concept_path=[], confidence=0.0)
-
-        # Decode input IDs to text
         text = self._tok.decode(input_ids[0].tolist() if hasattr(input_ids, 'tolist') else input_ids)
-        words = text.split()
-
-        # Extract core concept via semantic gate
-        core_cid, modifier_field, centroid, noise = self.generator.gate.extract_core(words)
-
-        anchor = self._space.concept_info.get(core_cid, {}).get("anchor", "?")
-
-        return FCFOutput(
-            text=text,
-            concept_path=[core_cid],
-            intent_anchor=anchor,
-            semantic_delta=float(len(noise) / max(len(words), 1)),
-            confidence=float(self.generator._query_confidence),
-        )
+        return FCFOutput(text=text, concept_path=[], confidence=0.0)
 
     def generate(
         self,
@@ -204,9 +182,8 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
                 "na": float(hm.noradrenaline),
                 "ach": float(hm.acetylcholine),
             },
-            confidence=float(self.generator._query_confidence),
-            intent_anchor=self._space.concept_info.get(
-                result.get("core_cid", 0), {}).get("anchor", None),
+            confidence=0.0,
+            intent_anchor=None,
             semantic_delta=float(result.get("intent_drift", 0.0)),
         )
 

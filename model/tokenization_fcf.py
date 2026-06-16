@@ -8,7 +8,7 @@ import sentencepiece as spm
 
 class FCFTokenizer(PreTrainedTokenizer):
     vocab_files_names = {
-        "spm_file": "bpe_ru.model",
+        "spm_file": "bpe_ru_146k.model",
     }
 
     def __init__(

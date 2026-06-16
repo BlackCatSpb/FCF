@@ -14,7 +14,7 @@ LATTICE_PATH = r'real_data/syntax_lattice.json'
 print("Loading SentencePiece...")
 sp = spm.SentencePieceProcessor(model_file=BPE_MODEL)
 
-print("Loading ConceptSpace (785MB)...")
+print("Loading ConceptSpace...")
 t0 = time.time()
 cs = ConceptSpace.load(CS_PATH)
 print(f"  {time.time()-t0:.1f}s — {len(cs.concept_vectors)} concepts")

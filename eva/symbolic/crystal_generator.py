@@ -33,12 +33,11 @@ _EOS_ID = 2
 class CrystalGenerator:
     """Generation as semantic navigation through BPE-token concept space."""
 
-    def __init__(self, cs, sp, lattice, config=None, morph_vocab=None):
+    def __init__(self, cs, sp, lattice, config=None):
         self.cs = cs
         self.sp = sp
         self.lattice = lattice
         self.config = config or {}
-        self.morph_vocab = morph_vocab
 
         self.beam_width = self.config.get('beam_width', 5)
         self.max_words = self.config.get('max_words', 30)
@@ -128,7 +127,7 @@ class CrystalGenerator:
     # ── Temperature ────────────────────────────────────────────
 
     def _theta_temp(self, word_num):
-        t = self.base_concept_temp * math.exp(-word_num / self.theta_tau)
+        t = self.base_concept_temp * math.exp(-word_num / max(self.theta_tau, 1.0))
         return max(t, self.base_concept_temp * 0.15)
 
     # ── Encode / Decode ────────────────────────────────────────
@@ -151,7 +150,7 @@ class CrystalGenerator:
         if not text:
             return False
         # Punctuation and single non-letter characters
-        if len(text) == 1 and not ('а' <= text.lower() <= 'я' or text.isalpha()):
+        if len(text) == 1 and not ('а' <= text.lower() <= 'я' or text.lower() == 'ё' or text.isalpha()):
             return False
         # Pure punctuation tokens
         if all(c in '.,!?;:()[]{}""''…—–«»' for c in text):
@@ -572,6 +571,7 @@ class CrystalGenerator:
             meta_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
             i_pos = meta_t[:, 0]
             j_pos = meta_t[:, 1]
+            dist = j_pos - i_pos
             pmi_w_t = meta_t[:, 2]
             dw_t = meta_t[:, 3]
             fw_t = meta_t[:, 4]
@@ -581,7 +581,7 @@ class CrystalGenerator:
                 1.0 + torch.log(ovs + 1.0) * 2.0,
                 torch.full_like(ovs, 0.1))
             lr = base_lr_val * torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w
-            theta = torch.exp(-torch.clamp(j_pos, max=5.0) / max(self.theta_tau, 1.0))
+            theta = torch.exp(-torch.clamp(dist, max=5.0) / max(self.theta_tau, 1.0))
             effective_lr = lr * torch.clamp(theta, min=0.1)
 
             gen_cids_arr = np.array(gpu_cid_gen, dtype=np.int32)
@@ -792,11 +792,13 @@ class CrystalGenerator:
             neg_idxs_np = neg_idxs.cpu().numpy()
             neg_cids_np = np.array(self._torch_cid_order)[neg_idxs_np]
             meta_arr = np.array(gpu_meta_l, dtype=np.float32)
+            i_arr = meta_arr[:, 0].astype(np.int32)
             j_arr = meta_arr[:, 1].astype(np.int32)
+            dist_arr = np.abs(j_arr - i_arr)
             pmi_w_arr = meta_arr[:, 2]
             dw_arr = meta_arr[:, 3]
             fw_arr = meta_arr[:, 4]
-            theta_gate_arr = np.exp(-np.minimum(j_arr, 5.0) / max(self.theta_tau, 1.0))
+            theta_gate_arr = np.exp(-np.minimum(dist_arr, 5.0) / max(self.theta_tau, 1.0))
             neg_elr_arr = base_lr_val * np.maximum(fw_arr, 0.05) * dw_arr * pmi_w_arr * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
 
             for pi in range(n_pairs):
@@ -991,7 +993,7 @@ class CrystalGenerator:
                         field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
 
                     lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
-                    theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
+                    theta_gate = math.exp(-min(abs(j-i), 5) / max(self.theta_tau, 1.0))
                     gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
         # ── GPU STDP / CPU STDP ──
@@ -1009,8 +1011,7 @@ class CrystalGenerator:
             self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
 
         # ── Contrastive objective ──
-        if not use_torch:
-            self._contrastive_objective(gen_updates)
+        self._contrastive_objective(gen_updates)
 
         # ── Sentence-level centroid pull (CBOW-like, raw vectors only) ──
         self._centroid_pull(ids, base_lr_val)
@@ -1101,7 +1102,7 @@ class CrystalGenerator:
                             field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
 
                         lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
-                        theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
+                        theta_gate = math.exp(-min(abs(j-i), 5) / max(self.theta_tau, 1.0))
                         gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
         # ── GPU STDP (single call for all pairs) ──
@@ -1119,8 +1120,7 @@ class CrystalGenerator:
             self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
 
         # ── Contrastive objective (run ONCE, not per-text) ──
-        if not use_torch:
-            self._contrastive_objective(gen_updates)
+        self._contrastive_objective(gen_updates)
 
         # ── Per-text centroid pull + lattice update ──
         for ids in all_ids:
@@ -1315,7 +1315,7 @@ if __name__ == '__main__':
     from eva.symbolic.syntax_lattice import SyntaxLattice
 
     sp = spm.SentencePieceProcessor(
-        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_32k.model'))
+        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_146k.model'))
 
     print("Initializing ConceptSpace (32K)...")
     cs = ConceptSpace(vocab_size=sp.vocab_size(), dim=384)

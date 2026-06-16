@@ -75,7 +75,7 @@ def main():
     lattice = SyntaxLattice()
     lattice.load(LAT_PATH)
     gen = CrystalGenerator(cs, sp, lattice)
-    print(f"  Load: {time.time()-t0:.1f}s | {sum(cs.concept_vectors._valid)}/{cs.vocab_size} vectors")
+    print(f"  Load: {time.time()-t0:.1f}s | {sum(cs.concept_vectors.valid)}/{cs.vocab_size} vectors")
 
     results = {'checkpoint': tag}
 

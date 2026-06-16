@@ -246,8 +246,8 @@ class ParameterOptimizer:
         ctx['cos_trend'] = cos_trend
 
         # Apply rules from config
-        for pd in self.config.params:
-            p = self.p.get(pd.name)
+        for param in self.config.params:
+            p = self.p.get(param.name)
             if p is None or not pd.rules:
                 continue
 

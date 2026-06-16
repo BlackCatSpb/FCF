@@ -80,7 +80,13 @@ class FCFConfig:
 
     @property
     def corpus_path(self) -> str:
-        return os.path.join(self.data_dir, 'full_corpus_ru_clean.txt')
+        path = os.path.join(self.data_dir, 'full_corpus_ru_clean.txt')
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Corpus not found at {path}. "
+                f"Run filter_corpus.py or check git LFS pull."
+            )
+        return path
 
     @property
     def bpe_model_path(self) -> str:
@@ -133,6 +139,9 @@ class FCFConfig:
 
     @property
     def l_m(self) -> int: return self.latent_dim - self.l_c - self.l_a
+
+    def get_field_dims(self):
+        return {'l_c': self.l_c, 'l_a': self.l_a, 'l_m': self.l_m}
 
     # ── Seed ─────────────────────────────────
     global_seed: int = 42

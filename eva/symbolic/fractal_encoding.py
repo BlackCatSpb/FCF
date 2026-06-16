@@ -9,8 +9,13 @@ This replaces the PMI-based H matrix with a deterministic
 hierarchical encoding that requires no corpus statistics.
 """
 
-LEVELS = 16
-GAMMA = 0.5
+try:
+    from eva.symbolic.fcf_config import CFG
+    LEVELS = CFG.octree_levels
+    GAMMA = CFG.gamma
+except (ImportError, AttributeError):
+    LEVELS = 16
+    GAMMA = 0.5
 
 def _next_digit(val, pos, seed=99991):
     """Deterministic pseudo-random digit for padding short decimal strings."""

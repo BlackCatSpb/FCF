@@ -81,12 +81,15 @@ class FractalField:
     v = normalize(code @ basis) — unchanged.
     """
 
-    def __init__(self, dim=384, latent_dim=512):
+    def __init__(self, dim=384, latent_dim=512, l_c=None, l_a=None, l_m=None):
         self.dim = dim
         self.latent_dim = latent_dim
-        self.l_c = latent_dim // 2      # 256 — identity
-        self.l_a = latent_dim // 4      # 128 — attention
-        self.l_m = latent_dim - self.l_c - self.l_a  # 128 — meta
+        if l_c is not None and l_a is not None and l_m is not None:
+            self.l_c, self.l_a, self.l_m = l_c, l_a, l_m
+        else:
+            self.l_c = latent_dim // 2      # 256 — identity
+            self.l_a = latent_dim // 4      # 128 — attention
+            self.l_m = latent_dim - self.l_c - self.l_a  # 128 — meta
 
         # Fractal basis: (latent_dim, dim) with orthonormal columns
         rng = np.random.RandomState(42)
@@ -350,20 +353,17 @@ class FractalField:
             tmp_path = binary_path.replace('.npz', '.tmp.npz')
             cids = np.array(list(self.codes.keys()), dtype=np.int32)
             codes_arr = np.array([self.codes[cid] for cid in cids], dtype=np.float32)
-            np.savez_compressed(tmp_path,
-                                codes=codes_arr, cids=cids, basis=self.basis,
-                                meta_w_lr=self.meta_w_lr,
-                                meta_w_th=self.meta_w_th)
+            kw = dict(
+                codes=codes_arr, cids=cids, basis=self.basis,
+                meta_w_lr=self.meta_w_lr,
+                meta_w_th=self.meta_w_th)
             # Save field bits if present
             if hasattr(self, 'field_bits') and self.field_bits:
                 fb_cids = np.array(list(self.field_bits.keys()), dtype=np.int32)
                 fb_arr = np.array([self.field_bits[cid] for cid in fb_cids], dtype=np.uint8)
-                # Add to existing npz
-                with np.load(tmp_path) as f:
-                    kw = dict(f)
                 kw['fb_cids'] = fb_cids
                 kw['fb_arr'] = fb_arr
-                np.savez_compressed(tmp_path, **kw)
+            np.savez_compressed(tmp_path, **kw)
             os.replace(tmp_path, binary_path)
             return {
                 'dim': self.dim,
@@ -505,51 +505,7 @@ class ConceptSpace:
 
 
 
-    def _compute_pmi_field_fast(self, cid, lattice, total_freq,
-                                 cooc, min_pmi=4.5):
-        """Field = self + anchors with PMI > threshold.
 
-        Uses precomputed concept→anchor co-occurrence index.
-
-        Returns packed uint8 array of n_anchors bits.
-        """
-        import math
-        n_bytes = (self.n_anchors + 7) // 8
-        bits = bytearray(n_bytes)
-
-        def set_bit(ai):
-            bits[ai >> 3] |= 1 << (ai & 7)
-
-        if cid in self.anchor_idx:
-            start_idx = self.anchor_idx[cid]
-            set_bit(start_idx)
-            row = self.H.getrow(start_idx)
-            for dst, pmi in zip(row.indices, row.data):
-                if pmi > min_pmi:
-                    set_bit(dst)
-            return np.frombuffer(bytes(bits), dtype=np.uint8).copy()
-
-        # Non-anchor: use precomputed co-occurrence index
-        count_c = lattice.concept_freq.get(cid, 0)
-        if count_c < 2:
-            return np.frombuffer(bytes(bits), dtype=np.uint8).copy()
-        p_c = count_c / total_freq
-        cid_cooc = cooc.get(cid, {})
-
-        for aidx, anchor_id in enumerate(self.anchor_ids):
-            count_anchor = lattice.concept_freq.get(anchor_id, 0)
-            if count_anchor < 1:
-                continue
-            count_pair = cid_cooc.get(anchor_id, 0)
-            if count_pair < 2:
-                continue
-            p_a = count_anchor / total_freq
-            p_pair = count_pair / total_freq
-            pmi = math.log(p_pair / max(p_c * p_a, 1e-10))
-            if pmi > min_pmi:
-                set_bit(aidx)
-
-        return np.frombuffer(bytes(bits), dtype=np.uint8).copy()
 
     # ── Octree encoding ──────────────────────────────────────
 
@@ -859,8 +815,8 @@ class ConceptSpace:
         v = self.concept_vectors.get(cid)
         if v is None:
             return []
-        valid = self.concept_vectors._valid
-        mat = self.concept_vectors._data[valid]
+        valid = self.concept_vectors.valid
+        mat = self.concept_vectors.data[valid]
         order = np.where(valid)[0]
         if mat.shape[0] == 0:
             return []
@@ -953,66 +909,7 @@ class ConceptSpace:
         print(f'  All vectors normalized: mean_norm={np.mean(new_norms):.4f}')
         print(f'  New centroid norm: {np.linalg.norm(np.mean(centered, axis=0)):.4f}')
 
-    def contrastive_spread(self, target_sim=0.5, lr=0.1, epochs=10):
-        """Push over-clustered vectors apart via targeted repulsion.
 
-        Unlike random-pair sampling, this finds each vector's nearest
-        neighbor and pushes THAT pair apart — directly attacking the
-        most egregious clustering.
-
-        Args:
-            target_sim: push if sim > this value
-            lr: learning rate
-            epochs: full passes
-        """
-        cids = list(self.concept_vectors.keys())
-        n = len(cids)
-        rng = np.random.RandomState(42)
-
-        print(f'  Contrastive spread: {n} concepts, target_sim={target_sim}, lr={lr}, epochs={epochs}')
-
-        for epoch in range(epochs):
-            vecs = np.array([self.concept_vectors[c] for c in cids], dtype=np.float32)
-            subset_size = min(n, 3000)
-            idxs = rng.choice(n, subset_size, replace=False)
-            n_pushed = 0
-            for idx in idxs:
-                vi = vecs[idx]
-                sims = np.dot(vecs, vi)
-                sims[idx] = -1
-                max_sim = sims.max()
-                if max_sim > target_sim:
-                    j = sims.argmax()
-                    vj = vecs[j]
-                    # Correct Riemannian gradient: push vi away from vj
-                    # ∇_R sim(vi, vj) = vj - sim*vi  → -∇_R = sim*vi - vj
-                    grad = max_sim * vi - vj
-                    new_vi = vi + lr * grad
-                    nvi = np.linalg.norm(new_vi)
-                    if nvi > 1e-10:
-                        self.concept_vectors[cids[idx]] = new_vi / nvi
-                    # Symmetric push for vj away from vi
-                    grad2 = max_sim * vj - vi
-                    new_vj = vj + lr * grad2
-                    nvj = np.linalg.norm(new_vj)
-                    if nvj > 1e-10:
-                        self.concept_vectors[cids[j]] = new_vj / nvj
-                    n_pushed += 1
-
-            # Verify
-            check = np.array([self.concept_vectors[c] for c in cids], dtype=np.float32) if epoch == epochs-1 or epoch % 3 == 2 else None
-            if check is not None:
-                sim_vals = []
-                for _ in range(10000):
-                    i = rng.randint(0, n)
-                    j = rng.randint(0, n)
-                    if i != j:
-                        sim_vals.append(float(np.dot(check[i], check[j])))
-                p50 = np.percentile(sim_vals, 50)
-                p99 = np.percentile(sim_vals, 99)
-                print(f'    epoch {epoch+1}: pushed {n_pushed}, mean_sim={np.mean(sim_vals):.3f}, p99={p99:.3f}')
-
-        print(f'  Done')
 
     def save(self, path, use_pq=False):
         """Save ConceptSpace to disk.
@@ -1082,7 +979,7 @@ class ConceptSpace:
 
 if __name__ == '__main__':
     import sentencepiece as spm
-    sp = spm.SentencePieceProcessor(model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru.model'))
+    sp = spm.SentencePieceProcessor(        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_146k.model'))
 
     print("Initializing ConceptSpace with BPE vocabulary...")
     cs = ConceptSpace(vocab_size=sp.vocab_size(), dim=384)

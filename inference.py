@@ -6,7 +6,7 @@ Usage:
   python inference.py --eval                 (run full eval, save JSON)
 """
 import sys, os; sys.path.insert(0, os.path.dirname(__file__))
-import os, json, time, glob, re, shutil, tempfile, argparse
+import json, time, glob, re, shutil, tempfile, argparse
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -36,7 +36,8 @@ class InferenceEngine:
     def __init__(self, tag='latest', config=None):
         self.tag = self._resolve_checkpoint(tag)
         self.config = config or {}
-        self.tmpdir = tempfile.mkdtemp(prefix=f'inf_{self.tag}_')
+        safe_tag = re.sub(r'[\\/*?:"<>|]', '_', str(self.tag))
+        self.tmpdir = tempfile.mkdtemp(prefix=f'inf_{safe_tag}_')
         self.sp = sp
         print(f"InferenceEngine: checkpoint {self.tag}", flush=True)
 
@@ -125,7 +126,7 @@ class InferenceEngine:
         idx = idx[np.argsort(-sims[idx])]
         cids = valid_idxs[idx]
 
-        return [(int(cid), clean_sp(self.sp.IdToPiece(int(cid))) if int(cid) < self.sp.vocab_size() else f'[ID{cid}]',
+        return [(cid, clean_sp(self.sp.IdToPiece(cid)) if cid < self.sp.vocab_size() else f'[ID{cid}]',
                  float(sims[idx[i]])) for i, cid in enumerate(cids)]
 
     def neighbours(self, word, k=10):
@@ -133,7 +134,7 @@ class InferenceEngine:
         if cid < 0 or not self.cs.concept_vectors.valid[cid]:
             return []
         top = self.cs.topk_similar_concepts(cid, k=k)
-        return [(int(c), clean_sp(self.sp.IdToPiece(c)) if c < self.sp.vocab_size() else f'[ID{c}]',
+        return [(c, clean_sp(self.sp.IdToPiece(c)) if c < self.sp.vocab_size() else f'[ID{c}]',
                  float(s)) for c, s in top]
 
     def concept_info(self, word):

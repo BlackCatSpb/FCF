@@ -64,7 +64,7 @@ seeds = [
     ('собака', None),
 ]
 
-_ckpt_path = os.path.join(os.path.dirname(__file__), 'real_data', 'checkpoint_state.json')
+_ckpt_path = os.path.join(_BASE, 'real_data', 'checkpoint_state.json')
 _total_lines = "?"
 if os.path.exists(_ckpt_path):
     try:

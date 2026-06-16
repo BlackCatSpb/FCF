@@ -49,7 +49,7 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - Serve via `python serve_vis.py` → http://127.0.0.1:8080/viewer.html
 
 ## Current State
-- Training live (PID 15496), epoch 2 at ~21000L
+- Training (epoch 2 at ~21000L)
 - Vector space fixes active: centroid pull LR 0.3, theta-gate cap 5, contrastive push-pull
 - Baseline eval at 21k shows cos=0.0124, vac@1=0 — need post-epoch-3 comparison
 
@@ -71,4 +71,4 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - `train_full.py`
 - `run_train.bat`
 - `real_data/checkpoint_state.json`
-- `FCF_IMPLEMENTATION_ROADMAP.md`
+- `PLAN.md`

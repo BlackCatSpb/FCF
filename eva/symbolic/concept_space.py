@@ -13,6 +13,7 @@ on the corpus. No external knowledge bases (ConceptNet) needed.
 import numpy as np
 from collections import defaultdict, Counter
 import math, json, os, random
+from typing import Dict
 
 
 class ConceptVectorStore:
@@ -37,7 +38,9 @@ class ConceptVectorStore:
         return self._valid
 
     def __getitem__(self, cid):
-        return self._data[cid]
+        if self._valid[cid]:
+            return self._data[cid]
+        return None
 
     def __setitem__(self, cid, v):
         self._data[cid] = v
@@ -106,6 +109,9 @@ class FractalField:
         self.meta_w_th = np.zeros(self.l_m, dtype=np.float32)
         self.meta_b_lr = np.float32(0.0)
         self.meta_b_th = np.float32(0.0)
+
+        # Field bits (lazy init via init_fields())
+        self.field_bits: Dict[int, np.ndarray] = {}
 
         # Cache
         self._vector_matrix = None
@@ -321,8 +327,9 @@ class FractalField:
             codes_arr = np.array([self.codes[cid] for cid in cids], dtype=np.float32)
             kw = dict(
                 codes=codes_arr, cids=cids, basis=self.basis,
-                meta_w_lr=self.meta_w_lr,
-                meta_w_th=self.meta_w_th)
+                meta_w_lr=self.meta_w_lr, meta_w_th=self.meta_w_th,
+                meta_b_lr=np.float32(self.meta_b_lr),
+                meta_b_th=np.float32(self.meta_b_th))
             # Save field bits if present
             if hasattr(self, 'field_bits') and self.field_bits:
                 fb_cids = np.array(list(self.field_bits.keys()), dtype=np.int32)
@@ -367,6 +374,7 @@ class FractalField:
             field.meta_w_lr = npz.get('meta_w_lr', np.zeros(field.l_m, dtype=np.float32))
             field.meta_w_th = npz.get('meta_w_th', np.zeros(field.l_m, dtype=np.float32))
             # Backward compat: field bits added in v2
+            # Partial checkpoint ok — fb_cids missing → empty field_bits
             if 'fb_cids' in npz.files:
                 fb_arr = npz['fb_arr']
                 fb_cids_arr = npz['fb_cids']
@@ -689,7 +697,7 @@ class ConceptSpace:
         norms[norms < 1e-10] = 1.0
         inhibit /= norms[:, None]
 
-        v_new = affected + inhibit * strength * sims_k[:, None]
+        v_new = affected + inhibit * strength
         vnorms = np.linalg.norm(v_new, axis=1)
         vnorms[vnorms < 1e-10] = 1.0
         v_new /= vnorms[:, None]
@@ -704,6 +712,7 @@ class ConceptSpace:
         self.concept_momentum = {cid: np.zeros(self.dim, dtype=np.float32)
                                  for cid in self.concept_vectors}
         self._hboost_mean_cache = None
+        self._hboost_std_cache = 0.0
         self._hboost_cache_step = 0
         self._usage_decay_steps = 0
 

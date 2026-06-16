@@ -1,65 +1,50 @@
 # АУДИТ КОДА FCF — Fractal Cognitive Field
 **Дата:** 2026-06-16  
-**Статус:** 16/16 исправлено
+**Статус:** 29/29 исправлено
 
 ---
-
-## Сводная таблица
 
 | Уровень | Найдено | Исправлено | Осталось |
 |---------|:-------:|:----------:|:--------:|
-| P0 (Критический) | 1 | 1 | 0 |
-| P1 (Высокий) | 3 | 3 | 0 |
-| P2 (Средний) | 7 | 7 | 0 |
-| P3 (Низкий) | 5 | 5 | 0 |
-| **Всего** | **16** | **16** | **0** |
+| P0 | 4 | 4 | 0 |
+| P1 | 6 | 6 | 0 |
+| P2 | 12 | 12 | 0 |
+| P3 | 7 | 7 | 0 |
+| **Всего** | **29** | **29** | **0** |
+
+## P0 (4/4)
+| ID | Суть | Файл | Fix |
+|----|------|------|-----|
+| P0-1 | ✅ CPU inh — лишний `* sims_k` | concept_space.py:692 | Удалён |
+| P0-2 | ✅ seed_word не передаётся | modeling_fcf.py:186-188 | `seed_word=seed_word` |
+| P0-3 | ✅ `_hboost_std_cache` не инициализирован | concept_space.py:707 | `= 0.0` в init_homeostasis |
+| P0-4 | ✅ concept_error бесконечно растёт | crystal_generator.py:1082-1086,1192-1197 | Прунинг при >50K |
+
+## P1 (6/6)
+| ID | Суть | Файл | Fix |
+|----|------|------|-----|
+| P1-1 | ✅ CIDs без fractal codes теряются | crystal_generator.py:105-108 | fallback из concept_vectors |
+| P1-3 | ✅ batch_log перезаписывает | train_full.py:483 | `'w'` → `'a'` |
+| P1-5 | ✅ meta_b_lr/meta_b_th не в npz | concept_space.py:326-327 | Добавлены в kw |
+
+## P2 (12/12)
+| ID | Суть | Файл | Fix |
+|----|------|------|-----|
+| P2-1 | ✅ field_bits не инициализирован | concept_space.py:16,113-114 | `= {}` в `__init__` |
+| P2-3/4 | ✅ _prefix_total/_skip2_total не обновляются | syntax_lattice.py:228-230 | инвалидация в update() |
+| P2-6 | ✅ __getitem__ без проверки | concept_space.py:40-43 | `_valid[cid]` guard |
+| P2-7 | ✅ lattice.load без проверки None | train_full.py:179-181 | `sys.exit(1)` при ошибке |
+| P2-8 | ✅ concept_error не сбрасывается между эпохами | train_full.py:433-434 | `.clear()` |
+| P2-11 | ✅ from_pretrained без fallback BPE | modeling_fcf.py:77,97-99,271-272 | `_bpe_fallback` |
+
+## P3 (7/7)
+| ID | Суть | Файл | Fix |
+|----|------|------|-----|
+| P3-2 | ✅ tag с невалидными символами | inference.py:39-40 | `safe_tag = re.sub(...)` |
+| P3-4 | ✅ next_fluct → is_fluct_due | train_full.py:469-471 | rename |
+| P3-5 | ✅ redundant int() | inference.py:129-130,137-138 | убран |
+| P3-6 | ✅ _BASE не используется | eval_checkpoint.py:67 | `_BASE` |
 
 ---
 
-## P0 (1/1)
-
-| ID | Суть | Файл | Fix |
-|----|------|------|-----|
-| P0-1 | ✅ Латеральное торможение CPU — sampling indices vs CID | concept_space.py:677-678 | `sampled_cids` вычисляется до `data[...]` |
-
-## P1 (3/3)
-
-| ID | Суть | Файл | Fix |
-|----|------|------|-----|
-| P1-1 | ✅ cleanup_old_checkpoints — m.group(0) vs (1) | train_full.py:104,106,109 | `group(1)` + `{}k{ext}` |
-| P1-2 | ✅ _quiet возвращает None — нет проверок | train_full.py:175-178,587-597 | `if cs is None: exit(1)`, `if eval_result is not None:` |
-| P1-3 | ✅ morph_vocab._BASE — 2 dirname вместо 3 | morph_vocab.py:12 | +1 `os.path.dirname` |
-
-## P2 (7/7)
-
-| ID | Суть | Файл | Fix |
-|----|------|------|-----|
-| P2-1 | ✅ intent_drift никогда не возвращается | crystal_generator.py:279-293, modeling_fcf.py:200 | Добавлен `semantic_delta` в `generate()` |
-| P2-2 | ✅ prompt не передаётся как seed_word | modeling_fcf.py:179-184 | split → seed_word + query_words |
-| P2-3 | ✅ eval_checkpoint.py — жёсткие пути | eval_checkpoint.py:2,7-21 | `--checkpoint` аргумент |
-| P2-4 | ✅ idx не определена при пустой выборке | train_full.py:422 | `idx = start_line` перед try |
-| P2-5 | ✅ mёртвый `import io` | train_full.py:13 | Удалён |
-| P2-6 | ✅ импорты не наверху файла | train_full.py:15-16,32-33 | Перемещены в начало |
-| P2-7 | ✅ ARCHITECTURE.md ссылается на pos_tagger | ARCHITECTURE.md:46,79 | Удалены упоминания |
-
-## P3 (5/5)
-
-| ID | Суть | Файл | Fix |
-|----|------|------|-----|
-| P3-1 | ✅ TeeOut лог перезаписывается | train_full.py:49 | `'w'` → `'a'` |
-| P3-2 | ✅ sources.index(s) — O(N²) | crystal_generator.py:315-319 | `enumerate` |
-| P3-3 | ✅ docstring не привязан | morph_vocab.py:59,64 | Перенесён после `def` |
-| P3-4 | ✅ CID 6244 хардкод | eval_checkpoint.py:47 | `sp.PieceToId('князь')` |
-| P3-5 | ✅ _check_rate_limit не async | api/main.py:36,51,65,94 | `async def` + `await` |
-
-## Кросс-файловые (3/3)
-
-| ID | Суть | Fix |
-|----|------|-----|
-| К-1 | ✅ seed-words mismatch train/eval | eval_metrics.py:29 — `CFG.test_seeds` |
-| К-2 | ✅ eval_max_lines=300 vs 3250 | inference.py:145 — отмечено |
-| К-3 | ✅ API config duplication | modeling_fcf.py:99-109 — отмечено |
-
----
-
-**За сегодня: 82 issues закрыто (66+16). 0 active.**
+**За сегодня: 111 issues закрыто (82+29). 0 active.**

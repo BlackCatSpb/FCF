@@ -74,6 +74,7 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         # Load data files from the standard real_data directory
         data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "real_data")
         self._data_dir = data_dir
+        self._bpe_fallback: Optional[str] = None
 
         # Lazy load: components are initialized on first use
         self._space: Optional[ConceptSpace] = None
@@ -92,6 +93,10 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
 
         if not os.path.exists(space_path):
             raise FileNotFoundError(f"ConceptSpace not found at {space_path}. Ensure the model directory contains concept_space.json.")
+
+        # Use fallback BPE path if model not in custom dir
+        if not os.path.exists(bpe_path) and self._bpe_fallback is not None:
+            bpe_path = self._bpe_fallback
 
         # Load tokenizer
         self._tok = _SPTokenizer(model_path=bpe_path)
@@ -183,9 +188,10 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         elif seed_word:
             query_words = [seed_word]
         else:
+            seed_word = None
             query_words = ["человек"]
 
-        result = self.generator.generate(query_words=query_words)
+        result = self.generator.generate(seed_word=seed_word, query_words=query_words)
 
         hm = self.generator.hormones
         return FCFOutput(
@@ -261,5 +267,8 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         model = cls(config)
         # Load model state from the same directory
         model._data_dir = pretrained_model_name_or_path
+        # Fallback BPE path if model not in custom dir
+        if not os.path.exists(os.path.join(pretrained_model_name_or_path, 'bpe_ru_146k.model')):
+            model._bpe_fallback = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'real_data', 'bpe_ru_146k.model')
         model._load()
         return model

@@ -94,7 +94,7 @@ class CrystalGenerator:
         self._torch_cid_to_idx = {cid: i for i, cid in enumerate(cids)}
         self._torch_device = dev
 
-        vecs = np.zeros((V, D), dtype=np.float32)
+        vecs = np.zeros((V, D), dtype=np.float32)  # ~225MB for V=146K, D=384
         if getattr(cs.fractal, 'codes', None) is not None and cs.fractal.basis is not None:
             basis = cs.fractal.basis
             for cid, code in cs.fractal.codes.items():
@@ -102,6 +102,10 @@ class CrystalGenerator:
                 n = np.linalg.norm(v)
                 if n > 1e-10:
                     vecs[cid] = v / n
+        if hasattr(cs, 'concept_vectors') and cs.concept_vectors:
+            for cid, v in cs.concept_vectors.items():
+                if np.all(vecs[cid] == 0):
+                    vecs[cid] = v
 
         self._vecs_t = torch.from_numpy(vecs).to(device)
         self._basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(device) if cs.fractal.basis is not None else None
@@ -827,6 +831,7 @@ class CrystalGenerator:
                                      (n_pairs, neg_samples), device=device)
 
             # Field overlap filter
+            # When _fb_t is None (no field_bits loaded), all negatives pass as valid
             if field_gate and self._fb_t is not None:
                 ctx_fb = self._fb_t[ctx_t]
                 neg_fb = self._fb_t[neg_idxs]
@@ -1078,6 +1083,12 @@ class CrystalGenerator:
 
         self.lattice.update(ids)
         self._graph_cache.clear()
+
+        # Prune concept_error cache
+        if len(self.concept_error) > 50000:
+            pruned = dict(sorted(self.concept_error.items(), key=lambda x: -x[1])[:30000])
+            self.concept_error = pruned
+
         return 1
 
     def train_batch(self, texts, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20,
@@ -1186,6 +1197,13 @@ class CrystalGenerator:
         for ids in all_ids:
             self._centroid_pull(ids, base_lr_val)
             self.lattice.update(ids)
+            self._graph_cache.clear()
+
+        # Prune concept_error cache
+        if len(self.concept_error) > 50000:
+            pruned = dict(sorted(self.concept_error.items(), key=lambda x: -x[1])[:30000])
+            self.concept_error = pruned
+        if len(self._graph_cache) > 1000:
             self._graph_cache.clear()
 
         return len(all_ids)

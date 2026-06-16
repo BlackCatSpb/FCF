@@ -176,7 +176,9 @@ if RESUME is not None:
         sys.exit(1)
     lattice = SyntaxLattice()
     load_ng = not FAST
-    _quiet(lattice.load, lat_path, load_ngrams=load_ng)
+    if _quiet(lattice.load, lat_path, load_ngrams=load_ng) is None:
+        print(f"Failed to load SyntaxLattice from {lat_path}")
+        sys.exit(1)
     ng_info = f" ({[len(v) for v in lattice.ngrams.values()]} prefixes)" if load_ng else " (ngrams skipped)"
     print(f"  Loaded {len(cs.concept_vectors)} vectors, {len(lattice.concept_freq)} concepts{ng_info}")
 
@@ -388,6 +390,7 @@ def save_3d_vis(cs, sp, checkpoint_name):
     return json_path
 
 def _write_viewer_html(path):
+    # Template lives in real_data/viewer_template.html
     with open(os.path.join(CFG.data_dir, 'viewer_template.html'), 'r', encoding='utf-8') as f:
         TEMPLATE = f.read()
     with open(path, 'w', encoding='utf-8') as f:
@@ -427,6 +430,8 @@ try:
             print(f"{'='*60}")
             # Reset start_line for new epoch
             start_line = 0
+            # Reset error-based PMI gate for new epoch
+            gen.concept_error.clear()
             # Re-read corpus with fresh decay
             destab_pct = 0.0  # fresh destab for new epoch
 
@@ -461,9 +466,9 @@ try:
 
             if len(batch_buffer) < BATCH_SIZE and idx < start_line + len(epoch_train) - 1:
                 # Check if periodic tasks are due — if so, flush early
-                next_fluct = (idx + 1 - last_fluct_lines) >= FLUCTUATE_EVERY
-                next_decay = (idx + 1 - last_decay_lines) >= DECAY_EVERY
-                if not next_fluct and not next_decay:
+                is_fluct_due = (idx + 1 - last_fluct_lines) >= FLUCTUATE_EVERY
+                is_decay_due = (idx + 1 - last_decay_lines) >= DECAY_EVERY
+                if not is_fluct_due and not is_decay_due:
                     continue
 
             # Flush batch
@@ -480,7 +485,7 @@ try:
             _batch_ms = (time.time() - _bt) * 1000
             _n = len(batch_buffer)
             if 'batch_log' not in locals() or batch_log is None:
-                batch_log = open(os.path.join(CFG.data_dir, '_batch_timing.csv'), 'w', encoding='utf-8')
+                batch_log = open(os.path.join(CFG.data_dir, '_batch_timing.csv'), 'a', encoding='utf-8')
                 batch_log.write('idx,lines,batch_ms,speed_lps\n')
             batch_log.write(f'{idx},{_n},{_batch_ms:.0f},{_n/max(_batch_ms,1)*1000:.0f}\n')
             batch_log.flush()

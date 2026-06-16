@@ -12,7 +12,7 @@ on the corpus. No external knowledge bases (ConceptNet) needed.
 
 import numpy as np
 from collections import defaultdict, Counter
-import math, json, os
+import math, json, os, random
 
 
 class ConceptVectorStore:
@@ -266,7 +266,7 @@ class FractalField:
 
         z_c, z_a, z_m = self.split_code(code)
         d_c, d_a, d_m = self.split_code(delta_code)
-        lr_mod, th_mod = self.meta_gate(z_m)
+        lr_mod, _ = self.meta_gate(z_m)
 
         # Apply updates with subspace-specific rates
         z_c_new = z_c + d_c * lr_c * lr_mod
@@ -283,40 +283,6 @@ class FractalField:
 
         self.codes[cid] = code_new.astype(np.float32)
         self._matrix_dirty = True
-
-    # ── Attention shift ──────────────────────────────────────
-
-    def shift_attention(self, cid, context_code_deltas, weights):
-        """Вычислить сдвиг z_a под влиянием контекста.
-
-        Args:
-            cid: target concept ID
-            context_code_deltas: list of (ctx_cid, direction_hint) or None
-            weights: list of scalar weights (PMI x dist_decay)
-
-        Returns:
-            z_a_shifted: новый z_a вектор или None
-        """
-        code = self.codes.get(cid)
-        if code is None:
-            return None
-        z_c, z_a, z_m = self.split_code(code)
-        lr_mod, _ = self.meta_gate(z_m)
-
-        shift = np.zeros_like(z_a)
-        total_w = 0.0
-        for ctx_z, w in zip(context_code_deltas, weights):
-            if ctx_z is None:
-                continue
-            _, ctx_za, _ = self.split_code(ctx_z)
-            shift += w * (ctx_za - z_a)
-            total_w += w
-
-        if total_w > 1e-10:
-            shift /= total_w
-            z_a_shifted = z_a + shift * lr_mod
-            return z_a_shifted
-        return z_a
 
     # ── Fluctuation ──────────────────────────────────────────
 
@@ -610,6 +576,7 @@ class ConceptSpace:
         naturally handles magnitude: largest for mid-similarity vectors, zero
         for v aligned with or opposite to centroid.
         """
+        # NOTE: vecs ~225MB temp array (len×768×float32); fine for ~75K vectors
         vecs = np.array(list(self.concept_vectors.values()), dtype=np.float32)
         centroid = np.mean(vecs, axis=0)
         cn = centroid / max(np.linalg.norm(centroid), 1e-10)
@@ -707,7 +674,7 @@ class ConceptSpace:
         if len(sampled_indices) < 1:
             return
 
-        sampled_vecs = self.concept_vectors._data[sampled_indices]
+        sampled_vecs = self.concept_vectors.data[sampled_indices]
         sampled_cids = [cids[i] for i in sampled_indices]
         sims = np.dot(sampled_vecs, vw_n)
         mask = sims > threshold
@@ -803,12 +770,25 @@ class ConceptSpace:
         """Get concept centroid vector."""
         return self.concept_vectors.get(cid)
 
-    def topk_similar_concepts(self, cid, k=10, sample_size=500):
+    def topk_similar_concepts(self, cid, k=10, sample_size=None):
         """Top-k concepts closest to given concept (dense array NN)."""
         v = self.concept_vectors.get(cid)
         if v is None:
             return []
-        valid = self.concept_vectors.valid
+        if sample_size is not None:
+            all_cids = list(self.concept_vectors)
+            if len(all_cids) > sample_size:
+                rng = random.Random(cid)
+                sampled = rng.sample(all_cids, sample_size)
+                mask = np.zeros(self.concept_vectors._V, dtype=bool)
+                for sc in sampled:
+                    if self.concept_vectors._valid[sc]:
+                        mask[sc] = True
+                valid = mask
+            else:
+                valid = self.concept_vectors.valid
+        else:
+            valid = self.concept_vectors.valid
         mat = self.concept_vectors.data[valid]
         order = np.where(valid)[0]
         if mat.shape[0] == 0:
@@ -830,79 +810,6 @@ class ConceptSpace:
             if len(result) >= k:
                 break
         return result[:k]
-
-    def expand_dim(self, target_dim):
-        """Expand vector space dimension (e.g. 128 → 384).
-
-        Extends existing basis with orthogonal new columns (Schur complement).
-        Existing fractal codes are preserved by appending zero coefficients
-        for the new dimensions — existing concept vectors remain unchanged.
-
-        Args:
-            target_dim: new dimension (must be > current dim)
-        """
-        if target_dim <= self.dim:
-            return
-        old_dim = self.dim
-        print(f'  Expanding dimension: {old_dim} -> {target_dim}')
-        new_dim = target_dim
-        n_new = new_dim - old_dim
-
-        # Extend existing basis with orthogonal new columns
-        rng = np.random.RandomState(42)
-        extension = rng.randn(self.fractal.latent_dim, n_new).astype(np.float32)
-        # Orthogonalize against existing basis columns
-        extension = extension - self.fractal.basis @ (self.fractal.basis.T @ extension)
-        Q_ext, _ = np.linalg.qr(extension, mode='reduced')
-        self.fractal.basis = np.concatenate([self.fractal.basis, Q_ext], axis=1).astype(np.float32)
-
-        # Extend existing codes with zeros for new dimensions
-        for cid in self.fractal.codes:
-            code = self.fractal.codes[cid]
-            ext = np.zeros(n_new, dtype=np.float32)
-            self.fractal.codes[cid] = np.concatenate([code, ext])
-
-        self.dim = new_dim
-        self.fractal._matrix_dirty = True
-        self._sync_from_fractal()
-        print(f'  Done: {self.vocab_size} concepts @ {self.dim}D')
-
-    def normalize_vectors(self):
-        """Center and normalize all concept vectors onto the unit sphere.
-
-        Current vectors are clustered (mean pair sim > 0.3, all pointing
-        toward centroid). This spreads them: subtract global centroid,
-        then L2-normalize each vector. Call after load or training shift.
-        """
-        if not self.concept_vectors:
-            return
-        vecs = np.array(list(self.concept_vectors.values()), dtype=np.float32)
-        centroid = np.mean(vecs, axis=0)
-        centroid_norm = np.linalg.norm(centroid)
-        print(f'  Centroid norm before: {centroid_norm:.4f} (0 = centered)')
-
-        # Center: subtract centroid
-        centered = vecs - centroid
-
-        # Normalize each to unit sphere
-        norms = np.linalg.norm(centered, axis=1)
-        norms[norms < 1e-10] = 1.0
-        centered /= norms[:, np.newaxis]
-
-        for i, cid in enumerate(self.concept_vectors):
-            self.concept_vectors[cid] = centered[i]
-
-        # Rebuild fractal codes to maintain invariant normalize(code @ basis) == v
-        for cid, v in self.concept_vectors.items():
-            code_new = v @ self.fractal.basis.T
-            self.fractal.codes[cid] = code_new
-        self.fractal._matrix_dirty = True
-
-        new_norms = np.linalg.norm(centered, axis=1)
-        print(f'  All vectors normalized: mean_norm={np.mean(new_norms):.4f}')
-        print(f'  New centroid norm: {np.linalg.norm(np.mean(centered, axis=0)):.4f}')
-
-
 
     def save(self, path, use_pq=False):
         """Save ConceptSpace to disk.

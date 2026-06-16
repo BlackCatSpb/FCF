@@ -204,127 +204,6 @@ class SyntaxLattice:
         result.sort(key=lambda x: -x[1])
         return result
 
-    def predict_with_context(self, concept_sequence: List[int], concept_space,
-                              temperature=0.3, top_k=20):
-        """Predict next concept using both n-gram lattice and vector space."""
-        context = concept_sequence[-3:] if len(concept_sequence) >= 3 else concept_sequence
-        syn_preds = self.predict(context)
-
-        if concept_sequence:
-            prev_cid = concept_sequence[-1]
-            v_prev = concept_space.concept_vector(prev_cid)
-            vec_preds = []
-            if v_prev is not None:
-                vp_n = v_prev / max(np.linalg.norm(v_prev), 1e-10)
-                similar = concept_space.topk_similar_concepts(prev_cid, k=top_k)
-                for cid, sim in similar:
-                    vec_preds.append((cid, sim))
-        else:
-            vec_preds = []
-
-        # 3. Combine: syntax + semantics
-        combined = {}
-        syn_weight = 0.6
-        vec_weight = 0.2
-        prior_weight = 0.2
-
-        # Syntax score
-        syn_dict = {cid: score for cid, score in syn_preds}
-        if syn_dict:
-            max_syn = max(syn_dict.values())
-            for cid, score in syn_dict.items():
-                combined[cid] = syn_weight * (score / max_syn)
-
-        # Vector similarity score
-        for cid, sim in vec_preds:
-            combined[cid] = combined.get(cid, 0) + vec_weight * max(sim, 0)
-
-        # Prior for ALL candidates seen so far
-        if self.concept_freq and combined:
-            max_freq = max(self.concept_freq.values())
-            for cid in list(combined.keys()):
-                freq = self.concept_freq.get(cid, 0)
-                prior = 1.0 - min(freq / max_freq, 1.0)
-                combined[cid] += prior_weight * prior * 0.1
-
-        if not combined:
-            return []
-
-        # Temperature sampling
-        result = [(cid, score) for cid, score in combined.items() if score > 0]
-        result.sort(key=lambda x: -x[1])
-
-        if temperature <= 0:
-            return result[:top_k]
-
-        scores = np.array([s for _, s in result])
-        scores = scores - scores.max()
-        scores = np.clip(scores, -50, 50)
-        probs = np.exp(scores / max(temperature, 0.01))
-        probs /= probs.sum()
-
-        scored = [(result[i][0], probs[i]) for i in range(min(top_k, len(result)))]
-        return scored
-
-    def build_anchor_matrix(self, n_anchors=1024, min_pmi=0.1):
-        """Build anchor matrix H from PMI between top concepts.
-
-        H[i,j] = PMI(anchor_i, anchor_j) based on 2-gram co-occurrence.
-        Returns (H, anchor_ids) where H is sparse CSR (n_anchors × n_anchors).
-
-        Args:
-            n_anchors: number of anchor concepts (must be power of 2 for BMSSP)
-            min_pmi: minimum PMI threshold — zero out weaker connections
-
-        Returns:
-            H: scipy.sparse.csr_matrix (n_anchors, n_anchors)
-            anchor_ids: list of concept IDs for each row/col
-        """
-        from scipy.sparse import csr_matrix
-
-        # Select anchors: top N by concept_freq
-        sorted_cids = sorted(self.concept_freq.keys(),
-                             key=lambda c: -self.concept_freq[c])
-        anchor_ids = sorted_cids[:min(n_anchors, len(sorted_cids))]
-        n = len(anchor_ids)
-        anchor_set = set(anchor_ids)
-        anchor_idx = {cid: i for i, cid in enumerate(anchor_ids)}
-
-        total_freq = max(sum(self.concept_freq.values()), 1)
-        rows, cols, data = [], [], []
-
-        n2 = self.ngrams.get(2, {})
-        for prefix, counter in n2.items():
-            if len(prefix) != 1:
-                continue
-            prev = prefix[0]
-            if prev not in anchor_set:
-                continue
-            i = anchor_idx[prev]
-            count_prev = sum(counter.values())
-            if count_prev < 1:
-                continue
-            p_prev = count_prev / total_freq
-            for next_cid, count_pair in counter.items():
-                if next_cid not in anchor_set:
-                    continue
-                if count_pair < 1:
-                    continue
-                j = anchor_idx[next_cid]
-                count_next = self.concept_freq.get(next_cid, 0)
-                if count_next < 1:
-                    continue
-                p_next = count_next / total_freq
-                p_pair = count_pair / total_freq
-                pmi = math.log(p_pair / max(p_prev * p_next, 1e-10))
-                if pmi > min_pmi:
-                    rows.append(i)
-                    cols.append(j)
-                    data.append(pmi)
-
-        H = csr_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float32)
-        return H, anchor_ids
-
     def update(self, concept_sequence):
         """Increment n-gram counts + connections from a concept sequence.
 
@@ -378,6 +257,8 @@ class SyntaxLattice:
 
         # Invalidate PPMI cache after ngram decay
         self._ppmi_cache = None
+        self._prefix_total = {}
+        self._skip2_total = {}
 
     def decay_connections(self, cutoff=0.1):
         """Decay and prune connections (call periodically)."""

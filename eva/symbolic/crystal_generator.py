@@ -42,7 +42,6 @@ class CrystalGenerator:
         self.lattice = lattice
         self.config = config or {}
 
-        self.beam_width = self.config.get('beam_width', 5)
         self.max_words = self.config.get('max_words', 30)
         self.min_words = self.config.get('min_words', 3)
         self._graph_cache = {}
@@ -198,6 +197,7 @@ class CrystalGenerator:
                 centroid /= n
 
         effective_max = max_words or self.max_words
+        total_freq = max(sum(self.lattice.concept_freq.values()), 1)
 
         # Beam: list of (concept_sequence, score, branch_id)
         beam = [([seed_cid], 0.0, 0)]
@@ -236,7 +236,6 @@ class CrystalGenerator:
 
                     # MMI: penalize high-frequency (generic) continuations
                     if self.mmi_lambda > 0:
-                        total_freq = max(sum(self.lattice.concept_freq.values()), 1)
                         p_cid = max(self.lattice.concept_freq.get(cid, 0) / total_freq, 1e-10)
                         new_score -= self.mmi_lambda * math.log(p_cid)
 
@@ -705,16 +704,20 @@ class CrystalGenerator:
                     v_self = gv_t[gi]
                     v_opp = gv_all[targets]
                     dot = (v_self * v_opp).sum(dim=1)
-                    delta = -str_val * (dot[:, None] * v_opp - v_self[None, :])
+                    delta = str_val * (dot[:, None] * v_opp - v_self[None, :])
                     delta_cpu = delta.cpu().numpy()
-                    for ti, tcid in enumerate(targets.cpu().numpy()):
-                        v_t = cs.concept_vectors.get(int(tcid))
+                    target_cids = targets.cpu().numpy()
+                    unique_cids, inv_idx = np.unique(target_cids, return_inverse=True)
+                    delta_sum = np.zeros((len(unique_cids), delta_cpu.shape[1]), dtype=np.float32)
+                    np.add.at(delta_sum, inv_idx, delta_cpu)
+                    for ui, ucid in enumerate(unique_cids):
+                        v_t = cs.concept_vectors.get(int(ucid))
                         if v_t is not None:
-                            v_new_t = v_t + delta_cpu[ti]
+                            v_new_t = v_t + delta_sum[ui]
                             nt = np.linalg.norm(v_new_t)
                             if nt > 1e-10:
                                 v_new_t /= nt
-                            cs._apply_vector_update(int(tcid), v_new_t)
+                            cs._apply_vector_update(int(ucid), v_new_t)
 
         return unique_gen
 
@@ -834,8 +837,8 @@ class CrystalGenerator:
             j_arr = meta_arr[:, 1].astype(np.int32)
             dist_arr = np.abs(j_arr - i_arr)
             theta_gate_arr = np.exp(-np.minimum(dist_arr, 5.0) / max(self.theta_tau, 1.0))
-            neg_elr_arr = base_lr_val * np.maximum(meta_arr[:, 4], 0.05) * meta_arr[:, 3] * meta_arr[:, 2] * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
-            valid_elr_t = torch.from_numpy(neg_elr_arr[valid_pi.cpu().numpy()]).to(device).unsqueeze(1)
+            neg_elr_arr = np.maximum(meta_arr[:, 4], 0.05) * meta_arr[:, 3] * meta_arr[:, 2] * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
+            valid_elr_t = torch.from_numpy(neg_elr_arr[valid_pi.cpu().numpy()]).to(device)
 
             # Gather neg CIDs and vectors from _vecs_t
             neg_cids = torch.tensor(self._torch_cid_order, device=device)[neg_idxs]  # (n_pairs, neg_samples)
@@ -847,18 +850,21 @@ class CrystalGenerator:
 
             # Vectorized push-away: shift = (y * v_neg - v_ctx) * elr
             sims = (v_neg * v_ctx).sum(dim=1, keepdim=True).clamp(min=0.05)  # (n_valid, 1)
-            shifts = (sims * v_neg - v_ctx) * valid_elr_t  # (n_valid, D)
+            shifts = (sims * v_neg - v_ctx) * valid_elr_t[:, None]  # (n_valid, D)
 
-            # Accumulate shifts by unique neg CID (scatter_add_)
+            # Accumulate shifts + total_elr by unique neg CID (scatter_add_), normalize, apply base_lr_val
             unique_neg_cids, inverse = torch.unique(valid_neg_cids, return_inverse=True)
             n_unique = len(unique_neg_cids)
             D = v_neg.shape[1]
             acc_shifts = torch.zeros(n_unique, D, device=device)
             acc_shifts.scatter_add_(0, inverse[:, None].expand(-1, D), shifts)
+            acc_elr = torch.zeros(n_unique, device=device)
+            acc_elr.scatter_add_(0, inverse, valid_elr_t)
 
-            # Apply: read current vectors, apply accumulated shift, normalize
+            # Normalize by total_elr, then apply base_lr_val as step size (matching CPU STDP pattern)
             v_cur = self._vecs_t[unique_neg_cids]  # (n_unique, D)
-            v_new = v_cur + acc_shifts
+            grad = acc_shifts / acc_elr[:, None].clamp(min=1e-10)
+            v_new = v_cur + grad * base_lr_val
             norms = torch.norm(v_new, dim=1, keepdim=True).clamp(min=1e-10)
             v_new = v_new / norms
 
@@ -1015,6 +1021,16 @@ class CrystalGenerator:
                 if _skip:
                     continue
 
+                # Field gate (compute unconditionally for contrastive objective)
+                field_weight = 1.0
+                if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
+                    overlap = cs.fractal.field_overlap(ids[i], ids[j])
+                    field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
+
+                lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
+                theta_gate = math.exp(-min(abs(j-i), 5) / max(self.theta_tau, 1.0))
+                gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
+
                 if use_torch:
                     ci = cid_to_idx.get(ids[i])
                     cj = cid_to_idx.get(ids[j])
@@ -1025,16 +1041,6 @@ class CrystalGenerator:
                     gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight))
                     gpu_cid_ctx.append(ids[i])
                     gpu_cid_gen.append(ids[j])
-                else:
-                    # Field gate
-                    field_weight = 1.0
-                    if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
-                        overlap = cs.fractal.field_overlap(ids[i], ids[j])
-                        field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
-
-                    lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
-                    theta_gate = math.exp(-min(abs(j-i), 5) / max(self.theta_tau, 1.0))
-                    gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
         # ── GPU STDP / CPU STDP ──
         if use_torch and gpu_ctx_l:
@@ -1122,6 +1128,16 @@ class CrystalGenerator:
                     if _skip:
                         continue
 
+                    # Field gate (compute unconditionally for contrastive objective)
+                    field_weight = 1.0
+                    if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
+                        overlap = cs.fractal.field_overlap(ids[i], ids[j])
+                        field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
+
+                    lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
+                    theta_gate = math.exp(-min(abs(j-i), 5) / max(self.theta_tau, 1.0))
+                    gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
+
                     if use_torch:
                         ci = cid_to_idx.get(ids[i])
                         cj = cid_to_idx.get(ids[j])
@@ -1132,15 +1148,6 @@ class CrystalGenerator:
                         gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight))
                         gpu_cid_ctx.append(ids[i])
                         gpu_cid_gen.append(ids[j])
-                    else:
-                        field_weight = 1.0
-                        if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
-                            overlap = cs.fractal.field_overlap(ids[i], ids[j])
-                            field_weight = 1.0 + math.log(overlap + 1) * 2.0 if overlap > 0 else 0.1
-
-                        lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
-                        theta_gate = math.exp(-min(abs(j-i), 5) / max(self.theta_tau, 1.0))
-                        gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
 
         # ── GPU STDP (single call for all pairs) ──
         if use_torch and gpu_ctx_l:
@@ -1245,6 +1252,8 @@ class CrystalGenerator:
         n_eval = 0
         t0 = time.time()
 
+        if use_gpu and self._torch_dirty:
+            self._ensure_torch()
         use_cuda = use_gpu and self._vecs_t is not None
         if use_cuda:
             device = self._torch_device

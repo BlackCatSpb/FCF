@@ -46,7 +46,7 @@ FCF — это не Transformer. Обучение идёт через STDP, ла
 
 - Исходный: `full_corpus_ru.txt` (153K строк, 30M символов, ~52MB, UTF-8)
 - Очищенный: `full_corpus_ru_clean.txt` (−61 строка мусора: URL-артефакты, ISBN, битые ссылки)
-- Валидация: 5% хвоста корпуса, `eval_max_lines=300`
+- Валидация: 5% хвоста корпуса, `eval_max_lines=300` (inference.py default: 3250)
 
 ---
 

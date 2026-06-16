@@ -172,53 +172,6 @@ class MorphVocab:
         print(f"  Path overrides: {len(self._path_override)} content concepts")
         return self
 
-    # ── Tokenization ───────────────────────────────────────────
-
-    def tokenize(self, text):
-        """Tokenize text into list of CIDs.
-
-        Uses SP for initial tokenization, then word_cache for lookup.
-        Returns flat CIDs in 0..vocab_size-1 range.
-        """
-        if not text:
-            return []
-
-        ids = self._sp.encode(text, out_type=int) if self._sp else []
-        if not ids:
-            return []
-
-        # Try to replace SP subword sequences with morph words
-        result = []
-        i = 0
-        while i < len(ids):
-            # Greedy: try longest match
-            best = None
-            best_len = 0
-            piece = self._sp.IdToPiece(ids[i]).lstrip('▁').lower()
-
-            # Single token match
-            if piece in self.word_cache:
-                best = self.word_cache[piece]
-                best_len = 1
-
-            # Multi-token match (assembled word)
-            assembled = piece
-            for j in range(i + 1, min(i + 5, len(ids))):
-                next_piece = self._sp.IdToPiece(ids[j]).lstrip('▁').lower()
-                assembled += next_piece
-                if assembled in self.word_cache:
-                    best = self.word_cache[assembled]
-                    best_len = j - i + 1
-
-            if best is not None:
-                result.append(best)
-                i += best_len
-            else:
-                result.append(ids[i])
-                i += 1
-
-        return result
-
     # ── Serialization ──────────────────────────────────────────
 
     def get_path_overrides(self):

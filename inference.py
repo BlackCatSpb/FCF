@@ -133,7 +133,7 @@ class InferenceEngine:
         if cid < 0 or not self.cs.concept_vectors.valid[cid]:
             return []
         top = self.cs.topk_similar_concepts(cid, k=k)
-        return [(int(c), clean_sp(self.sp.IdToPiece(int(c))) if int(c) < self.sp.vocab_size() else f'[ID{c}]',
+        return [(int(c), clean_sp(self.sp.IdToPiece(c)) if c < self.sp.vocab_size() else f'[ID{c}]',
                  float(s)) for c, s in top]
 
     def concept_info(self, word):
@@ -143,8 +143,6 @@ class InferenceEngine:
         return {'cid': cid, 'has_vector': vec is not None, 'freq': int(freq)}
 
     def run_eval(self, val_path=None, seeds=None, max_lines=3250):
-        def clean_sp(s):
-            return s.replace('\u2581', ' ').strip()
         val_path = val_path or CFG.val_corpus_path
         seeds = seeds or ['князь', 'жизнь', 'человек', 'война', 'развитие']
 

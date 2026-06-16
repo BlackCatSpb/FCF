@@ -53,9 +53,4 @@ def H_weighted(path_a, path_b, gamma=GAMMA):
         return 0.0
     return (1.0 - gamma ** k) / (1.0 - gamma)
 
-def path_index(prefix, pool_size=32768):
-    """FNV-1a deterministic hash → index into a vector pool."""
-    h = 0x811C9DC5
-    for o in prefix:
-        h = ((h * 16777619) ^ o) & 0x7FFFFFFF
-    return h % pool_size
+

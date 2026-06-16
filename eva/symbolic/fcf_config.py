@@ -236,7 +236,7 @@ class FCFConfig:
     # ── Destabilisation (PPMI noise) ──────────
     destab_scale_start: float = 0.6
     destab_scale_end: float = 0.02
-    destab_decay_lines: int = 30000  # default, overridden by opt.p['destab_decay_lines'] in training
+    destab_decay_lines: int = 30000  # used via opt.p['destab_decay_lines'], not directly
 
     # ── Drift guard ───────────────────────────
     code_bound: float = 10.0

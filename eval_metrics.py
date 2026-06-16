@@ -4,7 +4,7 @@ Usage: python eval_metrics.py [checkpoint_tag]
   Examples: '145k', '21k', 'latest'
 """
 import sys, os; sys.path.insert(0, os.path.dirname(__file__))
-import os, json, time, glob, re, shutil, tempfile
+import json, time, glob, re, shutil, tempfile
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -18,9 +18,14 @@ from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 from eva.symbolic.fcf_config import FCFConfig
 
-CFG = FCFConfig()
-BASE = CFG.data_dir
-sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
+try:
+    CFG = FCFConfig()
+    BASE = CFG.data_dir
+    sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
+except Exception:
+    CFG = None
+    BASE = '.'
+    sp = None
 TEST_SEEDS = ['князь', 'жизнь', 'человек', 'война', 'развитие']
 GEN_MAX_WORDS = 25
 

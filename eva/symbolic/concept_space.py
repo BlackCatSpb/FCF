@@ -509,7 +509,7 @@ class ConceptSpace:
 
     # ── Octree encoding ──────────────────────────────────────
 
-    def build_octree_fields(self, lattice, n_anchors=1024, min_lcp=2, gamma=0.5, path_overrides=None):
+    def build_octree_fields(self, lattice, n_anchors=1024, min_lcp=1, gamma=0.5, path_overrides=None):
         """Build H matrix and field_bits from nested octree encoding.
 
         Replaces PMI-based build_anchor_matrix + build_fields_from_lattice.
@@ -674,7 +674,7 @@ class ConceptSpace:
         self.set_vec(cid, v_new)
 
         # Sync fractal code to match — no subspace LR filtering
-        if code is not None or v_old is not None:
+        if self.fractal.basis is not None:
             new_code = v_new @ self.fractal.basis.T
             nv_code = np.linalg.norm(new_code @ self.fractal.basis)
             if nv_code > 1e-10:

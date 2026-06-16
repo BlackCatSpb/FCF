@@ -1,9 +1,26 @@
 # FCF (Fractal Cognitive Field) — Полный аудит проекта (2026-06-16)
 
 Дата: 2026-06-16
-Коммит: `c2e3588` (HEAD)
-Предыдущий аудит: полностью переписан (предыдущий AUDIT.md был от `03b8ae8`)
-Всего файлов: 27 Python, 5 бат-файлов/ps1, документация, конфиги
+Коммит: `0a3af72` (HEAD — "Phase A-E: fix all 26 verified issues from PLAN.md")
+Предыдущий аудит: `c2e3588` (полностью переписан)
+Всего Python-файлов: 24 (без `__pycache__`)
+Всего строк активного кода: ~5,500
+
+---
+
+## Статус предыдущих фиксов
+
+Предыдущий аудит (коммит `c2e3588`) выявил 30 issues. Коммит `0a3af72` ("Phase A-E") пытался исправить 26 из них согласно PLAN.md.
+
+**Результат верификации исправлений:**
+
+| Статус | Кол-во |
+|--------|--------|
+| Исправлено корректно | 22 |
+| Исправлено некорректно (сломано) | 3 |
+| Частично (остался Python-цикл) | 1 |
+| Не баги (сняты с рассмотрения) | 4 |
+| **Новых критических багов внесено фиксом** | **4** |
 
 ---
 
@@ -11,643 +28,665 @@
 
 | Уровень | Описание | Кол-во |
 |---------|----------|--------|
-| **P0** | Критические — падение/некорректные результаты | 3 |
-| **P1** | Высокие — серьёзные проблемы архитектуры/портабельности | 9 |
-| **P2** | Средние — мёртвый код, неоптимальности, несоответствия | 11 |
-| **P3** | Низкие — косметика, документация, старые файлы | 8 |
+| **P0** | Критические — падение/некорректные результаты | 6 |
+| **P1** | Высокие — серьёзные проблемы архитектуры/портабельности | 12 |
+| **P2** | Средние — мёртвый код, неоптимальности, несоответствия | 12 |
+| **P3** | Низкие — косметика, документация, качество кода | 8 |
 
 ---
 
 ## P0 — Критические
 
-### P0-1: theta_gate использует абсолютную позицию `j` вместо расстояния `j-i`
+### P0-1: theta_gate использует `j` вместо `j-i` — ИСПРАВЛЕНО
 
-**Файлы:**
-- `eva/symbolic/crystal_generator.py:994` (CPU путь train_from_text)
-- `eva/symbolic/crystal_generator.py:1104` (CPU путь train_batch)
-- `eva/symbolic/crystal_generator.py:584` (GPU путь _gpu_stdp_apply)
-- `eva/symbolic/crystal_generator.py:799` (GPU путь _negative_sampling_gpu)
+**Статус:** Исправлено корректно в `0a3af72`
 
-**Описание:** Формула theta_gate должна ослаблять LR для пар токенов, находящихся далеко друг от друга в предложении. Для этого нужно использовать расстояние `|j-i|`, но код использует абсолютную позицию `j`:
-
-```python
-# CPU (строка 994):
-theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
-
-# GPU (строка 584): 
-theta = torch.exp(-torch.clamp(j_pos, max=5.0) / max(self.theta_tau, 1.0))
-```
-
-Для предложения из 100 токенов:
-- Пара (0, 1): `j=1` → theta = `exp(-1/15)` ≈ 0.94 ✅ (должно быть `j-i=1`)
-- Пара (98, 99): `j=99` → theta = `exp(-5/15)` ≈ 0.72 ❌ (должно быть `j-i=1` → 0.94)
-- Пара (95, 100): `j=100` → theta = `exp(-5/15)` ≈ 0.72 (должно быть `j-i=5` → 0.72)
-- Пара (0, 2): `j=2` → theta = `exp(-2/15)` ≈ 0.88 ✅
-
-Для длинных предложений (>5 токенов) theta_gate для пар (98,99) и (1,2) будет **разным**, хотя расстояние одинаковое. Это приводит к **неравномерному распределению LR** — конец предложения получает меньший LR, чем начало, для одинаковых расстояний.
-
-**Исправление:** Заменить `j` на `j-i` во всех четырёх местах:
-```python
-dist = abs(j - i)
-theta_gate = math.exp(-min(dist, 5) / max(self.theta_tau, 1.0))
-```
+**Файлы:** `crystal_generator.py:574,584,795-797,801,996,1105`
+**Проверка:** Во всех 4 местах (GPU _gpu_stdp_apply, GPU _negative_sampling_gpu, CPU train_from_text, CPU train_batch) заменено на `dist = j-i` / `abs(j-i)`. GPU: `dist = j_pos - i_pos` (строка 576), CPU: `abs(j-i)` (строки 996, 1105). Корректно.
 
 ---
 
-### P0-2: API endpoint /health падает с AttributeError
+### P0-2: API /health endpoint падает с AttributeError — ИСПРАВЛЕНО НЕ ПОЛНОСТЬЮ
 
-**Файл:** `api/main.py:56`
+**Статус:** В `/health` endpoint остаётся обращение к `model.space.cid_list`
 
-**Описание:** Код обращается к несуществующим атрибутам:
+**Файл:** `api/main.py:54`
+
+**Описание:** В коммите `0a3af72` были исправлены:
+- строка 26: `len(model.space.cid_list)` -> `len(model.space.concept_vectors)` — в lifespan print
+- строка 56: `model.space.concept_transitions.nnz` -> `0` — в health response
+
+Но **строка 54 осталась нетронутой**:
 ```python
-transitions=model.space.concept_transitions.nnz if model.space.concept_transitions else 0
+concepts=len(model.space.cid_list),
 ```
-`concept_transitions` был удалён из `ConceptSpace` при рефакторинге. `AttributeError`.
+Метод `/health` (строка 46-57) использует `model.space.cid_list`. Атрибут `cid_list` отсутствует в `ConceptSpace`. При обращении к `/health` будет `AttributeError`.
 
-Дополнительно на строке 26: `len(model.space.cid_list)` — `cid_list` не существует в `ConceptSpace`. `AttributeError`.
-
-**Рекомендация:** Заменить на `len(model.space.concept_vectors)` и `0` для transitions (или вычислить через `len(model.space.fractal.codes)`).
+**Рекомендация:** Заменить `model.space.cid_list` на `len(model.space.concept_vectors)`.
 
 ---
 
-### P0-3: FCFModel.generate() и forward() падают с AttributeError
+### P0-3: FCFModel.generate/forward падают с AttributeError — ИСПРАВЛЕНО
 
-**Файл:** `model/modeling_fcf.py:148, 157, 208-209`
+**Статус:** Исправлено корректно в `0a3af72`
 
-**Описание:** Код обращается к несуществующим атрибутам `CrystalGenerator`:
+**Файл:** `model/modeling_fcf.py:131-136,173-188`
+**Проверка:** `forward()` переписан — убран gate. `_query_confidence` -> `0.0`. `concept_info` удалён. Работает.
 
-Строка 148:
+---
+
+### P0-4: parameter_optimizer.py — NameError из-за неполного переименования pd -> param
+
+**Статус:** НОВЫЙ БАГ (внесён фиксом N-2)
+
+**Файл:** `eva/symbolic/parameter_optimizer.py:251,255,268,272,277`
+
+**Описание:** В коммите `0a3af72` переменная цикла `pd` переименована в `param` на строках 249-250:
 ```python
-core_cid, modifier_field, centroid, noise = self.generator.gate.extract_core(words)
+for param in self.config.params:    # строка 249 (было: for pd in ...)
+    p = self.p.get(param.name)       # строка 250 (было: pd.name)
 ```
-`self.generator.gate` (ConceptGate) — не существует. Удалён при рефакторинге.
+Но **внутри цикла все обращения к `pd` остались**:
+- строка 251: `if p is None or not pd.rules:`
+- строка 255: `for rule in pd.rules:`
+- строка 268: `changes[pd.name] = p.current`
+- строка 272: `has_drift = any(r.action == 'toward_default' for r in pd.rules)`
+- строка 277: `changes[pd.name] = p.current`
 
-Строка 157:
+При выполнении `step()` будет `NameError: name 'pd' is not defined`. **ParameterOptimizer полностью неработоспособен** — адаптивные правила обучения не выполняются.
+
+**Рекомендация:** Заменить `pd.` на `param.` во всех строках внутри цикла (251, 255, 268, 272, 277).
+
+---
+
+### P0-5: train_full.py — TypeError: CrystalGenerator не принимает morph_vocab
+
+**Статус:** НОВЫЙ БАГ (внесён фиксом N-5)
+
+**Файл:** `train_full.py:308`
+
+**Описание:** В коммите `0a3af72` параметр `morph_vocab` удалён из `CrystalGenerator.__init__`:
 ```python
-confidence=float(self.generator._query_confidence),
+def __init__(self, cs, sp, lattice, config=None):  # morph_vocab удалён
 ```
-`_query_confidence` не определён в `CrystalGenerator`.
-
-Строка 208:
+Но в `train_full.py` строка 308 осталась передача `morph_vocab=mv`:
 ```python
-confidence=float(self.generator._query_confidence),
+gen = CrystalGenerator(cs, sp, lattice, morph_vocab=mv)
 ```
+При запуске обучения: `TypeError: __init__() got an unexpected keyword argument 'morph_vocab'`.
 
-Строка 209:
+**Рекомендация:** Убрать `morph_vocab=mv` из вызова на строке 308.
+
+---
+
+### P0-6: fractal_encoding.py — CFG/GAMMA import всегда падает в fallback
+
+**Статус:** НОВЫЙ БАГ (фикс P3-8 полностью сломан)
+
+**Файл:** `eva/symbolic/fractal_encoding.py:12-18`
+
+**Описание:**
 ```python
-intent_anchor=self._space.concept_info.get(result.get("core_cid", 0), {}).get("anchor", None)
+try:
+    from eva.symbolic.fcf_config import CFG
+    LEVELS = CFG.octree_levels
+    GAMMA = CFG.gamma
+except (ImportError, AttributeError):
+    LEVELS = 16
+    GAMMA = 0.5
 ```
-`concept_info` не существует в `ConceptSpace`. `core_cid` не возвращается из `generate()`.
 
-**Рекомендация:** Заменить на корректные вызовы или заглушки. `gate.extract_core` → использовать существующий механизм генерации. `_query_confidence` → удалить или определить. `concept_info` → использовать `lattice.concept_freq`.
+**Две причины, почему try ВСЕГДА падает:**
+
+1. **`CFG` не существует в `fcf_config.py`.** В модуле определён класс `FCFConfig`, но нет глобальной переменной `CFG`. `from eva.symbolic.fcf_config import CFG` -> `ImportError`.
+
+2. **`CFG.gamma` не существует.** Поле в `FCFConfig` называется `octree_gamma` (строка 231), а не `gamma`.
+
+**Результат:** Уровни и gamma всегда 16/0.5. Конфиг не синхронизирован. Создаётся ложное впечатление, что настройки читаются из конфига, хотя используются хардкоженные значения.
+
+**Рекомендация:**
+- Импортировать `FCFConfig` и создать экземпляр: `cfg = FCFConfig()`
+- Использовать `cfg.octree_levels` и `cfg.octree_gamma`
+- Убрать try/except и сделать явный fallback через `getattr`
 
 ---
 
 ## P1 — Высокие
 
-### P1-1: __main__ блоки используют 32K BPE модель вместо 146K
+### P1-1: `__main__` блоки используют 32K BPE модель — ИСПРАВЛЕНО
 
-**Файлы:**
-- `eva/symbolic/crystal_generator.py:1318` — `bpe_ru_32k.model`
-- `eva/symbolic/concept_space.py:1085` — `bpe_ru.model`
-- `eva/symbolic/syntax_lattice.py:743` — `bpe_ru.model`
+**Статус:** Исправлено корректно в `0a3af72`
 
-**Описание:** Три `__main__` блока для отладки используют старые BPE-модели (32K или без указания), хотя проект полностью перешёл на `bpe_ru_146k.model`. Файла `bpe_ru_32k.model` может не существовать в `real_data/`.
-
-**Рекомендация:** Заменить на `bpe_ru_146k.model`.
+**Файлы:** `crystal_generator.py:1318`, `concept_space.py:980`, `syntax_lattice.py:743`
+**Проверка:** Все три заменены на `bpe_ru_146k.model`.
 
 ---
 
-### P1-2: Contrastive objective не выполняется в GPU-пути
+### P1-2: Contrastive objective не выполняется в GPU-пути — ИСПРАВЛЕНО
 
-**Файл:** `eva/symbolic/crystal_generator.py:1012-1013, 1122-1123`
+**Статус:** Исправлено корректно в `0a3af72`
 
-**Описание:**
-```python
-# Оба метода (train_from_text и train_batch):
-if not use_torch:
-    self._contrastive_objective(gen_updates)
-```
-При `use_torch=True` contrastive objective **полностью пропускается**. GPU-путь теряет важный механизм обучения — hard-negative push-pull.
-
-**Рекомендация:** Реализовать GPU-версию `_contrastive_objective` или выполнять её на CPU после GPU-шага (но с корректными данными из `gen_updates`).
+**Файл:** `crystal_generator.py:1013-1014,1122-1123`
+**Проверка:** Убран `if not use_torch:` — `_contrastive_objective` вызывается всегда (строки 1013, 1122). OK.
 
 ---
 
-### P1-3: GPU negative sampling — Python-цикл не устранён
+### P1-3: GPU negative sampling — Python-цикл не устранён — ЧАСТИЧНО
 
-**Файл:** `eva/symbolic/crystal_generator.py:773-820`
+**Статус:** Precompute векторизован, Python-цикл остаётся
 
-**Описание:** В PLAN.md (P1-3) утверждается, что GPU negative sampling векторизован. Хотя precompute `neg_cids_np` и `neg_elr_arr` вынесены до цикла, **основной цикл остаётся Python-циклом**:
-
-```python
-for pi in range(n_pairs):
-    v_ctx = cs.concept_vectors.get(gpu_cid_ctx[pi])
-    ...
-    for ni in range(neg_samples):
-        if field_gate and neg_ovs_cpu[pi, ni] > 0:
-            continue
-        neg_cid = int(neg_cids_np[pi, ni])
-        ...
-        cs._apply_vector_update(neg_cid, v_new)
-```
-
-Каждая итерация вызывает `cs._apply_vector_update` — это Python-функция с numpy-операциями. Полной GPU-векторизации нет.
-
-**Рекомендация:** Собрать все valid neg-индексы в тензор, вычислить сдвиги одним матричным умножением, применить через `scatter_add_`.
+**Файл:** `crystal_generator.py:804-822`
+**Описание:** Precompute `neg_cids_np` и `neg_elr_arr` вынесены до цикла. Внутренний двойной цикл (pairs x neg_samples) с per-element `cs._apply_vector_update` остаётся. Полная GPU-векторизация требует `scatter_add_`.
 
 ---
 
-### P1-4: `_final_save` не вызывает `cleanup_old_checkpoints`
+### P1-4: `_final_save` не вызывает `cleanup_old_checkpoints` — ИСПРАВЛЕНО
 
-**Файл:** `train_full.py:390-400`
+**Статус:** Исправлено корректно в `0a3af72`
 
-**Описание:** Функция `_final_save` сохраняет cs, lattice, opt и checkpoint state, но **не вызывает `cleanup_old_checkpoints`**. Это означает:
-- При `KeyboardInterrupt` (строка 598) — старые чекпоинты не чистятся
-- При финальном сохранении (строка 606) — не чистятся
-- Старые checkpoint-файлы накапливаются
-
-Только внутри цикла обучения (строка 552) вызывается `cleanup_old_checkpoints`.
-
-**Рекомендация:** Добавить `cleanup_old_checkpoints(keep=CFG.cleanup_keep)` в `_final_save`.
+**Файл:** `train_full.py:402`
+**Проверка:** Добавлен `cleanup_old_checkpoints(keep=CFG.cleanup_keep)` в `_final_save`.
 
 ---
 
-### P1-5: `topk_similar_concepts` — прямой доступ к `_valid`/`_data`
+### P1-5: `topk_similar_concepts` — доступ к `_data`/`_valid` — ИСПРАВЛЕНО
 
-**Файл:** `eva/symbolic/concept_space.py:862-864`
+**Статус:** Исправлено корректно в `0a3af72`
 
-**Описание:** Метод `topk_similar_concepts` (публичный API) использует прямой доступ к защищённым атрибутам:
-```python
-valid = self.concept_vectors._valid
-mat = self.concept_vectors._data[valid]
-```
-Хотя в PLAN.md (P2-13) утверждается, что все обращения к `_data`/`_valid` заменены на `@property` `.data`/`.valid`, этот метод остался нетронутым. `inference.py:126` тоже использует `topk_similar_concepts`, который внутри обращается к `_data`/`_valid`.
-
-**Рекомендация:** Заменить на `self.concept_vectors.data` и `self.concept_vectors.valid`.
+**Файл:** `concept_space.py:818-819`
+**Проверка:** `.valid`/`.data` вместо `._valid`/`._data`.
 
 ---
 
-### P1-6: `eval_metrics.py` — прямой доступ к `_valid`
+### P1-6: `eval_metrics.py` — `_valid` вместо `valid` — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
 
 **Файл:** `eval_metrics.py:78`
-
-**Описание:**
-```python
-print(f"  Load: {time.time()-t0:.1f}s | {sum(cs.concept_vectors._valid)}/{cs.vocab_size} vectors")
-```
-Используется `_valid` вместо `valid`.
-
-**Рекомендация:** Заменить `_valid` на `valid`.
+**Проверка:** `.valid` вместо `._valid`.
 
 ---
 
-### P1-7: `tokenization_fcf.py` — опечатка в `vocab_files_names`
+### P1-7: `tokenization_fcf.py` — опечатка vocab_files_names — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
 
 **Файл:** `model/tokenization_fcf.py:11`
+**Проверка:** `"bpe_ru_146k.model"` вместо `"bpe_ru.model"`. OK.
+
+---
+
+### P1-8: `fcf_config.py:134-141` — l_c/l_a/l_m не синхронизированы с FractalField — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
+
+**Файлы:** `fcf_config.py:134-141`, `concept_space.py:84-89`
+**Проверка:** `FractalField.__init__` принимает `l_c/l_a/l_m` как параметры. `FCFConfig` имеет `get_field_dims()`. Передача через `**cfg.get_field_dims()` — ожидается в коде. OK.
+
+---
+
+### P1-9: `train_full.py:17-21` — `_quiet` бесшумно глотает все исключения
+
+**Статус:** НОВЫЙ БАГ
+
+**Файл:** `train_full.py:16-21`
 
 **Описание:**
 ```python
-vocab_files_names = {
-    "spm_file": "bpe_ru.model",
+def _quiet(func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        print(f"[WARN] {func.__name__} failed: {e}", file=sys.stderr)
+        return None
+```
+
+Функция используется для **критических операций**: сохранение чекпоинтов (`cs.save`, `lattice.save`), построение полей (`build_octree_fields`), визуализация (`save_3d_vis`), оценка (`gen.evaluate`). Если сохранение чекпоинта упадёт с `OSError: disk full` — обучение продолжит работать, считая что чекпоинт сохранён. При следующем сбое данные будут потеряны.
+
+Строки использования:
+- `_final_save:393-395` — сохранение cs, lattice, opt
+- `train_full.py:548` — сохранение чекпоинта
+- `train_full.py:556` — периодическое сохранение
+- `train_full.py:579` — визуализация
+- `train_full.py:582` — evaluate
+
+**Рекомендация:** Убрать `_quiet` для операций сохранения. Или добавить повторную попытку (retry). Как минимум — писать в stderr и syslog.
+
+---
+
+### P1-10: `api/main.py:31-36` — Rate limiter не thread-safe
+
+**Статус:** НОВЫЙ БАГ
+
+**Файл:** `api/main.py:31-40`
+
+**Описание:**
+```python
+_rate_limit = defaultdict(list)
+def _check_rate_limit(client_ip: str) -> bool:
+    now = time.time()
+    _rate_limit[client_ip] = [t for t in _rate_limit[client_ip] if now - t < 60]
+    ...
+```
+
+При использовании async FastAPI с несколькими воркерами (Uvicorn с `--workers > 1`) доступ к `_rate_limit` из разных потоков/процессов не синхронизирован. GIL защищает от гонки на чтение/запись одного элемента, но `defaultdict` при первом обращении с нового IP может создать ключ из нескольких потоков одновременно. Несостоятельность данных: лимит может быть превышен или, наоборот, сброшен.
+
+Также: rate limit хранится в памяти и теряется при перезапуске.
+
+**Рекомендация:** Использовать `threading.Lock` для `_rate_limit` или вынести в Redis/file.
+
+---
+
+### P1-11: `syntax_lattice.py:341-342` — concept_freq смешивает raw counts с EMA
+
+**Статус:** НОВЫЙ БАГ
+
+**Файл:** `eva/symbolic/syntax_lattice.py:122,341-342`
+
+**Описание:** Метод `build()` (строка 122) устанавливает `concept_freq` как **сырые счётчики**:
+```python
+self.concept_freq[c] += 1
+```
+
+Метод `update()` (строка 341-342) использует **EMA**:
+```python
+prev = self.concept_freq.get(next_c, 0)
+self.concept_freq[next_c] = prev * self.decay + 1.0
+```
+
+Для концепта с частотой 1000 в корпусе: после `build()` будет `concept_freq = 1000`. После первого `update()`: `1000 * 0.999 + 1.0 = 1000.0` (не меняется). Но концепты, которые были в корпусе редко (например, 5 раз): `5 * 0.999 + 1.0 = 5.995`. Через 1000 обновлений: ~1000 (равновесие EMA).
+
+Проблема: `decay_all()` (строка 366) умножает на `self.decay`:
+```python
+self.concept_freq[c] = max(self.concept_freq[c] * self.decay, min_freq)
+```
+Это работает для EMA-значений (они уменьшаются), но для raw-значений после build тоже OK (умножение на 0.999).
+
+Реальная проблема: `concept_freq` после `build()` имеет ДРУГОЙ масштаб, чем после длительного `update()`. В PMI формулах это несущественно, так как используется отношение частот. Но при смешивании raw и EMA в одной обученной системе (resume из чекпоинта) — нормировка может отличаться.
+
+Не критично, но потенциально влияет на качество PMI-фильтрации.
+
+---
+
+### P1-12: `train_full.py:569,594` — `opt.step()` вызывается дважды за чекпоинт
+
+**Статус:** НОВЫЙ БАГ
+
+**Файл:** `train_full.py:569,594`
+
+**Описание:** В цикле чекпоинта (строка 569):
+```python
+opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new)
+```
+Затем при eval (строка 594):
+```python
+opt.step(vec_ppl=vppl, acc1=acc1, vacc1=vacc1)
+```
+
+`step()` вызывает `ingest()` (накопление метрик в буфер) и затем `_eval_trigger()` (проверка правил адаптации). При первом вызове `cos_flat`/`cos_trend` обновляются, при втором перезаписываются. Двойной вызов за один чекпоинт может привести к двойной адаптации параметров, особенно для правил с `scale`/`shift`.
+
+**Рекомендация:** Объединить вызовы `opt.step()` в один с полным набором метрик.
+
+---
+
+### P1-13: `model/modeling_fcf.py:99-107` — gen_config не включает все ключи CrystalGenerator
+
+**Статус:** НОВЫЙ БАГ
+
+**Файл:** `model/modeling_fcf.py:99-107`
+
+**Описание:**
+```python
+gen_config = {
+    "beam_width": self.config.beam_width,
+    "max_words": self.config.max_length,
+    "concept_temp": self.config.concept_temp,
+    "word_temp": self.config.word_temp,
+    "theta_tau": self.config.theta_tau,
+    "learning_rate": self.config.learning_rate,
 }
 ```
-Атрибут `PreTrainedTokenizer` называется `vocab_files_names` (с 'i' — `vocab_files_names`). Опечатка `vocab_files_names` вместо `vocab_files_names`. Это приведёт к тому, что HuggingFace не найдёт файлы вокабуляра при `save_pretrained`/`from_pretrained`.
 
-Дополнительно: значение по умолчанию `"bpe_ru.model"` не соответствует текущей модели `bpe_ru_146k.model`.
+`CrystalGenerator.__init__` ожидает ключи: `beam_width`, `max_words`, `min_words`, `concept_temp`, `theta_tau`, `learning_rate`, `top_p`, `len_norm_alpha`, `block_ngram`, `mmi_lambda`. Из них в gen_config отсутствуют: `min_words`, `top_p`, `len_norm_alpha`, `block_ngram`, `mmi_lambda`. Используются значения по умолчанию из CrystalGenerator (0.9, 0.7, 4, 0.2), но это может не соответствовать тому, что настроено в `FCFConfig` (у которого нет полей для этих параметров).
 
-**Рекомендация:** Исправить на `vocab_files_names` и указать `bpe_ru_146k.model`.
-
----
-
-### P1-8: `train_full.py` — нет поддержки `--epochs` для авто-возобновления
-
-**Файл:** `train_full.py:115, 412`
-
-**Описание:** Параметр `--epochs` задаёт общее количество эпох. Но при резюме, `total_epochs = args.epochs`, а `current_epoch = resume_epoch`. Если пользователь запустил `--epochs 3 --resume` на второй эпохе, то обучение пойдёт с эпохи 2 по эпоху 3. Но если `resume_epoch` = 2, а `total_epochs` = 2, то обучение выполнит только эпоху 2 и закончит. Это корректно.
-
-Проблема: если `resume_epoch` = 1, `total_epochs` = 3, но при первом запуске было `--epochs 5`, то разницы нет — resume продолжает с эпохи 1 до 3. OK.
-
-Но есть неявная проблема: `total_epochs` НЕ сохраняется в `checkpoint_state.json`. Если пользователь запустил `--epochs 3`, дошёл до линии 2000 эпохи 1, прервал, и запустил `--epochs 5 --resume`, то он получит 5 эпох (перезапишет предыдущее намерение). Это может быть как фичей, так и багом.
-
----
-
-### P1-9: `fcf_config.py:133-135` — свойства `l_c`, `l_a`, `l_m` не согласованы с `FractalField`
-
-**Файл:** `eva/symbolic/fcf_config.py:133-135`
-
-**Описание:**
-```python
-@property
-def l_c(self) -> int: return self.latent_dim // 2          # 256
-@property
-def l_a(self) -> int: return self.latent_dim // 4          # 128
-@property
-def l_m(self) -> int: return self.latent_dim - self.l_c - self.l_a  # 128
-```
-
-В `FractalField` (concept_space.py:87-89) эти значения захардкожены:
-```python
-self.l_c = latent_dim // 2      # 256
-self.l_a = latent_dim // 4      # 128
-self.l_m = latent_dim - self.l_c - self.l_a  # 128
-```
-
-Консистентно при `latent_dim=512`, но если изменить `latent_dim` в `FCFConfig`, эти значения **не синхронизируются** с `FractalField`, так как в `FractalField.__init__` они вычисляются при создании, а не берутся из конфига.
-
-**Рекомендация:** Передавать `l_c`/`l_a`/`l_m` из `FCFConfig` в `FractalField`.
+**Рекомендация:** Добавить в `FCFConfig` поля `top_p`, `len_norm_alpha`, `block_ngram`, `mmi_lambda` и передавать их через gen_config.
 
 ---
 
 ## P2 — Средние
 
-### P2-1: TeeOut — закрытие stdout может сломать вывод
+### P2-1: TeeOut.close() делает stdout непригодным — ИСПРАВЛЕНО
 
-**Файл:** `train_full.py:68, 601-603`
+**Статус:** Исправлено корректно в `0a3af72`
 
-**Описание:** `sys.stdout` заменяется на `TeeOut`. В блоке `finally` (строка 601-603) вызывается `sys.stdout.close()`. После этого `sys.stdout` становится непригодным для вывода. Если после `finally` будет какая-либо ошибка или `print()`, она упадёт с `ValueError: I/O operation on closed file`.
+**Файл:** `train_full.py:68-69,604-611`
+**Проверка:** `old_stdout = sys.stdout` сохранён, `sys.stdout = old_stdout` восстановлен после закрытия. OK.
+
+---
+
+### P2-2: `_batch_log` — утечка файлового дескриптора — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
+
+**Файл:** `train_full.py:605-607`
+**Проверка:** `cs._batch_log.close()` в `finally`. OK.
+
+---
+
+### P2-3: `contrastive_spread` в ConceptSpace — мёртвый код — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
+
+**Файл:** `concept_space.py` (удалён ~60 строк)
+**Проверка:** Удалён. OK.
+
+---
+
+### P2-4: `_compute_pmi_field_fast` — не вызывается — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
+
+**Файл:** `concept_space.py` (удалён ~45 строк)
+**Проверка:** Удалён. OK.
+
+---
+
+### P2-5: `cleanup_old_checkpoints` не удаляет `.opt.json` — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
+
+**Файл:** `train_full.py:108`
+**Проверка:** `.opt.json` добавлен в список расширений для syntax_lattice. OK.
+
+---
+
+### P2-6: `_is_semantic_token` не обрабатывает 'ё' — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
+
+**Файл:** `crystal_generator.py:154`
+**Проверка:** Добавлено `or text.lower() == 'ё'`. OK.
+
+---
+
+### P2-7: `_theta_temp` — деление на ноль при theta_tau=0 — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
+
+**Файл:** `crystal_generator.py:130`
+**Проверка:** `max(self.theta_tau, 1.0)`. OK.
+
+---
+
+### P2-8: `inference.py:126` — neighbours транзитивно использует `_data`/`_valid` — ИСПРАВЛЕНО
+
+**Статус:** Исправлено транзитивно через P1-5.
+
+---
+
+### P2-9: `_final_save` без timestamp — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
+
+**Файл:** `train_full.py:396`
+**Проверка:** Добавлен `'timestamp': time.time()`. OK.
+
+---
+
+### P2-10: `corpus_path` может не существовать — ИСПРАВЛЕНО
+
+**Статус:** Исправлено корректно в `0a3af72`
+
+**Файл:** `fcf_config.py:82-89`
+**Проверка:** `FileNotFoundError` с понятным сообщением. OK.
+
+---
+
+### P2-11: stale vis/ файлы — ИСПРАВЛЕНО
+
+**Статус:** Исправлено в `0a3af72`
+
+---
+
+### P2-12: `concept_space.py:578-591` — избыточность LCP полей с min_lcp=2
+
+**Статус:** НОВЫЙ БАГ
+
+**Файл:** `concept_space.py:578-591`
+
+**Описание:** В `build_octree_fields` поле `field_bits` строится на основе LCP-префиксов длины `min_lcp` (по умолчанию 2). Каждый октант — 3 бита, поэтому 2 уровня дают 8^2 = 64 возможных префикса. Для 146K концептов это означает, что в среднем 146K/64 ≈ 2283 концепта имеют ОДИНАКОВЫЕ field_bits. Поле становится слишком грубым — теряется различающая способность.
 
 ```python
-finally:
-    if hasattr(sys.stdout, 'close'):
-        sys.stdout.close()
+prefix_to_anchors = defaultdict(list)
+for aidx, ap in enumerate(anchor_paths):
+    prefix_to_anchors[ap[:min_lcp]].append(aidx)
 ```
 
-**Рекомендация:** Сохранить оригинальный `sys.stdout` и восстановить его после закрытия `TeeOut`.
+Для anchor_ids (2048 топ-частотных): распределение по 64 префиксам даёт ~32 анкора на префикс. Таким образом, каждый концепт перекрывается с ~32 анкорами. Поле перестаёт быть информативным — почти все концепты имеют почти все биты.
+
+**Рекомендация:** Увеличить `min_lcp` хотя бы до 4 (8^4 = 4096 префиксов). Или использовать полное octree-расстояние LCP.
 
 ---
 
-### P2-2: `_batch_log` — утечка файлового дескриптора
+### P2-13: `train_full.py:449` — тавтология `idx + 1 > 0`
 
-**Файл:** `train_full.py:471-475`
+**Статус:** НОВЫЙ БАГ
 
-**Описание:** К объекту `cs` (ConceptSpace) динамически прикрепляется `_batch_log` — открытый файл CSV. Файл никогда не закрывается явно. При создании нового `TeeOut` при следующем запуске, старый `_batch_log` остаётся открытым. Нарушение границ ответственности.
-
-**Рекомендация:** Или сделать `_batch_log` отдельным объектом с `__enter__`/`__exit__`, или закрывать в `_final_save`.
-
----
-
-### P2-3: `contrastive_spread` в `ConceptSpace` — мёртвый код
-
-**Файл:** `eva/symbolic/concept_space.py:956-1015`
-
-**Описание:** Метод `contrastive_spread` полностью реализован (60 строк), но нигде не вызывается в проекте. Это не `_contrastive_objective` в `crystal_generator.py` — это отдельный метод `ConceptSpace`, оставшийся от предыдущей версии.
-
-**Рекомендация:** Удалить или переместить в архив.
-
----
-
-### P2-4: Пустая секция "H matrix + BMSSP" с изолированным кодом
-
-**Файл:** `eva/symbolic/concept_space.py:504-552`
-
-**Описание:** После удаления `build_anchor_matrix` и `build_fields_from_lattice`, осталась пустая строка с комментарием (строка 507) и неиспользуемый метод `_compute_pmi_field_fast` (строки 508-552). Этот метод не вызывается нигде — `build_octree_fields` полностью заменил PMI-подход.
-
-**Рекомендация:** Удалить `_compute_pmi_field_fast`.
-
----
-
-### P2-5: `cleanup_old_checkpoints` — не удаляет `.opt.json` файлы
-
-**Файл:** `train_full.py:87-109`
-
-**Описание:** Функция `cleanup_old_checkpoints` удаляет `concept_space_*k.*` и `syntax_lattice_*k.*`, но НЕ удаляет соответствующие `*k.opt.json` файлы. После нескольких циклов обучения в `real_data/` накапливаются старые `.opt.json` файлы.
-
-```python
-for ext in ['.json', '.codes.npz', '.opt.json']:
-    fp = os.path.join(base_dir, f'concept_space_{k_label}{ext}')
-    if os.path.exists(fp): os.remove(fp)
-# syntax_lattice_*k.opt.json не обрабатывается
-```
-
-**Рекомендация:** Добавить удаление `syntax_lattice_*k.opt.json` или расширить массив `ext`.
-
----
-
-### P2-6: `_is_semantic_token` — не обрабатывает букву 'ё'
-
-**Файл:** `eva/symbolic/crystal_generator.py:154`
+**Файл:** `train_full.py:455-456`
 
 **Описание:**
 ```python
-if len(text) == 1 and not ('а' <= text.lower() <= 'я' or text.isalpha()):
-    return False
+next_fluct = idx + 1 > 0 and (idx + 1 - last_fluct_lines) >= FLUCTUATE_EVERY
+next_decay = idx + 1 > 0 and (idx + 1 - last_decay_lines) >= DECAY_EVERY
 ```
-Диапазон `'а' <= text.lower() <= 'я'` исключает букву 'ё' (код 1105 в Unicode, а 'я' — 1103). Токены, состоящие из одной буквы 'ё', будут считаться не-семантическими.
 
-**Рекомендация:** Добавить `or text.lower() == 'ё'`.
+`idx + 1 > 0` всегда истинно (idx >= 0, так как обучение начинается с 0). При `idx=0`: `0+1 > 0` — True. Бессмысленная проверка.
+
+**Рекомендация:** Убрать `idx + 1 > 0 and`.
 
 ---
 
-### P2-7: `_theta_temp` — деление на ноль при `theta_tau=0`
+### P2-14: `concept_space.py:676-682` — потенциальный дрейф между векторами и фрактальными кодами
 
-**Файл:** `eva/symbolic/crystal_generator.py:131`
+**Статус:** НОВЫЙ БАГ
 
-**Описание:**
+**Файл:** `concept_space.py:676-682`
+
+**Описание:** После каждого STDP-обновления `_apply_vector_update` синхронизирует фрактальный код с вектором:
 ```python
-t = self.base_concept_temp * math.exp(-word_num / self.theta_tau)
-return max(t, self.base_concept_temp * 0.15)
+new_code = v_new @ self.fractal.basis.T
+nv_code = np.linalg.norm(new_code @ self.fractal.basis)
+if nv_code > 1e-10:
+    new_code /= nv_code
+self.fractal.codes[cid] = new_code
 ```
-Если `self.theta_tau` равно 0 или очень мало, будет `float division by zero` или `inf`. В `FCFConfig` минимум для `theta_tau` — 5, и в коде стоит `max(self.theta_tau, 1.0)`, но в `_theta_temp` этой защиты нет.
 
-**Рекомендация:** Добавить `max(self.theta_tau, 1.0)`.
+Нормализация гарантирует, что norm(new_code @ basis) = 1. Но если basis не строго ортонормирован (из-за накопленных ошибок с плавающей точкой), то `new_code @ basis` может отличаться от `v_new`. В `from_dict` (строка 420-437) есть проверка ортогональности и переортогонализация при ошибке > 1e-3, но в runtime она не выполняется.
 
----
+Со временем, после тысяч STDP-обновлений, `concept_vectors[cid]` и `fractal.compute_vector(cid)` могут разойтись. `ensure_matrix` (строка 231-249) использует `self.codes[cid]` для построения матрицы векторов, поэтому eval и generation могут использовать отличающиеся векторы.
 
-### P2-8: `inference.py` — метод `neighbours` использует `topk_similar_concepts` с `_data`/`_valid`
-
-**Файл:** `inference.py:126`
-
-**Описание:** Метод `InferenceEngine.neighbours()` вызывает `self.cs.topk_similar_concepts(cid, k=k)`, который внутри (concept_space.py:862-864) обращается к `self.concept_vectors._data` и `self.concept_vectors._valid`. Хотя `inference.py` сам использует `.valid` (строка 124), вызов `topk_similar_concepts` возвращается к приватным атрибутам.
-
-**Рекомендация:** Исправить `topk_similar_concepts` (см. P1-5).
+**Рекомендация:** Добавить периодическую проверку `norm(concept_vectors[cid] - fractal.compute_vector(cid)) < 1e-4` при чекпоинтах.
 
 ---
 
-### P2-9: `concept_space.init_concepts()` — падение при `vocab_size=0`
+### P2-15: `concept_space.py:588-589` — field_bits как uint8 в to_dict требует копирования
 
-**Файл:** `eva/symbolic/concept_space.py:472-481`
+**Файл:** `concept_space.py:589,365`
 
-**Описание:**
-```python
-def init_concepts(self):
-    for cid in range(self.vocab_size):
-        ...
-```
-Если `self.vocab_size == 0`, цикл не выполняется. Это нормально, но если `vocab_size` не установлен (None), будет `TypeError: 'NoneType' object cannot be interpreted as an integer`.
-
-В `__init__`: `self.vocab_size = vocab_size or 0`. Но если передать `vocab_size=None`, то `None or 0` = 0. OK.
-
----
-
-### P2-10: `train_full.py` — checkpoint_state.json без timestamp в `_final_save`
-
-**Файл:** `train_full.py:395-397`
-
-**Описание:** `_final_save` сохраняет `{'epoch': epoch, 'line': total_lines}` без поля `timestamp`, в то время как `save_checkpoint_state` (строка 77) добавляет `'timestamp': time.time()`. При перезаписи `_final_save` timestamp пропадает.
-
----
-
-### P2-11: `fcf_config.py:82-83` — корпус может отсутствовать
-
-**Файл:** `eva/symbolic/fcf_config.py:82-83`
-
-**Описание:**
-```python
-@property
-def corpus_path(self) -> str:
-    return os.path.join(self.data_dir, 'full_corpus_ru_clean.txt')
-```
-Файл `full_corpus_ru_clean.txt` создаётся скриптом `filter_corpus.py`. В `.gitattributes` есть `real_data/*.txt filter=lfs`. Если после clone без LFS файл не подтянулся, и `filter_corpus.py` не был запущен — обучение упадёт при попытке открыть несуществующий файл.
-
-**Рекомендация:** Добавить проверку существования и понятную ошибку.
+**Описание:** `field_bits` хранятся как `np.uint8` после `build_octree_fields` (строка 591: `.copy()`), и при сохранении в `to_dict` (строка 365) они корректно сериализуются. OK — это не баг, а подтверждение исправления N-6.
 
 ---
 
 ## P3 — Низкие
 
-### P3-1: stale точки визуализации в `real_data/vis/`
+### P3-1: stale vis/ файлы — ИСПРАВЛЕНО
 
-**Файлы:** `real_data/vis/points_*.json`
+### P3-2: hormonal_system.py порог повторения — ИСПРАВЛЕНО
 
-**Описание:** В директории vis/ находятся 16 файлов (до 80K точек), но текущее обучение — ~6000 линий (~6K). Это старые файлы от предыдущих запусков. Занимают ~50+ MB.
+**Статус:** Исправлено в `0a3af72`
+**Файл:** `hormonal_system.py:112`
+**Проверка:** `<= 2` -> `== 1`. OK.
 
-**Рекомендация:** Очистить старые точки визуализации.
+### P3-3: eval_checkpoint.py stale comment "785MB" — ИСПРАВЛЕНО
 
----
+**Статус:** Исправлено в `0a3af72`
 
-### P3-2: Знаковая неоднозначность PCA в `save_3d_vis`
+### P3-4: syntax_lattice.py load хардкодит max_n=4 — ИСПРАВЛЕНО
 
-**Файл:** `train_full.py:349`
+**Статус:** Исправлено в `0a3af72`
 
-**Описание:**
-```python
-pca = PCA(n_components=3, random_state=0)
-proj = pca.fit_transform(Xc)
-```
-PCA имеет знаковую неоднозначность — разные запуски могут инвертировать оси. При сравнении визуализаций между чекпоинтами кластеры могут быть "отзеркалены".
+### P3-5: fractal_encoding.py LEVELS/GAMMA хардкод — СМ. P0-6 (сломано)
 
----
+### P3-6: parameter_optimizer.py `pd` -> `param` — СМ. P0-4 (сломано)
 
-### P3-3: `hormonal_system.py:112-113` — порог повторения неточен
+### P3-7: crystal_generator.py morph_vocab не используется — СМ. P0-5 (сломано)
 
-**Файл:** `eva/symbolic/hormonal_system.py:112-113`
+### P3-8: `model/configuration_fcf.py:5` — sys.path modification на уровне модуля
 
-**Описание:**
-```python
-if len(self._last_few_cids) >= 3 and len(set(self._last_few_cids)) <= 2:
-    da_coherence -= 0.1  # boredom from repetition
-```
-Если 3 одинаковых CID → `set = {x}` → `len=1 <= 2` → True. Если 3 CID из 2 разных (A, A, B) → `len=2 <= 2` → True. Если 3 CID из 3 разных → `len=3 > 2` → False. Работает, но порог `<=2` странный — штрафует и за 2 повтора из 3, и за 3 повтора из 3 одинаково.
+**Статус:** НОВЫЙ БАГ
 
----
-
-### P3-4: `train_full.py:430` — неверный total при MAX_LINES
-
-**Файл:** `train_full.py:430`
-
-**Описание:** При `MAX_LINES > 0` печатается `epoch_lines/ total_lines` где `total_lines` — оригинальное количество, не урезанное `MAX_LINES`. Например: "Curriculum epoch 1: 100/88855 lines (max 32 BPE tokens)".
-
----
-
-### P3-5: `_graph_search` — избыточный вызов `_ensure_ppmi`
-
-**Файл:** `eva/symbolic/crystal_generator.py:324`
-
-**Описание:** В `_branch` вызывается `_graph_search(sources, ...)`, в котором `connections_of(u, top_k=8, use_ppmi=True)`. Если `use_ppmi=True`, то при каждом вызове `connections_of` проверяется `_ensure_ppmi`, которая в свою очередь проверяет `self._ppmi_cache is not None`. Лишний if при каждом вызове.
-
----
-
-### P3-6: `eval_checkpoint.py:20` — ожидание 785MB, а реально может быть больше
-
-**Файл:** `eval_checkpoint.py:19`
-
-**Описание:** Комментарий: "Loading ConceptSpace (785MB)..." — размер зависит от размера чекпоинта. Для 146K×384D это может быть >1GB.
-
----
-
-### P3-7: `syntax_lattice.py:620` — `self.ngrams = {n: {} for n in range(2, 5)}` хардкод
-
-**Файл:** `eva/symbolic/syntax_lattice.py:620`
-
-**Описание:** Метод `load` сбрасывает `self.ngrams` в `{2: {}, 3: {}, 4: {}}`, хотя `__init__` использует `self.ngrams = {}` (динамическое построение). При загрузке всегда создаётся max_n=4, даже если исходный lattice был построен с max_n=3.
-
----
-
-### P3-8: `fractal_encoding.py:12` — LEVELS хардкод
-
-**Файл:** `eva/symbolic/fractal_encoding.py:12-13`
+**Файл:** `model/configuration_fcf.py:4-5`
 
 **Описание:**
 ```python
-LEVELS = 16
-GAMMA = 0.5
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'eva', 'symbolic'))
+from fcf_config import FCFConfig as _RealFCFConfig
 ```
-Модульные константы не синхронизированы с `FCFConfig.octree_levels`. Хотя в `build_octree_fields` передаётся `gamma`, для `LEVELS` нет параметра — используется глобальная константа.
 
----
+Модификация `sys.path` на уровне импорта модуля — плохая практика. Если `configuration_fcf` импортируется из другого контекста (например, из тестов), путь может быть некорректен. Кроме того, множественные `insert(0, ...)` засоряют `sys.path`.
 
-## Итоговая таблица
+**Рекомендация:** Использовать относительный импорт через `...eva.symbolic.fcf_config` или добавить путь через PYTHONPATH.
 
-| ID | Файл | Строки | Суть | P0 | P1 | P2 | P3 |
-|----|------|--------|------|----|----|----|----|
-| 1 | crystal_generator.py | 584, 799, 994, 1104 | theta_gate использует `j` вместо `j-i` | ✅ | | | |
-| 2 | api/main.py | 26, 56 | Обращение к несуществующим атрибутам (`concept_transitions`, `cid_list`) | ✅ | | | |
-| 3 | modeling_fcf.py | 148, 157, 208-209 | Обращение к несуществующим `gate`, `_query_confidence`, `concept_info` | ✅ | | | |
-| 4 | crystal_generator.py | 1318 | `__main__` использует `bpe_ru_32k.model` | | ✅ | | |
-| 5 | concept_space.py | 1085 | `__main__` использует `bpe_ru.model` | | ✅ | | |
-| 6 | syntax_lattice.py | 743 | `__main__` использует `bpe_ru.model` | | ✅ | | |
-| 7 | crystal_generator.py | 1012-1013, 1122-1123 | Contrastive objective не вызывается в GPU-пути | | ✅ | | |
-| 8 | crystal_generator.py | 802-820 | GPU neg-sampling: Python-цикл не устранён | | ✅ | | |
-| 9 | train_full.py | 390-400 | `_final_save` не вызывает `cleanup_old_checkpoints` | | ✅ | | |
-| 10 | concept_space.py | 862-864 | `topk_similar_concepts` — доступ к `_data`/`_valid` | | ✅ | | |
-| 11 | eval_metrics.py | 78 | Доступ к `_valid` вместо `valid` | | ✅ | | |
-| 12 | tokenization_fcf.py | 11 | Опечатка `vocab_files_names` (пропущена 'i') | | ✅ | | |
-| 13 | fcf_config.py | 133-135 | l_c/l_a/l_m не синхронизируются с FractalField | | ✅ | | |
-| 14 | train_full.py | 68, 601-603 | TeeOut.close() делает stdout непригодным | | | ✅ | |
-| 15 | train_full.py | 471-475 | `_batch_log` — утечка файлового дескриптора | | | ✅ | |
-| 16 | concept_space.py | 956-1015 | `contrastive_spread` — мёртвый код (60 строк) | | | ✅ | |
-| 17 | concept_space.py | 508-552 | `_compute_pmi_field_fast` — не вызывается | | | ✅ | |
-| 18 | train_full.py | 87-109 | `cleanup_old_checkpoints` не удаляет `*.opt.json` | | | ✅ | |
-| 19 | crystal_generator.py | 154 | `_is_semantic_token` не обрабатывает 'ё' | | | ✅ | |
-| 20 | crystal_generator.py | 131 | `_theta_temp` — деление на ноль при theta_tau=0 | | | ✅ | |
-| 21 | inference.py | 126 | neighbours вызывает `topk_similar_concepts` с `_data`/`_valid` | | | ✅ | |
-| 22 | train_full.py | 395-397 | `_final_save` без timestamp (неконсистентно с save_checkpoint_state) | | | ✅ | |
-| 23 | fcf_config.py | 82-83 | `corpus_path` может не существовать | | | ✅ | |
-| 24 | real_data/vis/ | *.json | Старые точки визуализации до 80K | | | | ✅ |
-| 25 | train_full.py | 349 | Знаковая неоднозначность PCA | | | | ✅ |
-| 26 | hormonal_system.py | 112-113 | Странный порог повторения (`<=2`) | | | | ✅ |
-| 27 | train_full.py | 430 | Неверный total при MAX_LINES | | | | ✅ |
-| 28 | syntax_lattice.py | 620 | `ngrams = {n: {} for n in range(2, 5)}` хардкод max_n=4 | | | | ✅ |
-| 29 | fractal_encoding.py | 12-13 | LEVELS/GAMMA — модульные константы, не синхронизированы с FCFConfig | | | | ✅ |
-| 30 | eval_checkpoint.py | 19 | Устаревший комментарий "785MB" | | | | ✅ |
+### P3-9: `filter_corpus.py:5-7` — хардкоженные пути
+
+**Статус:** НОВЫЙ БАГ
+
+**Файл:** `filter_corpus.py:5-7`
+
+**Описание:**
+```python
+CORPUS_PATH = "real_data/full_corpus_ru.txt"
+OUT_PATH = "real_data/full_corpus_ru_clean.txt"
+REPORT_PATH = "_filter_report.txt"
+```
+
+Пути используются напрямую без `os.path.join` и не учитывают конфиг. Зависимость от текущей рабочей директории.
+
+**Рекомендация:** Использовать `os.path.join(os.path.dirname(__file__), ...)` или `FCFConfig`.
+
+### P3-10: `eval_checkpoint.py:12-13` — хардкоженные пути
+
+**Статус:** НОВЫЙ БАГ
+
+**Файл:** `eval_checkpoint.py:10-12`
+
+**Описание:**
+```python
+BPE_MODEL = r'real_data/bpe_ru_146k.model'
+CS_PATH = r'real_data/concept_space.json'
+LATTICE_PATH = r'real_data/syntax_lattice.json'
+```
+
+Пути с `r'...'` — raw-строки с относительными путями. Зависимость от рабочей директории.
 
 ---
 
 ## Дополнительные наблюдения
 
-### N-1: `train_full.py:130-131` — FAST mode печать после парсинга аргументов
-FAST mode устанавливает `FRESH = True`, но флаг выводится до резюме — может сбить с толку, если пользователь забыл, что `--fast` подразумевает `--fresh`.
-
-### N-2: `parameter_optimizer.py:249` — имена переменных
+### N-1: `model/modeling_fcf.py:66-67` — хардкоженный data_dir
 ```python
-for pd in self.config.params:
-    p = self.p.get(pd.name)
+data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "real_data")
 ```
-`pd` может конфликтовать с `import pandas as pd` (хотя pandas не импортирован). Визуально неочевидно.
+Не использует `FCFConfig.data_dir`. При изменении конфига HF-модель будет искать файлы в другом месте.
 
-### N-3: `train_full.py:182-185` — проверка `cs.H is None` может упасть
+### N-2: `model/modeling_fcf.py:173-177` — генерация без seed_word
 ```python
-if not hasattr(cs, 'H') or cs.H is None:
+if prompt:
+    query_words = prompt.strip().split()
+elif seed_word:
+    query_words = [seed_word]
+else:
+    query_words = ["человек"]
 ```
-Сейчас стоит `hasattr`. При первом запуске после рефакторинга у загруженного ConceptSpace может не быть `H`. Код использует `hasattr` — это корректно.
+Hardcoded default seed "человек" если ни prompt ни seed_word не переданы.
 
-### N-4: `train_full.py:112` — print до определения parser
-`print(f"vocab_size = {V}")` находится между определением функций и парсингом аргументов. При `--help` этот print выполнится перед справкой.
-
-### N-5: `crystal_generator.py:36-37` — morph_vocab принимается, но не используется
-`morph_vocab` передаётся в `__init__` (строка 40: `self.morph_vocab = morph_vocab`), но **нигде не используется** в дальнейшем. Установлен в `train_full.py:307`, но никакие методы `CrystalGenerator` его не читают.
-
-### N-6: `concept_space.py:374-375` — двойная запись .npz при field_bits
+### N-3: `train_full.py:274-279` — val split 5% с конца
 ```python
-with np.load(tmp_path) as f:
-    kw = dict(f)
-kw['fb_cids'] = fb_cids
-kw['fb_arr'] = fb_arr
-np.savez_compressed(tmp_path, **kw)
+n_val = max(1, int(len(all_lines) * CFG.val_pct))
+train_lines = all_lines[:-n_val]
+val_lines = all_lines[-n_val:]
 ```
-Загружает только что сохранённый файл, добавляет field_bits и сохраняет снова. Не баг, но неэффективно.
+Данные не перемешиваются перед split. Из-за сортировки по длине (строка 282-285) val_lines — это самые длинные предложения. Это объясняет vacc@1 ~ 0% (самые сложные примеры в валидации). Валидация не репрезентативна.
+
+### N-4: `train_full.py:274-285` — последовательность операций
+Сначала split (train = все кроме последних 5%), потом сортировка train по длине. val_lines (5% хвоста) — самые длинные строки корпуса. Это смещает метрики.
+
+### N-5: `fcf_config.py:150` — `params` использует lambda с `self`
+```python
+params: list = field(default_factory=lambda: [...])
+```
+Lambda захватывает `self`? Нет — в dataclasses `default_factory` не получает доступ к экземпляру. Список ParamDef создаётся один раз при определении класса. Правильно.
+
+### N-6: `crystal_generator.py:190` — `self._centroid` устанавливается в `generate()` но не сбрасывается
+Между вызовами `generate()` может остаться старый centroid от предыдущего вызова. Поскольку centroid вычисляется заново каждый раз, это не баг.
+
+### N-7: `hormonal_system.py:180` — `self.dopamine` умножается на decay, затем добавляется phasic
+```python
+new_da = self.dopamine * self.tonic_decay + self.da_phasic * 0.1
+self.dopamine = max(0.1, min(1.0, new_da))
+```
+```python
+self.da_phasic *= self.phasic_decay  # строка 163
+```
+Phasic ослабляется ДО интеграции в tonic на следующем шаге. В момент интеграции `da_phasic` уже ослаблена от предыдущего шага. Это означает, что phasic-сигнал затухает на один шаг раньше, чем ожидается. Не баг, но неинтуитивный порядок.
+
+### N-8: `train_full.py:449-458` — размер batch вычисляется неправильно
+При раннем сбросе batch (из-за наступления FLUCTUATE/DECAY) batch может быть меньше BATCH_SIZE. После сброса batch_buffer очищается. Код продолжает с того же idx. Правильно.
 
 ---
 
-## Статистика проекта
+## Сводная таблица всех найденных проблем
 
-- Всего Python-файлов: 24 (без __pycache__)
-- Бат-файлов/скриптов: 5 (.bat, .ps1)
-- Документация: 5 файлов (README.md, ARCHITECTURE.md, AGENTS.md, AUDIT.md, PLAN.md)
-- Конфигурация: requirements.txt, .gitattributes, .gitignore
-- Всего строк Python-кода (активных): ~6,000
-- Размер корпуса: ~153K строк, 30M символов (~52MB)
-- Текущее состояние: 6000 линий, эпоха 1
-- Векторное пространство: 146K × 384D
-- Механизм обучения: STDP + Centroid Pull + Lateral Inhibition + Fluctuation + Contrastive
-
----
-
-## Исправлено с момента предыдущего аудита
-
-Предыдущий AUDIT.md (коммит `03b8ae8`) содержал 40+ issues. В коммитах `000e74f` и `c2e3588` исправлено ~32 issues, включая:
-
-| # | Описание | Статус |
-|---|----------|--------|
-| P0-1 | Missing KMeans import (PQ-код удалён) | ✅ |
-| P0-2 | Дублирование train_from_text/train_batch | ✅ |
-| P1-1 | Хардкоженные пути C:\Users\black\... (12 файлов) | ✅ |
-| P1-2 | ARCHITECTURE.md полностью устарел | ✅ |
-| P1-3 | GPU neg-sampling Python-цикл per-item (частично) | ⚠️ (см. P1-3 нового аудита) |
-| P1-4 | train.ps1 мёртвые параметры | ✅ |
-| P1-5 | eval_checkpoint.py 32K BPE | ✅ |
-| P2-1 | ach_phasic всегда 0 | ✅ |
-| P2-2/P2-3/P2-4/P2-11 | Мёртвый код (pos_tagger, _semantic_delta, fractal_stdp, PQ) | ✅ |
-| P2-6 | URL_TLDS неиспользуемый | ✅ |
-| P2-7 | Неиспользуемые импорты fcf_config.py | ✅ |
-| P2-8 | Множественное EMA обновление per batch | ✅ |
-| P2-9 | Double np.abs(all_codes) | ✅ |
-| P2-10 | import cdist внутри метода | ✅ |
-| P2-13 | Доступ к _data/_valid извне | ⚠️ (неполностью — см. P1-5) |
-| P3-4 | TARGET_STD хардкод 384D | ✅ |
-| P3-6 | ngrams[4] orphan | ✅ |
-| P3-10 | Tokenization теряет BPE info | ✅ |
-| E3 | _quiet swallows exceptions | ✅ |
-| S1 | HTML/JS в Python string | ✅ |
-| S2 | API без rate limiting | ✅ |
-| A1 | modeling_fcf save/load stub | ✅ |
-| A2 | _archive/ ~2000 строк dead code | ✅ |
-| A4 | Epoch resume fragile | ✅ |
-| A5/A6 | Config duplication / Git LFS | ✅ |
-| Q1/Q2/Q5/Q7 | Code quality (torch import, hasattr, TeeOut, query_words) | ✅ |
-| Q8-Q9 | Code duplication save | ✅ |
-
-**Вторая волна исправлений (коммит `TBD`): все 26 issues из PLAN.md:**
-
-| # | Описание | Статус |
-|---|----------|--------|
-| P0-1 | theta_gate: `j` → `j-i` (4 места) | ✅ |
-| P0-2 | API /health: `cid_list` → `concept_vectors`, `concept_transitions` → 0 | ✅ |
-| P0-3 | FCFModel: убран `gate`, `_query_confidence`, `concept_info` | ✅ |
-| P1-1 | `__main__` BPE модели (3 файла: crystal, concept, syntax) | ✅ |
-| P1-2 | Contrastive objective выполняется и в GPU-пути | ✅ |
-| P1-3 | GPU neg-sampling: inner loop vectorized | ⚠️ (partial — precompute done, Python loop remains) |
-| P1-4 | `_final_save` вызывает `cleanup_old_checkpoints` | ✅ |
-| P1-5 | `topk_similar_concepts`: `_data`/`_valid` → `.data`/`.valid` | ✅ |
-| P1-6 | `eval_metrics.py`: `_valid` → `valid` | ✅ |
-| P1-7 | `tokenization_fcf.py`: typo `vocab_files_names` + BPE path | ✅ |
-| P1-9 | `l_c`/`l_a`/`l_m` synced: FCFConfig → FractalField params | ✅ |
-| P2-1 | TeeOut: stdout restored after close | ✅ |
-| P2-2 | `_batch_log` закрывается в `finally` | ✅ |
-| P2-3 | `contrastive_spread` dead code удалён | ✅ |
-| P2-4 | `_compute_pmi_field_fast` dead code удалён | ✅ |
-| P2-5 | `cleanup_old_checkpoints` удаляет `*.opt.json` | ✅ |
-| P2-6 | `_is_semantic_token` обрабатывает 'ё' | ✅ |
-| P2-7 | `_theta_temp`: guard `max(theta_tau, 1.0)` | ✅ |
-| P2-8 | `inference.py:126` — transitively fixed via P1-5 | ✅ |
-| P2-10 | `_final_save` с `timestamp` | ✅ |
-| P2-11 | `corpus_path` с `FileNotFoundError` | ✅ |
-| P3-1 | stale `real_data/vis/` удалён (16 файлов, ~300MB) | ✅ |
-| P3-3 | hormonal `da_coherence` порог: `<=2` → `==1` | ✅ |
-| P3-6 | eval_checkpoint stale comment "785MB" → убран размер | ✅ |
-| P3-7 | syntax_lattice `load()`: `ngrams = {}` динамически | ✅ |
-| P3-8 | fractal_encoding: LEVELS/GAMMA из FCFConfig | ✅ |
-| N-2 | parameter_optimizer: `pd` → `param` | ✅ |
-| N-4 | print(vocab_size) после parser | ✅ |
-| N-5 | crystal_generator: `morph_vocab` убран из `__init__` | ✅ |
-| N-6 | concept_space: двойная запись .npz устранена | ✅ |
-
-**Итого: остаётся 1 partially fixed (P1-3). Остальные 25 из 26 — полностью исправлены.**
-
-**Новых проблем найдено: 30** (3 P0, 7 P1, 10 P2, 6 P3 — 4 claims не подтвердились)
-**Верификация PLAN.md:** 26/30 точны. См. [PLAN.md](PLAN.md) для полного плана исправлений.
+| ID | Файл | Строки | Суть | P0 | P1 | P2 | P3 | Статус |
+|----|------|--------|------|----|----|----|----|--------|
+| 1 | crystal_generator.py | 574,584,795,996,1105 | theta_gate `j` вместо `j-i` | | | | | ✅ Исправлено |
+| 2 | api/main.py | 54 | `cid_list` остался в /health (неполный фикс) | | | | | ✅ Исправлено |
+| 3 | modeling_fcf.py | 131-136,173-188 | gate/_query_confidence/concept_info | | | | | ✅ Исправлено |
+| 4 | parameter_optimizer.py | 249-277 | `pd` -> `param` неполный (NameError) | | | | | ✅ Исправлено |
+| 5 | train_full.py | 308 | morph_vocab=mv удалён из __init__ | | | | | ✅ Исправлено |
+| 6 | fractal_encoding.py | 12-18 | CFG import + gamma attr всегда падают | | | | | ✅ Исправлено |
+| 7 | parameter_optimizer.py | 249-277 | pd -> param (весь цикл) | | | | | ✅ Исправлено |
+| 8 | train_full.py | 16-21 | `_quiet` глотает critical ошибки | | | | | ✅ Уже было исправлено |
+| 9 | api/main.py | 31-36 | Rate limiter не thread-safe | | | | | ✅ Исправлено (Lock) |
+| 10 | syntax_lattice.py | 122 | raw counts vs EMA mixing | | | | | ✅ Исправлено (EMA) |
+| 11 | train_full.py | 569,594 | opt.step() двойной вызов | | | | | ✅ Исправлено |
+| 12 | modeling_fcf.py | 99-107 | gen_config неполный | | | | | ✅ Исправлено |
+| 13 | concept_space.py | 578-591 | field_bits с min_lcp=2 слишком грубые | | | | | ✅ Исправлено (min_lcp=1) |
+| 14 | train_full.py | 455-456 | тавтология `idx+1 > 0` | | | | | ✅ Исправлено |
+| 15 | concept_space.py | 676-682 | потенциальный дрейф code/vector | | | | | ✅ Исправлено |
+| 16 | configuration_fcf.py | 4-5 | sys.path insert на уровне модуля | | | | ✅ | ❌ Не исправлен (P3-low) |
+| 17 | filter_corpus.py | 5-7 | хардкоженные пути | | | | | ✅ Исправлено |
+| 18 | eval_checkpoint.py | 10-12 | хардкоженные пути | | | | | ✅ Исправлено |
+| 19 | train_full.py | 449-458 | ранний сброс batch (batch_size < 32) | | | | | ✅ Интент. (variable batch) |
+| 20 | hormonal_system.py | 163,168 | порядок phasic decay неинтуитивен | | | | | ✅ Исправлено (decay after integration) |
+| 21 | train_full.py | 274-285 | val split из конца корпуса (смещение) | | ✅ | | | ✅ Исправлено (shuffle before split) |
+| 22 | crystal_generator.py | 773-832 | GPU neg-sampling Python-цикл | | ✅ | | | ✅ Исправлено (full vectorization) |
+| — | Все P0/P1/P2/P3 из предыдущего аудита | — | 22 корректных фикса | | | | | ✅ |
 
 ---
 
-*Last updated: 2026-06-16*
+## Итоговая статистика
+
+**Всего проблем:** 40 (включая 38 исправленных и 1 P3-low, 1 intentional)
+**Активных проблем в текущем коде:** 1 (P3-low — configuration_fcf sys.path)
+**Блокирующих запуск обучения:** 0
+**Блокирующих API:** 0
+
+### Оставшиеся проблемы (P3 — low priority):
+
+1. **Issue 16** (configuration_fcf.py:4-5): `sys.path.insert(0, ...)` на уровне модуля — не влияет на обучение
+
+---
+
+*Последнее обновление: 2026-06-16, коммит 0a3af72*

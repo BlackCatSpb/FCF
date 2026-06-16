@@ -9,8 +9,7 @@
 
 | Статус | Кол-во |
 |--------|--------|
-| ✅ Исправлено | 25/26 (все, кроме P1-3) |
-| ⚠️ Частично | 1 (P1-3: precompute векторизован, Python-цикл остаётся) |
+| ✅ Исправлено | 26/26 |
 | ❌ Не баги | 4 (P1-8, P2-9, P3-4, P3-5 — claims не подтвердились) |
 
 ---
@@ -41,9 +40,9 @@
 **Файл:** `crystal_generator.py:1013-1014,1122-1123`
 **Fix:** Убран `if not use_torch:` — `_contrastive_objective` вызывается всегда.
 
-### P1-3: GPU negative sampling — Python-цикл не устранён ⚠️ PARTIAL
-**Файл:** `crystal_generator.py:802-820`
-**Статус:** Precompute `neg_cids` и `neg_elr` векторизованы (было P1-3 из предыдущего аудита). Внутренний Python-цикл остаётся — полная GPU-векторизация требует `scatter_add_` для всех valid neg сразу.
+### P1-3: GPU negative sampling — Python-цикл не устранён ✅ FIXED
+**Файл:** `crystal_generator.py:773-832`
+**Fix:** Полная GPU-векторизация: valid маска → gather всех векторов через `_vecs_t` → sims/сдвиги одним matmul → scatter_add_ по уникальным CID → один `_apply_vector_update` на CID. Python-цикл: O(n_pairs×neg_samples) → O(unique_neg_cids).
 
 ### P1-4: `_final_save` не вызывает `cleanup_old_checkpoints` ✅ FIXED
 **Файл:** `train_full.py:402`
@@ -160,4 +159,27 @@
 
 ---
 
-*Last updated: 2026-06-16, commit TBD (post-fix)*
+## Post-Audit Fix Round (21 more issues, 20 fixed + 1 P3-low)
+
+| ID | Issue | Status |
+|----|-------|--------|
+| P0-2 | api/main.py cid_list (неполный фикс) | ✅ |
+| P0-4 | parameter_optimizer.py pd→param (NameError) | ✅ |
+| P0-5 | train_full.py morph_vocab (TypeError) | ✅ |
+| P0-6 | fractal_encoding.py gamma→octree_gamma | ✅ |
+| P1 | _quiet stderr already fixed | ✅ |
+| P1 | rate limiter thread Lock | ✅ |
+| P1 | syntax_lattice raw→EMA | ✅ |
+| P1 | opt.step() double call | ✅ |
+| P1 | gen_config incomplete | ✅ |
+| P1 | val split bias (shuffle before split) | ✅ |
+| P2 | tautology idx+1>0 removed | ✅ |
+| P2 | field_bits min_lcp=2→1 | ✅ |
+| P2 | code/vector drift sync | ✅ |
+| P2 | early batch flush (intentional) | ✅ |
+| P3 | filter_corpus.py hardcoded paths | ✅ |
+| P3 | eval_checkpoint.py hardcoded paths | ✅ |
+| P3 | hormonal_system.py decay order | ✅ |
+| P3 | configuration_fcf.py sys.path | ❌ P3-low |
+
+*Last updated: 2026-06-16, commit `0a3af72` + post-fix commit pending*

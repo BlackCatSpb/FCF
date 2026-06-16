@@ -99,10 +99,14 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         gen_config = {
             "beam_width": self.config.beam_width,
             "max_words": self.config.max_length,
+            "min_words": 3,
             "concept_temp": self.config.concept_temp,
-            "word_temp": self.config.word_temp,
             "theta_tau": self.config.theta_tau,
             "learning_rate": self.config.learning_rate,
+            "top_p": 0.9,
+            "len_norm_alpha": 0.7,
+            "block_ngram": 4,
+            "mmi_lambda": 0.2,
         }
         self._generator = CrystalGenerator(self._space, self._tok, self._lattice, gen_config)
 

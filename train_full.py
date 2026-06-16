@@ -9,7 +9,7 @@ os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
 import sys; sys.path.insert(0, os.path.dirname(__file__))
-import time, json, os, shutil, argparse, glob
+import time, json, os, shutil, argparse, glob, random
 import io
 import numpy as np
 
@@ -274,9 +274,12 @@ def get_lr(line_idx):
 with open(CFG.corpus_path, 'r', encoding='utf-8') as f:
     all_lines = [l.strip() for l in f if l.strip()]
 
+# Shuffle before split so val set isn't biased toward longest lines
+rng = random.Random(42)
+rng.shuffle(all_lines)
 n_val = max(1, int(len(all_lines) * CFG.val_pct))
-train_lines = all_lines[:-n_val]
-val_lines = all_lines[-n_val:]
+val_lines = all_lines[:n_val]
+train_lines = all_lines[n_val:]
 
 # ── Curriculum: sort train lines by BPE length (short → easy first) ──
 train_lens = [len(sp.encode(l)) for l in train_lines]
@@ -305,7 +308,7 @@ LIVE_REFRESH = 1.0  # seconds between live status updates
 COS_REFRESH = 5.0   # seconds between cos/pair recomputation
 
 print("STDP training...")
-gen = CrystalGenerator(cs, sp, lattice, morph_vocab=mv)
+gen = CrystalGenerator(cs, sp, lattice)
 gen.train_lr = opt.p['full_lr'].current
 t_start = time.time()
 
@@ -452,8 +455,8 @@ try:
 
             if len(batch_buffer) < BATCH_SIZE and idx < start_line + len(epoch_train) - 1:
                 # Check if periodic tasks are due — if so, flush early
-                next_fluct = idx + 1 > 0 and (idx + 1 - last_fluct_lines) >= FLUCTUATE_EVERY
-                next_decay = idx + 1 > 0 and (idx + 1 - last_decay_lines) >= DECAY_EVERY
+                next_fluct = (idx + 1 - last_fluct_lines) >= FLUCTUATE_EVERY
+                next_decay = (idx + 1 - last_decay_lines) >= DECAY_EVERY
                 if not next_fluct and not next_decay:
                     continue
 
@@ -566,9 +569,6 @@ try:
                 if n_code_out > 0 or vec_max_dev > CFG.vec_dev_warn:
                     print(f"  CODE_DRIFT n_out={n_code_out} max|code|={max_code_abs:.1f} vec_dev={vec_max_dev:.6f}")
 
-                opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new)
-                gen.train_lr = opt.p['full_lr'].current
-
                 seed = np.random.choice(CFG.test_seeds)
                 result = gen.generate(seed_word=seed, max_words=CFG.gen_max_words)
                 txt = result['text'].replace('\n', ' ').strip()
@@ -578,21 +578,24 @@ try:
                 if idx % (CHECKPOINT_EVERY * 5) == 0:
                     _quiet(save_3d_vis, cs, sp, ckpt_name)
 
+                eval_vppl = eval_acc1 = eval_vacc1 = None
                 if idx > 0 and idx % EVAL_EVERY_F == 0:
                     eval_result = _quiet(gen.evaluate, CFG.val_corpus_path, max_lines=CFG.eval_max_lines)
                     ppl = eval_result['perplexity']
-                    vppl = eval_result['vec_perplexity']
-                    acc1 = eval_result['accuracy_top1']
-                    vacc1 = eval_result['vec_accuracy_top1']
+                    eval_vppl = eval_result['vec_perplexity']
+                    eval_acc1 = eval_result['accuracy_top1']
+                    eval_vacc1 = eval_result['vec_accuracy_top1']
                     ppl_history.append((idx, ppl))
-                    vppl_history.append((idx, vppl))
+                    vppl_history.append((idx, eval_vppl))
                     ppl_trend = ''
                     if len(ppl_history) >= 2:
                         d = ppl - ppl_history[-2][1]
                         ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
-                    print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={acc1:.3f} vPPL={vppl:.0f} vacc@1={vacc1:.3f}")
-                    opt.step(vec_ppl=vppl, acc1=acc1, vacc1=vacc1)
-                    gen.train_lr = opt.p['full_lr'].current
+                    print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
+
+                opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
+                         vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
+                gen.train_lr = opt.p['full_lr'].current
                 print()
 
 except KeyboardInterrupt:

@@ -1,10 +1,11 @@
 import re
-import sys
+import sys, os
 from collections import Counter
 
-CORPUS_PATH = "real_data/full_corpus_ru.txt"
-OUT_PATH = "real_data/full_corpus_ru_clean.txt"
-REPORT_PATH = "_filter_report.txt"
+_BASE = os.path.dirname(os.path.abspath(__file__))
+CORPUS_PATH = os.path.join(_BASE, "real_data", "full_corpus_ru.txt")
+OUT_PATH = os.path.join(_BASE, "real_data", "full_corpus_ru_clean.txt")
+REPORT_PATH = os.path.join(_BASE, "_filter_report.txt")
 
 CYRILLIC = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
 LATIN = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")

@@ -159,14 +159,14 @@ class HormonalSystem:
         self.acetylcholine += self.ach_phasic * 0.1
         self.acetylcholine = max(0.1, min(1.0, self.acetylcholine))
 
-        # ---- Decay phasic signals ----
-        self.da_phasic *= self.phasic_decay
-        self.ach_phasic *= self.phasic_decay
-
-        # ---- Integrate phasic into tonic ----
+        # ---- Integrate phasic into tonic BEFORE decay ----
         # Floor at 0.1 so model doesn't get stuck in anhedonia
         new_da = self.dopamine * self.tonic_decay + self.da_phasic * 0.1
         self.dopamine = max(0.1, min(1.0, new_da))
+
+        # ---- Decay phasic signals (after integration) ----
+        self.da_phasic *= self.phasic_decay
+        self.ach_phasic *= self.phasic_decay
 
         # Track reward
         self.reward_history.append(self.dopamine)

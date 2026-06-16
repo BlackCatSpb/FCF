@@ -118,8 +118,8 @@ class ParameterOptimizer:
 
         # Build params from config
         self.p = {}
-        for pd in config.params:
-            self.p[pd.name] = Param.from_def(pd)
+        for param in config.params:
+            self.p[param.name] = Param.from_def(param)
 
         self.m = {
             'mean_cos': MetricBuffer(10),
@@ -248,11 +248,11 @@ class ParameterOptimizer:
         # Apply rules from config
         for param in self.config.params:
             p = self.p.get(param.name)
-            if p is None or not pd.rules:
+            if p is None or not param.rules:
                 continue
 
             rule_applied = False
-            for rule in pd.rules:
+            for rule in param.rules:
                 if self._eval_trigger(rule.trigger, ctx):
                     old = p.current
                     if rule.action == 'scale':
@@ -265,16 +265,16 @@ class ParameterOptimizer:
                         p.toward_default(rule.rate)
 
                     if abs(p.current - old) > 1e-8:
-                        changes[pd.name] = p.current
+                        changes[param.name] = p.current
                     rule_applied = True
 
             # Drift to default if no rule fired
-            has_drift = any(r.action == 'toward_default' for r in pd.rules)
+            has_drift = any(r.action == 'toward_default' for r in param.rules)
             if not rule_applied and has_drift:
                 old = p.current
                 p.toward_default(0.02)
                 if abs(p.current - old) > 1e-8:
-                    changes[pd.name] = p.current
+                    changes[param.name] = p.current
 
         # Special: clamp neg_samples to int
         if 'neg_samples' in changes:

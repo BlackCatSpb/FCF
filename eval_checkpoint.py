@@ -1,5 +1,5 @@
 """Generation test from checkpoint — shows REAL text output."""
-import sys, os; sys.path.insert(0, os.path.dirname(__file__))
+import sys, os; _BASE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, _BASE)
 sys.stdout.reconfigure(encoding='utf-8')
 import time, json
 import sentencepiece as spm
@@ -7,9 +7,9 @@ from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 
-BPE_MODEL = r'real_data/bpe_ru_146k.model'
-CS_PATH = r'real_data/concept_space.json'
-LATTICE_PATH = r'real_data/syntax_lattice.json'
+BPE_MODEL = os.path.join(_BASE, 'real_data', 'bpe_ru_146k.model')
+CS_PATH = os.path.join(_BASE, 'real_data', 'concept_space.json')
+LATTICE_PATH = os.path.join(_BASE, 'real_data', 'syntax_lattice.json')
 
 print("Loading SentencePiece...")
 sp = spm.SentencePieceProcessor(model_file=BPE_MODEL)

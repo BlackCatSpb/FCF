@@ -119,7 +119,7 @@ class SyntaxLattice:
                 if len(ids) < 2:
                     continue
                 for c in ids:
-                    self.concept_freq[c] += 1
+                    self.concept_freq[c] = self.concept_freq.get(c, 0) * self.decay + 1.0
                     n_concepts[0] += 1
                 for n in range(2, max_n + 1):
                     for i in range(len(ids) - n + 1):

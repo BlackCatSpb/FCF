@@ -1,5 +1,5 @@
 """FastAPI server for FCF concept model."""
-import sys, os, time
+import sys, os, time, threading
 from collections import defaultdict
 
 # Add project root to path
@@ -29,14 +29,16 @@ async def lifespan(app: FastAPI):
 
 
 _rate_limit = defaultdict(list)
+_rate_limit_lock = threading.Lock()
 RATE_LIMIT_PER_MIN = 10
 
 def _check_rate_limit(client_ip: str) -> bool:
     now = time.time()
-    _rate_limit[client_ip] = [t for t in _rate_limit[client_ip] if now - t < 60]
-    if len(_rate_limit[client_ip]) >= RATE_LIMIT_PER_MIN:
-        return False
-    _rate_limit[client_ip].append(now)
+    with _rate_limit_lock:
+        _rate_limit[client_ip] = [t for t in _rate_limit[client_ip] if now - t < 60]
+        if len(_rate_limit[client_ip]) >= RATE_LIMIT_PER_MIN:
+            return False
+        _rate_limit[client_ip].append(now)
     return True
 
 
@@ -51,7 +53,7 @@ async def health(request: Request):
         raise HTTPException(503, "Model not loaded")
     return HealthResponse(
         status="ok",
-        concepts=len(model.space.cid_list),
+        concepts=len(model.space.concept_vectors),
         dimensions=model.space.dim,
         transitions=0,
     )

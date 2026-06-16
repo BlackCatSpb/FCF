@@ -771,9 +771,11 @@ class CrystalGenerator:
             )
 
     def _negative_sampling_gpu(self, gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, device, field_gate, base_lr_val, neg_lr_ratio, neg_samples):
-        """GPU batched negative sampling."""
+        """GPU-vectorized negative sampling (fully batched)."""
         cs = self.cs
         n_pairs = len(gpu_ctx_l)
+        if n_pairs == 0:
+            return
 
         ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
 
@@ -781,45 +783,60 @@ class CrystalGenerator:
             neg_idxs = torch.randint(0, len(self._torch_cid_order),
                                      (n_pairs, neg_samples), device=device)
 
+            # Field overlap filter
             if field_gate and self._fb_t is not None:
                 ctx_fb = self._fb_t[ctx_t]
                 neg_fb = self._fb_t[neg_idxs]
                 neg_ovs = (ctx_fb.unsqueeze(1) & neg_fb).sum(dim=2)
-                neg_ovs_cpu = neg_ovs.cpu().numpy()
+                valid_mask = neg_ovs == 0
             else:
-                neg_ovs_cpu = np.zeros((n_pairs, neg_samples), dtype=np.int64)
+                valid_mask = torch.ones(n_pairs, neg_samples, dtype=torch.bool, device=device)
 
-            neg_idxs_np = neg_idxs.cpu().numpy()
-            neg_cids_np = np.array(self._torch_cid_order)[neg_idxs_np]
+            # Flatten: collect all valid (pair, neg) combos
+            valid_idx = torch.nonzero(valid_mask)  # (N_valid, 2) — [pi, ni]
+            if valid_idx.numel() == 0:
+                return
+            valid_pi = valid_idx[:, 0]
+            valid_ni = valid_idx[:, 1]
+            n_valid = len(valid_pi)
+
+            # LR per valid sample (vectorized from meta)
             meta_arr = np.array(gpu_meta_l, dtype=np.float32)
             i_arr = meta_arr[:, 0].astype(np.int32)
             j_arr = meta_arr[:, 1].astype(np.int32)
             dist_arr = np.abs(j_arr - i_arr)
-            pmi_w_arr = meta_arr[:, 2]
-            dw_arr = meta_arr[:, 3]
-            fw_arr = meta_arr[:, 4]
             theta_gate_arr = np.exp(-np.minimum(dist_arr, 5.0) / max(self.theta_tau, 1.0))
-            neg_elr_arr = base_lr_val * np.maximum(fw_arr, 0.05) * dw_arr * pmi_w_arr * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
+            neg_elr_arr = base_lr_val * np.maximum(meta_arr[:, 4], 0.05) * meta_arr[:, 3] * meta_arr[:, 2] * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
+            valid_elr_t = torch.from_numpy(neg_elr_arr[valid_pi.cpu().numpy()]).to(device).unsqueeze(1)
 
-            for pi in range(n_pairs):
-                v_ctx = cs.concept_vectors.get(gpu_cid_ctx[pi])
-                if v_ctx is None:
-                    continue
-                neg_elr = neg_elr_arr[pi]
-                for ni in range(neg_samples):
-                    if field_gate and neg_ovs_cpu[pi, ni] > 0:
-                        continue
-                    neg_cid = int(neg_cids_np[pi, ni])
-                    v_neg = cs.concept_vectors.get(neg_cid)
-                    if v_neg is None:
-                        continue
-                    y = max(float(np.dot(v_neg, v_ctx)), 0.05)
-                    shift = (y * v_neg - v_ctx) * neg_elr
-                    v_new = v_neg + shift
-                    nv = np.linalg.norm(v_new)
-                    if nv > 1e-10:
-                        v_new /= nv
-                    cs._apply_vector_update(neg_cid, v_new)
+            # Gather neg CIDs and vectors from _vecs_t
+            neg_cids = torch.tensor(self._torch_cid_order, device=device)[neg_idxs]  # (n_pairs, neg_samples)
+            valid_neg_cids = neg_cids[valid_pi, valid_ni]  # (n_valid,)
+            valid_ctx_cids = torch.tensor(gpu_cid_ctx, device=device)[valid_pi]  # (n_valid,)
+
+            v_neg = self._vecs_t[valid_neg_cids]   # (n_valid, D)
+            v_ctx = self._vecs_t[valid_ctx_cids]    # (n_valid, D)
+
+            # Vectorized push-away: shift = (y * v_neg - v_ctx) * elr
+            sims = (v_neg * v_ctx).sum(dim=1, keepdim=True).clamp(min=0.05)  # (n_valid, 1)
+            shifts = (sims * v_neg - v_ctx) * valid_elr_t  # (n_valid, D)
+
+            # Accumulate shifts by unique neg CID (scatter_add_)
+            unique_neg_cids, inverse = torch.unique(valid_neg_cids, return_inverse=True)
+            n_unique = len(unique_neg_cids)
+            D = v_neg.shape[1]
+            acc_shifts = torch.zeros(n_unique, D, device=device)
+            acc_shifts.scatter_add_(0, inverse[:, None].expand(-1, D), shifts)
+
+            # Apply: read current vectors, apply accumulated shift, normalize
+            v_cur = self._vecs_t[unique_neg_cids]  # (n_unique, D)
+            v_new = v_cur + acc_shifts
+            norms = torch.norm(v_new, dim=1, keepdim=True).clamp(min=1e-10)
+            v_new = v_new / norms
+
+            # Apply — one _apply_vector_update per unique neg CID
+            for ui in range(n_unique):
+                cs._apply_vector_update(int(unique_neg_cids[ui]), v_new[ui].cpu().numpy())
 
     def _negative_sampling_cpu(self, gen_updates, neg_lr_ratio, field_gate, neg_samples):
         """Original negative sampling (non-torch path)."""

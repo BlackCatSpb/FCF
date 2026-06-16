@@ -12,7 +12,7 @@ hierarchical encoding that requires no corpus statistics.
 try:
     from eva.symbolic.fcf_config import CFG
     LEVELS = CFG.octree_levels
-    GAMMA = CFG.gamma
+    GAMMA = CFG.octree_gamma
 except (ImportError, AttributeError):
     LEVELS = 16
     GAMMA = 0.5

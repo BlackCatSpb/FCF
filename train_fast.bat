@@ -1,5 +1,5 @@
 @echo off
-cd /d "C:\Users\black\OneDrive\Desktop\FCF"
+cd /d "%~dp0"
 echo [EVA] FAST MODE at %date% %time%
 echo [EVA] Log: real_data\train_log.txt
 echo.

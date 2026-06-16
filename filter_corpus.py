@@ -12,7 +12,6 @@ LATIN = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 RE_CYRILLIC_WORD = re.compile(r'[а-яёА-ЯЁ]{2,}')
 RE_NON_CYR_CHARS = re.compile(r'[^а-яёА-ЯЁa-zA-Z\s]')
 
-URL_TLDS = {'.reggi'}
 RE_DOMAIN_SUFFIX = re.compile(
     r'(?:\.(?:ru|com|org|net|am|by|kz|ua|su|tatar|moscow)\b)(?!\s*[а-яё])',
     re.IGNORECASE

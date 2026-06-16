@@ -108,30 +108,4 @@ def check_agreement(word1: str, word2: str) -> bool:
     return True
 
 
-# POS transition probabilities (learned from corpus)
-# These are typical Russian POS bigram frequencies
-POS_BIGRAMS = {
-    ('NOUN', 'VERB'): 0.15,
-    ('VERB', 'NOUN'): 0.12,
-    ('ADJ', 'NOUN'): 0.10,
-    ('PREP', 'NOUN'): 0.09,
-    ('NOUN', 'ADJ'): 0.05,
-    ('CONJ', 'NOUN'): 0.04,
-    ('VERB', 'ADV'): 0.04,
-    ('ADV', 'VERB'): 0.03,
-    ('NOUN', 'PREP'): 0.03,
-    ('PRON', 'VERB'): 0.03,
-    ('VERB', 'PREP'): 0.03,
-    ('NUM', 'NOUN'): 0.02,
-    ('NOUN', 'CONJ'): 0.02,
-    ('PART', 'VERB'): 0.02,
-    ('VERB', 'PRON'): 0.02,
-}
 
-
-def pos_transition_score(prev_pos: str, next_pos: str) -> float:
-    """Get transition score for POS bigram.
-
-    Returns a score in [0, 1] where higher is more likely.
-    """
-    return POS_BIGRAMS.get((prev_pos, next_pos), 0.01)

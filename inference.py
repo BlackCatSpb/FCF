@@ -5,7 +5,7 @@ Usage:
   python inference.py --neighbours "война"   (top-10 neighbours)
   python inference.py --eval                 (run full eval, save JSON)
 """
-import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
+import sys; sys.path.insert(0, os.path.dirname(__file__))
 import os, json, time, glob, re, shutil, tempfile, argparse
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -106,20 +106,22 @@ class InferenceEngine:
         if n > 1e-10:
             centroid /= n
 
-        valid = self.cs.concept_vectors._valid
-        data = self.cs.concept_vectors._data[valid]
+        valid_idxs = np.where(self.cs.concept_vectors.valid)[0]
+        if len(valid_idxs) == 0:
+            return []
+        data = self.cs.concept_vectors.data[valid_idxs]
         sims = data @ centroid
         top_k = min(k, len(sims))
         idx = np.argpartition(-sims, top_k)[:top_k]
         idx = idx[np.argsort(-sims[idx])]
-        cids = np.where(valid)[0][idx]
+        cids = valid_idxs[idx]
 
         return [(int(cid), clean_sp(self.sp.IdToPiece(int(cid))) if int(cid) < self.sp.vocab_size() else f'[ID{cid}]',
                  float(sims[idx[i]])) for i, cid in enumerate(cids)]
 
     def neighbours(self, word, k=10):
         cid = self.sp.PieceToId(word)
-        if cid < 0 or not self.cs.concept_vectors._valid[cid]:
+        if cid < 0 or not self.cs.concept_vectors.valid[cid]:
             return []
         top = self.cs.topk_similar_concepts(cid, k=k)
         return [(int(c), clean_sp(self.sp.IdToPiece(int(c))) if int(c) < self.sp.vocab_size() else f'[ID{c}]',
@@ -148,12 +150,12 @@ class InferenceEngine:
             print(f"  vPPL={ev.get('vec_perplexity',0):.0f}  PPL={ev.get('perplexity',0):.0f}  "
                   f"acc@1={ev.get('accuracy_top1',0):.3f}")
 
-        n_valid = sum(self.cs.concept_vectors._valid)
+        n_valid = sum(self.cs.concept_vectors.valid)
         rng = np.random.RandomState(42)
         sampled = rng.choice([c for c in range(self.cs.vocab_size)
-                              if self.cs.concept_vectors._valid[c]],
+                              if self.cs.concept_vectors.valid[c]],
                              size=min(2000, n_valid), replace=False)
-        vecs = np.array([self.cs.concept_vectors._data[c] for c in sampled], dtype=np.float32)
+        vecs = np.array([self.cs.concept_vectors.data[c] for c in sampled], dtype=np.float32)
         triu = (vecs @ vecs.T)[np.triu_indices(len(sampled), k=1)]
         cos_mean, cos_std = float(triu.mean()), float(triu.std())
         results.update(vec_cos_mean=cos_mean, vec_cos_std=cos_std,

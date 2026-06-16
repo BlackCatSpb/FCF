@@ -46,6 +46,11 @@ class HormonalSystem:
         self.tonic_decay = 0.95    # hormone drift toward baseline
         self.phasic_decay = 0.7    # phasic signal decay per step
 
+        # Dynamic state (initialized here instead of via setattr)
+        self._prev_avg_match = 0.0
+        self._repetition_counter = 0
+        self._last_few_cids = []
+
     def update(self, confidence=0.5, is_match=False, novelty=0.0,
                surprise=0.0, expected_cid=None, gen_cid=None):
         """Update hormone levels based on generation event.
@@ -71,14 +76,8 @@ class HormonalSystem:
         avg_match = np.mean(self.recent_matches) if self.recent_matches else 0.0
 
         # Track match rate change (for mastery drive)
-        if not hasattr(self, '_prev_avg_match'):
-            self._prev_avg_match = avg_match
         delta_match = avg_match - self._prev_avg_match
         self._prev_avg_match = avg_match
-
-        # Track repetitive patterns (for boredom penalty)
-        if not hasattr(self, '_repetition_counter'):
-            self._repetition_counter = 0
 
         # ---- Dopamine: reward signal (phasic) ----
         # Three sources of reward:
@@ -106,8 +105,6 @@ class HormonalSystem:
         da_mastery = max(0, delta_match) * 0.5
 
         # Boredom penalty: repeating same cid multiple times
-        if not hasattr(self, '_last_few_cids'):
-            self._last_few_cids = []
         if gen_cid is not None:
             self._last_few_cids.append(gen_cid)
             if len(self._last_few_cids) > 5:
@@ -199,7 +196,7 @@ class HormonalSystem:
             'recent_confidences': self.recent_confidences[-20:],
             'recent_matches': self.recent_matches[-20:],
             '_prev_avg_match': self._prev_avg_match,
-            '_last_few_cids': getattr(self, '_last_few_cids', []),
+            '_last_few_cids': self._last_few_cids,
         }
 
     def load(self, data):
@@ -210,7 +207,7 @@ class HormonalSystem:
         self.step = data.get('step', 0)
         self.recent_confidences = data.get('recent_confidences', [])
         self.recent_matches = data.get('recent_matches', [])
-        self._prev_avg_match = data.get('_prev_avg_match', None)
+        self._prev_avg_match = data.get('_prev_avg_match', 0.0)
         self._last_few_cids = data.get('_last_few_cids', [])
 
 

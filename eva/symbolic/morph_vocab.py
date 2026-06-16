@@ -263,5 +263,5 @@ def build_morph_vocab(corpus_path='real_data/full_corpus_ru.txt',
 
 
 if __name__ == '__main__':
-    import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
+    import sys; sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
     build_morph_vocab()

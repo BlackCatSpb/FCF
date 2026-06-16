@@ -1,277 +1,90 @@
-# FCF — Field Concept Framework
+# FCF — Fractal Concept Framework
 
-Neuro-symbolic concept learning engine. No transformers. No neural networks. No gradient descent.
+Neuro-symbolic concept learning engine. No transformers. No gradient descent.
 
-**FCF** — это альтернативный подход к генерации текста. Вместо того чтобы предсказывать следующий токен по вероятности (как GPT), FCF представляет каждое слово как **концепт** — точку в многомерном семантическом пространстве. Генерация — это навигация по этому пространству: извлечь核心 запроса, исследовать его связи, выразить их словами.
+## Core Facts
 
----
+| Parameter | Value |
+|-----------|-------|
+| Concepts | 146,494 × 384D |
+| BPE model | `real_data/bpe_ru_146k.model` (SentencePiece) |
+| Training corpus | `real_data/full_corpus_ru_clean.txt` (152,946 lines, ~52 MB) |
+| GPU | MX550 (2 GB VRAM) |
+| Batch size | 32 |
+| Epoch time | ~7.3 h |
 
-## Оглавление
+## Core Components
 
-- [Как это работает](#как-это-работает)
-- [Архитектура](#архитектура)
-- [Четыре слоя](#четыре-слоя)
-  - [1. ConceptSpace — семантическое пространство](#1-conceptspace--семантическое-пространство)
-  - [2. SemanticGate — сито](#2-semanticgate--сито)
-  - [3. SyntaxLattice — граф связей](#3-syntaxlattice--граф-связей)
-  - [4. CrystalGenerator — генератор](#4-crystalgenerator--генератор)
-- [Обучение](#обучение)
-- [Запуск](#запуск)
-- [Структура проекта](#структура-проекта)
-- [Принципы и философия](#принципы-и-философия)
-- [Примеры работы](#примеры-работы)
+### `concept_space.py` — ConceptVectorStore, ConceptSpace
+- Fractal field encoding: concepts as latent codes projected via shared orthonormal basis
+- Subspace decomposition: identity (z_c), attention (z_a), meta (z_m) with per-subspace LR
+- Octree field bits via `fractal_encoding.py`: wLCH path, H_weighted, LCP-based prefix grouping
+- STDP (GPU: batched scatter_add, CPU: per-pair)
+- Lateral inhibition via Riemannian gradient descent
+- Centroid pull, sphere normalization, homeostatic boost
 
----
+### `crystal_generator.py` — Training & inference engine
+- `train_from_text()`, `train_batch()`, `evaluate()`, negative sampling
+- STDP transitions, PMI-gated connection learning, field fluctuation
+- Generation via concept navigation with RRF scoring
 
-## Как это работает
+### `fractal_encoding.py` — Octree path + H_weighted + LCP
+- `path(cid)` → octal digits, `H_weighted(p, q, gamma)` → weighted similarity
+- Used by `build_octree_fields()` for anchor → concept field bits
 
-Представь, что каждое слово — это звезда в космосе. "Человек" — одна звезда, "время" — другая, "бежать" — третья. Расстояние между звёздами — это семантическая близость: "человек" ближе к "мужчина", чем к "космос".
+### `fcf_config.py` — `FCFConfig` singleton
+- All training hyperparameters in one place
 
-Когда пользователь вводит запрос "какой человек", FCF:
+### `syntax_lattice.py` — N-gram lattice + connection graph
+- N-gram prefix tree for sequence statistics
+- Connection graph with typed edges (related_to, has_quality, etc.)
 
-1. **Gate** определяет, что тут core — "человек", а "какой" — модификатор (признак)
-2. Ищет в графе связей, какие концепты чаще всего встречаются рядом с "человек" (умный, добрый, высокий, работа, жизнь)
-3. Генерирует текст, оставаясь в семантическом поле core — каждое следующее слово должно иметь связь с "человек" либо с предыдущим словом
-4. Если связей нет (пустой граф), падает на n-граммы из корпуса, потом на векторных соседей
+### `parameter_optimizer.py` — LR schedule, PMI gate, homeostasis
 
-Результат — не предсказание токенов, а **выражение семантического поля** запроса.
+### Other modules
+- `morph_vocab.py` — morphological vocabulary (Natasha-based)
+- `pos_tagger.py` — POS tagging
+- `hormonal_system.py` — neuromodulation (ACh, NE, DA, 5HT)
+- `train_full.py` — training harness, batching, checkpointing
+- `inference.py` — read-only inference engine
+- `eval_metrics.py` — evaluation framework (val vPPL, vector metrics)
+- `model/` — HuggingFace wrappers (incomplete)
+- `api/main.py` — FastAPI REST API
 
----
+## Key Algorithms
 
-## Архитектура
+- **STDP**: GPU batched scatter_add; CPU per-pair with fracture-adjusted LR
+- **Lateral inhibition**: Riemannian gradient `-grad_R = sim·v - v_win`, tangent to sphere
+- **Centroid pull**: uniform sphere repulsion from global centroid
+- **Fractal fluctuation**: autonomous code drift with subspace-specific scaling
+- **Contrastive spread**: targeted repulsion of nearest-neighbor pairs
 
-```
-                    ┌──────────────┐
-                    │  Corpus text │
-                    └──────┬───────┘
-                           ▼
-                    ┌──────────────┐
-                    │ train_from_  │
-                    │   _text()    │
-                    └──────┬───────┘
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│                     CrystalGenerator                      │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │   SemanticGate (извлекает core + modifiers)        │  │
-│  └────────────────────┬───────────────────────────────┘  │
-│                       ▼                                    │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │   ConceptSpace (36K векторов на 128D сфере)        │  │
-│  └────────────────────┬───────────────────────────────┘  │
-│                       ▼                                    │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │   SyntaxLattice (connection graph + n-grams)       │  │
-│  └────────────────────┬───────────────────────────────┘  │
-│                       ▼                                    │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │   _branch() — field exploration с RRF scoring      │  │
-│  └────────────────────────────────────────────────────┘  │
-│                       ▼                                    │
-│                    Generated text                          │
-└──────────────────────────────────────────────────────────┘
+## Bug Fixes (see AUDIT.md)
 
-            ConceptTokenizer (BPE + morph_parse)
-                    pymorphy3 разбор слов
-```
+B1 (GPU lateral inhibition direction), C2/C3 (LR-weighted averaging),
+B5 (centroid pull sync), B3 (contrastive_spread gradient), R1 (dependencies).
 
----
-
-## Четыре слоя
-
-### 1. ConceptSpace — семантическое пространство
-
-Хранит 36 273 концепта, каждый в виде:
-
-- **Vector** — 128D на единичной сфере (нормализован)
-- **Anchor** — нормальная форма слова ("человек", "хороший", "бежать")
-- **Satellites** — морфологические варианты (человека, человеку, человеком)
-- **Transitions** — вероятности перехода между концептами
-
-**Ключевые механизмы:**
-
-**Аффиксные сдвиги.** Русский язык богат морфологией: "хороший" → "хорошая", "хорошему", "хорошим". Вместо отдельного концепта для каждой формы — один концепт ("хороший") + векторный сдвиг для каждого аффикса. Префикс "по-" сдвигает вектор в одну сторону, окончание "ая" — в другую. Сдвиги инициализируются случайно и уточняются через обучение.
-
-**STDP на сфере.** Spike-Timing-Dependent Plasticity, адаптированная для единичной сферы:
-- Если два концепта встречаются подряд (core + modifier), их векторы сближаются (LTP)
-- Если встречаются, но не ожидались — отталкиваются (LTD)
-- Латеральное торможение: похожие концепты отталкиваются от победителя
-- Это **риманов градиент** — движение по поверхности сферы, а не в евклидовом пространстве
-
-**Матричный NN-поиск.** Для быстрого поиска ближайших соседей все 36K векторов собраны в одну матрицу (36 273 × 128). Поиск = один матричный multiply (`mat @ vec`). Перестраивается при изменениях (dirty flag).
-
-**Адаптивное создание концептов.** Если центроид запроса далёк от всех существующих концептов (>0.8 по расстоянию), gate создаёт новый концепт автоматически. Система сама решает, сколько векторного пространства ей нужно.
-
-### 2. SemanticGate — сито
-
-Не нейросеть. Не трансформер. Чистая символическая геометрия + накопленная статистика ролей.
-
-**Задача:** на входе массив слов запроса, на выходе: `(core_cid, modifier_field, centroid, noise)` — какой концепт является ядром запроса, какие слова его модифицируют, центроид поля, какие слова отброшены как шум.
-
-**Как скорит слова:**
-
-| Фактор | Вес | Почему |
-|--------|-----|--------|
-| Role memory | 40% | Сколько раз это слово было core vs modifier vs noise |
-| POS priors | 15% | Существительные чаще core, прилагательные — modifier |
-| Frequency | 15% | Частотные концепты — стабильное ядро |
-| Query connections | 20% | Средняя близость к остальным словам запроса |
-| Морфология | −5% | Наличие аффиксов понижает шанс быть core |
-
-**Role memory.** Накапливается через `train_from_text()`: для каждого слова в предложении gate запоминает, было оно core, modifier или noise в этом контексте. После 100+ предложений gate начинает уверенно отличать cores от modifiers — на основе данных, а не хардкоженных правил.
-
-**Неизвестные слова.** Если слово не найдено ни напрямую, ни через морфологический корень — gate возвращает нейтральный концепт с нулевой уверенностью. Это сигнал "я не знаю этого слова", а не forced fallback с подгонкой через orthographic similarity (этот медленный путь удалён).
-
-### 3. SyntaxLattice — граф связей
-
-Хранит два типа данных:
-
-**N-граммы.** Частотность последовательностей концептов (биграммы, триграммы) — классическая языковая модель. Используется как один из сигналов в генераторе.
-
-**Connection graph.** Парные связи между концептами с типом и силой:
-
-```
-connection(A, B) → {strength, type, count}
-```
-
-Типы связей: `related_to`, `has_quality`, `located_at`, `performs_action`, `has_possession`, `has_manner`.
-
-Строится из корпуса: для каждого предложения gate извлекает core, затем все пары core→modifier и core→core попарно связываются. Тип выводится из предлогов/союзов между ними и POS тегов.
-
-**Приоритет в генераторе:** connection graph (×1.5) > n-граммы (×1.3) > modifier field (×0.2) > векторные соседи (×0.3 novelty only).
-
-### 4. CrystalGenerator — генератор
-
-Главный класс, собирающий всё вместе.
-
-**Pipeline генерации:**
-
-1. `resolve_anchor(word)` — преобразует слово в концепт. Сначала прямой поиск в словаре (O(1)), потом морфологический корень (O(1)), если не найдено — нейтраль. Результаты кешируются.
-
-2. `extract_core(words)` — gate извлекает core запроса и modifier field.
-
-3. `decompose_core(core_cid)` — разлагает core на аспекты: какие концепты с ним связаны (из connection graph), какие n-граммы за ним следуют, какие модификаторы из запроса.
-
-4. `_branch(prev_cid, cids)` — выбирает следующее слово. RRF-скоринг с приоритетом:
-   - Connection graph (связи с предыдущим — реальная co-occurrence)
-   - N-граммы (реальные последовательности из корпуса)
-   - Core aspects (разложенные аспекты core)
-   - Modifier field (из gate, query-specific)
-   - Novelty prior (редкие концепты получают микробонус)
-
-5. `_select_word(cid)` — выбирает конкретное слово из концепта: якорь (нормальная форма) или спутник (морфологический вариант) с temperature.
-
-6. `_gate_verification(cid)` — проверяет, имеет ли выбранный концепт связь с core. Если нет — отбрасывается.
-
-**Гормональная система.** DA, 5HT, NA, ACh модулируют параметры генерации:
-- DA (дофамин) — exploration rate (высокий → больше новизны)
-- 5HT (серотонин) — стабильность (высокий → более короткие цепочки)
-- NA (норадреналин) — attention/arousal
-- ACh (ацетилхолин) — learning rate
-
----
-
-## Обучение
-
-`train_from_text(text)` — главный метод обучения. Это **не градиентный спуск**. Это извлечение и накопление структуры:
-
-```
-text → предложения → для каждого предложения:
-  1. Gate.extract_core(words) → core + modifiers
-  2. update_role_memory(words, core) → gate запоминает роли слов
-  3. Строятся связи core→core (сущ-глаг, сущ-сущ) с типом от infer_relation
-  4. Строятся связи core→modifier (сущ-прил)
-  5. Lattice.update(concept_ids) → n-граммы обновляются
-  6. STDP shift: core→modifier → векторы сближаются
-```
-
-Чем больше текста проходит через `train_from_text()`:
-- Тем плотнее connection graph (больше связей между концептами)
-- Тем точнее role_memory (gate лучше знает, какие слова бывают core)
-- Тем богаче n-граммы (больше реальных последовательностей)
-- Тем лучше генерация (больше learned patterns, меньше векторный шум)
-
----
-
-## Запуск
-
-**Обычное обучение:**
-```
-train.bat
-```
-
-**Fast mode (lr=0.15, neg_samples=3):**
-```
-train_fast.bat
-```
-
-**Ярлыки на рабочем столе:**
-- `EVA_Training` — полный запуск (train.bat → train_full.py)
-
-Чекпоинты автоматически сохраняются каждые 500 строк в бинарном формате (.npz).
-
----
-
-## Структура проекта
+## Project Structure
 
 ```
 FCF/
-├── eva/
-│   └── symbolic/
-│       ├── concept_space.py        # 36K концептов, векторы, аффиксные сдвиги, STDP, матричный NN
-│       ├── concept_tokenizer.py    # BPE + morph_parse (pymorphy3), word_morph_vector
-│       ├── concept_net.py          # ConceptNet skeleton loader
-│       ├── semantic_gate.py        # Извлечение core + modifier field + role_memory
-│       ├── syntax_lattice.py       # Connection graph + n-grams + infer_relation
-│       ├── crystal_generator.py    # Генерация: decompose, branch, select, gate verification
-│       ├── hierarchical_compressor.py  # Компрессия: слово→фраза→предложение→абзац
-│       ├── hormonal_system.py      # DA/5HT/NA/ACh модуляция параметров
-│       ├── concept_inductor.py     # Semantic resonance (вспомогательный)
-│       └── pos_tagger.py          # Частеречная разметка
-├── model/
-│   ├── modeling_fcf.py            # Внешний API: train_from_text, train_from_file
-│   └── configuration_fcf.py       # Конфиг
-├── experiments/
-│   └── test_comprehensive.py      # 51 black-box тест
-├── real_data/
-│   ├── concept_space.json         # 36K концептов (загруженный)
-│   ├── syntax_lattice.json        # 24K биграмм, 880K триграмм, 0 connections
-│   ├── full_corpus_ru.txt         # Корпус для тренировки (54MB, 153K строк)
-│   └── conceptnet/
-│       └── conceptnet_ru.txt      # ConceptNet Russian
-├── train_full.py                 # Тренировка: STDP, PPMI-gate, drift safeguards
-├── train.bat                     # Запуск train_full.py (обычный режим)
-├── train_fast.bat                # Запуск train_full.py --fast
-├── checkpoints/                   # Сохранённые модели
-└── ARCHITECTURE.md                # Этот файл
+├── eva/symbolic/
+│   ├── concept_space.py        # 146K concepts, fractal field, STDP
+│   ├── crystal_generator.py    # Training + generation engine
+│   ├── fractal_encoding.py     # Octree paths, H_weighted, LCP
+│   ├── fcf_config.py           # Config singleton
+│   ├── syntax_lattice.py       # N-gram prefix tree + connection graph
+│   ├── parameter_optimizer.py  # LR schedule, PMI gate, homeostasis
+│   ├── morph_vocab.py          # Morphological vocabulary
+│   ├── pos_tagger.py           # POS tagging
+│   └── hormonal_system.py      # ACh, NE, DA, 5HT modulation
+├── model/                      # HuggingFace wrappers (incomplete)
+├── api/main.py                 # FastAPI REST API
+├── real_data/                  # Corpus, BPE model, checkpoints
+├── train_full.py               # Training harness
+├── inference.py                # Inference engine
+├── eval_metrics.py             # Evaluation framework
+├── eval_checkpoint.py          # Checkpoint text generation test
+├── ARCHITECTURE.md             # This file
+└── AUDIT.md / PLAN.md          # Bug tracking, roadmap
 ```
-
----
-
-## Принципы и философия
-
-**Никаких хардкодов.** Генератор не содержит зашитых правил вроде "существительное + прилагательное". Всё, что генератор знает о сочетаемости слов, он узнаёт из данных: connection graph из co-occurrence, role_memory из повторяющихся паттернов, n-граммы из последовательностей. Если данные пусты — генератор выдаёт шум. Чем больше данных — тем лучше.
-
-**Честная неопределённость.** Если слово не найдено в словаре, система не пытается подогнать его через orthographic similarity (этот путь был удалён). Вместо этого она возвращает нейтральный концепт с нулевой уверенностью — честный сигнал "я этого не знаю". Неизвестные слова не загрязняют семантическое пространство.
-
-**Пластичность.** Векторное пространство не статично. STDP двигает векторы при каждой встрече концептов. Аффиксные сдвиги создаются для новых аффиксов по мере необходимости. Адаптивное создание концептов добавляет новые точки в пространство, когда центроид запроса слишком далёк от всех существующих. Система растёт вместе с данными.
-
-**Символическая геометрия.** В отличие от нейросетей, где значения — это эмерджентное свойство весов, здесь каждый концепт имеет явный вектор, каждый аффикс — явный сдвиг, каждая связь — явный тип. Можно проследить, почему генератор выбрал то или иное слово: потому что у него есть connection strength > 0.3 от core.
-
-**Обучение — это структура, не веса.** train_from_text() не обновляет градиенты, а извлекает и накапливает структуру: пары слов → связи в граф, частотности → n-граммы, роли → role_memory, совпадения → STDP сдвиги. Это делает обучение интерпретируемым и обратимым.
-
----
-
-## Примеры работы
-
-**До тренировки** (0 connections в графе, только предобученные n-граммы):
-> и в год быв открытый школа резервуардляводы ребёнок и юношество центр город
-
-Слова есть, но связи случайны — генератор падает на векторных соседей.
-
-**После тренировки** (connections заполняются, role_memory накапливается):
-> погода сегодня хорошая на улице тепло и солнечно
-
-По мере заполнения connection graph генератор начинает использовать реальные co-occurrence паттерны из корпуса.
-
-**Как улучшить:** чем больше текста пропущено через `train_from_text()`, тем плотнее connection graph, тем качественнее генерация. 54MB корпуса (153K строк) — хороший старт.

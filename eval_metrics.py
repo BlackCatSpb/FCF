@@ -3,7 +3,7 @@ Usage: python eval_metrics.py [checkpoint_tag]
   checkpoint_tag defaults to 'latest' (auto from checkpoint_state.json)
   Examples: '145k', '21k', 'latest'
 """
-import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
+import sys; sys.path.insert(0, os.path.dirname(__file__))
 import os, json, time, glob, re, shutil, tempfile
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -90,13 +90,15 @@ def main():
             if isinstance(v, (int, float)):
                 results[f'val_{k}'] = v
 
-    n_valid = sum(cs.concept_vectors._valid)
-    sample_k = min(2000, n_valid)
+    valid_candidates = [c for c in range(cs.vocab_size) if cs.concept_vectors.valid[c]]
+    k = min(2000, len(valid_candidates))
     rng = np.random.RandomState(42)
-    sampled = rng.choice([c for c in range(cs.vocab_size) if cs.concept_vectors._valid[c]],
-                         size=sample_k, replace=False)
-    vecs = np.array([cs.concept_vectors._data[c] for c in sampled], dtype=np.float32)
-    triu = (vecs @ vecs.T)[np.triu_indices(sample_k, k=1)]
+    if k == 0:
+        sampled = np.array([], dtype=int)
+    else:
+        sampled = rng.choice(valid_candidates, size=k, replace=False)
+    vecs = np.array([cs.concept_vectors.data[c] for c in sampled], dtype=np.float32)
+    triu = (vecs @ vecs.T)[np.triu_indices(len(sampled), k=1)]
     cos_mean, cos_std = float(triu.mean()), float(triu.std())
     cos_gt_01 = float((triu > 0.1).mean())
     cos_gt_02 = float((triu > 0.2).mean())
@@ -128,7 +130,7 @@ def main():
     print("\n--- Top-5 neighbours ---")
     for seed in TEST_SEEDS:
         cid = sp.PieceToId(seed)
-        if cid < 0 or not cs.concept_vectors._valid[cid]:
+        if cid < 0 or not cs.concept_vectors.valid[cid]:
             continue
         top = cs.topk_similar_concepts(cid, k=5)
         names = [f"{clean_sp(sp.IdToPiece(c))}({s:.4f})" for c, s in top]

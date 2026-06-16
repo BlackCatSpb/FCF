@@ -1,5 +1,5 @@
 @echo off
-cd /d "C:\Users\black\OneDrive\Desktop\FCF"
+cd /d "%~dp0"
 
 if exist real_data\checkpoint_state.json (
     set RESUME_ARG=--resume

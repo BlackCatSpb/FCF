@@ -28,6 +28,14 @@ class ConceptVectorStore:
         self._data = np.zeros((V, dim), dtype=np.float32)
         self._valid = np.zeros(V, dtype=bool)
 
+    @property
+    def data(self):
+        return self._data
+
+    @property
+    def valid(self):
+        return self._valid
+
     def __getitem__(self, cid):
         return self._data[cid]
 
@@ -459,13 +467,6 @@ class ConceptSpace:
         self._total_shift = 0.0
         self._update_count = 0
 
-        # Product Quantization (storage compression)
-        self.pq_codebooks = None
-        self.pq_codes = None
-        self.pq_cid_order = []
-        self.pq_n_subvectors = 0
-        self.pq_n_centroids = 0
-
         # ---- Initialization ----
 
     def init_concepts(self):
@@ -502,71 +503,7 @@ class ConceptSpace:
 
     # ── H matrix + BMSSP ────────────────────────────────────
 
-    def build_anchor_matrix(self, lattice, n_anchors=1024, min_pmi=0.1):
-        """Build anchor matrix H from SyntaxLattice PMI and store anchors.
 
-        Args:
-            lattice: SyntaxLattice instance
-            n_anchors: number of anchor concepts
-            min_pmi: minimum PMI threshold
-
-        Sets:
-            self.H: scipy.sparse.csr_matrix (n, n) of PMI values
-            self.anchor_ids: list of concept IDs
-            self.anchor_idx: dict {cid: index}
-        """
-        self.H, self.anchor_ids = lattice.build_anchor_matrix(n_anchors, min_pmi)
-        self.anchor_idx = {cid: i for i, cid in enumerate(self.anchor_ids)}
-        self.n_anchors = len(self.anchor_ids)
-        print(f"  H matrix: {self.n_anchors}x{self.n_anchors} anchors, "
-              f"{self.H.nnz} non-zero ({100*self.H.nnz/self.n_anchors**2:.1f}%)")
-
-    def build_fields_from_lattice(self, lattice, min_pmi=4.5):
-        """Compute binary field bits via direct PMI connections.
-
-        Each concept's field = itself + anchors connected by PMI > threshold.
-
-        Args:
-            lattice: SyntaxLattice instance
-            min_pmi: minimum PMI for anchor connection
-        """
-        if not hasattr(self, 'H'):
-            raise ValueError("Call build_anchor_matrix() first")
-
-        self.fractal.init_fields(self.n_anchors)
-        seen_cids = set(lattice.concept_freq.keys()) & set(self.fractal.codes.keys())
-
-        # Build concept→anchor co-occurrence index from 2-grams
-        # For each bigram (a→b), record b in cooc[a] and a in cooc[b]
-        import math
-        from collections import defaultdict, Counter
-        n2 = lattice.ngrams.get(2, {})
-        total_freq = max(sum(lattice.concept_freq.values()), 1)
-        anchor_set = set(self.anchor_ids)
-        cooc = defaultdict(Counter)  # cid → {anchor_cid: total_count}
-
-        for prefix, counter in n2.items():
-            a = prefix[0]
-            for b, cnt in counter.items():
-                if a in anchor_set:
-                    cooc[b][a] = cooc[b].get(a, 0) + cnt
-                if b in anchor_set:
-                    cooc[a][b] = cooc[a].get(b, 0) + cnt
-
-        for cid in seen_cids:
-            bits = self._compute_pmi_field_fast(cid, lattice, total_freq,
-                                                cooc, min_pmi)
-            self.fractal.field_bits[cid] = bits
-
-        active_counts = []
-        for bs in self.fractal.field_bits.values():
-            c = int(sum(1 for b in bs for i in range(8) if b & (1 << i)))
-            active_counts.append(c)
-        if active_counts:
-            import numpy as np
-            a = np.array(active_counts)
-            print(f"  PMI fields: {len(seen_cids)}/{len(self.fractal.codes)} concepts, "
-                  f"sizes: min={a.min()} max={a.max()} mean={a.mean():.1f}")
 
     def _compute_pmi_field_fast(self, cid, lattice, total_freq,
                                  cooc, min_pmi=4.5):
@@ -788,60 +725,6 @@ class ConceptSpace:
                 new_code /= nv_code
             self.fractal.codes[cid] = new_code
 
-    def fractal_stdp(self, prev_cid, gen_cid, expected_cid=None, lr=0.1, word_num=0,
-                     inh_strength=0.05, inh_threshold=0.35):
-        """STDP on fractal latent codes — self-organisation through code projection.
-
-        Same Riemannian geometry as svd_shift(), but the vector update
-        is projected back into fractal code space via basis.T.
-
-        Args:
-            prev_cid: context concept (pre-synaptic)
-            gen_cid: generated concept (post-synaptic)
-            expected_cid: target concept (from training data), or None
-            lr: learning rate
-            word_num: position in sentence (theta-rhythm modulates learning)
-            inh_strength: lateral inhibition strength multiplier
-            inh_threshold: cosine threshold for lateral inhibition
-        """
-        theta_gate = math.exp(-word_num / 15.0)
-        effective_lr = lr * max(theta_gate, 0.1)
-
-        expected = expected_cid or gen_cid
-        is_match = (gen_cid == expected)
-
-        v_ctx = self.concept_vectors.get(prev_cid)
-        v_gen = self.concept_vectors.get(gen_cid)
-        if v_ctx is None or v_gen is None:
-            return
-
-        if is_match:
-            scale = 1.0 * effective_lr
-        else:
-            scale = -0.05 * effective_lr
-            v_exp = self.concept_vectors.get(expected)
-            if v_exp is not None:
-                y_exp = float(np.dot(v_gen, v_exp))
-                y_exp = max(y_exp, 0.05)
-                corr = (v_exp - y_exp * v_gen) * effective_lr
-                v_corrected = v_gen + corr
-                cn = np.linalg.norm(v_corrected)
-                if cn > 1e-10:
-                    v_corrected /= cn
-                self._apply_vector_update(gen_cid, v_corrected)
-                v_gen = self.concept_vectors[gen_cid]
-
-        y = float(np.dot(v_gen, v_ctx))
-        y = max(y, 0.05)
-        shift = (v_ctx - y * v_gen) * scale
-        v_new = v_gen + shift
-        nv = np.linalg.norm(v_new)
-        if nv > 1e-10:
-            v_new /= nv
-        self._apply_vector_update(gen_cid, v_new)
-
-        self._lateral_inhibition_fractal(gen_cid, strength=inh_strength * effective_lr, threshold=inh_threshold)
-
     def _lateral_inhibition_fractal(self, winner_cid, strength=0.01, threshold=0.35, sample_size=None):
         """Lateral inhibition with correct Riemannian gradient, vectorised.
 
@@ -920,8 +803,9 @@ class ConceptSpace:
         if not self.fractal.codes:
             return 0, 0.0
         all_codes = np.array(list(self.fractal.codes.values()), dtype=np.float32)
-        max_abs = float(np.max(np.abs(all_codes)))
-        n_out = int(np.sum(np.max(np.abs(all_codes), axis=1) > bound))
+        abs_codes = np.abs(all_codes)
+        max_abs = float(np.max(abs_codes))
+        n_out = int(np.sum(np.max(abs_codes, axis=1) > bound))
         return n_out, max_abs
 
     def validate_vector_norms(self):
@@ -998,183 +882,6 @@ class ConceptSpace:
                 break
         return result[:k]
 
-    # ── Product Quantization — storage compression ─────────────────
-
-    def pq_train(self, n_subvectors=32, n_centroids=256):
-        """Train PQ codebooks from current concept vectors.
-
-        Args:
-            n_subvectors: number of sub-vectors to split each D-dim vector into
-            n_centroids: centroids per subspace (256 = 8-bit index)
-
-        Splits each D-dim vector into n_subvectors subspaces of dim D/n_subvectors.
-        Performs k-means in each subspace to learn n_centroids.
-
-        PQ compression ratio:
-            before: N x D x float32 (4 bytes)
-            after:  N x n_subvectors x uint8 (1 byte) + n_subvectors x n_centroids x subdim x float32
-            typical for 128D → 32x8 = 32 bytes vs 512 bytes = 16x compression
-        """
-        vecs = list(self.concept_vectors.values())
-        if not vecs:
-            return
-        N = len(vecs)
-        D = self.dim
-        assert D % n_subvectors == 0, f'Dim {D} must be divisible by {n_subvectors}'
-        subdim = D // n_subvectors
-
-        mat = np.array(vecs, dtype=np.float32)
-        # Normalize each vector
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        norms[norms < 1e-10] = 1.0
-        mat /= norms
-
-        codebooks = []
-        for m in range(n_subvectors):
-            subvecs = mat[:, m * subdim:(m + 1) * subdim]
-            kmeans = KMeans(n_clusters=n_centroids, random_state=42 + m,
-                            n_init=1, max_iter=20)
-            kmeans.fit(subvecs)
-            cb = kmeans.cluster_centers_.astype(np.float32)
-            # Normalize centroids so sim = 1 - ||q-cb||²/2 is valid
-            cb_norms = np.linalg.norm(cb, axis=1, keepdims=True)
-            cb_norms[cb_norms < 1e-10] = 1.0
-            cb /= cb_norms
-            codebooks.append(cb)
-
-        self.pq_codebooks = codebooks
-        self.pq_n_subvectors = n_subvectors
-        self.pq_n_centroids = n_centroids
-        self.pq_cid_order = list(self.concept_vectors.keys())
-        self.pq_codes = None  # not encoded yet
-        return codebooks
-
-    def pq_encode(self):
-        """Encode all concept vectors using trained codebooks.
-
-        Returns:
-            pq_codes: (N, n_subvectors) uint8 array
-        """
-        if self.pq_codebooks is None:
-            raise ValueError('Call pq_train() first')
-        vecs = [self.concept_vectors[cid] for cid in self.pq_cid_order]
-        mat = np.array(vecs, dtype=np.float32)
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        norms[norms < 1e-10] = 1.0
-        mat /= norms
-
-        N = len(mat)
-        n_sub = self.pq_n_subvectors
-        subdim = self.dim // n_sub
-        codes = np.zeros((N, n_sub), dtype=np.uint8)
-
-        for m in range(n_sub):
-            sub = mat[:, m * subdim:(m + 1) * subdim]  # (N, subdim)
-            cb = self.pq_codebooks[m]  # (n_centroids, subdim)
-            dists = np.sum((sub[:, None, :] - cb[None, :, :]) ** 2, axis=2)  # (N, n_centroids)
-            codes[:, m] = np.argmin(dists, axis=1).astype(np.uint8)
-
-        self.pq_codes = codes
-        return codes
-
-    def pq_decode_all(self):
-        """Reconstruct full vectors from PQ codes.
-
-        Updates concept_vectors in-place with decoded (approximate) vectors.
-        """
-        if self.pq_codes is None or self.pq_codebooks is None:
-            return
-        n_sub = self.pq_n_subvectors
-        subdim = self.dim // n_sub
-        N = len(self.pq_cid_order)
-        decoded = np.zeros((N, self.dim), dtype=np.float32)
-        for m in range(n_sub):
-            cb = self.pq_codebooks[m]
-            codes_m = self.pq_codes[:, m]
-            decoded[:, m * subdim:(m + 1) * subdim] = cb[codes_m]
-        # Renormalize
-        norms = np.linalg.norm(decoded, axis=1, keepdims=True)
-        norms[norms < 1e-10] = 1.0
-        decoded /= norms
-        # Write back
-        for i, cid in enumerate(self.pq_cid_order):
-            self.concept_vectors[cid] = decoded[i]
-
-    def pq_decode(self, cid):
-        """Decode a single concept vector from PQ codes."""
-        if self.pq_codes is None or self.pq_codebooks is None:
-            return self.concept_vectors.get(cid)
-        try:
-            idx = self.pq_cid_order.index(cid)
-        except ValueError:
-            return self.concept_vectors.get(cid)
-        n_sub = self.pq_n_subvectors
-        subdim = self.dim // n_sub
-        v = np.zeros(self.dim, dtype=np.float32)
-        for m in range(n_sub):
-            cb = self.pq_codebooks[m]
-            v[m * subdim:(m + 1) * subdim] = cb[self.pq_codes[idx, m]]
-        norm = np.linalg.norm(v)
-        if norm > 1e-10:
-            v /= norm
-        return v
-
-    def pq_adc_search(self, query_vec, k=10):
-        """Approximate nearest neighbor via Asymmetric Distance Computation.
-
-        Query is kept in full float32 (not encoded).
-        Database distances computed by summing subspace distances
-        from pre-computed lookup tables.
-
-        Args:
-            query_vec: (D,) float32 query vector (NOT normalized — done internally)
-            k: number of nearest neighbors
-
-        Returns:
-            [(cid, similarity), ...]  (cosine similarity, higher = closer)
-        """
-        if self.pq_codes is None or self.pq_codebooks is None:
-            return []
-        vn = query_vec / max(np.linalg.norm(query_vec), 1e-10)
-        n_sub = self.pq_n_subvectors
-        subdim = self.dim // n_sub
-        N = len(self.pq_cid_order)
-
-        # Build distance table: for each subspace, distance from query to each centroid
-        dist_tables = []
-        for m in range(n_sub):
-            q_sub = vn[m * subdim:(m + 1) * subdim]
-            cb = self.pq_codebooks[m]
-            diffs = cb - q_sub  # (n_centroids, subdim)
-            dists = np.sum(diffs ** 2, axis=1)  # (n_centroids,)
-            dist_tables.append(dists)
-
-        # For each database vector, sum subspace distances via lookup
-        # Optimized: precompute full distance matrix
-        total_dists = np.zeros(N, dtype=np.float32)
-        for m in range(n_sub):
-            codes_m = self.pq_codes[:, m].astype(np.int32)
-            total_dists += dist_tables[m][codes_m]
-
-        # Convert distance to cosine similarity: sim = 1 - dist²/2
-        sims = 1.0 - total_dists / 2.0
-        sims = np.clip(sims, -1.0, 1.0)
-
-        # Top-k
-        k_actual = min(k, N)
-        idx = np.argpartition(-sims, k_actual - 1)[:k_actual]
-        idx = idx[np.argsort(-sims[idx])]
-        return [(self.pq_cid_order[i], float(sims[i])) for i in idx[:k]]
-
-    def pq_compression_ratio(self):
-        """Report storage savings from PQ compression."""
-        if self.pq_codes is None:
-            return 0
-        orig = len(self.pq_cid_order) * self.dim * 4  # float32
-        codes_size = self.pq_codes.nbytes
-        cb_size = sum(cb.nbytes for cb in self.pq_codebooks)
-        return orig / (codes_size + cb_size)
-
     def expand_dim(self, target_dim):
         """Expand vector space dimension (e.g. 128 → 384).
 
@@ -1209,11 +916,6 @@ class ConceptSpace:
         self.dim = new_dim
         self.fractal._matrix_dirty = True
         self._sync_from_fractal()
-
-        # Invalidate caches
-        self.pq_codebooks = None
-        self.pq_codes = None
-        self.pq_cid_order = []
         print(f'  Done: {self.vocab_size} concepts @ {self.dim}D')
 
     def normalize_vectors(self):
@@ -1247,11 +949,6 @@ class ConceptSpace:
             self.fractal.codes[cid] = code_new
         self.fractal._matrix_dirty = True
 
-        # Invalidate PQ caches
-        self.pq_codebooks = None
-        self.pq_codes = None
-        self.pq_cid_order = []
-
         new_norms = np.linalg.norm(centered, axis=1)
         print(f'  All vectors normalized: mean_norm={np.mean(new_norms):.4f}')
         print(f'  New centroid norm: {np.linalg.norm(np.mean(centered, axis=0)):.4f}')
@@ -1272,7 +969,6 @@ class ConceptSpace:
         n = len(cids)
         rng = np.random.RandomState(42)
 
-        from scipy.spatial.distance import cdist
         print(f'  Contrastive spread: {n} concepts, target_sim={target_sim}, lr={lr}, epochs={epochs}')
 
         for epoch in range(epochs):
@@ -1327,23 +1023,10 @@ class ConceptSpace:
         """
         # Binary .npz for fractal codes
         binary_path = path.replace('.json', '.codes.npz')
-        if use_pq and self.pq_codes is not None:
-            data = {
-                'dim': self.dim,
-                'vocab_size': self.vocab_size,
-                'pq': True,
-                'n_subvectors': self.pq_n_subvectors,
-                'n_centroids': self.pq_n_centroids,
-                'pq_cid_order': self.pq_cid_order,
-                'pq_codes': self.pq_codes.tolist(),
-                'codebooks': [cb.tolist() for cb in self.pq_codebooks],
-            }
-        else:
-            data = {
-                'dim': self.dim,
-                'vocab_size': self.vocab_size,
-                'pq': False,
-            }
+        data = {
+            'dim': self.dim,
+            'vocab_size': self.vocab_size,
+        }
         data['fractal'] = self.fractal.to_dict(binary_path=binary_path)
         concept_usage = getattr(self, 'concept_usage', None)
         if concept_usage is not None:
@@ -1369,34 +1052,7 @@ class ConceptSpace:
         obj.dim = data['dim']
         obj.vocab_size = data.get('vocab_size', 0)
 
-        obj.pq_codebooks = None
-        obj.pq_codes = None
-        obj.pq_cid_order = []
-        obj.pq_n_subvectors = 0
-        obj.pq_n_centroids = 0
-
         obj.concept_vectors = ConceptVectorStore(obj.vocab_size, obj.dim)
-
-        if data.get('pq'):
-            n_sub = data['n_subvectors']
-            n_cen = data['n_centroids']
-            obj.pq_n_subvectors = n_sub
-            obj.pq_n_centroids = n_cen
-            obj.pq_cid_order = data['pq_cid_order']
-            obj.pq_codebooks = [np.array(cb, dtype=np.float32) for cb in data['codebooks']]
-            obj.pq_codes = np.array(data['pq_codes'], dtype=np.uint8)
-            subdim = obj.dim // n_sub
-            N = len(obj.pq_cid_order)
-            decoded = np.zeros((N, obj.dim), dtype=np.float32)
-            for m in range(n_sub):
-                cb = obj.pq_codebooks[m]
-                codes_m = obj.pq_codes[:, m]
-                decoded[:, m * subdim:(m + 1) * subdim] = cb[codes_m]
-            norms = np.linalg.norm(decoded, axis=1, keepdims=True)
-            norms[norms < 1e-10] = 1.0
-            decoded /= norms
-            for i, cid in enumerate(obj.pq_cid_order):
-                obj.concept_vectors[cid] = decoded[i]
 
         obj.rng = np.random.RandomState(42)
         obj._inhibition_step = 0
@@ -1420,14 +1076,13 @@ class ConceptSpace:
             obj.concept_fitness = {int(c): f for c, f in saved_fitness.items()}
         else:
             obj.init_homeostasis()
-        pq_note = ' (PQ)' if data.get('pq') else ''
-        print(f"  Loaded ConceptSpace: {len(obj.concept_vectors)} concepts @ {obj.dim}D{pq_note}")
+        print(f"  Loaded ConceptSpace: {len(obj.concept_vectors)} concepts @ {obj.dim}D")
         return obj
 
 
 if __name__ == '__main__':
     import sentencepiece as spm
-    sp = spm.SentencePieceProcessor(model_file=r'C:\Users\black\OneDrive\Desktop\FCF\real_data\bpe_ru.model')
+    sp = spm.SentencePieceProcessor(model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru.model'))
 
     print("Initializing ConceptSpace with BPE vocabulary...")
     cs = ConceptSpace(vocab_size=sp.vocab_size(), dim=384)
@@ -1464,4 +1119,4 @@ if __name__ == '__main__':
         for c, s in top:
             print(f"  {sp.IdToPiece(c):20s} (CID {c:5d}) sim={s:.4f}")
 
-    cs.save(r'C:\Users\black\OneDrive\Desktop\FCF\real_data\concept_space.json')
+    cs.save(os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'concept_space.json'))

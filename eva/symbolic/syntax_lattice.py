@@ -65,7 +65,7 @@ class SyntaxLattice:
 
     def __init__(self, decay=0.999):
         # n-gram stores: prefix_tuple -> [(next_concept, count)]
-        self.ngrams = {2: {}, 3: {}, 4: {}}  # n -> dict of prefix_key -> Counter
+        self.ngrams = {}  # n -> dict of prefix_key -> Counter (built dynamically)
 
         # Total counts for smoothing
         self.total_ngrams = {}  # n -> total count
@@ -735,23 +735,23 @@ class SyntaxLattice:
 
 
 if __name__ == '__main__':
-    import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
+    import sys; sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
     import sentencepiece as spm
     from eva.symbolic.concept_space import ConceptSpace
 
     sp = spm.SentencePieceProcessor(
-        model_file=r'C:\Users\black\OneDrive\Desktop\FCF\real_data\bpe_ru.model')
+        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru.model'))
 
     cs = ConceptSpace.load(
-        r'C:\Users\black\OneDrive\Desktop\FCF\real_data\concept_space.json')
+        os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'concept_space.json'))
 
     print("Building SyntaxLattice from full corpus via SentencePiece...")
     lattice = SyntaxLattice()
     lattice.build(
-        r'C:\Users\black\OneDrive\Desktop\FCF\real_data\full_corpus_ru_clean.txt',
+        os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'full_corpus_ru_clean.txt'),
         sp,
         max_n=4,
     )
 
-    lattice.save(r'C:\Users\black\OneDrive\Desktop\FCF\real_data\syntax_lattice.json')
+    lattice.save(os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'syntax_lattice.json'))
     print("Done.")

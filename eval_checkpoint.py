@@ -1,5 +1,5 @@
 """Generation test from checkpoint — shows REAL text output."""
-import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
+import sys, os; sys.path.insert(0, os.path.dirname(__file__))
 sys.stdout.reconfigure(encoding='utf-8')
 import time
 import sentencepiece as spm
@@ -7,7 +7,7 @@ from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 
-BPE_MODEL = r'real_data/bpe_ru_32k.model'
+BPE_MODEL = r'real_data/bpe_ru_146k.model'
 CS_PATH = r'real_data/concept_space.json'
 LATTICE_PATH = r'real_data/syntax_lattice.json'
 

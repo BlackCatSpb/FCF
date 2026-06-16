@@ -12,10 +12,15 @@ Key simplifications vs old architecture:
   - No special token stream: raw token IDs with SentencePiece BOS/EOS
 """
 
-import math, random
+import math, os, random
 import numpy as np
 from collections import Counter
-import torch
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    torch = None
+    _HAS_TORCH = False
 
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.hormonal_system import HormonalSystem
@@ -69,6 +74,8 @@ class CrystalGenerator:
 
     def _ensure_torch(self, device=None):
         """Precompute GPU tensors for batched training. Rebuilds if dirty."""
+        if not _HAS_TORCH:
+            raise ImportError("PyTorch is required for GPU training.")
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         dev = torch.device(device)
@@ -123,21 +130,6 @@ class CrystalGenerator:
     def _theta_temp(self, word_num):
         t = self.base_concept_temp * math.exp(-word_num / self.theta_tau)
         return max(t, self.base_concept_temp * 0.15)
-
-    # ── Semantic distance ──────────────────────────────────────
-
-    def _semantic_delta(self, query_vec, response_path, window=5):
-        if query_vec is None or not response_path:
-            return 0.5
-        recent = response_path[-window:]
-        recent_vecs = [self.cs.concept_vector(c)
-                       for c in recent if self.cs.concept_vector(c) is not None]
-        if not recent_vecs:
-            return 0.5
-        response_vec = np.mean(recent_vecs, axis=0).astype(np.float32)
-        response_vec /= max(np.linalg.norm(response_vec), 1e-10)
-        qn = query_vec / max(np.linalg.norm(query_vec), 1e-10)
-        return 1.0 - float(np.dot(qn, response_vec))
 
     # ── Encode / Decode ────────────────────────────────────────
 
@@ -697,10 +689,15 @@ class CrystalGenerator:
                 cnt = torch.zeros(len(unique_gen), device=device)
                 cnt.scatter_add_(0, inv_t, torch.ones(N, device=device))
 
-                # ── Per-concept prediction error tracking (Level 2) ──
-                y_cpu = y.cpu().numpy()
-                for pi, gen_cid in enumerate(gpu_cid_gen):
-                    err = 1.0 - float(y_cpu[pi])
+                # ── Per-concept prediction error tracking (Level 2, deduplicated) ──
+                err_per_pair = 1.0 - y
+                err_grouped = torch.zeros(len(unique_gen), device=device)
+                err_grouped.scatter_add_(0, inv_t, err_per_pair)
+                cnt_err = torch.zeros(len(unique_gen), device=device)
+                cnt_err.scatter_add_(0, inv_t, torch.ones(N, device=device))
+                avg_err_cpu = (err_grouped / cnt_err.clamp(min=1)).cpu().numpy()
+                for gi, gen_cid in enumerate(unique_gen):
+                    err = float(avg_err_cpu[gi])
                     old = self.concept_error.get(gen_cid, err)
                     self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
 
@@ -815,11 +812,10 @@ class CrystalGenerator:
 
                 y = np.maximum(v_gen @ ctx_mat.T, 0.05)
 
-                # ── Per-concept prediction error tracking (Level 2) ──
-                for yi in y:
-                    err = 1.0 - float(yi)
-                    old = self.concept_error.get(gen_cid, err)
-                    self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
+                # ── Per-concept prediction error tracking (Level 2, deduplicated) ──
+                err = 1.0 - float(np.mean(y))
+                old = self.concept_error.get(gen_cid, err)
+                self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
 
                 total_delta = ((ctx_mat * elr_arr[:, None]).sum(axis=0) -
                               v_gen * (y * elr_arr).sum())
@@ -880,27 +876,30 @@ class CrystalGenerator:
                 else:
                     neg_ovs_cpu = np.zeros((n_pairs, neg_samples), dtype=np.int64)
 
-                neg_idxs_cpu = neg_idxs.cpu()  # avoid CUDA sync per .item()
+                neg_idxs_np = neg_idxs.cpu().numpy()
+                neg_cids_np = np.array(self._torch_cid_order)[neg_idxs_np]
+                meta_arr = np.array(gpu_meta_l, dtype=np.float32)
+                i_arr = meta_arr[:, 0].astype(np.int32)
+                j_arr = meta_arr[:, 1].astype(np.int32)
+                pmi_w_arr = meta_arr[:, 2]
+                dw_arr = meta_arr[:, 3]
+                fw_arr = meta_arr[:, 4]
+                theta_gate_arr = np.exp(-np.minimum(j_arr, 5.0) / max(self.theta_tau, 1.0))
+                neg_elr_arr = base_lr * np.maximum(fw_arr, 0.05) * dw_arr * pmi_w_arr * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
 
-                for pi, (i, j, pmi_w, dw, fw) in enumerate(gpu_meta_l):
-                    neg_elr = base_lr * max(fw, 0.05) * dw * pmi_w * neg_lr_ratio
-                    theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
-                    neg_elr *= max(theta_gate, 0.1)
-
+                for pi in range(n_pairs):
+                    i = int(i_arr[pi])
                     v_ctx = cs.concept_vectors.get(ids[i])
                     if v_ctx is None:
                         continue
-
+                    neg_elr = neg_elr_arr[pi]
                     for ni in range(neg_samples):
                         if field_gate and neg_ovs_cpu[pi, ni] > 0:
-                            continue  # same field — allow similarity
-
-                        neg_idx = int(neg_idxs_cpu[pi, ni].item())
-                        neg_cid = self._torch_cid_order[neg_idx]
+                            continue
+                        neg_cid = int(neg_cids_np[pi, ni])
                         v_neg = cs.concept_vectors.get(neg_cid)
                         if v_neg is None:
                             continue
-
                         y = max(float(np.dot(v_neg, v_ctx)), 0.05)
                         shift = (y * v_neg - v_ctx) * neg_elr
                         v_new = v_neg + shift
@@ -1136,10 +1135,15 @@ class CrystalGenerator:
                 cnt = torch.zeros(len(unique_gen), device=device)
                 cnt.scatter_add_(0, inv_t, torch.ones(N, device=device))
 
-                # Per-concept error tracking
-                y_cpu = y.cpu().numpy()
-                for pi, gen_cid in enumerate(gpu_cid_gen):
-                    err = 1.0 - float(y_cpu[pi])
+                # Per-concept error tracking (deduplicated)
+                err_per_pair = 1.0 - y
+                err_grouped = torch.zeros(len(unique_gen), device=device)
+                err_grouped.scatter_add_(0, inv_t, err_per_pair)
+                cnt_err = torch.zeros(len(unique_gen), device=device)
+                cnt_err.scatter_add_(0, inv_t, torch.ones(N, device=device))
+                avg_err_cpu = (err_grouped / cnt_err.clamp(min=1)).cpu().numpy()
+                for gi, gen_cid in enumerate(unique_gen):
+                    err = float(avg_err_cpu[gi])
                     old = self.concept_error.get(gen_cid, err)
                     self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
 
@@ -1246,10 +1250,9 @@ class CrystalGenerator:
                 total_elr = float(elr_arr.sum())
                 y = np.maximum(v_gen @ ctx_mat.T, 0.05)
 
-                for yi in y:
-                    err = 1.0 - float(yi)
-                    old = self.concept_error.get(gen_cid, err)
-                    self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
+                err = 1.0 - float(np.mean(y))
+                old = self.concept_error.get(gen_cid, err)
+                self.concept_error[gen_cid] = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
 
                 total_delta = ((ctx_mat * elr_arr[:, None]).sum(axis=0) -
                               v_gen * (y * elr_arr).sum())
@@ -1288,20 +1291,25 @@ class CrystalGenerator:
                 else:
                     neg_ovs_cpu = np.zeros((n_pairs, neg_samples), dtype=np.int64)
 
-                neg_idxs_cpu = neg_idxs.cpu()  # move to CPU once (avoids CUDA sync per .item())
+                neg_idxs_np = neg_idxs.cpu().numpy()
+                neg_cids_np = np.array(self._torch_cid_order)[neg_idxs_np]
+                meta_arr = np.array(gpu_meta_l, dtype=np.float32)
+                j_arr = meta_arr[:, 1].astype(np.int32)
+                pmi_w_arr = meta_arr[:, 2]
+                dw_arr = meta_arr[:, 3]
+                fw_arr = meta_arr[:, 4]
+                theta_gate_arr = np.exp(-np.minimum(j_arr, 5.0) / max(self.theta_tau, 1.0))
+                neg_elr_arr = base_lr * np.maximum(fw_arr, 0.05) * dw_arr * pmi_w_arr * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
 
-                for pi, (i, j, pmi_w, dw, fw) in enumerate(gpu_meta_l):
-                    neg_elr = base_lr * max(fw, 0.05) * dw * pmi_w * neg_lr_ratio
-                    theta_gate = math.exp(-min(j, 5) / max(self.theta_tau, 1.0))
-                    neg_elr *= max(theta_gate, 0.1)
+                for pi in range(n_pairs):
                     v_ctx = cs.concept_vectors.get(gpu_cid_ctx[pi])
                     if v_ctx is None:
                         continue
+                    neg_elr = neg_elr_arr[pi]
                     for ni in range(neg_samples):
                         if field_gate and neg_ovs_cpu[pi, ni] > 0:
                             continue
-                        neg_idx = int(neg_idxs_cpu[pi, ni].item())
-                        neg_cid = self._torch_cid_order[neg_idx]
+                        neg_cid = int(neg_cids_np[pi, ni])
                         v_neg = cs.concept_vectors.get(neg_cid)
                         if v_neg is None:
                             continue
@@ -1580,13 +1588,13 @@ class CrystalGenerator:
 
 
 if __name__ == '__main__':
-    import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
+    import sys; sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
     import sentencepiece as spm
     from eva.symbolic.concept_space import ConceptSpace
     from eva.symbolic.syntax_lattice import SyntaxLattice
 
     sp = spm.SentencePieceProcessor(
-        model_file=r'C:\Users\black\OneDrive\Desktop\FCF\real_data\bpe_ru_32k.model')
+        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_32k.model'))
 
     print("Initializing ConceptSpace (32K)...")
     cs = ConceptSpace(vocab_size=sp.vocab_size(), dim=384)

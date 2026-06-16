@@ -8,18 +8,17 @@ os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
-import sys; sys.path.insert(0, r'C:\Users\black\OneDrive\Desktop\FCF')
+import sys; sys.path.insert(0, os.path.dirname(__file__))
 import time, json, os, shutil, argparse, glob
 import io
 import numpy as np
 
-def _quiet(fn, *args, **kwargs):
-    old = sys.stdout
-    sys.stdout = io.StringIO()
+def _quiet(func, *args, **kwargs):
     try:
-        return fn(*args, **kwargs)
-    finally:
-        sys.stdout = old
+        return func(*args, **kwargs)
+    except Exception as e:
+        print(f"[WARN] {func.__name__} failed: {e}", file=sys.stderr)
+        return None
 
 def _load_morph(path, sp_path):
     """Load or build MorphVocab (builds from corpus if no cached file)."""
@@ -45,20 +44,26 @@ os.makedirs(CFG.vis_dir, exist_ok=True)
 
 # Redirect stdout to UTF-8 log file (terminal cp1251 can't print ▁)
 LOG_FILE = CFG.log_path
-_log_fh = open(LOG_FILE, 'w', encoding='utf-8')
-
 class TeeOut:
+    def __init__(self):
+        self._log_fh = open(LOG_FILE, 'w', encoding='utf-8')
     def write(self, s):
-        _log_fh.write(s)
-        _log_fh.flush()
+        self._log_fh.write(s)
+        self._log_fh.flush()
         try:
             sys.__stdout__.write(s)
         except UnicodeEncodeError:
             sys.__stdout__.write(s.encode('ascii', errors='replace').decode('ascii'))
         sys.__stdout__.flush()
     def flush(self):
-        _log_fh.flush()
+        self._log_fh.flush()
         sys.__stdout__.flush()
+    def __del__(self):
+        self.close()
+    def close(self):
+        if self._log_fh is not None:
+            self._log_fh.close()
+            self._log_fh = None
 
 sys.stdout = TeeOut()
 
@@ -112,10 +117,12 @@ parser.add_argument('--resume', '-r', nargs='?', const='', default='',
                     help='resume from checkpoint. Default: auto from checkpoint_state.json. With Nk: load numbered (e.g. 6k)')
 parser.add_argument('--fast', '-f', action='store_true', help='fast mode: higher lr + negative sampling, always fresh')
 parser.add_argument('--fresh', action='store_true', help='force fresh start even if checkpoint exists')
+parser.add_argument('--max-lines', type=int, default=0, help='limit training to N lines (for testing)')
 args = parser.parse_args()
 RESUME = args.resume
 FAST = args.fast
 FRESH = args.fresh or FAST
+MAX_LINES = args.max_lines
 
 if FRESH:
     RESUME = None
@@ -279,6 +286,10 @@ train_lines = [p[1] for p in train_pairs]
 # Per-epoch max length filter
 EPOCH_MAX_LEN = {1: 32, 2: 128, 3: 10**9}
 
+if MAX_LINES > 0:
+    train_lines = train_lines[:MAX_LINES]
+    print(f"  Limited to {len(train_lines)} lines (--max-lines={MAX_LINES})")
+
 print(f"  {len(train_lines)} train, {len(val_lines)} val")
 print(f"  Shortest: {train_lens[0]} BPE tokens, Longest: {train_lens[-1]} BPE tokens")
 print(f"  Median: {train_lens[len(train_lens)//2]} BPE tokens")
@@ -371,104 +382,22 @@ def save_3d_vis(cs, sp, checkpoint_name):
     return json_path
 
 def _write_viewer_html(path):
-    html = """<!DOCTYPE html>
-<html lang="ru">
-<head><meta charset="utf-8"><title>EVA 3D</title>
-<style>
-body{margin:0;overflow:hidden;background:#0a0a12;font-family:monospace;color:#ccc}
-#info{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);
-  color:#888;font-size:13px;background:rgba(0,0,0,.7);padding:4px 14px;border-radius:6px;
-  pointer-events:none;z-index:10}
-#popup{position:absolute;display:none;pointer-events:none;z-index:20;
-  background:rgba(10,10,18,.92);border:1px solid #3a3a50;border-radius:8px;
-  padding:8px 14px;color:#ccc;font:14px monospace;white-space:nowrap}
-#loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-  color:#666;font:24px monospace;z-index:30;text-align:center}
-#error{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-  color:#f66;font:16px monospace;z-index:30;text-align:center;display:none;
-  background:rgba(0,0,0,.8);padding:20px 30px;border-radius:10px;max-width:500px}
-</style></head>
-<body>
-<div id=loading>loading points...</div>
-<div id=error></div>
-<div id=popup></div>
-<div id=info>scroll/drag to rotate · right-drag to pan · hover for token</div>
-
-<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
-<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
-<script>
-async function main(){
-  const errDiv=document.getElementById('error');
-  try{
-    const resp=await fetch('points_latest.json');
-    if(!resp.ok) throw new Error('HTTP '+resp.status+': '+resp.statusText);
-    const points=await resp.json();
-    document.getElementById('loading').remove();
-
-    const scene=new THREE.Scene();
-    const cam=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,10);
-    cam.position.set(2,1.5,2.5);
-    const renderer=new THREE.WebGLRenderer({antialias:true});
-    renderer.setSize(innerWidth,innerHeight);
-    renderer.setPixelRatio(Math.min(devicePixelRatio,2));
-    document.body.prepend(renderer.domElement);
-
-    const controls=new THREE.OrbitControls(cam,renderer.domElement);
-    controls.enableDamping=true;controls.dampingFactor=0.08;
-    controls.minDistance=0.3;controls.maxDistance=8;
-
-    const grid=new THREE.GridHelper(2.4,12,0x333355,0x222244);
-    scene.add(grid);
-    scene.add(new THREE.AmbientLight(0x404060));
-
-    const N=points.length;
-    const pos=new Float32Array(N*3);
-    const col=new Float32Array(N*3);
-    const C0=[0.27,0.67,1.0],C1=[0.09,0.27,0.6],C2=[0.91,0.07,0.05];
-
-    for(let i=0;i<N;i++){
-      const p=points[i];
-      pos[i*3]=p.x;pos[i*3+1]=p.y;pos[i*3+2]=p.z;
-      const f=Math.min(p.f/500,1);
-      if(f<0.5){const s=f*2;col[i*3]=C0[0]-s*0.18;col[i*3+1]=C0[1]-s*0.4;col[i*3+2]=C0[2];}
-      else{const s=(f-0.5)*2;col[i*3]=C1[0]+s*0.82;col[i*3+1]=C1[1]-s*0.2;col[i*3+2]=C1[2]-s*0.55;}
-    }
-
-    const geo=new THREE.BufferGeometry();
-    geo.setAttribute('position',new THREE.BufferAttribute(pos,3));
-    geo.setAttribute('color',new THREE.BufferAttribute(col,3));
-
-    const canvas=document.createElement('canvas');canvas.width=64;canvas.height=64;
-    const ctx=canvas.getContext('2d');
-    const grad=ctx.createRadialGradient(32,32,0,32,32,32);
-    grad.addColorStop(0,'rgba(255,255,255,1)');grad.addColorStop(0.3,'rgba(255,255,255,0.9)');grad.addColorStop(1,'rgba(255,255,255,0)');
-    ctx.fillStyle=grad;ctx.fillRect(0,0,64,64);
-    const tex=new THREE.CanvasTexture(canvas);
-
-    const mat=new THREE.PointsMaterial({size:0.03,map:tex,transparent:true,vertexColors:true,sizeAttenuation:true,blending:THREE.AdditiveBlending,depthWrite:false,opacity:0.85});
-    const mesh=new THREE.Points(geo,mat);scene.add(mesh);
-
-    const raycaster=new THREE.Raycaster();const pointer=new THREE.Vector2();const popup=document.getElementById('popup');
-    renderer.domElement.addEventListener('pointermove',e=>{const r=renderer.domElement.getBoundingClientRect();pointer.x=((e.clientX-r.left)/r.width)*2-1;pointer.y=-((e.clientY-r.top)/r.height)*2+1;});
-
-    function animate(){
-      requestAnimationFrame(animate);controls.update();
-      raycaster.setFromCamera(pointer,cam);const hits=raycaster.intersectObject(mesh);
-      if(hits.length>0){const idx=hits[0].index;const p=points[idx];popup.style.display='block';const r=renderer.domElement.getBoundingClientRect();popup.style.left=((pointer.x*0.5+0.5)*r.width+16)+'px';popup.style.top=((-pointer.y*0.5+0.5)*r.height-30)+'px';popup.innerHTML='<b>'+p.t+'</b> id='+p.id+' freq='+p.f;}
-      else{popup.style.display='none';}
-      renderer.render(scene,cam);
-    }
-    animate();
-    window.addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
-  }catch(e){
-    errDiv.style.display='block';
-    errDiv.innerHTML='<b>Error</b><br>'+e.message+'<br><br>Open via HTTP server:<br><tt>python serve_vis.py</tt>';
-  }
-}
-main();
-</script></body></html>"""
+    with open(os.path.join(CFG.data_dir, 'viewer_template.html'), 'r', encoding='utf-8') as f:
+        TEMPLATE = f.read()
     with open(path, 'w', encoding='utf-8') as f:
-        f.write(html)
+        f.write(TEMPLATE)
+
+def _final_save(cs, lattice, opt, epoch, total_lines):
+    """Save all training state."""
+    _quiet(cs.save, CFG.cs_path)
+    _quiet(lattice.save, CFG.lattice_path)
+    _quiet(opt.save_state, CFG.data_dir)
+    ckpt = {'epoch': epoch, 'line': total_lines}
+    with open(CFG.ckpt_state_path, 'w', encoding='utf-8') as f:
+        json.dump(ckpt, f)
+    for f in glob.glob(os.path.join(CFG.data_dir, '*.html')):
+        try: os.remove(f)
+        except: pass
 
 # Determine starting line and epoch
 start_line = resume_line if RESUME is not None else 0
@@ -476,12 +405,7 @@ total_epochs = args.epochs
 current_epoch = resume_epoch if RESUME is not None else 1
 
 if RESUME is not None:
-    if current_epoch == 1 and start_line >= len(train_lines) - 1:
-        current_epoch = 2
-        start_line = 0
-        print(f"Epoch 1 complete — starting epoch 2 (line 0 / {len(train_lines)})")
-    if current_epoch > 1:
-        print(f"Resuming epoch {current_epoch} at line {start_line}")
+    print(f"Resuming epoch {current_epoch} at line {start_line}")
 
 _ckpt_epoch = current_epoch
 try:
@@ -671,26 +595,15 @@ try:
 
 except KeyboardInterrupt:
     print("\n\n[EVA] Training interrupted — saving checkpoint...")
-    _quiet(cs.save, CFG.cs_path)
-    _quiet(lattice.save, CFG.lattice_path)
-    opt_state_path = CFG.cs_path.replace('.json', '.opt.json')
-    with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
-        json.dump(opt.save_state(), f, ensure_ascii=False)
-    os.replace(opt_state_path + '.tmp', opt_state_path)
-    save_checkpoint_state(idx, epoch=_ckpt_epoch)
-    cleanup_old_checkpoints(keep=CFG.cleanup_keep)
+    _final_save(cs, lattice, opt, _ckpt_epoch, idx)
     print("[EVA] Checkpoint saved. Exiting.")
     sys.exit(0)
+finally:
+    if hasattr(sys.stdout, 'close'):
+        sys.stdout.close()
 
 # Final save
-_quiet(cs.save, CFG.cs_path)
-_quiet(lattice.save, CFG.lattice_path)
-opt_state_path = CFG.cs_path.replace('.json', '.opt.json')
-with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
-    json.dump(opt.save_state(), f, ensure_ascii=False)
-os.replace(opt_state_path + '.tmp', opt_state_path)
-save_checkpoint_state(idx, epoch=_ckpt_epoch)
-cleanup_old_checkpoints(keep=CFG.cleanup_keep)
+_final_save(cs, lattice, opt, _ckpt_epoch, idx)
 
 # ── Final diagnostics ───────────────────────────────────────────
 
@@ -708,14 +621,7 @@ for seed in CFG.test_seeds:
 t_total = time.time() - t_start
 print(f"  {n_trained} lines in {t_total:.0f}s ({n_trained/t_total:.0f} L/s)")
 print("Saving...")
-_quiet(cs.save, CFG.cs_path)
-_quiet(lattice.save, CFG.lattice_path)
-opt_state_path = CFG.cs_path.replace('.json', '.opt.json')
-with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
-    json.dump(opt.save_state(), f, ensure_ascii=False)
-os.replace(opt_state_path + '.tmp', opt_state_path)
-save_checkpoint_state(idx, epoch=_ckpt_epoch)
-cleanup_old_checkpoints(keep=CFG.cleanup_keep)
+_final_save(cs, lattice, opt, _ckpt_epoch, idx)
 print("Done.")
 
 

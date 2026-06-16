@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head><meta charset="utf-8"><title>EVA 3D</title>
+<style>
+body{margin:0;overflow:hidden;background:#0a0a12;font-family:monospace;color:#ccc}
+#info{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);
+  color:#888;font-size:13px;background:rgba(0,0,0,.7);padding:4px 14px;border-radius:6px;
+  pointer-events:none;z-index:10}
+#popup{position:absolute;display:none;pointer-events:none;z-index:20;
+  background:rgba(10,10,18,.92);border:1px solid #3a3a50;border-radius:8px;
+  padding:8px 14px;color:#ccc;font:14px monospace;white-space:nowrap}
+#loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  color:#666;font:24px monospace;z-index:30;text-align:center}
+#error{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  color:#f66;font:16px monospace;z-index:30;text-align:center;display:none;
+  background:rgba(0,0,0,.8);padding:20px 30px;border-radius:10px;max-width:500px}
+</style></head>
+<body>
+<div id=loading>loading points...</div>
+<div id=error></div>
+<div id=popup></div>
+<div id=info>scroll/drag to rotate · right-drag to pan · hover for token</div>
+
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+async function main(){
+  const errDiv=document.getElementById('error');
+  try{
+    const resp=await fetch('points_latest.json');
+    if(!resp.ok) throw new Error('HTTP '+resp.status+': '+resp.statusText);
+    const points=await resp.json();
+    document.getElementById('loading').remove();
+
+    const scene=new THREE.Scene();
+    const cam=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,10);
+    cam.position.set(2,1.5,2.5);
+    const renderer=new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(innerWidth,innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+    document.body.prepend(renderer.domElement);
+
+    const controls=new THREE.OrbitControls(cam,renderer.domElement);
+    controls.enableDamping=true;controls.dampingFactor=0.08;
+    controls.minDistance=0.3;controls.maxDistance=8;
+
+    const grid=new THREE.GridHelper(2.4,12,0x333355,0x222244);
+    scene.add(grid);
+    scene.add(new THREE.AmbientLight(0x404060));
+
+    const N=points.length;
+    const pos=new Float32Array(N*3);
+    const col=new Float32Array(N*3);
+    const C0=[0.27,0.67,1.0],C1=[0.09,0.27,0.6],C2=[0.91,0.07,0.05];
+
+    for(let i=0;i<N;i++){
+      const p=points[i];
+      pos[i*3]=p.x;pos[i*3+1]=p.y;pos[i*3+2]=p.z;
+      const f=Math.min(p.f/500,1);
+      if(f<0.5){const s=f*2;col[i*3]=C0[0]-s*0.18;col[i*3+1]=C0[1]-s*0.4;col[i*3+2]=C0[2];}
+      else{const s=(f-0.5)*2;col[i*3]=C1[0]+s*0.82;col[i*3+1]=C1[1]-s*0.2;col[i*3+2]=C1[2]-s*0.55;}
+    }
+
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.BufferAttribute(pos,3));
+    geo.setAttribute('color',new THREE.BufferAttribute(col,3));
+
+    const canvas=document.createElement('canvas');canvas.width=64;canvas.height=64;
+    const ctx=canvas.getContext('2d');
+    const grad=ctx.createRadialGradient(32,32,0,32,32,32);
+    grad.addColorStop(0,'rgba(255,255,255,1)');grad.addColorStop(0.3,'rgba(255,255,255,0.9)');grad.addColorStop(1,'rgba(255,255,255,0)');
+    ctx.fillStyle=grad;ctx.fillRect(0,0,64,64);
+    const tex=new THREE.CanvasTexture(canvas);
+
+    const mat=new THREE.PointsMaterial({size:0.03,map:tex,transparent:true,vertexColors:true,sizeAttenuation:true,blending:THREE.AdditiveBlending,depthWrite:false,opacity:0.85});
+    const mesh=new THREE.Points(geo,mat);scene.add(mesh);
+
+    const raycaster=new THREE.Raycaster();const pointer=new THREE.Vector2();const popup=document.getElementById('popup');
+    renderer.domElement.addEventListener('pointermove',e=>{const r=renderer.domElement.getBoundingClientRect();pointer.x=((e.clientX-r.left)/r.width)*2-1;pointer.y=-((e.clientY-r.top)/r.height)*2+1;});
+
+    function animate(){
+      requestAnimationFrame(animate);controls.update();
+      raycaster.setFromCamera(pointer,cam);const hits=raycaster.intersectObject(mesh);
+      if(hits.length>0){const idx=hits[0].index;const p=points[idx];popup.style.display='block';const r=renderer.domElement.getBoundingClientRect();popup.style.left=((pointer.x*0.5+0.5)*r.width+16)+'px';popup.style.top=((-pointer.y*0.5+0.5)*r.height-30)+'px';popup.innerHTML='<b>'+p.t+'</b> id='+p.id+' freq='+p.f;}
+      else{popup.style.display='none';}
+      renderer.render(scene,cam);
+    }
+    animate();
+    window.addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+  }catch(e){
+    errDiv.style.display='block';
+    errDiv.innerHTML='<b>Error</b><br>'+e.message+'<br><br>Open via HTTP server:<br><tt>python serve_vis.py</tt>';
+  }
+}
+main();
+</script></body></html>

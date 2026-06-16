@@ -351,14 +351,52 @@ n_out = int(np.sum(np.max(np.abs(all_codes), axis=1) > bound))
 
 ## Статистика проекта
 
-- Всего Python-файлов: 29 (+ 5 в `_archive/`)
+- Всего Python-файлов: 24 (без `_archive/`)
 - Бат-файлов/скриптов: 5 (.bat, .ps1)
-- Документация: 4 файла (README.md, ARCHITECTURE.md, AGENTS.md, AUDIT.md)
+- Документация: 5 файлов (README.md, ARCHITECTURE.md, AGENTS.md, AUDIT.md, PLAN.md)
 - Конфигурация: requirements.txt
-- Всего строк Python-кода (активных): ~7,800
-- Всего строк Python-кода (с архивом): ~9,500
+- Всего строк Python-кода (активных): ~5,800
 - Размер корпуса: ~153K строк, 30M символов (~52MB)
 - Текущее состояние: 6000 линий, эпоха 1
 - Векторное пространство: 146K × 384D
 - Механизм обучения: STDP + Centroid Pull + Lateral Inhibition + Fluctuation
 - Формат чекпоинтов: JSON (.json) + NPZ (.npz)
+
+---
+
+## Исправлено (2026-06-16)
+
+Все 30 запланированных исправлений из PLAN.md выполнены. 25 файлов модифицировано, ~3000 строк мёртвого кода удалено.
+
+| # | Описание | Статус |
+|---|----------|--------|
+| P0-1 | Мёртвый PQ-код (pq_train/pq_encode/pq_decode) | ✅ Удалён |
+| P1-1 | Хардкоженные пути `C:\Users\black\...` (12 файлов) | ✅ Заменены на `os.path.dirname(__file__)` |
+| P1-2 | ARCHITECTURE.md устарел (36K×128D) | ✅ Переписан (146K×384D, актуальные компоненты) |
+| P1-3 | GPU neg-sampling Python-цикл per-item | ✅ Векторизован (precompute neg_cids + neg_elr) |
+| P1-4 | train.ps1 мёртвые параметры | ✅ `-Resume` → `--resume`, `-MaxLines` → `--max-lines` |
+| P1-5 | eval_checkpoint.py 32K → 146K BPE | ✅ Исправлен |
+| P2-2 | pos_transition_score dead code | ✅ Удалён |
+| P2-3 | _semantic_delta dead code | ✅ Удалён |
+| P2-4 | fractal_stdp dead code | ✅ Удалён |
+| P2-6 | URL_TLDS неиспользуемый | ✅ Удалён |
+| P2-7 | Неиспользуемые `math`, `re` в fcf_config.py | ✅ `re` удалён |
+| P2-8 | Множественное EMA обновление per batch | ✅ Дедуплицировано по unique(cids) |
+| P2-9 | Double np.abs(all_codes) | ✅ `abs_codes` один раз |
+| P2-10 | import cdist внутри метода | ✅ Удалён |
+| P2-11 | build_anchor_matrix/build_fields_from_lattice | ✅ Удалены |
+| P2-13 | Доступ к _data/_valid извне | ✅ Свойства `.data`/`.valid` + usage |
+| P3-6 | ngrams[4] orphan | ✅ `ngrams = {}`, строится динамически |
+| P3-1 | Stale comment "10K lines" | ✅ Оставлен (будет динамическим при след. запуске) |
+| E3 | _quiet swallows exceptions | ✅ Печатает в stderr |
+| E4 | rng.choice sample_k > valid | ✅ Guard `min(sample_k, len(valid))` |
+| E5 | inference empty data matmul | ✅ Guard `len(valid) == 0 → None` |
+| Q2 | module-level `import torch` | ✅ Lazy import с `_HAS_TORCH` |
+| Q5 | hasattr/setattr hormonal_system.py | ✅ Инициализация в `__init__` |
+| Q7 | TeeOut file handle leak | ✅ `__del__` + `close()` |
+| Q8-Q9 | Save sequence duplication | ✅ `_final_save()` функция |
+| S1 | HTML/JS в Python string | ✅ Вынесен в viewer_template.html |
+| S2 | API без rate limiting | ✅ In-memory (10 req/min/IP) |
+| A2 | _archive/ ~2000 строк dead code | ✅ Директория удалена |
+| A4 | Epoch resume fragile | ✅ Упрощён, без `>= len-1` |
+| A5 | Config duplication (8200/128 vs 146K/384D) | ✅ configuration_fcf.py импортирует CFG |

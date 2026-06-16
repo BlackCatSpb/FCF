@@ -1,10 +1,11 @@
 """FastAPI server for FCF concept model."""
-import sys, os
+import sys, os, time
+from collections import defaultdict
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from contextlib import asynccontextmanager
 
 from api.schemas import GenerateRequest, GenerateResponse, HealthResponse
@@ -27,11 +28,25 @@ async def lifespan(app: FastAPI):
     print("Shutting down.")
 
 
+_rate_limit = defaultdict(list)
+RATE_LIMIT_PER_MIN = 10
+
+def _check_rate_limit(client_ip: str) -> bool:
+    now = time.time()
+    _rate_limit[client_ip] = [t for t in _rate_limit[client_ip] if now - t < 60]
+    if len(_rate_limit[client_ip]) >= RATE_LIMIT_PER_MIN:
+        return False
+    _rate_limit[client_ip].append(now)
+    return True
+
+
 app = FastAPI(title="FCF Concept Model", version="1.0.0", lifespan=lifespan)
 
 
 @app.get("/health", response_model=HealthResponse)
-async def health():
+async def health(request: Request):
+    if not _check_rate_limit(request.client.host):
+        raise HTTPException(429, "Rate limit exceeded")
     if model is None:
         raise HTTPException(503, "Model not loaded")
     return HealthResponse(
@@ -43,7 +58,9 @@ async def health():
 
 
 @app.post("/generate", response_model=GenerateResponse)
-async def generate(req: GenerateRequest):
+async def generate(req: GenerateRequest, request: Request):
+    if not _check_rate_limit(request.client.host):
+        raise HTTPException(429, "Rate limit exceeded")
     if model is None:
         raise HTTPException(503, "Model not loaded")
 
@@ -67,6 +84,8 @@ async def generate(req: GenerateRequest):
 
 
 @app.post("/chat", response_model=GenerateResponse)
-async def chat(req: GenerateRequest):
+async def chat(req: GenerateRequest, request: Request):
     """Alias for /generate — chat-compatible endpoint."""
-    return await generate(req)
+    if not _check_rate_limit(request.client.host):
+        raise HTTPException(429, "Rate limit exceeded")
+    return await generate(req, request)

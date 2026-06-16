@@ -26,7 +26,7 @@ except Exception:
     CFG = None
     BASE = '.'
     sp = None
-TEST_SEEDS = ['князь', 'жизнь', 'человек', 'война', 'развитие']
+TEST_SEEDS = CFG.test_seeds if CFG is not None else ['князь', 'человек', 'война', 'любовь', 'дом', 'жизнь']
 GEN_MAX_WORDS = 25
 
 

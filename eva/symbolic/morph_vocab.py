@@ -9,7 +9,7 @@ except ImportError:
     Segmenter = NewsEmbedding = NewsMorphTagger = NatMorph = Doc = None
 
 
-_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # eva/symbolic -> FCF/
+_BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # morph_vocab.py -> eva/symbolic -> eva -> FCF/
 
 
 class MorphVocab:
@@ -57,11 +57,11 @@ class MorphVocab:
     @classmethod
     def build(cls, corpus_path=None,
               sp_model_path=None):
+        """Build morphological vocabulary: parse corpus, assign custom paths."""
         if corpus_path is None:
             corpus_path = os.path.join(_BASE, 'real_data', 'full_corpus_ru.txt')
         if sp_model_path is None:
             sp_model_path = os.path.join(_BASE, 'real_data', 'bpe_ru_146k.model')
-        """Build morphological vocabulary: parse corpus, assign custom paths."""
         self = cls(sp_model_path=sp_model_path)
 
         if Segmenter is None:

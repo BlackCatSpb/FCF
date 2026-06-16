@@ -278,6 +278,17 @@ class CrystalGenerator:
 
         text = self._decode_tokens(best_seq)
 
+        semantic_delta = 0.0
+        if len(best_seq) >= 2:
+            deltas = []
+            for i in range(len(best_seq) - 1):
+                v1 = self.cs.concept_vector(best_seq[i])
+                v2 = self.cs.concept_vector(best_seq[i+1])
+                if v1 is not None and v2 is not None:
+                    deltas.append(1.0 - float(v1 @ v2))
+            if deltas:
+                semantic_delta = sum(deltas) / len(deltas)
+
         return {
             'text': text,
             'concept_path': best_seq,
@@ -285,6 +296,7 @@ class CrystalGenerator:
             'word_count': len(best_seq),
             'max_words': effective_max,
             'chains': all_chains,
+            'semantic_delta': semantic_delta,
         }
 
     # ── Graph-based semantic search ──────────────────────────────
@@ -312,10 +324,10 @@ class CrystalGenerator:
         origins = {}
         frontier = []
 
-        for s in sources:
+        for src_idx, s in enumerate(sources):
             d[s] = 0.0
             visited.add(s)
-            origins[s] = {sources.index(s)}
+            origins[s] = {src_idx}
             frontier.append(s)
 
         step = 0

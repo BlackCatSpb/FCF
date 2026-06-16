@@ -1,15 +1,23 @@
 """Generation test from checkpoint — shows REAL text output."""
 import sys, os; _BASE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, _BASE)
 sys.stdout.reconfigure(encoding='utf-8')
-import time, json
+import time, json, argparse
 import sentencepiece as spm
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--checkpoint', '-c', default=None,
+                    help='Checkpoint suffix like "100k" to load numbered concept_space/syntax_lattice')
+args = parser.parse_args()
+
 BPE_MODEL = os.path.join(_BASE, 'real_data', 'bpe_ru_146k.model')
 CS_PATH = os.path.join(_BASE, 'real_data', 'concept_space.json')
 LATTICE_PATH = os.path.join(_BASE, 'real_data', 'syntax_lattice.json')
+if args.checkpoint:
+    CS_PATH = os.path.join(_BASE, 'real_data', f'concept_space_{args.checkpoint}.json')
+    LATTICE_PATH = os.path.join(_BASE, 'real_data', f'syntax_lattice_{args.checkpoint}.json')
 
 print("Loading SentencePiece...")
 sp = spm.SentencePieceProcessor(model_file=BPE_MODEL)
@@ -44,7 +52,7 @@ for a, b in [('▁соба', 'ка'), ('▁человек', '▁война'), ('
 
 # Test connections for князь
 print(f"\nTop-5 connections for князь (CID 6244):")
-for cid, info in lattice.connections_of(6244, top_k=5):
+for cid, info in lattice.connections_of(sp.PieceToId('князь'), top_k=5):
     token = sp.IdToPiece(cid).replace('▁', '_')
     print(f"  {token:20s} (CID {cid:5d}) strength={info['strength']:.3f} type={info['type']}")
 

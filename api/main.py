@@ -33,7 +33,7 @@ _rate_limit = defaultdict(list)
 _rate_limit_lock = threading.Lock()
 RATE_LIMIT_PER_MIN = 10
 
-def _check_rate_limit(client_ip: str) -> bool:
+async def _check_rate_limit(client_ip: str) -> bool:
     now = time.time()
     with _rate_limit_lock:
         _rate_limit[client_ip] = [t for t in _rate_limit[client_ip] if now - t < 60]
@@ -48,7 +48,7 @@ app = FastAPI(title="FCF Concept Model", version="1.0.0", lifespan=lifespan)
 
 @app.get("/health", response_model=HealthResponse)
 async def health(request: Request):
-    if not _check_rate_limit(request.client.host):
+    if not await _check_rate_limit(request.client.host):
         raise HTTPException(429, "Rate limit exceeded")
     if model is None:
         raise HTTPException(503, "Model not loaded")
@@ -62,7 +62,7 @@ async def health(request: Request):
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest, request: Request):
-    if not _check_rate_limit(request.client.host):
+    if not await _check_rate_limit(request.client.host):
         raise HTTPException(429, "Rate limit exceeded")
     if model is None:
         raise HTTPException(503, "Model not loaded")
@@ -91,6 +91,6 @@ async def generate(req: GenerateRequest, request: Request):
 @app.post("/chat", response_model=GenerateResponse)
 async def chat(req: GenerateRequest, request: Request):
     """Alias for /generate — chat-compatible endpoint."""
-    if not _check_rate_limit(request.client.host):
+    if not await _check_rate_limit(request.client.host):
         raise HTTPException(429, "Rate limit exceeded")
     return await generate(req, request)

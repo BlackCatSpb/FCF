@@ -177,7 +177,9 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         self.generator.config = gen_config
 
         if prompt:
-            query_words = prompt.strip().split()
+            words = prompt.strip().split()
+            seed_word = words[0]
+            query_words = words[1:] if len(words) > 1 else []
         elif seed_word:
             query_words = [seed_word]
         else:
@@ -197,7 +199,7 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
             },
             confidence=0.0,
             intent_anchor=None,
-            semantic_delta=float(result.get("intent_drift", 0.0)),
+            semantic_delta=float(result.get("semantic_delta", 0.0)),
         )
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):

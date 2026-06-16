@@ -43,7 +43,6 @@ Neuro-symbolic concept learning engine. No transformers. No gradient descent.
 
 ### Other modules
 - `morph_vocab.py` — morphological vocabulary (Natasha-based)
-- `pos_tagger.py` — POS tagging
 - `hormonal_system.py` — neuromodulation (ACh, NE, DA, 5HT)
 - `train_full.py` — training harness, batching, checkpointing
 - `inference.py` — read-only inference engine
@@ -76,8 +75,7 @@ FCF/
 │   ├── syntax_lattice.py       # N-gram prefix tree + connection graph
 │   ├── parameter_optimizer.py  # LR schedule, PMI gate, homeostasis
 │   ├── morph_vocab.py          # Morphological vocabulary
-│   ├── pos_tagger.py           # POS tagging
-│   └── hormonal_system.py      # ACh, NE, DA, 5HT modulation
+    │   └── hormonal_system.py      # ACh, NE, DA, 5HT modulation
 ├── model/                      # HuggingFace wrappers (incomplete)
 ├── api/main.py                 # FastAPI REST API
 ├── real_data/                  # Corpus, BPE model, checkpoints

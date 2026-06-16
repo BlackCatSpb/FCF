@@ -674,8 +674,8 @@ class ConceptSpace:
         if len(sampled_indices) < 1:
             return
 
-        sampled_vecs = self.concept_vectors.data[sampled_indices]
         sampled_cids = [cids[i] for i in sampled_indices]
+        sampled_vecs = self.concept_vectors.data[sampled_cids]
         sims = np.dot(sampled_vecs, vw_n)
         mask = sims > threshold
         if not np.any(mask):

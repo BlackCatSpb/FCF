@@ -10,8 +10,9 @@ os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
 import sys; sys.path.insert(0, os.path.dirname(__file__))
 import time, json, os, shutil, argparse, glob, random
-import io
 import numpy as np
+import sentencepiece as spm
+from sklearn.decomposition import PCA
 
 def _quiet(func, *args, **kwargs):
     try:
@@ -29,8 +30,6 @@ def _load_morph(path, sp_path):
     mv = MorphVocab.build(sp_model_path=sp_path)
     mv.save(path)
     return mv
-import sentencepiece as spm
-from sklearn.decomposition import PCA
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
@@ -46,7 +45,7 @@ os.makedirs(CFG.vis_dir, exist_ok=True)
 LOG_FILE = CFG.log_path
 class TeeOut:
     def __init__(self):
-        self._log_fh = open(LOG_FILE, 'w', encoding='utf-8')
+        self._log_fh = open(LOG_FILE, 'a', encoding='utf-8')
     def write(self, s):
         self._log_fh.write(s)
         self._log_fh.flush()
@@ -101,12 +100,12 @@ def cleanup_old_checkpoints(keep=None):
     for p in glob.glob(os.path.join(base_dir, 'concept_space_*k.json')):
         m = re.search(r'_(\d+)k\.json$', os.path.basename(p))
         if m and int(m.group(1)) not in keep_ks:
-            k_label = m.group(0).replace('.json', '')
+            k_label = m.group(1)
             for ext in ['.json', '.codes.npz', '.opt.json']:
-                fp = os.path.join(base_dir, f'concept_space_{k_label}{ext}')
+                fp = os.path.join(base_dir, f'concept_space_{k_label}k{ext}')
                 if os.path.exists(fp): os.remove(fp)
             for ext in ['.json', '.lattice.npz', '.meta.json', '.opt.json']:
-                fp = os.path.join(base_dir, f'syntax_lattice_{k_label}{ext}')
+                fp = os.path.join(base_dir, f'syntax_lattice_{k_label}k{ext}')
                 if os.path.exists(fp): os.remove(fp)
 # ── Parse args ──────────────────────────────────────────────────
 
@@ -172,6 +171,9 @@ if RESUME is not None:
 
 if RESUME is not None:
     cs = _quiet(ConceptSpace.load, cs_path)
+    if cs is None:
+        print(f"Failed to load ConceptSpace from {cs_path}")
+        sys.exit(1)
     lattice = SyntaxLattice()
     load_ng = not FAST
     _quiet(lattice.load, lat_path, load_ngrams=load_ng)
@@ -415,6 +417,7 @@ if RESUME is not None:
     print(f"Resuming epoch {current_epoch} at line {start_line}")
 
 _ckpt_epoch = current_epoch
+idx = start_line
 try:
     for epoch in range(current_epoch, total_epochs + 1):
         _ckpt_epoch = epoch
@@ -584,17 +587,18 @@ try:
                 eval_vppl = eval_acc1 = eval_vacc1 = None
                 if idx > 0 and idx % EVAL_EVERY_F == 0:
                     eval_result = _quiet(gen.evaluate, CFG.val_corpus_path, max_lines=CFG.eval_max_lines)
-                    ppl = eval_result['perplexity']
-                    eval_vppl = eval_result['vec_perplexity']
-                    eval_acc1 = eval_result['accuracy_top1']
-                    eval_vacc1 = eval_result['vec_accuracy_top1']
-                    ppl_history.append((idx, ppl))
-                    vppl_history.append((idx, eval_vppl))
-                    ppl_trend = ''
-                    if len(ppl_history) >= 2:
-                        d = ppl - ppl_history[-2][1]
-                        ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
-                    print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
+                    if eval_result is not None:
+                        ppl = eval_result['perplexity']
+                        eval_vppl = eval_result['vec_perplexity']
+                        eval_acc1 = eval_result['accuracy_top1']
+                        eval_vacc1 = eval_result['vec_accuracy_top1']
+                        ppl_history.append((idx, ppl))
+                        vppl_history.append((idx, eval_vppl))
+                        ppl_trend = ''
+                        if len(ppl_history) >= 2:
+                            d = ppl - ppl_history[-2][1]
+                            ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
+                        print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
 
                 opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
                          vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)

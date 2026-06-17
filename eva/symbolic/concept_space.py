@@ -108,6 +108,7 @@ class FractalField:
 
         # Field bits (lazy init via init_fields())
         self.field_bits: Dict[int, np.ndarray] = {}
+        self._fb_dirty = False
 
         # Cache
         self._vector_matrix = None
@@ -181,6 +182,7 @@ class FractalField:
         n_bytes = (n_anchors + 7) // 8
         for cid in self.codes:
             self.field_bits[cid] = np.zeros(n_bytes, dtype=np.uint8)
+        self._fb_dirty = True
 
     def get_field_bits(self, cid):
         """Get binary field vector for a concept."""
@@ -506,7 +508,7 @@ class ConceptSpace:
 
     # ---- STDP: Spike-Timing-Dependent Plasticity on fractal codes ----
 
-    def _apply_vector_update(self, cid, v_new, max_shift=0.5):
+    def _apply_vector_update(self, cid: int, v_new: np.ndarray, max_shift: float = 0.5) -> None:
         """Set concept_vector[cid] directly, then sync fractal code.
 
         Vector is the canonical representation — fractal code is
@@ -719,7 +721,7 @@ class ConceptSpace:
                 break
         return result[:k]
 
-    def save(self, path, use_pq=False):
+    def save(self, path: str, use_pq: bool = False) -> None:
         """Save ConceptSpace to disk.
 
         Args:

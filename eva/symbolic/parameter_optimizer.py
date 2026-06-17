@@ -130,10 +130,14 @@ class ParameterOptimizer:
         self._flat_thresh = 0.002    # |cos| below this = flat (symmetric plateau)
         self._flat_steps = 0         # consecutive steps with |cos| below thresh
         self._cos_trend_buffer = deque(maxlen=5)  # abs(cos) history for plateau detection
+        self._full_stuck_counter = 0
 
     def _eval_trigger(self, trigger: str, ctx: dict) -> bool:
         """Evaluate a trigger string against context dict of metrics."""
         try:
+            # Full stuck: all metrics in plateau simultaneously
+            if trigger == 'full_stuck':
+                return self._full_stuck_counter >= 5
             # Plateau triggers
             if trigger == 'vec_ppl_plateau':
                 return self.m['vec_ppl'].plateau(patience=3, rel_thresh=0.002)
@@ -300,6 +304,20 @@ class ParameterOptimizer:
             else:
                 self._flat_steps = 0
 
+        # Full-stuck detection: all key metrics in plateau simultaneously
+        vacc1 = kw.get('vacc1')
+        mean_cos = kw.get('mean_cos')
+        vec_ppl = kw.get('vec_ppl')
+        cos_plateau = mean_cos is not None and abs(mean_cos) < self._flat_thresh
+        ppl_plateau = self.m['vec_ppl'].plateau(patience=3, rel_thresh=0.005) if vec_ppl is not None else True
+        v1_stuck = vacc1 is not None and vacc1 == 0.0
+        if cos_plateau and ppl_plateau and v1_stuck:
+            self._full_stuck_counter += 1
+        else:
+            self._full_stuck_counter = 0
+        if self._full_stuck_counter >= 5:
+            changes['full_stuck'] = True
+
         self._prev_mean_cos = kw.get('mean_cos', self._prev_mean_cos)
         return changes
 
@@ -314,6 +332,7 @@ class ParameterOptimizer:
             '_step': self._step,
             '_flat_steps': self._flat_steps,
             '_cos_trend_buffer': list(self._cos_trend_buffer),
+            '_full_stuck_counter': self._full_stuck_counter,
         }
 
     def load_state(self, state):
@@ -334,6 +353,7 @@ class ParameterOptimizer:
         self._vacc1_stuck = state.get('_vacc1_stuck', 0)
         self._step = state.get('_step', 0)
         self._flat_steps = state.get('_flat_steps', 0)
+        self._full_stuck_counter = state.get('_full_stuck_counter', 0)
         buf = state.get('_cos_trend_buffer', [])
         self._cos_trend_buffer = deque(buf, maxlen=5)
 

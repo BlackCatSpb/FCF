@@ -66,12 +66,12 @@ class MetricPair:
 
 
 # ──────────────────────────────────────────────
-#  Главный конфиг
+#  Пути к файлам
 # ──────────────────────────────────────────────
 
 @dataclass
-class FCFConfig:
-    # ── Пути ─────────────────────────────────
+class PathConfig:
+    """All file/directory paths for the FCF project."""
     base_dir: str = field(default_factory=_auto_base_dir)
 
     @property
@@ -117,6 +117,170 @@ class FCFConfig:
     @property
     def ckpt_state_path(self) -> str:
         return os.path.join(self.data_dir, 'checkpoint_state.json')
+
+
+# ──────────────────────────────────────────────
+#  Построитель метрических пар
+# ──────────────────────────────────────────────
+
+class MetricPairBuilder:
+    """Static builder for MetricPair lists from morph_vocab and lattice."""
+
+    @staticmethod
+    def build_antonym_pairs(morph_vocab, sp, n=5) -> list:
+        """Построить антонимичные пары через приставки не-/без-/бес-."""
+        pairs = []
+        wc = morph_vocab.word_cache
+        words = list(wc.keys())
+        random.seed(42)
+        random.shuffle(words)
+        found = 0
+        seen = set()
+        for w in words:
+            if found >= n:
+                break
+            if w.startswith('не') and len(w) > 4:
+                base = w[2:]
+                if base in wc and base not in seen:
+                    pairs.append(MetricPair(w, base, 'antonym'))
+                    seen.add(w); seen.add(base)
+                    found += 1
+            elif w.startswith('без') or w.startswith('бес'):
+                base = w[4:] if w.startswith('бес') else w[3:]
+                if base in wc and base not in seen:
+                    pairs.append(MetricPair(w, base, 'antonym'))
+                    seen.add(w); seen.add(base)
+                    found += 1
+        return pairs
+
+    @staticmethod
+    def build_morph_pairs(morph_vocab, n=5) -> list:
+        """Пары форм одной леммы — проверка LCP в октантных путях."""
+        pairs = []
+        from collections import defaultdict
+        by_lemma = defaultdict(set)
+        wi = getattr(morph_vocab, '_word_info', {})
+        if not wi:
+            return pairs
+        for word in morph_vocab.word_cache:
+            if word in wi:
+                lemma = wi[word][0]
+                by_lemma[lemma].add(word)
+        found = 0
+        for lemma, forms in by_lemma.items():
+            if found >= n:
+                break
+            forms = list(forms)
+            if len(forms) >= 2:
+                a, b = forms[0], forms[-1]
+                if a in morph_vocab.word_cache and b in morph_vocab.word_cache:
+                    pairs.append(MetricPair(a, b, 'morph'))
+                    found += 1
+        return pairs
+
+    @staticmethod
+    def build_high_pmi_pairs(lattice, sp, n=10) -> list:
+        """Top-PMI биграммы из корпуса — сильные коллокации."""
+        pairs = []
+        if not lattice.ngrams or not lattice.ngrams.get(2):
+            return pairs
+        scored = []
+        for (a,), counter in lattice.ngrams[2].items():
+            total = sum(counter.values())
+            if total < 5:
+                continue
+            for b, cnt in counter.most_common(5):
+                pmi = math.log(cnt / total / max(lattice.concept_freq.get(b, 1) / max(sum(lattice.concept_freq.values()), 1), 1e-10))
+                if pmi > 3:
+                    scored.append((pmi, a, b))
+        scored.sort(key=lambda x: -x[0])
+        for pmi, a, b in scored[:n]:
+            ta = sp.IdToPiece(a) if a < sp.vocab_size() else str(a)
+            tb = sp.IdToPiece(b) if b < sp.vocab_size() else str(b)
+            pairs.append(MetricPair(ta, tb, 'collocation', expected_sim=min(pmi/5, 1.0)))
+        return pairs
+
+    @staticmethod
+    def build_defaults() -> tuple:
+        """Return (live_pairs, eval_pairs) with built-in antonym pairs."""
+        builtin = [
+            MetricPair('да', 'нет', 'antonym'),
+            MetricPair('хороший', 'плохой', 'antonym'),
+            MetricPair('большой', 'маленький', 'antonym'),
+            MetricPair('высокий', 'низкий', 'antonym'),
+            MetricPair('правда', 'ложь', 'antonym'),
+            MetricPair('жизнь', 'смерть', 'antonym'),
+            MetricPair('война', 'мир', 'antonym'),
+            MetricPair('любовь', 'ненависть', 'antonym'),
+            MetricPair('всегда', 'никогда', 'antonym'),
+            MetricPair('начало', 'конец', 'antonym'),
+            MetricPair('новый', 'старый', 'antonym'),
+            MetricPair('белый', 'чёрный', 'antonym'),
+            MetricPair('день', 'ночь', 'antonym'),
+            MetricPair('добро', 'зло', 'antonym'),
+        ]
+        live = [
+            MetricPair('соба', 'ка', 'bpe'),
+            MetricPair('человек', 'война', 'bpe'),
+            MetricPair('князь', 'Андрей', 'bpe'),
+            MetricPair('любовь', 'смерть', 'bpe'),
+        ]
+        return live, builtin
+
+
+# ──────────────────────────────────────────────
+#  Главный конфиг
+# ──────────────────────────────────────────────
+
+@dataclass
+class FCFConfig:
+    # ── Пути ─────────────────────────────────
+    paths: PathConfig = field(default_factory=PathConfig)
+    base_dir: str = field(default_factory=_auto_base_dir)
+
+    @property
+    def data_dir(self) -> str:
+        return self.paths.data_dir
+
+    @property
+    def corpus_path(self) -> str:
+        return self.paths.corpus_path
+
+    @property
+    def bpe_model_path(self) -> str:
+        return self.paths.bpe_model_path
+
+    @property
+    def morph_vocab_path(self) -> str:
+        return self.paths.morph_vocab_path
+
+    @property
+    def cs_path(self) -> str:
+        return self.paths.cs_path
+
+    @property
+    def lattice_path(self) -> str:
+        return self.paths.lattice_path
+
+    @property
+    def log_path(self) -> str:
+        return self.paths.log_path
+
+    @property
+    def val_corpus_path(self) -> str:
+        return self.paths.val_corpus_path
+
+    @property
+    def vis_dir(self) -> str:
+        return self.paths.vis_dir
+
+    @property
+    def status_path(self) -> str:
+        return self.paths.status_path
+
+    @property
+    def ckpt_state_path(self) -> str:
+        return self.paths.ckpt_state_path
 
     # ── Архитектура ─────────────────────────
     dim: int = 384
@@ -178,6 +342,7 @@ class FCFConfig:
             AdaptRule('cos_trend > 0.001 and mean_cos > 0.01', 'pmi_strength', 'shift', -0.02),
             AdaptRule('cos_trend < -0.001 and mean_cos < 0.005', 'pmi_strength', 'shift', 0.02),
             AdaptRule('cos_flat >= 3', 'pmi_strength', 'shift', 0.05),
+            AdaptRule('full_stuck', 'pmi_strength', 'shift', -0.05),
         ]),
         ParamDef('pmi_gate_min',   0.05,   0.5,    0.20,   0.02, rules=[
             AdaptRule('delta < 2.0', 'pmi_gate_min', 'shift', -0.01),
@@ -189,6 +354,7 @@ class FCFConfig:
         ]),
         ParamDef('destab_decay_lines', 5000, 60000, 30000, 2000, rules=[
             AdaptRule('cos_flat >= 3', 'destab_decay_lines', 'shift', 2000),
+            AdaptRule('full_stuck', 'destab_decay_lines', 'shift', -2000),
         ]),
     ])
 
@@ -209,6 +375,7 @@ class FCFConfig:
     fluctuate_every: int = 2000
     decay_every_fast: int = 2000
     decay_every_slow: int = 3000
+    decay_every_pairs: int = 32000
 
     # ── Гиперы FAST-режима ────────────────────
     fast_lr: float = 0.15
@@ -258,121 +425,19 @@ class FCFConfig:
     #  Генерация пар из MorphVocab/корпуса
     # ──────────────────────────────────────────
 
-    @staticmethod
-    def build_antonym_pairs(morph_vocab, sp, n=5) -> list:
-        """Построить антонимичные пары через приставки не-/без-/бес-."""
-        pairs = []
-        wc = morph_vocab.word_cache  # word -> cid
-        words = list(wc.keys())
-        random.seed(42)
-        random.shuffle(words)
-        found = 0
-        seen = set()
-        for w in words:
-            if found >= n:
-                break
-            if w.startswith('не') and len(w) > 4:
-                base = w[2:]
-                if base in wc and base not in seen:
-                    pairs.append(MetricPair(w, base, 'antonym'))
-                    seen.add(w); seen.add(base)
-                    found += 1
-            elif w.startswith('без') or w.startswith('бес'):
-                base = w[4:] if w.startswith('бес') else w[3:]
-                if base in wc and base not in seen:
-                    pairs.append(MetricPair(w, base, 'antonym'))
-                    seen.add(w); seen.add(base)
-                    found += 1
-        return pairs
-
-    @staticmethod
-    def build_morph_pairs(morph_vocab, n=5) -> list:
-        """Пары форм одной леммы — проверка LCP в октантных путях."""
-        pairs = []
-        from collections import defaultdict
-        by_lemma = defaultdict(set)
-        # word_cache: word -> cid; _word_info: word -> (lemma, gram, is_service)
-        wi = getattr(morph_vocab, '_word_info', {})
-        if not wi:
-            return pairs
-        for word in morph_vocab.word_cache:
-            if word in wi:
-                lemma = wi[word][0]
-                by_lemma[lemma].add(word)
-
-        found = 0
-        for lemma, forms in by_lemma.items():
-            if found >= n:
-                break
-            forms = list(forms)
-            if len(forms) >= 2:
-                a, b = forms[0], forms[-1]
-                if a in morph_vocab.word_cache and b in morph_vocab.word_cache:
-                    pairs.append(MetricPair(a, b, 'morph'))
-                    found += 1
-        return pairs
-
-    @staticmethod
-    def build_high_pmi_pairs(lattice, sp, n=10) -> list:
-        """Top-PMI биграммы из корпуса — сильные коллокации."""
-        pairs = []
-        if not lattice.ngrams or not lattice.ngrams.get(2):
-            return pairs
-        scored = []
-        for (a,), counter in lattice.ngrams[2].items():
-            total = sum(counter.values())
-            if total < 5:
-                continue
-            for b, cnt in counter.most_common(5):
-                pmi = math.log(cnt / total / max(lattice.concept_freq.get(b, 1) / max(sum(lattice.concept_freq.values()), 1), 1e-10))
-                if pmi > 3:
-                    scored.append((pmi, a, b))
-        scored.sort(key=lambda x: -x[0])
-        for pmi, a, b in scored[:n]:
-            ta = sp.IdToPiece(a) if a < sp.vocab_size() else str(a)
-            tb = sp.IdToPiece(b) if b < sp.vocab_size() else str(b)
-            pairs.append(MetricPair(ta, tb, 'collocation', expected_sim=min(pmi/5, 1.0)))
-        return pairs
-
     def build_metric_pairs(self, morph_vocab=None, lattice=None, sp=None):
         """Заполнить live_pairs и eval_pairs автоматически."""
-        pairs = []
-        # Встроенные антонимы
-        builtin = [
-            MetricPair('да', 'нет', 'antonym'),
-            MetricPair('хороший', 'плохой', 'antonym'),
-            MetricPair('большой', 'маленький', 'antonym'),
-            MetricPair('высокий', 'низкий', 'antonym'),
-            MetricPair('правда', 'ложь', 'antonym'),
-            MetricPair('жизнь', 'смерть', 'antonym'),
-            MetricPair('война', 'мир', 'antonym'),
-            MetricPair('любовь', 'ненависть', 'antonym'),
-            MetricPair('всегда', 'никогда', 'antonym'),
-            MetricPair('начало', 'конец', 'antonym'),
-            MetricPair('новый', 'старый', 'antonym'),
-            MetricPair('белый', 'чёрный', 'antonym'),
-            MetricPair('день', 'ночь', 'antonym'),
-            MetricPair('добро', 'зло', 'antonym'),
-        ]
-        pairs.extend(builtin)
+        builder = MetricPairBuilder()
+        live, eval_p = builder.build_defaults()
 
         if morph_vocab is not None:
-            pairs.extend(self.build_antonym_pairs(morph_vocab, sp, 5))
+            eval_p.extend(builder.build_antonym_pairs(morph_vocab, sp, 5))
+            morph = builder.build_morph_pairs(morph_vocab, 3)
+            live.extend(morph)
 
-        # BPE-пары для живого мониторинга (короткие, влезают в терминал)
-        self.live_pairs = [
-            MetricPair('соба', 'ка', 'bpe'),
-            MetricPair('человек', 'война', 'bpe'),
-            MetricPair('князь', 'Андрей', 'bpe'),
-            MetricPair('любовь', 'смерть', 'bpe'),
-        ]
-
-        if morph_vocab is not None:
-            morph = self.build_morph_pairs(morph_vocab, 3)
-            self.live_pairs.extend(morph)
-
-        self.eval_pairs = pairs
-        return pairs
+        self.live_pairs = live
+        self.eval_pairs = eval_p
+        return eval_p
 
     # ──────────────────────────────────────────
     #  Сериализация

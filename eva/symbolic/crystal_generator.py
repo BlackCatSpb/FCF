@@ -16,6 +16,7 @@ import math, os, random
 import numpy as np
 from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 # meta_t column indices (gpu_meta_l tuple order)
 _META_I = 0
@@ -146,7 +147,7 @@ class CrystalGenerator:
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         dev = torch.device(device)
-        if self._torch_device == dev and self._vecs_t is not None and not self._torch_dirty:
+        if self._torch_device == dev and self._vecs_t is not None and not self._torch_dirty and not self.cs.fractal._fb_dirty:
             return
 
         # OOM fallback: try GPU, fall back to CPU on CUDA out of memory
@@ -203,6 +204,7 @@ class CrystalGenerator:
         self._fb_t = torch.from_numpy(fb_arr).to(dev, non_blocking=True)
 
         self._torch_dirty = False
+        self.cs.fractal._fb_dirty = False
         if dev.type == 'cuda':
             torch.cuda.synchronize()
             alloc_mb = torch.cuda.max_memory_allocated() / 1024**2
@@ -471,7 +473,7 @@ class CrystalGenerator:
 
     # ── Branch ─────────────────────────────────────────────────
 
-    def _branch(self, seq, word_num, theta_temp=0.3, target_cid=None, centroid=None):
+    def _branch(self, seq: List[int], word_num: int, theta_temp: float = 0.3, target_cid: Optional[int] = None, centroid: Optional[np.ndarray] = None) -> List[Tuple[int, float]]:
         """Generate diverse branching candidates via RRF over multiple signals."""
         prev_cid = seq[-1]
         cids = seq[-3:] if len(seq) >= 3 else seq
@@ -684,8 +686,8 @@ class CrystalGenerator:
 
     # ── Training ───────────────────────────────────────────────
 
-    def _gpu_stdp_apply(self, gpu_ctx_l, gpu_tgt_l, gpu_meta_l, gpu_cid_gen, base_lr_val,
-                         field_gate, inh_strength, inh_threshold, destab_scale):
+    def _gpu_stdp_apply(self, gpu_ctx_l: List[int], gpu_tgt_l: List[int], gpu_meta_l: List[Tuple[float, ...]], gpu_cid_gen: List[int], base_lr_val: float,
+                         field_gate: bool, inh_strength: float, inh_threshold: float, destab_scale: float) -> np.ndarray:
         """GPU batched STDP: field overlaps, LR compute, scatter_add, updates, lateral inhibition."""
         cs = self.cs
         device = self._torch_device
@@ -837,7 +839,7 @@ class CrystalGenerator:
 
         return unique_gen
 
-    def _cpu_stdp_apply(self, gen_updates, base_lr_val, destab_scale, inh_strength, inh_threshold):
+    def _cpu_stdp_apply(self, gen_updates: Dict[int, List[Tuple[int, float]]], base_lr_val: float, destab_scale: float, inh_strength: float, inh_threshold: float) -> None:
         """One combined STDP update per unique gen_cid (batched numpy) with destab support."""
         cs = self.cs
         best_gen_cid = None
@@ -975,6 +977,10 @@ class CrystalGenerator:
             theta_gate_arr = np.exp(-np.minimum(dist_arr, 5.0) / max(self.theta_tau, 1.0))
             neg_elr_arr = np.maximum(meta_arr[:, _META_FW], 0.05) * meta_arr[:, _META_DW] * meta_arr[:, _META_PMI] * meta_arr[:, _META_FIELD_W] * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
             neg_elr_arr *= (0.5 + self.hormones.acetylcholine * 0.5) * (0.5 + self.hormones.dopamine * 0.5)
+            # Adaptive concept_error weighting: high error → stronger push-away
+            for pi in range(n_pairs):
+                ce = self.concept_error.get(gpu_cid_gen[pi], 0.0)
+                neg_elr_arr[pi] *= (1.0 + ce * 2.0)
             valid_elr_t = torch.from_numpy(neg_elr_arr[valid_pi.cpu().numpy()]).to(device, non_blocking=True)
 
             # Gather neg CIDs and vectors from _vecs_t
@@ -1018,6 +1024,7 @@ class CrystalGenerator:
         for gen_cid, updates in gen_updates.items():
             for prev_cid, elr in updates:
                 neg_elr = elr * neg_lr_ratio
+                neg_elr *= (1.0 + self.concept_error.get(gen_cid, 0.0) * 2.0)
                 v_ctx = cs.get_vec(prev_cid)
                 if v_ctx is None:
                     continue
@@ -1051,6 +1058,8 @@ class CrystalGenerator:
                 continue
             avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
             contr_lr = avg_elr * 0.3
+            # Concept-error weighting: high error → stronger contrastive push
+            contr_lr *= (1.0 + self.concept_error.get(gen_cid, 0.0) * 2.0)
 
             # Top-100 nearest neighbours (potential hard negatives)
             neighbours = cs.topk_similar_concepts(gen_cid, k=100, sample_size=2000)
@@ -1149,10 +1158,13 @@ class CrystalGenerator:
                                pmi_strength, pmi_gate_min, field_gate, base_lr,
                                use_torch, cid_to_idx,
                                gen_updates, gpu_ctx_l, gpu_tgt_l, gpu_meta_l,
-                               gpu_cid_ctx, gpu_cid_gen):
-        """Shared pair-building loop: context→target STDP pairs for one sentence."""
+                               gpu_cid_ctx, gpu_cid_gen) -> int:
+        """Shared pair-building loop: context→target STDP pairs for one sentence.
+        Returns the number of pairs built.
+        """
         cs = self.cs
         T = len(ids)
+        n_pairs = 0
         for i in range(T):
             start = max(0, i - context_window)
             end = min(T, i + context_window + 1)
@@ -1173,8 +1185,13 @@ class CrystalGenerator:
                     continue
 
                 field_weight = 1.0
-                if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
-                    overlap = cs.fractal.field_overlap(ids[i], ids[j])
+                if field_gate:
+                    if use_torch and self._fb_t is not None:
+                        overlap = int(torch.bitwise_and(self._fb_t[ids[i]], self._fb_t[ids[j]]).sum().item())
+                    elif hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
+                        overlap = cs.fractal.field_overlap(ids[i], ids[j])
+                    else:
+                        overlap = 0
                     field_weight = min(1.0 + math.log(overlap + 1) * 2.0, 3.0) if overlap > 0 else 0.1
 
                 lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
@@ -1182,6 +1199,7 @@ class CrystalGenerator:
                 lr *= (0.5 + self.hormones.acetylcholine * 0.5) * (0.5 + self.hormones.dopamine * 0.5)
                 theta_gate = math.exp(-min(abs(j-i), 5) / max(self.theta_tau, 1.0))
                 gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
+                n_pairs += 1
 
                 if use_torch:
                     ci = cid_to_idx.get(ids[i])
@@ -1193,6 +1211,8 @@ class CrystalGenerator:
                     gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight))
                     gpu_cid_ctx.append(ids[i])
                     gpu_cid_gen.append(ids[j])
+
+        return n_pairs
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20, neg_samples=1,
                         inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=None,
@@ -1315,11 +1335,12 @@ class CrystalGenerator:
         gpu_cid_ctx = []
         gpu_cid_gen = []
 
+        total_pairs = 0
         for ids in all_ids:
-            self._build_pairs_from_ids(ids, context_window, total_freq, pmi_strength, pmi_gate_min,
-                                       field_gate, base_lr, use_torch, cid_to_idx,
-                                       gen_updates, gpu_ctx_l, gpu_tgt_l, gpu_meta_l,
-                                       gpu_cid_ctx, gpu_cid_gen)
+            total_pairs += self._build_pairs_from_ids(ids, context_window, total_freq, pmi_strength, pmi_gate_min,
+                                                       field_gate, base_lr, use_torch, cid_to_idx,
+                                                       gen_updates, gpu_ctx_l, gpu_tgt_l, gpu_meta_l,
+                                                       gpu_cid_ctx, gpu_cid_gen)
 
         # ── GPU STDP (single call for all pairs) ──
         if use_torch and gpu_ctx_l:
@@ -1351,7 +1372,7 @@ class CrystalGenerator:
         if use_torch:
             self._torch_dirty = True
 
-        return len(all_ids)
+        return total_pairs
 
     # ── Evaluation ────────────────────────────────────────────
 

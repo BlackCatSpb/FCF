@@ -384,6 +384,8 @@ last_cos_time = 0.0
 last_cos_sim = (0.0, 0.0)
 last_fluct_lines = 0
 last_decay_lines = 0
+last_decay_pairs = 0
+total_pairs_since_last_decay = 0
 
 def live_status(text):
     """Write one-line status to terminal only — \r updates in place."""
@@ -528,7 +530,7 @@ try:
             if len(batch_buffer) < BATCH_SIZE and idx < start_line + len(epoch_train) - 1:
                 # Check if periodic tasks are due — if so, flush early
                 is_fluct_due = (idx + 1 - last_fluct_lines) >= FLUCTUATE_EVERY
-                is_decay_due = (idx + 1 - last_decay_lines) >= DECAY_EVERY
+                is_decay_due = total_pairs_since_last_decay >= CFG.decay_every_pairs
                 if not is_fluct_due and not is_decay_due:
                     continue
 
@@ -541,7 +543,7 @@ try:
             cw_ramp = max(1, int(round(cw_target * cp)))
             ns_ramp = int(round(ns_target * cp))
             pg_ramp = pg_target * cp
-            gen.train_batch(batch_buffer, pmi_strength=opt.p['pmi_strength'].current,
+            n_pairs = gen.train_batch(batch_buffer, pmi_strength=opt.p['pmi_strength'].current,
                 pmi_gate_min=pg_ramp,
                 base_lr=batch_lr,
                 neg_samples=ns_ramp,
@@ -550,6 +552,7 @@ try:
                 inh_threshold=opt.p['inh_threshold'].current,
                 neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate,
                 use_torch=CFG.use_torch, destab_scale=batch_destab)
+            total_pairs_since_last_decay += n_pairs
             _batch_ms = (time.time() - _bt) * 1000
             _n = len(batch_buffer)
             if 'batch_log' not in locals() or batch_log is None:
@@ -572,11 +575,12 @@ try:
                                      generator=gen)
                 last_fluct_lines = idx
 
-            if idx > 0 and idx - last_decay_lines >= DECAY_EVERY:
+            if idx > 0 and total_pairs_since_last_decay >= CFG.decay_every_pairs:
                 lattice.decay_all()
                 lattice.decay_connections()
                 cs.decay_usage(decay=0.98)
                 last_decay_lines = idx
+                total_pairs_since_last_decay = 0
 
             # ---- Live status (every ~1 second on terminal) ----
             if now - last_stat_time >= LIVE_REFRESH:
@@ -686,9 +690,15 @@ try:
                             ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
                         print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
 
-                opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
+                opt_changes = opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
                          vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1 or 0)
                 gen.train_lr = opt.p['full_lr'].current
+                if opt_changes.get('full_stuck'):
+                    print(f"  FULL_STUCK — forcing fluctuate")
+                    cs.fluctuate_fractal(noise_scale=opt.p['noise_scale'].current,
+                                         decay=opt.p['decay_rate'].current,
+                                         repel_strength=opt.p['repel_strength'].current,
+                                         generator=gen)
                 print()
 
 except KeyboardInterrupt:

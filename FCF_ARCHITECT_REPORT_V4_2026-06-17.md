@@ -272,3 +272,38 @@
 ---
 
 *Отчёт составлен коллегией AI-агентов: Architect-AI, Neuro-Symbolic Specialist, GPU-Opt Agent, Training-Dynamics Agent, Quality-Safety Agent*
+
+---
+
+## 10. Статус исправлений V4 (сессия 3)
+
+Все 19 проблем из V4 закрыты (TN-13 отменён как logging suggestion). Коммит: `39d58cf`.
+
+| ID | Проблема | Приор. | Статус | Изменение |
+|:--:|----------|:------:|:------:|-----------|
+| **SN-1** | Undefined `gpu_cid_gen` → NameError | **P0** | ✅ | Добавлен в сигнатуру `_negative_sampling_gpu:937` + проброшен из call sites (`train_from_text:1272`, `train_batch:1354`) |
+| **TN-12** | `full_stuck` ложные срабатывания без eval | **P0** | ✅ | `ppl_plateau = False` при `vec_ppl is None`; `v1_stuck` требует `vacc1 is not None`; `train_full.py:694` убран `or 0` |
+| **QN-1** | `np.load` без `allow_pickle=False` (RCE) | **P0** | ✅ | `allow_pickle=False` в `syntax_lattice.py:548` и `concept_space.py:267` |
+| **SN-2** | Double distance decay CPU vs GPU | **P1** | ✅ | Убран `dist_weight` из `lr` формулы в `_build_pairs_from_ids:1197` |
+| **A-N1** | OOM fallback retries CUDA на каждый вызов | **P2** | ✅ | Persistent `self._torch_fallback=True` после OOM; проверка в `_ensure_torch:148` |
+| **A-N2** | Double `fluctuate_fractal` при `full_stuck` | **P2** | ✅ | Проверка `last_fluct_lines != idx` в `train_full.py:696`; `last_fluct_lines = idx` внутри блока |
+| **A-N3** | PMI отключён на 1 батч после `decay_all` | **P2** | ✅ | `_refresh_prefix_totals()` в конце `decay_all()` (`syntax_lattice.py:264`) |
+| **A-N4** | Test coverage gap | **P2** | ✅ | 4 новых GPU/CPU parity теста; 32 теста всего; `@pytest.fixture` изоляция |
+| **SN-3** | concept_error кэш 30K < 146K vocab | **P2** | ✅ | Лимит изменён на `min(3 * vocab_size // 4, 100000)` |
+| **GN-1** | Регенерация `_cid_order_t` | **P2** | ✅ | Устранён побочно (A-N6 — identity CID indexing removed) |
+| **GN-2** | CPU-цикл concept_error в GPU path | **P2** | ✅ | Векторизован через `_ce_t` tensor (строится в `_build_torch_tensors:212`) + torch indexing |
+| **GN-3** | evaluate — дублирование `prev_vecs` CPU→GPU | **P2** | ✅ | Заменён на `_vecs_t[prev_cids_t]` GPU gather (`crystal_generator.py:1478-1482`) |
+| **T-2** | Destab reset на epoch 2+ | **P2** | ✅ | `destab_pct` от `global_step` (монотонный счётчик) вместо per-epoch `idx` |
+| **QN-2** | OOM fallback ненадёжен | **P2** | ✅ | `isinstance(e, torch.cuda.OutOfMemoryError)` + fallback string check |
+| **A-N5** | `last_decay_lines` мёртвый код | **P3** | ✅ | Удалён из `train_full.py` |
+| **A-N6** | identity-индексация CIDs | **P3** | ✅ | `neg_idxs` используется напрямую как CIDs |
+| **A-N7** | class-переменная `_default_use_torch` | **P3** | ✅ | Заменена на instance `self._use_torch_default` |
+| **QN-3** | `FCFConfig.base_dir` дублирует `PathConfig` | **P3** | ✅ | Удалён из `FCFConfig` |
+| **QN-4** | Тесты не изолированы | **P3** | ✅ | `@pytest.fixture` для `cs`, `lattice`, `gen`, `dim`, `vocab_size` |
+| **TN-13** | Гормоны не обновляются при train | **P2** | ➖ | Отменён (только logging suggestion, без behavioural fix) |
+
+**Файлы изменены (7):** `concept_space.py`, `crystal_generator.py`, `fcf_config.py`, `parameter_optimizer.py`, `syntax_lattice.py`, `train_full.py`, `tests/test_stdp.py`
+
+**Тесты:** 32/32 ✅
+
+**Общий прогресс:** 76 V3 + 19 V4 = **95 проблем закрыто** из 95. TN-13 отменён как logging suggestion без behavioural изменения.

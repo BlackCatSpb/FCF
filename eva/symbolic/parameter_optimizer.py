@@ -309,7 +309,7 @@ class ParameterOptimizer:
         mean_cos = kw.get('mean_cos')
         vec_ppl = kw.get('vec_ppl')
         cos_plateau = mean_cos is not None and abs(mean_cos) < self._flat_thresh
-        ppl_plateau = self.m['vec_ppl'].plateau(patience=3, rel_thresh=0.005) if vec_ppl is not None else True
+        ppl_plateau = vec_ppl is not None and self.m['vec_ppl'].plateau(patience=3, rel_thresh=0.005)
         v1_stuck = vacc1 is not None and vacc1 == 0.0
         if cos_plateau and ppl_plateau and v1_stuck:
             self._full_stuck_counter += 1

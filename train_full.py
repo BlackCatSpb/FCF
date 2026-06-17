@@ -383,7 +383,8 @@ last_stat_time = 0.0
 last_cos_time = 0.0
 last_cos_sim = (0.0, 0.0)
 last_fluct_lines = 0
-last_decay_lines = 0
+
+global_step = 0
 last_decay_pairs = 0
 total_pairs_since_last_decay = 0
 
@@ -507,6 +508,7 @@ try:
 
         idx = start_line
         for idx, line in enumerate(epoch_train[start_line:], start=start_line):
+            global_step += 1
             if not line:
                 continue
 
@@ -518,7 +520,7 @@ try:
             # LR warmup
             gen.train_lr = get_lr(idx)
 
-            destab_pct = min(idx / max(round(opt.p['destab_decay_lines'].current), 1), 1.0)
+            destab_pct = min(global_step / max(round(opt.p['destab_decay_lines'].current), 1), 1.0)
             destab_from = max(CFG.destab_scale_start, CFG.destab_scale_end)
             destab_to = min(CFG.destab_scale_start, CFG.destab_scale_end)
             destab_scale = destab_from + (destab_to - destab_from) * destab_pct
@@ -579,7 +581,6 @@ try:
                 lattice.decay_all()
                 lattice.decay_connections()
                 cs.decay_usage(decay=0.98)
-                last_decay_lines = idx
                 total_pairs_since_last_decay = 0
 
             # ---- Live status (every ~1 second on terminal) ----
@@ -691,14 +692,15 @@ try:
                         print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
 
                 opt_changes = opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
-                         vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1 or 0)
+                         vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
                 gen.train_lr = opt.p['full_lr'].current
-                if opt_changes.get('full_stuck'):
+                if opt_changes.get('full_stuck') and last_fluct_lines != idx:
                     print(f"  FULL_STUCK — forcing fluctuate")
                     cs.fluctuate_fractal(noise_scale=opt.p['noise_scale'].current,
                                          decay=opt.p['decay_rate'].current,
                                          repel_strength=opt.p['repel_strength'].current,
                                          generator=gen)
+                    last_fluct_lines = idx
                 print()
 
 except KeyboardInterrupt:

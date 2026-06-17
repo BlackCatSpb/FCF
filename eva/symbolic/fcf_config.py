@@ -236,7 +236,6 @@ class MetricPairBuilder:
 class FCFConfig:
     # ── Пути ─────────────────────────────────
     paths: PathConfig = field(default_factory=PathConfig)
-    base_dir: str = field(default_factory=_auto_base_dir)
 
     @property
     def data_dir(self) -> str:

@@ -261,6 +261,7 @@ class SyntaxLattice:
         self._ppmi_cache = None
         self._prefix_total = {}
         self._skip2_total = {}
+        self._refresh_prefix_totals()
 
     def decay_connections(self, cutoff=0.1):
         """Decay and prune connections (call periodically)."""
@@ -545,7 +546,7 @@ class SyntaxLattice:
 
         # New binary format
         if os.path.exists(binary_path):
-            npz = np.load(binary_path)
+            npz = np.load(binary_path, allow_pickle=False)
             # N-grams (skip for generation-only mode)
             if load_ngrams:
                 for n_str in [k for k in npz.files if k.startswith('prefixes_')]:

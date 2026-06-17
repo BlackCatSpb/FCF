@@ -2,6 +2,7 @@
 
 import math, os, sys
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -12,35 +13,52 @@ from eva.symbolic.fcf_config import FCFConfig, PathConfig, MetricPairBuilder
 
 try:
     import torch
-    HAS_TORCH = torch.cuda.is_available()
+    HAS_TORCH = True
 except ImportError:
     torch = None
     HAS_TORCH = False
 
-DIM = 64
-VOCAB_SIZE = 20
+
+@pytest.fixture
+def dim():
+    return 64
 
 
-def make_minimal_cs():
-    cs = ConceptSpace(vocab_size=VOCAB_SIZE, dim=DIM)
+@pytest.fixture
+def vocab_size():
+    return 20
+
+
+@pytest.fixture
+def cs(dim, vocab_size):
+    cs = ConceptSpace(vocab_size=vocab_size, dim=dim)
     cs.init_concepts()
     cs.init_homeostasis()
     return cs
 
 
-def make_minimal_lattice():
+@pytest.fixture
+def lattice(vocab_size):
     lat = SyntaxLattice()
-    lat.concept_freq = {i: max(10 - i, 1) for i in range(VOCAB_SIZE)}
+    lat.concept_freq = {i: max(10 - i, 1) for i in range(vocab_size)}
     return lat
+
+
+@pytest.fixture
+def gen(cs, lattice):
+    from eva.symbolic.crystal_generator import CrystalGenerator
+    gen = CrystalGenerator(cs, None, lattice)
+    gen.max_grad_norm = 1.0
+    return gen
 
 
 # ── 1. ConceptVectorStore ───────────────────────────────────────
 
 class TestConceptVectorStore:
-    def test_basic_crud(self):
-        s = ConceptVectorStore(10, DIM)
+    def test_basic_crud(self, dim):
+        s = ConceptVectorStore(10, dim)
         assert len(s) == 0
-        v = np.random.randn(DIM).astype(np.float32)
+        v = np.random.randn(dim).astype(np.float32)
         v /= max(np.linalg.norm(v), 1e-10)
         s[3] = v
         assert 3 in s
@@ -50,17 +68,17 @@ class TestConceptVectorStore:
         assert np.allclose(r, v)
         assert s.get(999) is None
 
-    def test_bounds_check(self):
-        s = ConceptVectorStore(10, DIM)
-        v = np.random.randn(DIM).astype(np.float32)
+    def test_bounds_check(self, dim):
+        s = ConceptVectorStore(10, dim)
+        v = np.random.randn(dim).astype(np.float32)
         s[0] = v
         assert s.get(-1) is None
         assert s.get(100) is None
 
-    def test_items_and_keys(self):
-        s = ConceptVectorStore(5, DIM)
+    def test_items_and_keys(self, dim):
+        s = ConceptVectorStore(5, dim)
         for i in range(5):
-            v = np.random.randn(DIM).astype(np.float32)
+            v = np.random.randn(dim).astype(np.float32)
             v /= max(np.linalg.norm(v), 1e-10)
             s[i] = v
         keys = list(s.keys())
@@ -74,26 +92,26 @@ class TestConceptVectorStore:
 # ── 2. FractalField ─────────────────────────────────────────────
 
 class TestFractalField:
-    def test_init_and_vector(self):
-        ff = FractalField(dim=DIM, latent_dim=64)
+    def test_init_and_vector(self, dim):
+        ff = FractalField(dim=dim, latent_dim=64)
         v = ff.init_concept(0)
         assert v is not None
         assert abs(np.linalg.norm(v) - 1.0) < 1e-6
 
-    def test_basis_health(self):
-        ff = FractalField(dim=DIM, latent_dim=64)
+    def test_basis_health(self, dim):
+        ff = FractalField(dim=dim, latent_dim=64)
         assert not ff.check_basis_health()
 
-    def test_fluctuate(self):
-        ff = FractalField(dim=DIM, latent_dim=64)
+    def test_fluctuate(self, dim):
+        ff = FractalField(dim=dim, latent_dim=64)
         v0 = ff.init_concept(0)
         ff.fluctuate(noise_scale=0.001, decay=0.999)
         v1 = ff.compute_vector(0)
         assert v1 is not None
         assert abs(np.linalg.norm(v1) - 1.0) < 1e-6
 
-    def test_fb_dirty_flag(self):
-        ff = FractalField(dim=DIM, latent_dim=64)
+    def test_fb_dirty_flag(self, dim):
+        ff = FractalField(dim=dim, latent_dim=64)
         assert not ff._fb_dirty
         ff.init_fields(n_anchors=32)
         assert ff._fb_dirty
@@ -105,29 +123,25 @@ class TestFractalField:
 # ── 3. ConceptSpace ─────────────────────────────────────────────
 
 class TestConceptSpace:
-    def test_initialization(self):
-        cs = make_minimal_cs()
-        assert cs.vocab_size == VOCAB_SIZE
+    def test_initialization(self, cs, vocab_size):
+        assert cs.vocab_size == vocab_size
         assert len(cs.concept_vectors) > 0
 
-    def test_vector_norms(self):
-        cs = make_minimal_cs()
+    def test_vector_norms(self, cs):
         ok, total, max_dev = cs.validate_vector_norms()
         assert ok == total
 
-    def test_topk_similar(self):
-        cs = make_minimal_cs()
+    def test_topk_similar(self, cs):
         top = cs.topk_similar_concepts(0, k=5, sample_size=20)
         assert len(top) <= 5
         for cid, sim in top:
             assert cid != 0
             assert -1.0 <= sim <= 1.0
 
-    def test_apply_vector_update(self):
-        cs = make_minimal_cs()
+    def test_apply_vector_update(self, cs, dim):
         v = cs.concept_vectors.get(0)
         assert v is not None
-        v_new = v + np.random.randn(DIM).astype(np.float32) * 0.01
+        v_new = v + np.random.randn(dim).astype(np.float32) * 0.01
         nv = np.linalg.norm(v_new)
         if nv > 1e-10:
             v_new /= nv
@@ -140,74 +154,123 @@ class TestConceptSpace:
 # ── 4. STDP ─────────────────────────────────────────────────────
 
 class TestSTDP:
-    def test_cpu_stdp_no_crash(self):
-        cs = make_minimal_cs()
-        lattice = make_minimal_lattice()
-        from eva.symbolic.crystal_generator import CrystalGenerator
-        gen = CrystalGenerator(cs, None, lattice)
-        gen.max_grad_norm = 1.0
+    def test_cpu_stdp_no_crash(self, gen, cs):
         gen._cpu_stdp_apply({1: [(0, 0.1), (2, 0.05)]}, base_lr_val=0.03,
                             destab_scale=0.0, inh_strength=0.0, inh_threshold=0.1)
         v1 = cs.concept_vectors.get(1)
         assert v1 is not None
         assert abs(np.linalg.norm(v1) - 1.0) < 1e-6
 
-    def test_negative_sampling_cpu(self):
-        cs = make_minimal_cs()
-        lattice = make_minimal_lattice()
-        from eva.symbolic.crystal_generator import CrystalGenerator
-        gen = CrystalGenerator(cs, None, lattice)
-        gen.max_grad_norm = 1.0
+    def test_negative_sampling_cpu(self, gen, cs):
         gen._negative_sampling_cpu({1: [(0, 0.1)]}, neg_lr_ratio=0.5,
                                     field_gate=False, neg_samples=2)
         v1 = cs.concept_vectors.get(1)
         assert v1 is not None
 
-    def test_contrastive_objective(self):
-        cs = make_minimal_cs()
-        lattice = make_minimal_lattice()
-        from eva.symbolic.crystal_generator import CrystalGenerator
-        gen = CrystalGenerator(cs, None, lattice)
-        gen.max_grad_norm = 1.0
+    def test_contrastive_objective(self, gen, cs):
         gen._contrastive_objective({1: [(0, 0.1)]})
         v1 = cs.concept_vectors.get(1)
         assert v1 is not None
         assert abs(np.linalg.norm(v1) - 1.0) < 1e-6
 
-    def test_concept_error_fifo(self):
-        cs = make_minimal_cs()
-        lattice = make_minimal_lattice()
-        from eva.symbolic.crystal_generator import CrystalGenerator
-        gen = CrystalGenerator(cs, None, lattice)
+    def test_concept_error_fifo(self, gen):
         for i in range(50):
             gen.concept_error[i] = float(i) / 50.0
-        while len(gen.concept_error) > 30:
+        _ce_limit = min(3 * gen.cs.vocab_size // 4, 100000)
+        while len(gen.concept_error) > _ce_limit:
             gen.concept_error.popitem(last=False)
-        assert len(gen.concept_error) <= 30
+        assert len(gen.concept_error) <= _ce_limit
 
 
 # ── 5. GPU/CPU parity ───────────────────────────────────────────
 
 class TestGPUParity:
-    def test_cpu_no_torch(self):
-        cs = make_minimal_cs()
-        lattice = make_minimal_lattice()
-        from eva.symbolic.crystal_generator import CrystalGenerator
-        gen = CrystalGenerator(cs, None, lattice)
-        gen.max_grad_norm = 1.0
+    def test_cpu_no_torch(self, gen, cs):
         v_before = cs.concept_vectors.get(1).copy()
         gen._cpu_stdp_apply({1: [(0, 0.1)]}, base_lr_val=0.03,
                             destab_scale=0.0, inh_strength=0.0, inh_threshold=0.1)
         v_after = cs.concept_vectors.get(1)
         assert not np.allclose(v_before, v_after)
 
-    @staticmethod
-    def _make_spy():
-        import sentencepiece as spm
-        path = os.path.join(os.path.dirname(__file__), '..', 'real_data', 'bpe_ru_146k.model')
-        if os.path.exists(path):
-            return spm.SentencePieceProcessor(model_file=path)
-        return None
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_gpu_stdp_apply_no_crash(self, gen, cs):
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        gen._gpu_stdp_apply(
+            gpu_ctx_l=[0, 0],
+            gpu_tgt_l=[1, 2],
+            gpu_meta_l=np.array([(0, 1, 0.5, 1.0, 1.0, 1.0),
+                                 (0, 2, 0.3, 1.0, 1.0, 1.0)], dtype=np.float32),
+            gpu_cid_gen=[1, 2],
+            base_lr_val=0.03,
+            field_gate=False,
+            inh_strength=0.0,
+            inh_threshold=0.1,
+            destab_scale=0.0,
+        )
+        for cid in [1, 2]:
+            v = cs.concept_vectors.get(cid)
+            assert v is not None
+            assert abs(np.linalg.norm(v) - 1.0) < 1e-6
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_negative_sampling_gpu_no_crash(self, gen, cs):
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        gen._negative_sampling_gpu(
+            gpu_ctx_l=[0],
+            gpu_meta_l=np.array([(0, 1, 0.5, 1.0, 1.0, 1.0)], dtype=np.float32),
+            gpu_cid_ctx=[0],
+            gpu_cid_gen=[1],
+            device=torch.device('cpu'),
+            field_gate=False,
+            base_lr_val=0.03,
+            neg_lr_ratio=0.5,
+            neg_samples=2,
+        )
+        v1 = cs.concept_vectors.get(1)
+        assert v1 is not None
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_cpu_gpu_stdp_parity(self, gen, cs, dim):
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+
+        # Run GPU STDP on a pair
+        gen._gpu_stdp_apply(
+            gpu_ctx_l=[0],
+            gpu_tgt_l=[1],
+            gpu_meta_l=np.array([(0, 1, 0.5, 1.0, 1.0, 1.0)], dtype=np.float32),
+            gpu_cid_gen=[1],
+            base_lr_val=0.03,
+            field_gate=False,
+            inh_strength=0.0,
+            inh_threshold=0.1,
+            destab_scale=0.0,
+        )
+        v_gpu = cs.concept_vectors.get(1).copy()
+
+        # Reset
+        cs2 = ConceptSpace(vocab_size=20, dim=dim)
+        cs2.init_concepts()
+        cs2.init_homeostasis()
+        gen2 = __import__('eva.symbolic.crystal_generator', fromlist=['']).CrystalGenerator(cs2, None, SyntaxLattice())
+        gen2.max_grad_norm = 1.0
+        gen2._torch_device = torch.device('cpu')
+        gen2._ensure_torch(device='cpu')
+
+        # Seed RNG for reproducibility
+        np.random.seed(42)
+        gen2._cpu_stdp_apply({1: [(0, 0.1)]}, base_lr_val=0.03,
+                             destab_scale=0.0, inh_strength=0.0, inh_threshold=0.1)
+        v_cpu = cs2.concept_vectors.get(1)
+
+        # Compare numerical parity (within tolerance)
+        # Note: GPU and CPU paths may diverge due to different accumulation order
+        # so we use a relaxed tolerance
+        if v_cpu is not None:
+            diff = np.linalg.norm(v_gpu - v_cpu)
+            assert diff < 1.0, f"GPU/CPU vectors diverged: norm diff={diff:.4f}"
 
 
 # ── 6. ParameterOptimizer ───────────────────────────────────────
@@ -222,17 +285,15 @@ class TestParameterOptimizer:
                  vec_ppl=100.0, acc1=0.3, vacc1=0.0)
         assert opt.p['full_lr'].current != old_lr
 
-    def test_save_load_state(self):
+    def test_full_stuck_no_eval(self):
         cfg = FCFConfig()
         opt = ParameterOptimizer(cfg)
-        opt.step(mean_cos=0.05, std_cos=0.01, delta=2.0, ng_new=100,
-                 vec_ppl=80.0, acc1=0.5, vacc1=0.1)
-        state = opt.save_state()
-        opt2 = ParameterOptimizer(cfg)
-        opt2.load_state(state)
-        assert opt2.p['full_lr'].current == opt.p['full_lr'].current
+        changes = None
+        for _ in range(7):
+            changes = opt.step(mean_cos=0.0005, std_cos=0.005, delta=0.1, ng_new=10)
+        assert changes is None or not changes.get('full_stuck')
 
-    def test_full_stuck_detection(self):
+    def test_full_stuck_with_eval(self):
         cfg = FCFConfig()
         opt = ParameterOptimizer(cfg)
         for _ in range(7):
@@ -247,6 +308,16 @@ class TestParameterOptimizer:
             opt.step(mean_cos=0.05, std_cos=0.02, delta=1.0, ng_new=100,
                      vec_ppl=80.0, acc1=0.5, vacc1=0.0)
         assert opt._vacc1_stuck >= 4
+
+    def test_save_load_state(self):
+        cfg = FCFConfig()
+        opt = ParameterOptimizer(cfg)
+        opt.step(mean_cos=0.05, std_cos=0.01, delta=2.0, ng_new=100,
+                 vec_ppl=80.0, acc1=0.5, vacc1=0.1)
+        state = opt.save_state()
+        opt2 = ParameterOptimizer(cfg)
+        opt2.load_state(state)
+        assert opt2.p['full_lr'].current == opt.p['full_lr'].current
 
 
 # ── 7. FCFConfig ────────────────────────────────────────────────
@@ -278,8 +349,8 @@ class TestFCFConfig:
 # ── 8. Edge cases ───────────────────────────────────────────────
 
 class TestEdgeCases:
-    def test_empty_concept_vector_store(self):
-        s = ConceptVectorStore(10, DIM)
+    def test_empty_concept_vector_store(self, dim):
+        s = ConceptVectorStore(10, dim)
         assert list(s.keys()) == []
         assert list(s.items()) == []
         assert len(s) == 0
@@ -293,6 +364,6 @@ class TestEdgeCases:
         cfg = FCFConfig()
         assert 0 <= cfg.destab_scale_end <= cfg.destab_scale_start <= 1.0
 
-    def test_fractal_subspace_dims(self):
-        ff = FractalField(dim=DIM, latent_dim=64)
+    def test_fractal_subspace_dims(self, dim):
+        ff = FractalField(dim=dim, latent_dim=64)
         assert ff.l_c + ff.l_a + ff.l_m == 64

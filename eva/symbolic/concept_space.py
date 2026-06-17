@@ -264,7 +264,7 @@ class FractalField:
         binary_file = data.get('binary_codes')
         if binary_file and base_dir:
             path = os.path.join(base_dir, binary_file) if os.path.isdir(base_dir) else binary_file
-            npz = np.load(path)
+            npz = np.load(path, allow_pickle=False)
             field.basis = npz['basis'].astype(np.float32)
             cids = npz['cids']
             codes_arr = npz['codes']

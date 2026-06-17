@@ -144,6 +144,9 @@ class CrystalGenerator:
         """Precompute GPU tensors for batched training. Rebuilds if dirty."""
         if not _HAS_TORCH:
             raise ImportError("PyTorch is required for GPU training.")
+        # Persistent CPU fallback: if OOM was hit once, stay on CPU
+        if getattr(self, '_torch_fallback', False):
+            device = 'cpu'
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         dev = torch.device(device)
@@ -154,9 +157,10 @@ class CrystalGenerator:
         if dev.type == 'cuda':
             try:
                 return self._build_torch_tensors(dev)
-            except RuntimeError as e:
-                if 'out of memory' in str(e):
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if isinstance(e, torch.cuda.OutOfMemoryError) or 'out of memory' in str(e):
                     print(f"[WARN] CUDA OOM ({torch.cuda.max_memory_allocated()/1024**2:.0f}MB) — falling back to CPU")
+                    self._torch_fallback = True
                     torch.cuda.empty_cache()
                     dev = torch.device('cpu')
                 else:
@@ -202,6 +206,12 @@ class CrystalGenerator:
             for cid, fb in cs.fractal.field_bits.items():
                 fb_arr[cid] = np.asarray(fb, dtype=np.uint8).ravel()
         self._fb_t = torch.from_numpy(fb_arr).to(dev, non_blocking=True)
+
+        # Concept error tensor for vectorized GPU negative sampling
+        ce_arr = np.zeros(V, dtype=np.float32)
+        for cid, err in self.concept_error.items():
+            ce_arr[int(cid)] = err
+        self._ce_t = torch.from_numpy(ce_arr).to(dev, non_blocking=True)
 
         self._torch_dirty = False
         self.cs.fractal._fb_dirty = False
@@ -934,7 +944,7 @@ class CrystalGenerator:
                 sample_size=min(100, len(cs.concept_vectors)),
             )
 
-    def _negative_sampling_gpu(self, gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, device, field_gate, base_lr_val, neg_lr_ratio, neg_samples):
+    def _negative_sampling_gpu(self, gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen, device, field_gate, base_lr_val, neg_lr_ratio, neg_samples):
         """GPU-vectorized negative sampling (fully batched)."""
         cs = self.cs
         n_pairs = len(gpu_ctx_l)
@@ -977,15 +987,17 @@ class CrystalGenerator:
             theta_gate_arr = np.exp(-np.minimum(dist_arr, 5.0) / max(self.theta_tau, 1.0))
             neg_elr_arr = np.maximum(meta_arr[:, _META_FW], 0.05) * meta_arr[:, _META_DW] * meta_arr[:, _META_PMI] * meta_arr[:, _META_FIELD_W] * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
             neg_elr_arr *= (0.5 + self.hormones.acetylcholine * 0.5) * (0.5 + self.hormones.dopamine * 0.5)
-            # Adaptive concept_error weighting: high error → stronger push-away
-            for pi in range(n_pairs):
-                ce = self.concept_error.get(gpu_cid_gen[pi], 0.0)
-                neg_elr_arr[pi] *= (1.0 + ce * 2.0)
+            # Adaptive concept_error weighting: high error → stronger push-away (vectorized GPU)
             valid_elr_t = torch.from_numpy(neg_elr_arr[valid_pi.cpu().numpy()]).to(device, non_blocking=True)
+            if hasattr(self, '_ce_t') and self._ce_t is not None:
+                gpu_cid_gen_t = torch.tensor(gpu_cid_gen, device=device)
+                valid_ce = self._ce_t[gpu_cid_gen_t][valid_pi]  # (n_valid,)
+                valid_ce = valid_ce.to(dtype=valid_elr_t.dtype)
+                valid_elr_t *= (1.0 + valid_ce * 2.0)
 
             # Gather neg CIDs and vectors from _vecs_t
-            neg_cids = torch.tensor(self._torch_cid_order, device=device)[neg_idxs]  # (n_pairs, neg_samples)
-            valid_neg_cids = neg_cids[valid_pi, valid_ni]  # (n_valid,)
+            # _torch_cid_order = list(range(V)), so neg_idxs are already CIDs
+            valid_neg_cids = neg_idxs[valid_pi, valid_ni]  # (n_valid,)
             valid_ctx_cids = torch.tensor(gpu_cid_ctx, device=device)[valid_pi]  # (n_valid,)
 
             v_neg = self._vecs_t[valid_neg_cids]   # (n_valid, D)
@@ -999,9 +1011,9 @@ class CrystalGenerator:
             unique_neg_cids, inverse = torch.unique(valid_neg_cids, return_inverse=True)
             n_unique = len(unique_neg_cids)
             D = v_neg.shape[1]
-            acc_shifts = torch.zeros(n_unique, D, device=device)
+            acc_shifts = torch.zeros(n_unique, D, device=device, dtype=shifts.dtype)
             acc_shifts.scatter_add_(0, inverse[:, None].expand(-1, D), shifts)
-            acc_elr = torch.zeros(n_unique, device=device)
+            acc_elr = torch.zeros(n_unique, device=device, dtype=valid_elr_t.dtype)
             acc_elr.scatter_add_(0, inverse, valid_elr_t)
 
             # Normalize by total_elr, then apply base_lr_val as step size (matching CPU STDP pattern)
@@ -1194,7 +1206,7 @@ class CrystalGenerator:
                         overlap = 0
                     field_weight = min(1.0 + math.log(overlap + 1) * 2.0, 3.0) if overlap > 0 else 0.1
 
-                lr = base_lr * max(freq_weight, 0.05) * dist_weight * pmi_w * field_weight
+                lr = base_lr * max(freq_weight, 0.05) * pmi_w * field_weight
                 # Hormonal STDP gate: novelty (ACh) + reward (DA) modulate plasticity
                 lr *= (0.5 + self.hormones.acetylcholine * 0.5) * (0.5 + self.hormones.dopamine * 0.5)
                 theta_gate = math.exp(-min(abs(j-i), 5) / max(self.theta_tau, 1.0))
@@ -1223,10 +1235,10 @@ class CrystalGenerator:
         for the hot path (dot products, field overlaps, negative sampling checks).
         """
         if use_torch is None:
-            if not hasattr(CrystalGenerator, '_default_use_torch'):
+            if not hasattr(self, '_use_torch_default'):
                 from eva.symbolic.fcf_config import FCFConfig
-                CrystalGenerator._default_use_torch = FCFConfig().use_torch
-            use_torch = CrystalGenerator._default_use_torch
+                self._use_torch_default = FCFConfig().use_torch
+            use_torch = self._use_torch_default
         if use_torch:
             self._ensure_torch()
             if self._vecs_t is None:
@@ -1269,7 +1281,7 @@ class CrystalGenerator:
 
         # ── Negative sampling ──
         if neg_samples > 0 and use_torch and self._vecs_t is not None and gpu_ctx_l:
-            self._negative_sampling_gpu(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, device, field_gate,
+            self._negative_sampling_gpu(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen, device, field_gate,
                                          base_lr_val, neg_lr_ratio, neg_samples)
         elif neg_samples > 0:
             self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
@@ -1283,8 +1295,9 @@ class CrystalGenerator:
         self.lattice.update(ids)
         self._graph_cache.clear()
 
-        # Prune concept_error cache (FIFO: keep most recently seen CIDs)
-        while len(self.concept_error) > 30000:
+        # Prune concept_error cache (LRU: keep most recently seen CIDs)
+        _ce_limit = min(3 * self.cs.vocab_size // 4, 100000)
+        while len(self.concept_error) > _ce_limit:
             self.concept_error.popitem(last=False)
 
         if use_torch:
@@ -1301,10 +1314,10 @@ class CrystalGenerator:
         then per-text centroid pull + lattice update.
         """
         if use_torch is None:
-            if not hasattr(CrystalGenerator, '_default_use_torch'):
+            if not hasattr(self, '_use_torch_default'):
                 from eva.symbolic.fcf_config import FCFConfig
-                CrystalGenerator._default_use_torch = FCFConfig().use_torch
-            use_torch = CrystalGenerator._default_use_torch
+                self._use_torch_default = FCFConfig().use_torch
+            use_torch = self._use_torch_default
         if use_torch:
             self._ensure_torch()
             if self._vecs_t is None:
@@ -1351,7 +1364,7 @@ class CrystalGenerator:
 
         # ── Negative sampling (GPU, single call) ──
         if neg_samples > 0 and use_torch and self._vecs_t is not None and gpu_ctx_l:
-            self._negative_sampling_gpu(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, device, field_gate,
+            self._negative_sampling_gpu(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen, device, field_gate,
                                          base_lr_val, neg_lr_ratio, neg_samples)
         elif neg_samples > 0:
             self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
@@ -1365,8 +1378,9 @@ class CrystalGenerator:
             self.lattice.update(ids)
             self._graph_cache.clear()
 
-        # Prune concept_error cache (FIFO: keep most recently seen CIDs)
-        while len(self.concept_error) > 30000:
+        # Prune concept_error cache (LRU: keep most recently seen CIDs)
+        _ce_limit = min(3 * self.cs.vocab_size // 4, 100000)
+        while len(self.concept_error) > _ce_limit:
             self.concept_error.popitem(last=False)
 
         if use_torch:
@@ -1462,16 +1476,10 @@ class CrystalGenerator:
             batch_n = len(batch_prev)
 
             if use_cuda:
-                # GPU matmul: build prev_vecs on CPU, transfer, compute sims, bring back
-                prev_vecs = np.array([
-                    self.cs.concept_vectors.get(c, np.zeros(self.cs.dim, dtype=np.float32))
-                    for c in batch_prev
-                ], dtype=np.float32)
-                pn = np.linalg.norm(prev_vecs, axis=1, keepdims=True)
-                pn[pn < 1e-10] = 1.0
-                prev_vecs /= pn
+                # GPU gather: extract prev vectors directly from _vecs_t
                 with torch.no_grad():
-                    pv_t = torch.from_numpy(prev_vecs).to(device, non_blocking=True)
+                    prev_cids_t = torch.tensor(batch_prev, device=device)
+                    pv_t = self._vecs_t[prev_cids_t]  # (batch, D), already normalized
                     sims_t = pv_t @ V_gpu.T  # (batch, vocab_size)
                     sims_t = torch.clamp(sims_t, min=0)
                     sims = sims_t.cpu().numpy()

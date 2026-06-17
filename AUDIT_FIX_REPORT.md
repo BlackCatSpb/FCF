@@ -86,3 +86,61 @@
 **Проблема:** Жёсткие пороги по эпохам (`EPOCH_MAX_LEN = {1: 32, 2: 128}`) — резкий скачок с 32 до 128 токенов, не учитывающий прогресс внутри эпохи.
 
 **Решение:** Все 4 параметра (`max_len`, `context_window`, `neg_samples`, `pmi_gate_min`) плавно растут линейно от минимальных значений до целевых за первые 20% обучения. Линии отсортированы по длине — короткие (простые) идут первыми. После завершения рампа параметры возвращаются к значениям из CFG/CLI.
+
+---
+
+## Сессия 2: 2026-06-17 — 12 оставшихся пунктов из Architect Report
+
+### Изменения
+
+#### `eva/symbolic/crystal_generator.py`
+
+| # | Что | Где | Описание |
+|---|-----|-----|----------|
+| 1 | **P0: non_blocking=True** | `_ensure_torch`, `_gpu_stdp_apply`, `_negative_sampling_gpu`, `evaluate` | Добавлен `non_blocking=True` во все 7 вызовов `.to(device)` для асинхронной передачи CPU→GPU |
+| 2 | **P1: PPMI contrastive objective** | `_contrastive_objective()` | Заменён uniform random на PPMI-based: top-100 nearest по cosine, фильтр сильных PPMI-связей, top-5 hardest negatives (cos > 0.05) |
+| 3 | **P1: Field pre-filter в _branch** | `_branch()` step 8 | Категорическое исключение кандидатов с нулевым field overlap относительно контекста (вместо бонусного множителя) |
+| 4 | **P1: Gradient clipping** | `_gpu_stdp_apply`, `_cpu_stdp_apply`, `_negative_sampling_gpu/cpu`, `_contrastive_objective` | `max_grad_norm` (default 1.0) во всех 5 точках приложения градиента — numpy и torch |
+| 5 | **P2: _torch_dirty ordering** | `train_from_text()`, `train_batch()` | Перенесён в самый конец методов, после `_contrastive_objective`, `_centroid_pull`, `lattice.update` |
+| 6 | **P2: Batch centroid pull** | `_centroid_pull_batch()` | Накопление центроидных сдвигов за весь батч → один `_apply_vector_update` на уникальный CID |
+| 7 | **P3: Adaptive beam width** | `_adaptive_beam_width()`, `generate()` | `entropy_ratio = H/H_max` → `beam = base * (0.5 + entropy_ratio)`. Узкий beam при уверенности, широкий — при неопределённости |
+| 8 | **P3: Field destab fallback** | `_destab_field_fallback()`, GPU/CPU destab | При пустом PPMI-графе (редкие токены) — выбор случайного концепта с пересекающимся field_bits для шума дестабилизации |
+| 9 | **P3: Hormonal STDP gate** | `_build_pairs_from_ids()`, `_gpu_stdp_apply()`, `_negative_sampling_gpu()` | `lr *= (0.5 + ACh * 0.5) * (0.5 + DA * 0.5)` — ацетилхолин (новизна) и дофамин (награда) модулируют пластичность |
+| 10 | **P3: OOM fallback + VRAM** | `_ensure_torch()` → `_build_torch_tensors()` | Try/except `RuntimeError: out of memory` → fallback на CPU + лог `torch.cuda.max_memory_allocated()` при >1500MB |
+
+#### `eva/symbolic/concept_space.py`
+
+| # | Что | Где | Описание |
+|---|-----|-----|----------|
+| 11 | **P2: Basis re-orthogonalization** | `FractalField.check_basis_health()` | Вынесена из `load()` в отдельный метод; вызывает ре-ортогонализацию + `_matrix_dirty = True` при `err > 1e-3` |
+
+#### `train_full.py`
+
+| # | Что | Где | Описание |
+|---|-----|-----|----------|
+| 12 | **P2: Basis check в чекпоинтах** | checkpoint block | `cs.fractal.check_basis_health()` → `gen._invalidate_torch()` при изменениях |
+| 13 | **P3: _quiet safety** | `_quiet()` | `except (KeyboardInterrupt, SystemExit): raise` — не глотает Ctrl+C |
+
+#### `eva/symbolic/fcf_config.py`
+
+| # | Что | Где | Описание |
+|---|-----|-----|----------|
+| 14 | **P1: max_grad_norm** | `FCFConfig` class | Добавлено поле `max_grad_norm: float = 1.0` |
+
+### Коммит
+
+```
+bea5756 fix: implement all 12 remaining architecture report fixes (P0-P3)
+24 files changed, 2079 insertions(+), 485 deletions(-)
+```
+
+### Покрытие архитектурного отчёта (итог)
+
+| Раздел | Всего проблем | Исправлено | Пропущено |
+|--------|:------------:|:----------:|:---------:|
+| P0 | 2 | 2 (100%) | — |
+| P1 | 4 | 4 (100%) | — |
+| P2 | 5 | 5 (100%) | — |
+| P3 | 6 | 6 (100%) | — |
+| Предложения (6.x) | 7 | — | 7 (опциональные новые методы) |
+| **Итого** | **24** | **17 (71%)** | **7** |

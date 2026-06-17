@@ -368,6 +368,8 @@ class FCFConfig:
 
     # ── Расписания ────────────────────────────
     lr_warmup_lines: int = 1000
+    lr_cosine_T0: int = 5000
+    lr_cosine_mult: float = 1.5
     checkpoint_every: int = 500
     eval_every_fast: int = 1000
     eval_every_slow: int = 2000

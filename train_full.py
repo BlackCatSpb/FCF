@@ -9,7 +9,7 @@ os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
 import sys; sys.path.insert(0, os.path.dirname(__file__))
-import time, json, os, shutil, argparse, glob, random, re, zlib
+import time, json, os, shutil, argparse, glob, random, re, zlib, math
 import numpy as np
 import sentencepiece as spm
 from sklearn.decomposition import PCA
@@ -315,7 +315,17 @@ if RESUME is not None:
 def get_lr(line_idx):
     if line_idx < CFG.lr_warmup_lines:
         return opt.p['full_lr'].current * (line_idx + 1) / CFG.lr_warmup_lines
-    return opt.p['full_lr'].current
+    # Cosine annealing with warm restarts
+    T_0 = max(CFG.lr_cosine_T0, 1)
+    T_mult = CFG.lr_cosine_mult
+    # Find which restart period we're in
+    t = line_idx - CFG.lr_warmup_lines
+    cur_T = T_0
+    while t >= cur_T:
+        t -= cur_T
+        cur_T = int(cur_T * T_mult)
+    cos_pct = min(t / max(cur_T, 1), 1.0)
+    return opt.p['full_lr'].current * max(0.5 * (1.0 + math.cos(math.pi * cos_pct)), 0.05)
 
 
 # ── Train/val split ──────────────────────────────────────────────
@@ -578,9 +588,9 @@ try:
                 last_fluct_lines = idx
 
             if idx > 0 and total_pairs_since_last_decay >= CFG.decay_every_pairs:
-                lattice.decay_all()
+                lattice.decay_all(rare_concept_protect=True, rare_threshold=3)
                 lattice.decay_connections()
-                cs.decay_usage(decay=0.98)
+                cs.decay_usage(decay=0.98, rare_protect=True)
                 total_pairs_since_last_decay = 0
 
             # ---- Live status (every ~1 second on terminal) ----

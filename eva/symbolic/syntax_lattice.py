@@ -227,7 +227,7 @@ class SyntaxLattice:
         # Rebuild prefix totals
         self._refresh_prefix_totals()
 
-    def decay_all(self, min_freq=0.01):
+    def decay_all(self, min_freq=0.01, rare_concept_protect=False, rare_threshold=3):
         """Sweep all ngrams, concept frequencies, and connections with decay factor.
 
         Periodic call during training to forget old statistics while
@@ -235,6 +235,8 @@ class SyntaxLattice:
 
         Args:
             min_freq: floor for concept frequency
+            rare_concept_protect: if True, skip decay for concepts with freq < rare_threshold
+            rare_threshold: max frequency to consider a concept "rare"
         """
         # Decay ngram counts (float)
         for order in self.ngrams:
@@ -245,9 +247,12 @@ class SyntaxLattice:
                     if counter[ncid] < 1e-6:
                         del counter[ncid]
 
-        # Decay concept frequency
+        # Decay concept frequency (skip rare concepts if protection enabled)
         for c in list(self.concept_freq.keys()):
-            self.concept_freq[c] = max(self.concept_freq[c] * self.decay, min_freq)
+            freq = self.concept_freq[c]
+            if rare_concept_protect and freq < rare_threshold:
+                continue
+            self.concept_freq[c] = max(freq * self.decay, min_freq)
 
         # Decay skip2 (Counter of Counter)
         for k in list(self.skip2.keys()):

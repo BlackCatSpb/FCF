@@ -616,9 +616,12 @@ class ConceptSpace:
         self._hboost_cache_step = 0
         self._usage_decay_steps = 0
 
-    def decay_usage(self, decay=0.98):
+    def decay_usage(self, decay=0.98, rare_protect=False, rare_threshold=3):
         """Exponential decay of concept usage to prevent homeostatic saturation."""
         for cid in self.concept_usage:
+            if rare_protect and cid in self.fractal.codes and np.any(self.fractal.codes[cid] != 0):
+                if self.concept_usage[cid] < rare_threshold:
+                    continue
             self.concept_usage[cid] *= decay
         self._usage_decay_steps += 1
         self._hboost_mean_cache = None

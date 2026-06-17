@@ -95,7 +95,11 @@ class CrystalGenerator:
         self._torch_cid_to_idx = {}
         self._vecs_t = None
         self._fb_t = None
+        self._ce_t = None
         self._basis_t = None
+        self._ema_vecs_t = None  # EMA copy for stable eval/generation (TN-2)
+        self._ema_decay = 0.999
+        self._ema_steps = 0
         self._torch_dirty = False  # set True after fluctuate → trigger rebuild
         self._total_freq_cache = None
 
@@ -138,7 +142,7 @@ class CrystalGenerator:
     def _on_vector_update(self, cid, v_new):
         """Hook called by ConceptSpace._apply_vector_update to keep _vecs_t in sync."""
         if self._vecs_t is not None:
-            self._vecs_t[cid] = torch.from_numpy(v_new.astype(np.float32)).to(self._vecs_t.device)
+            self._vecs_t[cid] = torch.from_numpy(v_new.astype(np.float32)).to(self._vecs_t.device).to(self._vecs_t.dtype)
 
     def _ensure_torch(self, device=None):
         """Precompute GPU tensors for batched training. Rebuilds if dirty."""
@@ -178,6 +182,7 @@ class CrystalGenerator:
         self._torch_cid_to_idx = {cid: i for i, cid in enumerate(cids)}
         self._torch_device = dev
 
+        # Build on CPU, copy to pre-allocated GPU buffer
         vecs = np.zeros((V, D), dtype=np.float32)
         if getattr(cs.fractal, 'codes', None) is not None and cs.fractal.basis is not None:
             basis = cs.fractal.basis
@@ -191,8 +196,12 @@ class CrystalGenerator:
                 if np.all(vecs[cid] == 0):
                     vecs[cid] = v
 
-        self._vecs_t = torch.from_numpy(vecs).to(dev, non_blocking=True)
-        self._basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(dev, non_blocking=True) if cs.fractal.basis is not None else None
+        if self._vecs_t is None or self._vecs_t.shape[0] != V or self._vecs_t.device != dev:
+            self._vecs_t = torch.empty(V, D, device=dev, dtype=torch.float16)
+        self._vecs_t.copy_(torch.from_numpy(vecs), non_blocking=True)
+
+        if self._basis_t is None or self._basis_t.device != dev:
+            self._basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(dev, non_blocking=True) if cs.fractal.basis is not None else None
 
         if hasattr(cs.fractal, 'field_bits') and cs.fractal.field_bits:
             sample_fb = next(iter(cs.fractal.field_bits.values()))
@@ -205,13 +214,24 @@ class CrystalGenerator:
         if hasattr(cs.fractal, 'field_bits'):
             for cid, fb in cs.fractal.field_bits.items():
                 fb_arr[cid] = np.asarray(fb, dtype=np.uint8).ravel()
-        self._fb_t = torch.from_numpy(fb_arr).to(dev, non_blocking=True)
+        if self._fb_t is None or self._fb_t.shape[0] != V or self._fb_t.device != dev:
+            self._fb_t = torch.empty(V, fb_bytes, device=dev, dtype=torch.uint8)
+        self._fb_t.copy_(torch.from_numpy(fb_arr), non_blocking=True)
 
         # Concept error tensor for vectorized GPU negative sampling
         ce_arr = np.zeros(V, dtype=np.float32)
         for cid, err in self.concept_error.items():
             ce_arr[int(cid)] = err
-        self._ce_t = torch.from_numpy(ce_arr).to(dev, non_blocking=True)
+        if self._ce_t is None or self._ce_t.shape[0] != V or self._ce_t.device != dev:
+            self._ce_t = torch.empty(V, device=dev, dtype=torch.float32)
+        self._ce_t.copy_(torch.from_numpy(ce_arr), non_blocking=True)
+
+        # Initialize EMA as a copy of vecs_t (FP32 for precision)
+        if self._ema_vecs_t is None or self._ema_vecs_t.shape[0] != V or self._ema_vecs_t.device != dev:
+            self._ema_vecs_t = self._vecs_t.float().clone()
+        else:
+            self._ema_vecs_t.copy_(self._vecs_t.float())
+        self._ema_steps = 0
 
         self._torch_dirty = False
         self.cs.fractal._fb_dirty = False
@@ -727,8 +747,8 @@ class CrystalGenerator:
             elr_grouped = torch.zeros(len(unique_gen), device=device)
             elr_grouped.scatter_add_(0, inv_t, effective_lr)
 
-            vc = self._vecs_t[ctx_t]
-            vg = self._vecs_t[tgt_t]
+            vc = self._vecs_t[ctx_t].float()
+            vg = self._vecs_t[tgt_t].float()
             y = torch.clamp((vg * vc).sum(dim=1), min=0.05)
             pair_delta = vc * effective_lr[:, None] - vg * (y * effective_lr)[:, None]
 
@@ -792,6 +812,16 @@ class CrystalGenerator:
             gen_vecs.append(v_new)
             gen_cids_list.append(gen_cid)
 
+        # EMA update for affected CIDs (Polyak averaging)
+        self._ema_steps += 1
+        if self._ema_vecs_t is not None and gen_cids_list:
+            ema_cids = torch.tensor(gen_cids_list, device=device)
+            with torch.no_grad():
+                self._ema_vecs_t[ema_cids] = (
+                    self._ema_decay * self._ema_vecs_t[ema_cids]
+                    + (1 - self._ema_decay) * torch.from_numpy(np.array(gen_vecs, dtype=np.float32)).to(device, non_blocking=True)
+                )
+
         # Lateral inhibition: CPU (sampling) for small batches (<50 gen), GPU (full-V) for large
         if gen_vecs and inh_strength > 0:
             if len(gen_vecs) < 50:
@@ -809,6 +839,8 @@ class CrystalGenerator:
             else:
                 gen_cids_t = torch.tensor(gen_cids_list, device=device)
                 gv_t = torch.from_numpy(np.array(gen_vecs, dtype=np.float32)).to(device, non_blocking=True)
+                if self._vecs_t.dtype == torch.float16:
+                    gv_t = gv_t.half()
                 self._vecs_t[gen_cids_t] = gv_t
                 gv_all = self._vecs_t
                 sims = gv_t @ gv_all.T
@@ -1000,8 +1032,8 @@ class CrystalGenerator:
             valid_neg_cids = neg_idxs[valid_pi, valid_ni]  # (n_valid,)
             valid_ctx_cids = torch.tensor(gpu_cid_ctx, device=device)[valid_pi]  # (n_valid,)
 
-            v_neg = self._vecs_t[valid_neg_cids]   # (n_valid, D)
-            v_ctx = self._vecs_t[valid_ctx_cids]    # (n_valid, D)
+            v_neg = self._vecs_t[valid_neg_cids].float()   # (n_valid, D)
+            v_ctx = self._vecs_t[valid_ctx_cids].float()    # (n_valid, D)
 
             # Vectorized push-away: shift = (y * v_neg - v_ctx) * elr
             sims = (v_neg * v_ctx).sum(dim=1, keepdim=True).clamp(min=0.05)  # (n_valid, 1)
@@ -1017,7 +1049,7 @@ class CrystalGenerator:
             acc_elr.scatter_add_(0, inverse, valid_elr_t)
 
             # Normalize by total_elr, then apply base_lr_val as step size (matching CPU STDP pattern)
-            v_cur = self._vecs_t[unique_neg_cids]  # (n_unique, D)
+            v_cur = self._vecs_t[unique_neg_cids].float()  # (n_unique, D)
             grad = acc_shifts / acc_elr[:, None].clamp(min=1e-10)
             if self.max_grad_norm > 0:
                 gn = torch.norm(grad, dim=1, keepdim=True).clamp(min=1e-10)
@@ -1467,7 +1499,7 @@ class CrystalGenerator:
         use_cuda = use_gpu and self._vecs_t is not None
         if use_cuda:
             device = self._torch_device
-            V_gpu = self._vecs_t
+            V_gpu = (self._ema_vecs_t if self._ema_vecs_t is not None else self._vecs_t).float()
 
         for start in range(0, n_positions, batch_size):
             end = min(start + batch_size, n_positions)
@@ -1479,7 +1511,7 @@ class CrystalGenerator:
                 # GPU gather: extract prev vectors directly from _vecs_t
                 with torch.no_grad():
                     prev_cids_t = torch.tensor(batch_prev, device=device)
-                    pv_t = self._vecs_t[prev_cids_t]  # (batch, D), already normalized
+                    pv_t = self._vecs_t[prev_cids_t].float()  # (batch, D), already normalized
                     sims_t = pv_t @ V_gpu.T  # (batch, vocab_size)
                     sims_t = torch.clamp(sims_t, min=0)
                     sims = sims_t.cpu().numpy()

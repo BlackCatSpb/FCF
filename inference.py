@@ -101,7 +101,7 @@ class InferenceEngine:
         result = self.gen.generate(
             seed_word=seed_word, max_words=max_words, beam_width=beam_width,
             query_words=query_words)
-        result['time'] = round(time.time() - t0, 2)
+        result.time = round(time.time() - t0, 2)
         return result
 
     def retrieve(self, query, k=10):
@@ -111,7 +111,7 @@ class InferenceEngine:
                 if self.cs.concept_vector(cid) is not None]
         if not vecs:
             return []
-        centroid = np.mean(vecs, axis=0).astype(np.float32)
+        centroid = np.mean(np.array(vecs, dtype=np.float32), axis=0)
         n = np.linalg.norm(centroid)
         if n > 1e-10:
             centroid /= n
@@ -164,8 +164,11 @@ class InferenceEngine:
         sampled = rng.choice([c for c in range(self.cs.vocab_size)
                               if self.cs.concept_vectors.valid[c]],
                              size=min(2000, n_valid), replace=False)
-        vecs = np.array([self.cs.concept_vectors.get(c) for c in sampled], dtype=np.float32)
-        triu = (vecs @ vecs.T)[np.triu_indices(len(sampled), k=1)]
+        vecs_list = [v for c in sampled for v in [self.cs.concept_vectors.get(c)] if v is not None]
+        if not vecs_list:
+            return results
+        vecs = np.array(vecs_list, dtype=np.float32)
+        triu = (vecs @ vecs.T)[np.triu_indices(len(vecs), k=1)]
         cos_mean, cos_std = float(triu.mean()), float(triu.std())
         results.update(vec_cos_mean=cos_mean, vec_cos_std=cos_std,
                        vec_cos_gt_01=float((triu > 0.1).mean()),
@@ -175,8 +178,8 @@ class InferenceEngine:
         for seed in seeds:
             try:
                 r = self.gen.generate(seed_word=seed, max_words=25)
-                gen_samples.append({'seed': seed, 'text': r['text'].replace('\n',' ').strip(),
-                                    'words': r['word_count'], 'score': r['score']})
+                gen_samples.append({'seed': seed, 'text': r.text.replace('\n',' ').strip(),
+                                    'words': r.word_count, 'score': r.score})
             except Exception as e:
                 gen_samples.append({'seed': seed, 'text': f'[ERROR: {e}]', 'words': 0, 'score': 0})
         results['gen_samples'] = gen_samples
@@ -234,9 +237,9 @@ def main():
             qw = args.query.split(',') if args.query else None
             r = eng.generate(args.prompt, max_words=args.max_words,
                              beam_width=args.beam_width, query_words=qw)
-            print(r['text'].replace('\n', ' ').strip())
-            print(f"  [{r['word_count']}w, score={r['score']:.2f}, "
-                  f"time={r['time']}s]", flush=True)
+            print(r.text.replace('\n', ' ').strip())
+            print(f"  [{r.word_count}w, score={r.score:.2f}, "
+                  f"time={r.time}s]", flush=True)
 
         if args.neighbours:
             top = eng.neighbours(args.neighbours)
@@ -260,8 +263,8 @@ def main():
                     qw = args.query.split(',') if args.query else None
                     r = eng.generate(line, max_words=args.max_words,
                                      beam_width=args.beam_width, query_words=qw)
-                    print(r['text'].replace('\n', ' ').strip())
-                    print(f"  [{r['word_count']}w, score={r['score']:.2f}]", flush=True)
+                    print(r.text.replace('\n', ' ').strip())
+                    print(f"  [{r.word_count}w, score={r.score:.2f}]", flush=True)
                 except (EOFError, KeyboardInterrupt):
                     break
 

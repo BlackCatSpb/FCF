@@ -55,14 +55,6 @@ class Param:
             step = math.copysign(1e-10, diff)
         return self.set(self.current + step)
 
-    @property
-    def rng(self):
-        return self.max - self.min
-
-    @property
-    def pct(self):
-        return (self.current - self.min) / max(self.rng, 1e-10)
-
     def __repr__(self):
         return f"{self.name}={self.current:.4f} [{self.min:.4f}, {self.max:.4f}]"
 
@@ -113,7 +105,7 @@ class ParameterOptimizer:
             config = FCFConfig()
 
         self.config = config
-        self.TARGET_STD = 1.0 / math.sqrt(self.config.dim)  # uniform random d-sphere
+        self.TARGET_STD = 1.0 / math.sqrt(max(self.config.dim, 1))  # uniform random d-sphere
         self._rules = []  # (trigger_fn, param_name, action, value, rate)
 
         # Build params from config
@@ -279,17 +271,17 @@ class ParameterOptimizer:
         # Special: clamp neg_samples to int
         if 'neg_samples' in changes:
             p = self.p['neg_samples']
-            p.current = int(round(p.current))
+            p.current = round(p.current)
 
         # Special: clamp context_window to int
         if 'context_window' in changes:
             p = self.p['context_window']
-            p.current = int(round(p.current))
+            p.current = round(p.current)
 
         # Special: theta_tau to int
         if 'theta_tau' in changes:
             p = self.p['theta_tau']
-            p.current = int(round(p.current))
+            p.current = round(p.current)
 
         # Track vacc1 stuck counter
         vacc1 = kw.get('vacc1')

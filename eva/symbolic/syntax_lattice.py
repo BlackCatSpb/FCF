@@ -14,7 +14,6 @@ Connection graph adds semantic relation layer.
 
 import numpy as np
 from collections import defaultdict, Counter
-from scipy.sparse import csr_matrix
 import json, math, os
 from typing import List, Optional, Dict, Tuple
 
@@ -70,9 +69,9 @@ class SyntaxLattice:
         # Total counts for smoothing
         self.total_ngrams = {}  # n -> total count
 
-        # Concept frequency — Counter for raw counts, decay=EMA factor
+        # Concept frequency — defaultdict(float) for EMA frequencies
         self.decay = decay
-        self.concept_freq = Counter()
+        self.concept_freq = defaultdict(float)
 
         # Max n-gram order
         self.max_n = 4
@@ -104,7 +103,7 @@ class SyntaxLattice:
         """
         self.max_n = max_n
         for n in range(2, max_n + 1):
-            self.ngrams[n] = defaultdict(Counter)
+            self.ngrams[n] = defaultdict(lambda: defaultdict(float))
 
         n_concepts = [0, 0, 0, 0]
         line_count = 0
@@ -143,8 +142,9 @@ class SyntaxLattice:
     def _refresh_prefix_totals(self):
         """Precompute sum(counter.values()) for each prefix for O(1) PMI denominator."""
         self._prefix_total = {}
-        for prefix, counter in self.ngrams[2].items():
-            self._prefix_total[prefix] = sum(counter.values())
+        for n, ngram_dict in self.ngrams.items():
+            for prefix, counter in ngram_dict.items():
+                self._prefix_total[prefix] = sum(counter.values())
         self._skip2_total = {}
         for cid, counter in self.skip2.items():
             self._skip2_total[cid] = sum(counter.values())
@@ -217,8 +217,7 @@ class SyntaxLattice:
                 if prefix not in self.ngrams[n]:
                     self.ngrams[n][prefix] = Counter()
                 self.ngrams[n][prefix][next_c] += 1
-                prev = self.concept_freq.get(next_c, 0)
-                self.concept_freq[next_c] = prev * self.decay + 1.0
+                self.concept_freq[next_c] = self.concept_freq.get(next_c, 0) * self.decay + 1.0
 
         for i in range(len(concept_sequence) - 1):
             self.add_connection(concept_sequence[i], concept_sequence[i + 1])
@@ -325,8 +324,8 @@ class SyntaxLattice:
             return None
 
         # Connection strength: normalized co-occurrence
-        max_count = max(self.concept_freq.get(cid_a, 1),
-                        self.concept_freq.get(cid_b, 1))
+        max_count = max(self.concept_freq.get(cid_a, 0),
+                        self.concept_freq.get(cid_b, 0))
         strength = min(conn['count'] / max(max_count, 1), 1.0)
 
         # Dominant relation type
@@ -442,7 +441,7 @@ class SyntaxLattice:
         cf_items = list(self.concept_freq.items())
         if cf_items:
             npz_data['cf_cids'] = np.array([c for c, _ in cf_items], dtype=np.int32)
-            npz_data['cf_counts'] = np.array([v for _, v in cf_items], dtype=np.int32)
+            npz_data['cf_counts'] = np.array([v for _, v in cf_items], dtype=np.float32)
         # skip2 → npz jagged
         sk_items = list(self.skip2.items())
         if sk_items:
@@ -509,7 +508,7 @@ class SyntaxLattice:
         self.connections = defaultdict(lambda: {'count': 0, 'types': Counter()})
         self._connections_index = defaultdict(dict)
         self.skip2 = defaultdict(Counter)
-        self.concept_freq = Counter()
+        self.concept_freq = defaultdict(float)
         self.decay = 0.999
         self.max_n = 4
 
@@ -523,10 +522,10 @@ class SyntaxLattice:
                     ng = {}
                     for prefix_key, counter_data in ngrams_data.items():
                         prefix = tuple(int(c) for c in prefix_key.split())
-                        ng[prefix] = Counter({int(k): v for k, v in counter_data.items()})
+                        ng[prefix] = defaultdict(float, {int(k): v for k, v in counter_data.items()})
                     self.ngrams[n] = ng
             if 'concept_freq' in data:
-                self.concept_freq = Counter({int(k): v for k, v in data['concept_freq'].items()})
+                self.concept_freq = defaultdict(float, {int(k): v for k, v in data['concept_freq'].items()})
             if 'skip2' in data:
                 for k, v in data['skip2'].items():
                     self.skip2[int(k)] = Counter({int(ck): cv for ck, cv in v.items()})
@@ -568,8 +567,8 @@ class SyntaxLattice:
                     self.ngrams[n] = ng
             # concept_freq
             if 'cf_cids' in npz.files:
-                self.concept_freq = Counter(dict(zip(npz['cf_cids'].tolist(),
-                                                     npz['cf_counts'].tolist())))
+                self.concept_freq = defaultdict(float, zip(npz['cf_cids'].tolist(),
+                                                            npz['cf_counts'].tolist()))
             # skip2
             if load_ngrams and 'sk_a' in npz.files:
                 sk_a = npz['sk_a']

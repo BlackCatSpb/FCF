@@ -34,6 +34,8 @@ class MorphVocab:
 
         # word -> CID (direct SP ID or morph-overridden ID)
         self.word_cache = {}
+        # CID -> word (reverse index for O(1) decode)
+        self._cid_to_word = {}
         # CID -> custom octree path tuple (service/fallback CIDs not stored here)
         self._path_override = {}
 
@@ -143,6 +145,7 @@ class MorphVocab:
             if word in all_sp_tokens:
                 cid = all_sp_tokens[word]
                 self.word_cache[word] = cid
+                self._cid_to_word[cid] = word
                 if is_service:
                     n_service += 1
                 else:
@@ -208,12 +211,10 @@ class MorphVocab:
         """Convert CID back to (word, is_morph) for generation output."""
         if cid >= self.vocab_size:
             return None, False
+        if cid in self._cid_to_word:
+            return self._cid_to_word[cid], True
         piece = self._sp.IdToPiece(cid)
-        word = piece.lstrip('▁')
-        for w, c in self.word_cache.items():
-            if c == cid:
-                return w, True
-        return word, False
+        return piece.lstrip('▁'), False
 
 
 def build_morph_vocab(corpus_path='real_data/full_corpus_ru.txt',

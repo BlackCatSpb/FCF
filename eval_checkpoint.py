@@ -1,7 +1,10 @@
 """Generation test from checkpoint — shows REAL text output."""
-import sys, os; _BASE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, _BASE)
+import sys, os; _BASE = os.path.dirname(os.path.abspath(__file__))
+if _BASE not in sys.path:
+    sys.path.insert(0, _BASE)
 sys.stdout.reconfigure(encoding='utf-8')
 import time, json, argparse
+import numpy as np
 import sentencepiece as spm
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
@@ -42,8 +45,7 @@ print("Initializing generator...")
 gen = CrystalGenerator(cs, sp, lattice)
 
 # ── Diagnostics ──
-import numpy as np
-vecs = np.array(list(cs.concept_vectors.values()), dtype=np.float32)
+vecs = cs.concept_vectors.values()
 rng = np.random.RandomState(42)
 pair_sims = [float(vecs[rng.randint(32000)] @ vecs[rng.randint(32000)])
              for _ in range(2000)]
@@ -88,11 +90,11 @@ for seed, query in seeds:
         kwargs['query_words'] = [query]
 
     result = gen.generate(**kwargs)
-    chain = result['concept_path']
+    text = result.text
+    chain = result.concept_path
     tokens = [sp.IdToPiece(c) for c in chain[:12]]
-    text = result['text']
 
     print(f"\n[{seed}]" + (f" (query={query})" if query else ""))
     print(f"  tokens: {' '.join(tokens)}{'...' if len(chain) > 12 else ''}")
     print(f"  text:   {text.strip()[:120]}")
-    print(f"  score:  {result['score']:.1f}  words: {result['word_count']}")
+    print(f"  score:  {result.score:.1f}  words: {result.word_count}")

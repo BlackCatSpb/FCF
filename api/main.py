@@ -35,6 +35,7 @@ RATE_LIMIT_PER_MIN = 10
 
 async def _check_rate_limit(client_ip: str) -> bool:
     now = time.time()
+    client_ip = client_ip or "unknown"
     with _rate_limit_lock:
         _rate_limit[client_ip] = [t for t in _rate_limit[client_ip] if now - t < 60]
         if len(_rate_limit[client_ip]) >= RATE_LIMIT_PER_MIN:

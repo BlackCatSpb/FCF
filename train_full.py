@@ -9,7 +9,7 @@ os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
 import sys; sys.path.insert(0, os.path.dirname(__file__))
-import time, json, os, shutil, argparse, glob, random
+import time, json, os, shutil, argparse, glob, random, re, zlib
 import numpy as np
 import sentencepiece as spm
 from sklearn.decomposition import PCA
@@ -17,6 +17,8 @@ from sklearn.decomposition import PCA
 def _quiet(func, *args, **kwargs):
     try:
         return func(*args, **kwargs)
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception as e:
         print(f"[WARN] {func.__name__} failed: {e}", file=sys.stderr)
         return None
@@ -34,7 +36,7 @@ from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 from eva.symbolic.parameter_optimizer import ParameterOptimizer
-from eva.symbolic.fcf_config import FCFConfig, MetricPair
+from eva.symbolic.fcf_config import FCFConfig
 
 # ── Config ──────────────────────────────────────────────────────
 CFG = FCFConfig()
@@ -79,15 +81,19 @@ def save_checkpoint_state(line_idx, epoch=1):
 
 def load_checkpoint_state():
     if os.path.exists(CFG.ckpt_state_path):
-        with open(CFG.ckpt_state_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return data.get('line'), data.get('epoch', 1)
+        try:
+            with open(CFG.ckpt_state_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data.get('line'), data.get('epoch', 1)
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"[WARN] Corrupted checkpoint state ({e}), starting fresh",
+                  file=sys.stderr)
+            return None, None
     return None, None
 
 def cleanup_old_checkpoints(keep=None):
     if keep is None:
         keep = CFG.cleanup_keep
-    import re
     base_dir = CFG.data_dir
     files = []
     for p in glob.glob(os.path.join(base_dir, 'concept_space_*k.json')):
@@ -103,10 +109,16 @@ def cleanup_old_checkpoints(keep=None):
             k_label = m.group(1)
             for ext in ['.json', '.codes.npz', '.opt.json']:
                 fp = os.path.join(base_dir, f'concept_space_{k_label}k{ext}')
-                if os.path.exists(fp): os.remove(fp)
+                try:
+                    if os.path.exists(fp): os.remove(fp)
+                except OSError as e:
+                    print(f"[WARN] cleanup: {e}", file=sys.stderr)
             for ext in ['.json', '.lattice.npz', '.meta.json', '.opt.json']:
                 fp = os.path.join(base_dir, f'syntax_lattice_{k_label}k{ext}')
-                if os.path.exists(fp): os.remove(fp)
+                try:
+                    if os.path.exists(fp): os.remove(fp)
+                except OSError as e:
+                    print(f"[WARN] cleanup: {e}", file=sys.stderr)
 # ── Parse args ──────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
@@ -185,17 +197,33 @@ if RESUME is not None:
     ng_info = f" ({[len(v) for v in lattice.ngrams.values()]} prefixes)" if load_ng else " (ngrams skipped)"
     print(f"  Loaded {len(cs.concept_vectors)} vectors, {len(lattice.concept_freq)} concepts{ng_info}")
 
+    if not any(lattice.ngrams.values()):
+        print("  Rebuilding lattice n-grams from corpus...")
+        try:
+            lattice.build(CFG.corpus_path, sp, max_n=CFG.max_n)
+        except Exception as e:
+            print(f"FATAL: lattice.build failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
     mv = _load_morph(CFG.morph_vocab_path, CFG.bpe_model_path)
     path_overrides = mv.get_path_overrides()
     if not hasattr(cs, 'H') or cs.H is None:
         print("  Rebuilding H matrix + octree fields from loaded lattice...")
-        _quiet(cs.build_octree_fields, lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
-                                gamma=CFG.octree_gamma, path_overrides=path_overrides)
+        try:
+            cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
+                                   gamma=CFG.octree_gamma, path_overrides=path_overrides)
+        except Exception as e:
+            print(f"FATAL: build_octree_fields failed: {e}", file=sys.stderr)
+            sys.exit(1)
 
 else:
     print(f"\nInitializing {V} concepts @ {CFG.dim}D...")
     cs = ConceptSpace(vocab_size=V, dim=CFG.dim)
-    _quiet(cs.init_concepts)
+    try:
+        cs.init_concepts()
+    except Exception as e:
+        print(f"FATAL: init_concepts failed: {e}", file=sys.stderr)
+        sys.exit(1)
     cs.init_homeostasis()
 
     mv = _load_morph(CFG.morph_vocab_path, CFG.bpe_model_path)
@@ -203,17 +231,27 @@ else:
 
     print("Building SyntaxLattice...")
     lattice = SyntaxLattice()
-    _quiet(lattice.build, CFG.corpus_path, sp, max_n=CFG.max_n)
+    try:
+        lattice.build(CFG.corpus_path, sp, max_n=CFG.max_n)
+    except Exception as e:
+        print(f"FATAL: lattice.build failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
     print("Octree H + fields...")
-    _quiet(cs.build_octree_fields, lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
-                            gamma=CFG.octree_gamma, path_overrides=path_overrides)
+    try:
+        cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
+                               gamma=CFG.octree_gamma, path_overrides=path_overrides)
+    except Exception as e:
+        print(f"FATAL: build_octree_fields failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # ── Diagnostics ────────────────────────────────────────────────
     # (functions defined unconditionally below; baseline run once)
 
 def mean_cosine_sim(cs, sample=2000):
     all_cids = list(cs.concept_vectors.keys())
+    if not all_cids:
+        return 0.0, 0.0
     rng_state = np.random.RandomState(42)
     cids = rng_state.choice(all_cids, size=min(sample, len(all_cids)), replace=False).tolist()
     vecs_list = [cs.concept_vectors.get(c) for c in cids]
@@ -234,13 +272,15 @@ def mean_cosine_sim(cs, sample=2000):
 
 def check_consistency(cs, sample=500):
     all_cids = list(cs.concept_vectors.keys())
+    if not all_cids:
+        return 0, 0
     rng_state = np.random.RandomState(42)
     cids = rng_state.choice(all_cids, size=min(sample, len(all_cids)), replace=False).tolist()
     ok = 0
     for cid in cids:
-        v_stored = cs.concept_vectors[cid]
+        v_stored = cs.concept_vectors.get(cid)
         v_code = cs.fractal.compute_vector(cid)
-        if v_code is not None and abs(float(np.dot(v_stored, v_code)) - 1.0) < 1e-6:
+        if v_stored is not None and v_code is not None and abs(float(np.dot(v_stored, v_code)) - 1.0) < 1e-6:
             ok += 1
     return ok, len(cids)
 
@@ -296,8 +336,17 @@ train_pairs = sorted(zip(train_lens, train_lines), key=lambda x: x[0])
 train_lens = [p[0] for p in train_pairs]
 train_lines = [p[1] for p in train_pairs]
 
-# Per-epoch max length filter
-EPOCH_MAX_LEN = {1: 32, 2: 128, 3: 10**9}
+# Continuous curriculum: ramp max_len, context_window, neg_samples over first fraction
+CURICULUM_FRACTION = 0.20
+CURICULUM_MIN_LEN = 16
+TOTAL_LINES_GLOBAL = len(train_lines)
+
+def _curriculum_p(idx):
+    return min(idx / max(TOTAL_LINES_GLOBAL * CURICULUM_FRACTION, 1), 1.0)
+
+def _curriculum_max_len(idx, max_total=10**9):
+    p = _curriculum_p(idx)
+    return int(CURICULUM_MIN_LEN + (max_total - CURICULUM_MIN_LEN) * p)
 
 if MAX_LINES > 0:
     train_lines = train_lines[:MAX_LINES]
@@ -408,15 +457,19 @@ def _final_save(cs, lattice, opt, epoch, total_lines):
     except Exception as e:
         print(f"FATAL: Checkpoint save failed: {e}")
         sys.exit(1)
-    _quiet(opt.save_state, CFG.data_dir)
+    try:
+        opt.save_state(CFG.data_dir)
+    except Exception as e:
+        print(f"[WARN] opt.save_state failed: {e}", file=sys.stderr)
     ckpt = {'epoch': epoch, 'line': total_lines, 'timestamp': time.time()}
     with open(CFG.ckpt_state_path, 'w', encoding='utf-8') as f:
         json.dump(ckpt, f)
-    for f in glob.glob(os.path.join(CFG.data_dir, '*.html')):
-        if os.path.basename(f).lower() == 'viewer.html':
-            continue
-        try: os.remove(f)
-        except: pass
+    for f in glob.glob(os.path.join(CFG.data_dir, 'points_*.html')):
+        try:
+            if os.path.isfile(f):
+                os.remove(f)
+        except:
+            pass
     cleanup_old_checkpoints(keep=CFG.cleanup_keep)
 
 # Determine starting line and epoch
@@ -441,14 +494,9 @@ try:
             # Re-read corpus with fresh decay
             destab_pct = 0.0  # fresh destab for new epoch
 
-        max_len = EPOCH_MAX_LEN.get(epoch, 10**9)
-        # Pre-filter lines by curriculum max length
-        epoch_mask = [l <= max_len for l in train_lens]
-        epoch_train = [l for l, ok in zip(train_lines, epoch_mask) if ok]
-        epoch_lines = len(epoch_train)
-        if epoch_lines != total_lines:
-            print(f"  Curriculum epoch {epoch}: {epoch_lines}/{total_lines} lines "
-                  f"(max {max_len} BPE tokens)")
+        # Continuous curriculum: max_len ramps from CURICULUM_MIN_LEN → unlimited
+        epoch_train = train_lines
+        epoch_lines = total_lines
 
         BATCH_SIZE = 32
         batch_buffer = []
@@ -460,11 +508,18 @@ try:
             if not line:
                 continue
 
+            # Continuous curriculum: skip lines exceeding current max_len
+            max_len = _curriculum_max_len(idx)
+            if len(sp.encode(line)) > max_len:
+                continue
+
             # LR warmup
             gen.train_lr = get_lr(idx)
 
-            destab_pct = min(idx / max(int(round(opt.p['destab_decay_lines'].current)), 1), 1.0)
-            destab_scale = CFG.destab_scale_start + (CFG.destab_scale_end - CFG.destab_scale_start) * destab_pct
+            destab_pct = min(idx / max(round(opt.p['destab_decay_lines'].current), 1), 1.0)
+            destab_from = max(CFG.destab_scale_start, CFG.destab_scale_end)
+            destab_to = min(CFG.destab_scale_start, CFG.destab_scale_end)
+            destab_scale = destab_from + (destab_to - destab_from) * destab_pct
 
             batch_buffer.append(line)
             batch_lr = gen.train_lr
@@ -479,11 +534,18 @@ try:
 
             # Flush batch
             _bt = time.time()
+            cp = _curriculum_p(idx)
+            cw_target = int(round(opt.p['context_window'].current))
+            ns_target = int(round(opt.p['neg_samples'].current))
+            pg_target = opt.p['pmi_gate_min'].current
+            cw_ramp = max(1, int(round(cw_target * cp)))
+            ns_ramp = int(round(ns_target * cp))
+            pg_ramp = pg_target * cp
             gen.train_batch(batch_buffer, pmi_strength=opt.p['pmi_strength'].current,
-                pmi_gate_min=opt.p['pmi_gate_min'].current,
+                pmi_gate_min=pg_ramp,
                 base_lr=batch_lr,
-                neg_samples=int(round(opt.p['neg_samples'].current)),
-                context_window=int(round(opt.p['context_window'].current)),
+                neg_samples=ns_ramp,
+                context_window=cw_ramp,
                 inh_strength=opt.p['inh_strength'].current,
                 inh_threshold=opt.p['inh_threshold'].current,
                 neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate,
@@ -506,10 +568,9 @@ try:
             if idx > 0 and idx - last_fluct_lines >= FLUCTUATE_EVERY:
                 cs.fluctuate_fractal(noise_scale=opt.p['noise_scale'].current,
                                      decay=opt.p['decay_rate'].current,
-                                     repel_strength=opt.p['repel_strength'].current)
+                                     repel_strength=opt.p['repel_strength'].current,
+                                     generator=gen)
                 last_fluct_lines = idx
-                if hasattr(gen, '_invalidate_torch'):
-                    gen._invalidate_torch()
 
             if idx > 0 and idx - last_decay_lines >= DECAY_EVERY:
                 lattice.decay_all()
@@ -566,6 +627,10 @@ try:
                 cs_num = CFG.cs_path.replace('.json', f'_{ckpt_name}.json')
                 lat_num = CFG.lattice_path.replace('.json', f'_{ckpt_name}.json')
                 print()
+                reortho = cs.fractal.check_basis_health()
+                if reortho:
+                    gen._invalidate_torch()
+                    print(f"  Basis re-orthogonalized")
                 try:
                     cs.save(cs_num)
                     lattice.save(lat_num)
@@ -596,9 +661,9 @@ try:
                 if n_code_out > 0 or vec_max_dev > CFG.vec_dev_warn:
                     print(f"  CODE_DRIFT n_out={n_code_out} max|code|={max_code_abs:.1f} vec_dev={vec_max_dev:.6f}")
 
-                seed = np.random.choice(CFG.test_seeds)
+                seed = CFG.test_seeds[zlib.crc32(str(idx).encode()) % len(CFG.test_seeds)]
                 result = gen.generate(seed_word=seed, max_words=CFG.gen_max_words)
-                txt = result['text'].replace('\n', ' ').strip()
+                txt = result.text.replace('\n', ' ').strip()
                 print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} | gen({seed}): {txt}")
 
                 # 3D PCA visualization every 5th checkpoint
@@ -622,7 +687,7 @@ try:
                         print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
 
                 opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
-                         vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
+                         vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1 or 0)
                 gen.train_lr = opt.p['full_lr'].current
                 print()
 
@@ -654,13 +719,11 @@ print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total}")
 print("--- Generation ---")
 for seed in CFG.test_seeds:
     result = gen.generate(seed_word=seed, max_words=CFG.gen_max_words)
-    txt = result['text']
-    print(f"  [{seed}] {txt}  ({result['score']:.2f})")
+    txt = result.text
+    print(f"  [{seed}] {txt}  ({result.score:.2f})")
 
 t_total = time.time() - t_start
 print(f"  {n_trained} lines in {t_total:.0f}s ({n_trained/t_total:.0f} L/s)")
-print("Saving...")
-_final_save(cs, lattice, opt, _ckpt_epoch, idx)
 print("Done.")
 
 

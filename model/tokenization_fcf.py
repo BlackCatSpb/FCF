@@ -67,17 +67,11 @@ class FCFTokenizer(PreTrainedTokenizer):
         return {str(i): i for i in range(self.sp.get_piece_size())}
 
     def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None):
+        if self.spm_file and os.path.exists(self.spm_file):
+            import shutil
+            out_path = os.path.join(save_directory, (filename_prefix or "") + "spm.model")
+            shutil.copy2(self.spm_file, out_path)
+            return (out_path,)
         return (self.spm_file or "",)
 
-    def encode_text(self, text: str) -> List[int]:
-        if not self.sp:
-            return []
-        return self.sp.encode(text)
 
-    def decode_text(self, token_ids: List[int]) -> str:
-        if not self.sp:
-            return ""
-        return self.sp.decode(token_ids)
-
-    def concept_metadata(self, token_ids: List[int]):
-        return []

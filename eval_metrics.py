@@ -21,7 +21,7 @@ from eva.symbolic.fcf_config import FCFConfig
 CFG = FCFConfig()
 BASE = CFG.data_dir
 sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
-TEST_SEEDS = CFG.test_seeds if CFG is not None else ['князь', 'человек', 'война', 'любовь', 'дом', 'жизнь']
+TEST_SEEDS = CFG.test_seeds
 GEN_MAX_WORDS = 25
 
 
@@ -119,9 +119,9 @@ def main():
     for seed in TEST_SEEDS:
         try:
             r = gen.generate(seed_word=seed, max_words=GEN_MAX_WORDS)
-            text = r['text'].replace('\n', ' ').strip()
-            gen_samples.append({'seed': seed, 'text': text, 'words': r['word_count'], 'score': r['score']})
-            print(f"  [{seed}]({r['word_count']}w): {text[:100]}")
+            text = r.text.replace('\n', ' ').strip()
+            gen_samples.append({'seed': seed, 'text': text, 'words': r.word_count, 'score': r.score})
+            print(f"  [{seed}]({r.word_count}w): {text[:100]}")
         except Exception as e:
             gen_samples.append({'seed': seed, 'text': f'[ERROR: {e}]', 'words': 0, 'score': 0})
             print(f"  [{seed}]: ERROR {e}")

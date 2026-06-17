@@ -1,8 +1,15 @@
 """FCFConfig — HuggingFace-compatible configuration for FCF concept model."""
 from transformers import PretrainedConfig
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'eva', 'symbolic'))
-from fcf_config import FCFConfig as _RealFCFConfig
+_fcf_path = os.path.join(os.path.dirname(__file__), '..', 'eva', 'symbolic')
+sys.path.append(_fcf_path)
+try:
+    from fcf_config import FCFConfig as _RealFCFConfig
+finally:
+    try:
+        sys.path.remove(_fcf_path)
+    except ValueError:
+        pass
 
 
 class FCFConfig(PretrainedConfig):

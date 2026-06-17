@@ -80,13 +80,7 @@ class FCFConfig:
 
     @property
     def corpus_path(self) -> str:
-        path = os.path.join(self.data_dir, 'full_corpus_ru_clean.txt')
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Corpus not found at {path}. "
-                f"Run filter_corpus.py or check git LFS pull."
-            )
-        return path
+        return os.path.join(self.data_dir, 'full_corpus_ru_clean.txt')
 
     @property
     def bpe_model_path(self) -> str:
@@ -245,6 +239,7 @@ class FCFConfig:
     # ── Параметры max_shift для STDP ──────────
     # Default 0.5 matches hardcoded max_shift in concept_space._apply_vector_update
     stdp_max_shift: float = 0.5
+    max_grad_norm: float = 1.0  # clip gradient norm to prevent explosive updates
     neg_lr_ratio: float = 0.5
 
     # ── Engine ────────────────────────────────
@@ -401,7 +396,13 @@ class FCFConfig:
                 items = []
                 for item in val:
                     if isinstance(item, ParamDef):
-                        items.append({k2: v2 for k2, v2 in item.__dict__.items()})
+                        d2 = {}
+                        for k2, v2 in item.__dict__.items():
+                            if isinstance(v2, list) and v2 and all(isinstance(r, AdaptRule) for r in v2):
+                                d2[k2] = [r.__dict__ for r in v2]
+                            else:
+                                d2[k2] = v2
+                        items.append(d2)
                     elif isinstance(item, MetricPair):
                         items.append(item.__dict__)
                     else:
@@ -421,7 +422,6 @@ class FCFConfig:
         for k, v in data.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
-        cfg.__post_init__()  # Convert raw dicts back to ParamDef/MetricPair
         return cfg
 
     def __post_init__(self):

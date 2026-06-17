@@ -103,8 +103,6 @@ class FractalField:
         mat = rng.randn(latent_dim, dim).astype(np.float32)
         Q, _ = np.linalg.qr(mat, mode='reduced')
         self.basis = Q.astype(np.float32)
-        self._fluctuation_step = 0
-
         # Latent codes: cid → (latent_dim,) array
         self.codes = {}
 
@@ -115,6 +113,27 @@ class FractalField:
         self._vector_matrix = None
         self._cid_order = []
         self._matrix_dirty = True
+
+    def check_basis_health(self):
+        """Verify orthogonality, re-orthogonalize if drifted. Returns True if changed."""
+        QtQ = self.basis.T @ self.basis
+        err = np.max(np.abs(QtQ - np.eye(self.dim, dtype=np.float32)))
+        if err > 1e-3:
+            Q, _ = np.linalg.qr(self.basis, mode='reduced')
+            old_basis = self.basis
+            cids = list(self.codes.keys())
+            codes_mat = np.stack([self.codes[cid] for cid in cids])
+            vecs = codes_mat @ old_basis
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+            norms[norms < 1e-10] = 1.0
+            vecs /= norms
+            new_codes = vecs @ Q.T
+            for i, cid in enumerate(cids):
+                self.codes[cid] = new_codes[i]
+            self.basis = Q.astype(np.float32)
+            self._matrix_dirty = True
+            return True
+        return False
 
     # ── Init ─────────────────────────────────────────────────
 
@@ -167,27 +186,6 @@ class FractalField:
         """Get binary field vector for a concept."""
         return self.field_bits.get(cid)
 
-    def set_field_bit(self, cid, anchor_idx, value=1):
-        """Set a single bit in the concept's field vector."""
-        bits = self.field_bits.get(cid)
-        if bits is None:
-            return
-        byte_idx = anchor_idx // 8
-        bit_idx = anchor_idx % 8
-        if value:
-            bits[byte_idx] |= (1 << bit_idx)
-        else:
-            bits[byte_idx] &= ~(1 << bit_idx)
-
-    def check_field_bit(self, cid, anchor_idx):
-        """Test a single bit in the concept's field vector."""
-        bits = self.field_bits.get(cid)
-        if bits is None:
-            return False
-        byte_idx = anchor_idx // 8
-        bit_idx = anchor_idx % 8
-        return bool(bits[byte_idx] & (1 << bit_idx))
-
     def field_overlap(self, cid_a, cid_b):
         """Count overlapping field bits between two concepts."""
         ba = self.field_bits.get(cid_a)
@@ -209,25 +207,15 @@ class FractalField:
             v /= nv
         return v
 
-    def ensure_matrix(self):
-        """Build (N, D) normalized vector matrix from all latent codes."""
-        if not self._matrix_dirty and self._vector_matrix is not None:
-            return self._vector_matrix, self._cid_order
-
-        self._cid_order = list(self.codes.keys())
-        n = len(self._cid_order)
-        if n == 0:
-            self._vector_matrix = np.empty((0, self.dim), dtype=np.float32)
-            return self._vector_matrix, self._cid_order
-
-        C = np.array([self.codes[cid] for cid in self._cid_order], dtype=np.float32)
-        V = C @ self.basis
-        norms = np.linalg.norm(V, axis=1, keepdims=True)
-        norms[norms < 1e-10] = 1.0
-        V /= norms
-        self._vector_matrix = V
-        self._matrix_dirty = False
-        return self._vector_matrix, self._cid_order
+    def fluctuate(self, noise_scale=0.005, decay=0.999):
+        """Apply autonomous drift to all latent codes."""
+        if not hasattr(self, '_fluct_rng'):
+            self._fluct_rng = np.random.RandomState(42)
+        for cid in list(self.codes.keys()):
+            c = self.codes[cid]
+            noise = self._fluct_rng.randn(self.latent_dim).astype(np.float32) * noise_scale
+            c[:] = c * decay + noise
+        self._matrix_dirty = True
 
     def reinitialize_all(self, cid_list):
         """Reset all latent codes to random initialization."""
@@ -343,6 +331,7 @@ class ConceptSpace:
         # Shift tracking
         self._total_shift = 0.0
         self._update_count = 0
+        self._after_update_hook = None
 
         # ---- Initialization ----
 
@@ -371,12 +360,6 @@ class ConceptSpace:
     def set_vec(self, cid, v):
         """Update vector in dense store."""
         self.concept_vectors[cid] = v
-
-    def reinit_fractal(self, cid_list=None):
-        """Reinitialize all fractal latent codes (resets all vectors)."""
-        cids = cid_list if cid_list is not None else list(self.concept_vectors.keys())
-        self.fractal.reinitialize_all(cids)
-        self._sync_from_fractal()
 
     # ── Octree encoding ──────────────────────────────────────
 
@@ -468,10 +451,17 @@ class ConceptSpace:
             print(f"  Octree fields: {len(seen_cids)}/{len(self.fractal.codes)} concepts, "
                   f"sizes: min={a.min()} max={a.max()} mean={a.mean():.1f}")
 
-    def fluctuate_fractal(self, noise_scale=0.003, decay=0.9995, repel_strength=0.0):
-        """Autonomous drift + optional centroid repulsion."""
+    def fluctuate_fractal(self, noise_scale=0.003, decay=0.9995, repel_strength=0.0, generator=None):
+        """Autonomous drift + optional centroid repulsion.
+
+        Args:
+            generator: Optional CrystalGenerator instance whose GPU tensors
+                       to invalidate after the drift.
+        """
         self.fractal.fluctuate(noise_scale=noise_scale, decay=decay)
         self._sync_from_fractal()
+        if generator is not None:
+            generator._invalidate_torch()
         if repel_strength > 0:
             self._repel_centroid(repel_strength)
 
@@ -487,8 +477,10 @@ class ConceptSpace:
         naturally handles magnitude: largest for mid-similarity vectors, zero
         for v aligned with or opposite to centroid.
         """
+        if len(self.concept_vectors) < 2:
+            return
         # NOTE: vecs ~225MB temp array (len×768×float32); fine for ~75K vectors
-        vecs = np.array(list(self.concept_vectors.values()), dtype=np.float32)
+        vecs = self.concept_vectors._data[self.concept_vectors._valid]
         centroid = np.mean(vecs, axis=0)
         cn = centroid / max(np.linalg.norm(centroid), 1e-10)
         for cid, v in self.concept_vectors.items():
@@ -553,6 +545,11 @@ class ConceptSpace:
             if nv_code > 1e-10:
                 new_code /= nv_code
             self.fractal.codes[cid] = new_code
+            self.fractal._matrix_dirty = True
+
+        # Notify external hook (e.g. CrystalGenerator _vecs_t sync)
+        if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
+            self._after_update_hook(cid, v_new)
 
     def _lateral_inhibition_fractal(self, winner_cid, strength=0.01, threshold=0.35, sample_size=None):
         """Lateral inhibition with correct Riemannian gradient, vectorised.
@@ -628,7 +625,8 @@ class ConceptSpace:
         """Check if any fractal code exceeds |bound|. Returns (n_outliers, max_abs)."""
         if not self.fractal.codes:
             return 0, 0.0
-        all_codes = np.array(list(self.fractal.codes.values()), dtype=np.float32)
+        codes_list = list(self.fractal.codes.values())
+        all_codes = np.array(codes_list, dtype=np.float32)
         abs_codes = np.abs(all_codes)
         max_abs = float(np.max(abs_codes))
         n_out = int(np.sum(np.max(abs_codes, axis=1) > bound))
@@ -638,7 +636,7 @@ class ConceptSpace:
         """Check all vectors are unit norm. Returns (ok_count, total, max_deviation)."""
         if not self.concept_vectors:
             return 0, 0, 0.0
-        all_vecs = np.array(list(self.concept_vectors.values()), dtype=np.float32)
+        all_vecs = self.concept_vectors._data[self.concept_vectors._valid]
         norms = np.linalg.norm(all_vecs, axis=1)
         devs = np.abs(norms - 1.0)
         ok = int(np.sum(devs < 1e-6))
@@ -738,7 +736,10 @@ class ConceptSpace:
         concept_usage = getattr(self, 'concept_usage', None)
         if concept_usage is not None:
             data['concept_usage'] = {str(c): u for c, u in concept_usage.items()}
-
+        data['inhibit_rng_state'] = [s.tolist() if isinstance(s, np.ndarray) else s for s in self._inhibit_rng.get_state()]
+        data['inhibition_step'] = self._inhibition_step
+        data['total_shift'] = self._total_shift
+        data['update_count'] = self._update_count
 
         with open(path + '.tmp', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
@@ -761,9 +762,15 @@ class ConceptSpace:
         obj.concept_vectors = ConceptVectorStore(obj.vocab_size, obj.dim)
 
         obj.rng = np.random.RandomState(42)
-        obj._inhibition_step = 0
-        obj._total_shift = 0.0
-        obj._update_count = 0
+        rng_state = data.get('inhibit_rng_state')
+        if rng_state is not None:
+            obj._inhibit_rng = np.random.RandomState()
+            obj._inhibit_rng.set_state(tuple(rng_state))
+        else:
+            obj._inhibit_rng = np.random.RandomState(42)
+        obj._inhibition_step = data.get('inhibition_step', 0)
+        obj._total_shift = data.get('total_shift', 0.0)
+        obj._update_count = data.get('update_count', 0)
 
         if 'fractal' in data:
             base_dir = os.path.dirname(path)
@@ -774,6 +781,15 @@ class ConceptSpace:
                     obj.concept_vectors[cid] = v
         else:
             obj.fractal = FractalField(dim=obj.dim, latent_dim=512)
+            valid_idxs = np.flatnonzero(obj.concept_vectors._valid)
+            for idx in valid_idxs:
+                v = obj.concept_vectors._data[idx]
+                cid = int(idx)
+                code = v @ obj.fractal.basis.T
+                nv = np.linalg.norm(code @ obj.fractal.basis)
+                if nv > 1e-10:
+                    code /= nv
+                obj.fractal.codes[cid] = code
 
         saved_usage = data.get('concept_usage')
         if saved_usage:

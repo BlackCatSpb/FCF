@@ -1,5 +1,5 @@
 """FCFModel — HuggingFace-compatible concept navigation model."""
-import os, json, math
+import os, json, math, threading
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 import numpy as np
@@ -42,9 +42,6 @@ class _SPTokenizer:
     def PieceToId(self, piece):
         return self.sp.PieceToId(piece)
 
-    def word_to_cid(self, word):
-        return self.sp.encode(word)[0]
-
     def vocab_size(self):
         return self.sp.vocab_size()
 
@@ -81,10 +78,14 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         self._tok: Optional[_SPTokenizer] = None
         self._lattice: Optional[SyntaxLattice] = None
         self._generator: Optional[CrystalGenerator] = None
+        self._load_lock = threading.Lock()
 
     def _load(self):
         if self._space is not None:
             return
+        with self._load_lock:
+            if self._space is not None:
+                return
 
         data_dir = self._data_dir
         space_path = os.path.join(data_dir, "concept_space.json")
@@ -192,8 +193,8 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
 
         hm = self.generator.hormones
         return FCFOutput(
-            text=result.get("text", ""),
-            concept_path=result.get("concept_path", []),
+            text=result.text,
+            concept_path=result.concept_path,
             hormones={
                 "da": float(hm.dopamine),
                 "5ht": float(hm.serotonin),
@@ -202,7 +203,7 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
             },
             confidence=0.0,
             intent_anchor=None,
-            semantic_delta=float(result.get("semantic_delta", 0.0)),
+            semantic_delta=result.semantic_delta,
         )
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):

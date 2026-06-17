@@ -10,7 +10,6 @@ Functions:
 
 import numpy as np
 from sklearn.cluster import MiniBatchKMeans
-from collections import defaultdict
 import math
 
 

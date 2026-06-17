@@ -169,19 +169,12 @@ class HormonalSystem:
         self.da_phasic *= self.phasic_decay
         self.ach_phasic *= self.phasic_decay
 
-        # Track reward
+        # Track reward (bounded FIFO)
         self.reward_history.append(self.dopamine)
+        if len(self.reward_history) > 1000:
+            self.reward_history = self.reward_history[-1000:]
 
     # ---- Modulation functions ----
-
-    def modulate_stdp_lr(self, base_lr):
-        """Acetylcholine gates plasticity. Dopamine modulates STDP magnitude.
-        High ACh + High DA -> strong learning (novel correct pattern).
-        Low ACh -> weak learning (consolidation, familiar)."""
-        plasticity = self.acetylcholine * (0.5 + 0.5 * self.dopamine)
-        # Phasic ACh provides immediate LR boost for surprising events
-        phasic_boost = 1.0 + self.ach_phasic * 1.5
-        return base_lr * max(plasticity * phasic_boost, 0.05)
 
     def modulate_temperature(self, base_temp):
         """Serotonin modulates risk-taking.
@@ -196,18 +189,6 @@ class HormonalSystem:
         Low NA (relaxed) -> broad beam (parallel exploration)."""
         focus = 1.0 - self.noradrenaline * 0.5
         return max(1, int(base_width * focus))
-
-    def modulate_homeostasis(self, base_boost):
-        """Dopamine modulates homeostatic plasticity.
-        High DA -> homeostasis is relaxed (rewarding state).
-        Low DA -> homeostasis is strong (need for novelty)."""
-        drive = 1.0 - self.dopamine * 0.6
-        return base_boost * max(drive, 0.2)
-
-    def confidence_score(self):
-        """Current confidence based on recent match rate and dopamine."""
-        avg_m = np.mean(self.recent_matches) if self.recent_matches else 0.0
-        return 0.3 + 0.4 * avg_m + 0.3 * self.dopamine
 
     def summary(self):
         return {
@@ -267,5 +248,4 @@ if __name__ == '__main__':
         if i % 5 == 0 or i == 19:
             print(f"  step {i:2d}: {hs.summary()} "
                   f"temp={hs.modulate_temperature(0.5):.3f} "
-                  f"lr={hs.modulate_stdp_lr(0.1):.3f} "
                   f"beam={hs.modulate_beam_width(4)}")

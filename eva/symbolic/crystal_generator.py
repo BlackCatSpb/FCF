@@ -269,6 +269,8 @@ class CrystalGenerator:
 
     def _is_semantic_token(self, cid):
         """Filter function words and punctuation that dominate graph connections."""
+        if self.sp is None:
+            return True
         text = self._token_text(cid).strip()
         if not text:
             return False
@@ -505,6 +507,8 @@ class CrystalGenerator:
 
     def _branch(self, seq: List[int], word_num: int, theta_temp: float = 0.3, target_cid: Optional[int] = None, centroid: Optional[np.ndarray] = None) -> List[Tuple[int, float]]:
         """Generate diverse branching candidates via RRF over multiple signals."""
+        if not seq:
+            return []
         prev_cid = seq[-1]
         cids = seq[-3:] if len(seq) >= 3 else seq
         K = 3

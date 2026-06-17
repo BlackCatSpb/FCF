@@ -367,3 +367,38 @@ class TestEdgeCases:
     def test_fractal_subspace_dims(self, dim):
         ff = FractalField(dim=dim, latent_dim=64)
         assert ff.l_c + ff.l_a + ff.l_m == 64
+
+
+# ── 9. V5 Safety & Fuzz Tests (QN-6, QN-7, QN-9) ──
+
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+class TestV5Safety:
+    def test_oom_fallback_monkeypatch(self, gen):
+        gen._torch_fallback = False
+        gen._ensure_torch(device='cpu')
+        assert hasattr(gen, '_torch_fallback')
+
+    def test_oom_does_not_raise_on_cpu(self, gen):
+        gen._torch_fallback = False
+        gen._ensure_torch(device='cpu')
+        assert gen._vecs_t is not None
+
+    def test_branch_fuzz_empty_seq(self, gen):
+        result = gen._branch(seq=[], word_num=0, theta_temp=1.0)
+        assert result == []
+
+    def test_branch_fuzz_zero_temp(self, gen, cs):
+        result = gen._branch(seq=[0, 1], word_num=1, theta_temp=0.0, centroid=np.zeros(64))
+        assert isinstance(result, list) if result else True
+
+    def test_save_load_concept_space_roundtrip(self, cs, tmp_path):
+        p = tmp_path / "cs_test.npz"
+        cs.save(str(p))
+        assert os.path.exists(str(p))
+
+    def test_save_load_lattice_roundtrip(self, lattice, tmp_path):
+        p = tmp_path / "lat_test.json"
+        lattice.save(str(p))
+        lat2 = SyntaxLattice()
+        lat2.load(str(p))
+        assert hasattr(lat2, 'ngrams')

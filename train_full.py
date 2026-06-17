@@ -346,6 +346,20 @@ train_pairs = sorted(zip(train_lens, train_lines), key=lambda x: x[0])
 train_lens = [p[0] for p in train_pairs]
 train_lines = [p[1] for p in train_pairs]
 
+# Self-paced learning: re-rank by concept_error at each checkpoint
+def _rescore_lines(lines, gen):
+    if not hasattr(gen, 'concept_error') or not gen.concept_error:
+        return lines
+    scores = []
+    for line in lines:
+        ids = gen._encode_input(line)
+        if not ids:
+            scores.append(0.0)
+        else:
+            mean_err = sum(gen.concept_error.get(cid, 0.5) for cid in ids) / len(ids)
+            scores.append(mean_err)
+    return [l for _, l in sorted(zip(scores, lines))]
+
 # Continuous curriculum: ramp max_len, context_window, neg_samples over first fraction
 CURICULUM_FRACTION = 0.20
 CURICULUM_MIN_LEN = 16
@@ -700,6 +714,10 @@ try:
                             d = ppl - ppl_history[-2][1]
                             ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
                         print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
+                    # Self-paced learning: re-rank remaining lines by concept_error
+                    remaining = idx - start_line + 1
+                    if remaining > 0 and remaining < len(epoch_train):
+                        epoch_train = _rescore_lines(epoch_train[idx - start_line + 1:], gen)
 
                 opt_changes = opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
                          vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)

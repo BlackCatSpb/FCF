@@ -360,6 +360,135 @@ def _rescore_lines(lines, gen):
             scores.append(mean_err)
     return [l for _, l in sorted(zip(scores, lines))]
 
+
+class TrainingPipeline:
+    """Encapsulates the main training loop with batch scheduling, checkpoints, and reporting."""
+    def __init__(self, gen, sp, cs, lattice, opt, cfg):
+        self.gen = gen
+        self.sp = sp
+        self.cs = cs
+        self.lattice = lattice
+        self.opt = opt
+        self.cfg = cfg
+        self.ppl_history = []
+        self.vppl_history = []
+        self.last_fluct_lines = 0
+        self.global_step = 0
+        self.total_pairs_since_last_decay = 0
+        self.last_stat_time = 0.0
+        self.last_cos_time = 0.0
+        self.last_cos_sim = (0.0, 0.0)
+        self.ngram_last_total = 0
+
+    def run_epoch(self, epoch_train, start_line, epoch_num, t_start):
+        gen = self.gen; cs = self.cs; lattice = self.lattice; opt = self.opt
+        BATCH_SIZE = 32
+        batch_buffer = []
+        n_trained = 0
+        epoch_lines = len(epoch_train)
+        CHECKPOINT_EVERY = self.cfg.checkpoint_every
+        EVAL_EVERY = self.cfg.eval_every_fast
+        FLUCTUATE_EVERY = self.cfg.fluctuate_every
+        idx = start_line
+        for idx, line in enumerate(epoch_train[start_line:], start=start_line):
+            if not line: continue
+            max_len = _curriculum_max_len(idx)
+            if len(self.sp.encode(line)) > max_len: continue
+            gen.train_lr = get_lr(idx)
+            destab_pct = min(self.global_step / max(round(opt.p['destab_decay_lines'].current), 1), 1.0)
+            destab_from = max(self.cfg.destab_scale_start, self.cfg.destab_scale_end)
+            destab_to = min(self.cfg.destab_scale_start, self.cfg.destab_scale_end)
+            destab_scale = destab_from + (destab_to - destab_from) * destab_pct
+            batch_buffer.append(line)
+            batch_lr = gen.train_lr
+            if len(batch_buffer) < BATCH_SIZE and idx < start_line + epoch_lines - 1:
+                if (idx + 1 - self.last_fluct_lines) < FLUCTUATE_EVERY:
+                    if self.total_pairs_since_last_decay < self.cfg.decay_every_pairs:
+                        continue
+            _bt = time.time()
+            cp = _curriculum_p(idx)
+            cw_ramp = max(1, int(round(opt.p['context_window'].current * cp)))
+            ns_ramp = int(round(opt.p['neg_samples'].current * cp))
+            pg_ramp = opt.p['pmi_gate_min'].current * cp
+            n_pairs = gen.train_batch(batch_buffer, pmi_strength=opt.p['pmi_strength'].current,
+                pmi_gate_min=pg_ramp, base_lr=batch_lr, neg_samples=ns_ramp,
+                context_window=cw_ramp, inh_strength=opt.p['inh_strength'].current,
+                inh_threshold=opt.p['inh_threshold'].current, neg_lr_ratio=self.cfg.neg_lr_ratio,
+                field_gate=self.cfg.field_gate, use_torch=self.cfg.use_torch, destab_scale=destab_scale)
+            self.total_pairs_since_last_decay += n_pairs
+            self.global_step += 1
+            n_trained += len(batch_buffer)
+            batch_buffer = []
+            now = time.time()
+            elapsed = now - t_start
+            if now - self.last_stat_time >= 1.0:
+                rate = idx / max(elapsed, 0.1)
+                pct = 100 * idx / epoch_lines
+                eta_s = ""
+                if rate >= 0.1:
+                    eta = (epoch_lines - idx) / rate
+                    eta_h, eta_m = int(eta // 3600), int((eta % 3600) // 60)
+                    eta_s = f"ETA {eta_h}h{eta_m:02d}m"
+                if idx > 0 and idx % CHECKPOINT_EVERY == 0:
+                    self._checkpoint(epoch_num, idx, elapsed, epoch_lines, destab_scale, t_start)
+                self.last_stat_time = now
+        return idx, n_trained
+
+    def _checkpoint(self, epoch, idx, elapsed, epoch_lines, destab_scale, t_start):
+        gen = self.gen; cs = self.cs; lattice = self.lattice; opt = self.opt
+        rate = idx / max(elapsed, 0.1)
+        pct = 100 * idx / epoch_lines
+        print(f"\n[{pct:5.1f}%] {idx:7d}L | {rate:4.0f} L/s")
+        mean_sim, std_sim = mean_cosine_sim(cs)
+        ok, total_c = check_consistency(cs)
+        ng_total = sum(len(v) for v in lattice.ngrams.values())
+        ng_new = ng_total - self.ngram_last_total
+        self.ngram_last_total = ng_total
+        print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} ngrams={ng_total}(+{ng_new})")
+        ckpt_name = f"e{epoch}_l{idx}"
+        try:
+            cs.save(self.cfg.cs_path)
+            lattice.save(self.cfg.lattice_path)
+        except Exception as e:
+            print(f"FATAL: save failed: {e}")
+            import sys; sys.exit(1)
+        n_upd = cs._update_count
+        avg_delta = (cs._total_shift / max(n_upd, 1)) * 1e3
+        cs._total_shift = 0.0; cs._update_count = 0
+        n_code_out, max_code_abs = cs.check_code_range(bound=self.cfg.code_bound)
+        vec_ok, vec_total, vec_max_dev = cs.validate_vector_norms()
+        if n_code_out > 0 or vec_max_dev > self.cfg.vec_dev_warn:
+            print(f"  CODE_DRIFT n_out={n_code_out} max|code|={max_code_abs:.1f} vec_dev={vec_max_dev:.6f}")
+        seed = self.cfg.test_seeds[zlib.crc32(str(idx).encode()) % len(self.cfg.test_seeds)]
+        if gen.sp is not None:
+            result = gen.generate(seed_word=seed, max_words=self.cfg.gen_max_words)
+            txt = result.text.replace('\n', ' ').strip()
+            print(f"  gen({seed}): {txt}")
+        if idx % (CHECKPOINT_EVERY * 5) == 0:
+            _quiet(save_3d_vis, cs, self.sp, ckpt_name)
+        eval_vppl = eval_acc1 = eval_vacc1 = None
+        if idx > 0 and idx % self.cfg.eval_every_fast == 0:
+            eval_result = _quiet(gen.evaluate, self.cfg.val_corpus_path, max_lines=self.cfg.eval_max_lines)
+            if eval_result is not None:
+                ppl = eval_result['perplexity']
+                eval_vppl = eval_result['vec_perplexity']
+                eval_acc1 = eval_result['accuracy_top1']
+                eval_vacc1 = eval_result['vec_accuracy_top1']
+                self.ppl_history.append((idx, ppl))
+                self.vppl_history.append((idx, eval_vppl))
+                ppl_trend = ''
+                if len(self.ppl_history) >= 2:
+                    d = ppl - self.ppl_history[-2][1]
+                    ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
+                print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
+                remaining = idx - 0 + 1
+                if remaining > 0 and remaining < epoch_lines:
+                    epoch_train = globals().get('train_lines', [])
+                    if remaining < len(epoch_train):
+                        epoch_train = _rescore_lines(epoch_train[remaining:], gen)
+        opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
+                 vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
+
 # Continuous curriculum: ramp max_len, context_window, neg_samples over first fraction
 CURICULUM_FRACTION = 0.20
 CURICULUM_MIN_LEN = 16

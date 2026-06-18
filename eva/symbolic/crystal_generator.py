@@ -18,6 +18,8 @@ from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from eva.symbolic.stdp_trainer import STDPTrainer
+
 # meta_t column indices (gpu_meta_l tuple order)
 _META_I = 0
 _META_J = 1
@@ -88,6 +90,9 @@ class CrystalGenerator:
         self.concept_error_decay = 0.9  # EMA decay
 
         self.train_lr = 0.01
+
+        # STDPTrainer — delegated training methods
+        self._trainer = None
 
         # Torch state (lazy init, invalidated by fluctuate_fractal)
         self._torch_device = None
@@ -1105,578 +1110,63 @@ class CrystalGenerator:
         else:
             self._contrastive_objective_cpu(gen_updates)
 
-    def _contrastive_objective_cpu(self, gen_updates):
-        """CPU fallback for contrastive objective."""
-        cs = self.cs
-        for gen_cid, updates in gen_updates.items():
-            v_gen = cs.concept_vectors.get(gen_cid)
-            if v_gen is None:
-                continue
-            avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
-            contr_lr = avg_elr * 0.3
-            contr_lr *= (1.0 + self.concept_error.get(gen_cid, 0.0) * 2.0)
+    def _contrastive_objective_cpu(self, *a, **kw):
+        if self._trainer is None: self._trainer = STDPTrainer(self)
+        return self._trainer._contrastive_objective_cpu(*a, **kw)
 
-            neighbours = cs.topk_similar_concepts(gen_cid, k=100, sample_size=2000)
-            cooc_set = {ctx_cid for ctx_cid, _ in updates}
-            hard_negatives = []
-            for neg_cid, cos_val in neighbours:
-                if neg_cid == gen_cid or neg_cid in cooc_set:
-                    continue
-                if self.lattice.connection_strength(gen_cid, neg_cid) > 0.1:
-                    continue
-                if cos_val > 0.05 and cos_val < 0.5:
-                    hard_negatives.append((neg_cid, cos_val))
-
-            hard_negatives.sort(key=lambda x: -x[1])
-            for neg_cid, cos_val in hard_negatives[:5]:
-                v_neg = cs.concept_vectors.get(neg_cid)
-                if v_neg is None:
-                    continue
-                contr_grad = cos_val * v_neg - v_gen
-                gn = float(np.linalg.norm(contr_grad))
-                if gn > self.max_grad_norm > 0:
-                    contr_grad = contr_grad / gn * self.max_grad_norm
-                push = contr_grad * contr_lr
-                v_new = v_gen + push
-                nv = np.linalg.norm(v_new)
-                if nv > 1e-10:
-                    v_new /= nv
-                cs._apply_vector_update(gen_cid, v_new)
-
-    def _contrastive_objective_gpu(self, gen_updates):
-        """GPU-accelerated contrastive: batch sim matrix + vector ops."""
-        cs = self.cs; d = self._device; DT = self._DT
-        gen_cids = list(gen_updates.keys())
-        if not gen_cids:
-            return
-        n_gen = len(gen_cids); n_v = self._vecs_t.shape[0]
-
-        # Pre-compute contrastive LRs for each gen_cid
-        contr_lrs = []
-        gen_idxs = []
-        for i, gen_cid in enumerate(gen_cids):
-            updates = gen_updates[gen_cid]
-            avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
-            contr_lr = avg_elr * 0.3
-            contr_lr *= (1.0 + self.concept_error.get(gen_cid, 0.0) * 2.0)
-            contr_lrs.append(contr_lr)
-            gen_idxs.append(gen_cid)
-
-        # Batch sim: (n_gen x dim) @ (n_v x dim).T = (n_gen x n_v)
-        g_vecs = self._vecs_t[gen_idxs].float()  # [n_gen, D]
-        all_vecs = self._vecs_t[:n_v].float()     # [n_v, D]
-        sim = g_vecs @ all_vecs.T                 # [n_gen, n_v]
-
-        # Co-occurrence sets (CPU, cheap)
-        cooc_sets = {gc: {ctx for ctx, _ in gen_updates[gc]} for gc in gen_cids}
-        with torch.no_grad():
-            for i, gen_cid in enumerate(gen_cids):
-                contr_lr = contr_lrs[i]
-                gi_sim = sim[i]  # [n_v]
-                # Top-100 nearest (excluding self)
-                topk = gi_sim.topk(min(2000, n_v))  # use 2000 candidates
-                neg_cands = [(int(topk.indices[j].item()), float(topk.values[j].item())) for j in range(min(2000, n_v))]
-                hard_negatives = []
-                cooc_set = cooc_sets[gen_cid]
-                for neg_cid, cos_val in neg_cands:
-                    if neg_cid == gen_cid or neg_cid in cooc_set:
-                        continue
-                    # connection_strength check (fast Python call)
-                    if self.lattice.connection_strength(gen_cid, neg_cid) > 0.1:
-                        continue
-                    if cos_val > 0.05 and cos_val < 0.5:
-                        hard_negatives.append((neg_cid, cos_val))
-                        if len(hard_negatives) >= 5:
-                            break
-
-                if not hard_negatives:
-                    continue
-                # GPU push: load gen vector once, neg vectors, apply
-                v_gen = cs.concept_vectors.get(gen_cid)
-                if v_gen is None:
-                    continue
-                v_gen_t = torch.from_numpy(v_gen).to(device=d, dtype=DT)
-                for neg_cid, cos_val in hard_negatives:
-                    v_neg = cs.concept_vectors.get(neg_cid)
-                    if v_neg is None:
-                        continue
-                    v_neg_t = torch.from_numpy(v_neg).to(device=d, dtype=DT)
-                    contr_grad = cos_val * v_neg_t - v_gen_t
-                    gn = contr_grad.norm()
-                    if gn > self.max_grad_norm > 0:
-                        contr_grad = contr_grad / gn * self.max_grad_norm
-                    push = contr_grad * contr_lr
-                    v_new = v_gen_t + push
-                    nv = v_new.norm()
-                    if nv > 1e-10:
-                        v_new /= nv
-                    cs._apply_vector_update(gen_cid, v_new.cpu().numpy())
-                    # Update GPU tensor to match
-                    self._vecs_t[gen_cid] = v_new.to(dtype=self._vecs_t.dtype)
-
-    def _centroid_pull(self, ids, base_lr_val):
-        """Sentence-level centroid pull (CBOW-like, raw vectors only)."""
-        cs = self.cs
-        if len(ids) >= 3:
-            sent_vecs = [cs.concept_vectors.get(c) for c in ids]
-            sent_vecs = [v for v in sent_vecs if v is not None]
-            if len(sent_vecs) >= 3:
-                centroid = np.mean(sent_vecs, axis=0).astype(np.float32)
-                n_cent = np.linalg.norm(centroid)
-                if n_cent > 1e-10:
-                    centroid /= n_cent
-                    sent_lr = base_lr_val * 0.3
-                    for cid in ids:
-                        v = cs.concept_vectors.get(cid)
-                        if v is None:
-                            continue
-                        sim = float(np.dot(v, centroid))
-                        shift = (centroid - sim * v) * sent_lr
-                        v_new = v + shift
-                        nv = np.linalg.norm(v_new)
-                        if nv > 1e-10:
-                            v_new /= nv
-                        cs._apply_vector_update(cid, v_new)
-
-    def _centroid_pull_batch(self, all_ids_batch, base_lr_val):
-        """Batch centroid pull: accumulate shifts per CID, apply once per unique CID."""
-        cs = self.cs
-        shifts = {}  # cid → sum of (centroid - sim * v)
-        for ids in all_ids_batch:
-            if len(ids) < 3:
-                continue
-            sent_vecs = [cs.concept_vectors.get(c) for c in ids]
-            sent_vecs = [v for v in sent_vecs if v is not None]
-            if len(sent_vecs) < 3:
-                continue
-            centroid = np.mean(sent_vecs, axis=0).astype(np.float32)
-            n_cent = np.linalg.norm(centroid)
-            if n_cent <= 1e-10:
-                continue
-            centroid /= n_cent
-            for cid in ids:
-                v = cs.concept_vectors.get(cid)
-                if v is None:
-                    continue
-                sim = float(np.dot(v, centroid))
-                shift = centroid - sim * v
-                if cid in shifts:
-                    shifts[cid] = shifts[cid] + shift
-                else:
-                    shifts[cid] = shift.copy()
-        if not shifts:
-            return
-        sent_lr = base_lr_val * 0.3
-        for cid, shift_sum in shifts.items():
-            v = cs.concept_vectors.get(cid)
-            if v is None:
-                continue
-            v_new = v + shift_sum * sent_lr
-            nv = np.linalg.norm(v_new)
-            if nv > 1e-10:
-                v_new /= nv
-            cs._apply_vector_update(cid, v_new)
-
-    def _build_pairs_from_ids(self, ids, context_window, total_freq,
-                               pmi_strength, pmi_gate_min, field_gate, base_lr,
-                               use_torch, cid_to_idx,
-                               gen_updates, gpu_ctx_l, gpu_tgt_l, gpu_meta_l,
-                               gpu_cid_ctx, gpu_cid_gen) -> int:
-        """Shared pair-building loop: context→target STDP pairs for one sentence.
-        Returns the number of pairs built.
-        """
-        cs = self.cs
-        T = len(ids)
-        n_pairs = 0
-        for i in range(T):
-            start = max(0, i - context_window)
-            end = min(T, i + context_window + 1)
-            for j in range(start, end):
-                if j <= i:
-                    continue
-                dist = abs(j - i)
-                dist_weight = math.exp(-dist / 2.0)
-
-                fa = self.lattice.concept_freq.get(ids[i], 0)
-                fb = self.lattice.concept_freq.get(ids[j], 0)
-                freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
-
-                pmi_w_raw = self._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq,
-                                              min_weight=pmi_gate_min)
-                _skip, pmi_w = self._apply_pmi_gate(pmi_w_raw, pmi_strength, pmi_gate_min, ids[j])
-                if _skip:
-                    continue
-
-                field_weight = 1.0
-                if field_gate:
-                    if use_torch and self._fb_t is not None:
-                        overlap = int(torch.bitwise_and(self._fb_t[ids[i]], self._fb_t[ids[j]]).sum().item())
-                    elif hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
-                        overlap = cs.fractal.field_overlap(ids[i], ids[j])
-                    else:
-                        overlap = 0
-                    field_weight = min(1.0 + math.log(overlap + 1) * 2.0, 3.0) if overlap > 0 else 0.1
-
-                lr = base_lr * max(freq_weight, 0.05) * pmi_w * field_weight
-                # Hormonal STDP gate: novelty (ACh) + reward (DA) modulate plasticity
-                lr *= (0.5 + self.hormones.acetylcholine * 0.5) * (0.5 + self.hormones.dopamine * 0.5)
-                theta_gate = math.exp(-min(abs(j-i), 5) / max(self.theta_tau, 1.0))
-                gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
-                n_pairs += 1
-                # ── Dual-timescale: slow component with broader window and lower magnitude ──
-                theta_slow = math.exp(-min(abs(j-i), 10) / max(self.theta_tau * 3.0, 1.0))
-                slow_lr = lr * max(theta_slow, 0.02) * 0.3
-                if slow_lr > 1e-6:
-                    gen_updates[ids[j]].append((ids[i], slow_lr))
-                    n_pairs += 1
-
-                if use_torch:
-                    ci = cid_to_idx.get(ids[i])
-                    cj = cid_to_idx.get(ids[j])
-                    if ci is None or cj is None:
-                        continue
-                    gpu_ctx_l.append(ci)
-                    gpu_tgt_l.append(cj)
-                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight))
-                    gpu_cid_ctx.append(ids[i])
-                    gpu_cid_gen.append(ids[j])
-
-        return n_pairs
+    def _contrastive_objective_gpu(self, *a, **kw):
+        if self._trainer is None: self._trainer = STDPTrainer(self)
+        return self._trainer._contrastive_objective_gpu(*a, **kw)
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20, neg_samples=1,
                         inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=None,
                         destab_scale=0.0):
-        """Train via PMI-gated context-window STDP with optional GPU batching.
-
-        Same STDP logic as train_from_text, but with GPU batched compute
-        for the hot path (dot products, field overlaps, negative sampling checks).
-        """
-        if use_torch is None:
-            if not hasattr(self, '_use_torch_default'):
-                from eva.symbolic.fcf_config import FCFConfig
-                self._use_torch_default = FCFConfig().use_torch
-            use_torch = self._use_torch_default
-        if use_torch:
-            self._ensure_torch()
-            if self._vecs_t is None:
-                use_torch = False  # fallback to numpy
-
-        if not text:
-            return 0
-        ids = self._encode_input(text)
-        if len(ids) < 2:
-            return 0
-
-        base_lr = base_lr if base_lr is not None else getattr(self, 'train_lr', 0.01)
-        base_lr_val = base_lr
-        cs = self.cs
-        total_freq = self._get_total_freq()
-        device = self._torch_device if use_torch else None
-        cid_to_idx = self._torch_cid_to_idx if use_torch else {}
-
-        # ── Build pairs, group by gen_cid ──
-        gen_updates = defaultdict(list)
-
-        # Collect indices for GPU batch
-        gpu_ctx_l = []   # tensor indices for GPU
-        gpu_tgt_l = []
-        gpu_meta_l = []  # (i, j_pos, pmi_w, dist_weight, freq_weight) for STDP
-        gpu_cid_ctx = []  # raw CID for context
-        gpu_cid_gen = []  # raw CID for generated
-
-        self._build_pairs_from_ids(ids, context_window, total_freq, pmi_strength, pmi_gate_min,
-                                   field_gate, base_lr, use_torch, cid_to_idx,
-                                   gen_updates, gpu_ctx_l, gpu_tgt_l, gpu_meta_l,
-                                   gpu_cid_ctx, gpu_cid_gen)
-
-        # ── GPU STDP / CPU STDP ──
-        if use_torch and gpu_ctx_l:
-            unique_gen = self._gpu_stdp_apply(gpu_ctx_l, gpu_tgt_l, gpu_meta_l, gpu_cid_gen, base_lr_val,
-                                               field_gate, inh_strength, inh_threshold, destab_scale)
-        else:
-            self._cpu_stdp_apply(gen_updates, base_lr_val, destab_scale, inh_strength, inh_threshold)
-
-        # ── Negative sampling ──
-        if neg_samples > 0 and use_torch and self._vecs_t is not None and gpu_ctx_l:
-            self._negative_sampling_gpu(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen, device, field_gate,
-                                         base_lr_val, neg_lr_ratio, neg_samples)
-        elif neg_samples > 0:
-            self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
-
-        # ── Contrastive objective ──
-        self._contrastive_objective(gen_updates)
-
-        # ── Centroid pull + lattice update ──
-        self._centroid_pull(ids, base_lr_val)
-
-        self.lattice.update(ids)
-        self._graph_cache.clear()
-
-        # Prune concept_error cache (LRU: keep most recently seen CIDs)
-        _ce_limit = min(3 * self.cs.vocab_size // 4, 100000)
-        while len(self.concept_error) > _ce_limit:
-            self.concept_error.popitem(last=False)
-
-        if use_torch:
-            self._torch_dirty = True
-
-        return 1
+        """Delegate to STDPTrainer for STDP training on one text."""
+        if self._trainer is None:
+            self._trainer = STDPTrainer(self)
+        return self._trainer.train_from_text(text, base_lr, context_window, pmi_strength, pmi_gate_min,
+                                              neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
+                                              field_gate, use_torch, destab_scale)
 
     def train_batch(self, texts, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20,
                     neg_samples=1, inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5,
                     field_gate=True, use_torch=None, destab_scale=0.0):
-        """Process multiple texts in one GPU batch for higher throughput.
+        """Delegate to STDPTrainer for batched STDP training."""
+        if self._trainer is None:
+            self._trainer = STDPTrainer(self)
+        return self._trainer.train_batch(texts, base_lr, context_window, pmi_strength, pmi_gate_min,
+                                          neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
+                                          field_gate, use_torch, destab_scale)
 
-        Builds pairs from all texts, does a single GPU STDP call,
-        then per-text centroid pull + lattice update.
-        """
-        if use_torch is None:
-            if not hasattr(self, '_use_torch_default'):
-                from eva.symbolic.fcf_config import FCFConfig
-                self._use_torch_default = FCFConfig().use_torch
-            use_torch = self._use_torch_default
-        if use_torch:
-            self._ensure_torch()
-            if self._vecs_t is None:
-                use_torch = False
+    # ── Training internals (forwarded to STDPTrainer for test compatibility) ──
 
-        all_ids = []
-        for text in texts:
-            if not text:
-                continue
-            ids = self._encode_input(text)
-            if len(ids) >= 2:
-                all_ids.append(ids)
-        if not all_ids:
-            return 0
+    def _cpu_stdp_apply(self, *a, **kw):
+        if self._trainer is None: self._trainer = STDPTrainer(self)
+        return self._trainer._cpu_stdp_apply(*a, **kw)
 
-        base_lr = base_lr if base_lr is not None else getattr(self, 'train_lr', 0.01)
-        base_lr_val = base_lr
-        cs = self.cs
-        total_freq = self._get_total_freq()
-        device = self._torch_device if use_torch else None
-        cid_to_idx = self._torch_cid_to_idx if use_torch else {}
+    def _gpu_stdp_apply(self, *a, **kw):
+        if self._trainer is None: self._trainer = STDPTrainer(self)
+        return self._trainer._gpu_stdp_apply(*a, **kw)
 
-        gen_updates = defaultdict(list)
+    def _negative_sampling_cpu(self, *a, **kw):
+        if self._trainer is None: self._trainer = STDPTrainer(self)
+        return self._trainer._negative_sampling_cpu(*a, **kw)
 
-        gpu_ctx_l = []
-        gpu_tgt_l = []
-        gpu_meta_l = []
-        gpu_cid_ctx = []
-        gpu_cid_gen = []
+    def _negative_sampling_gpu(self, *a, **kw):
+        if self._trainer is None: self._trainer = STDPTrainer(self)
+        return self._trainer._negative_sampling_gpu(*a, **kw)
 
-        total_pairs = 0
-        for ids in all_ids:
-            total_pairs += self._build_pairs_from_ids(ids, context_window, total_freq, pmi_strength, pmi_gate_min,
-                                                       field_gate, base_lr, use_torch, cid_to_idx,
-                                                       gen_updates, gpu_ctx_l, gpu_tgt_l, gpu_meta_l,
-                                                       gpu_cid_ctx, gpu_cid_gen)
-
-        # ── GPU STDP (single call for all pairs) ──
-        if use_torch and gpu_ctx_l:
-            unique_gen = self._gpu_stdp_apply(gpu_ctx_l, gpu_tgt_l, gpu_meta_l, gpu_cid_gen, base_lr_val,
-                                               field_gate, inh_strength, inh_threshold, destab_scale)
-        else:
-            self._cpu_stdp_apply(gen_updates, base_lr_val, destab_scale, inh_strength, inh_threshold)
-
-        # ── Negative sampling (GPU, single call) ──
-        if neg_samples > 0 and use_torch and self._vecs_t is not None and gpu_ctx_l:
-            self._negative_sampling_gpu(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen, device, field_gate,
-                                         base_lr_val, neg_lr_ratio, neg_samples)
-        elif neg_samples > 0:
-            self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
-
-        # ── Contrastive objective (run ONCE, not per-text) ──
-        self._contrastive_objective(gen_updates)
-
-        # ── Batch centroid pull (one-shot for all unique CIDs) + lattice update ──
-        self._centroid_pull_batch(all_ids, base_lr_val)
-        for ids in all_ids:
-            self.lattice.update(ids)
-            self._graph_cache.clear()
-
-        # Prune concept_error cache (LRU: keep most recently seen CIDs)
-        _ce_limit = min(3 * self.cs.vocab_size // 4, 100000)
-        while len(self.concept_error) > _ce_limit:
-            self.concept_error.popitem(last=False)
-
-        if use_torch:
-            self._torch_dirty = True
-
-        return total_pairs
+    def _contrastive_objective(self, *a, **kw):
+        if self._trainer is None: self._trainer = STDPTrainer(self)
+        return self._trainer._contrastive_objective(*a, **kw)
 
     # ── Evaluation ────────────────────────────────────────────
 
     def evaluate(self, corpus_path, max_lines=None, batch_size=500, use_gpu=True):
-        """Compute perplexity and accuracy on held-out corpus.
-
-        GPU-accelerated: uses _vecs_t for batch matmul when use_gpu=True.
-        """
-        import time
-
-        with open(corpus_path, 'r', encoding='utf-8') as f:
-            lines = [l.strip() for l in f if l.strip()]
-        if max_lines:
-            lines = lines[:max_lines]
-
-        all_ids = []
-        for line in lines:
-            ids = self._encode_input(line)
-            if len(ids) >= 2:
-                all_ids.extend(ids)
-
-        n_positions = len(all_ids) - 1
-        if n_positions < 1:
-            return {'perplexity': float('inf'), 'accuracy_top1': 0.0,
-                    'accuracy_top5': 0.0, 'n_tokens': 0}
-
-        cids = sorted(self.cs.concept_vectors.keys())
-        cid_to_idx = {c: i for i, c in enumerate(cids)}
-        vocab_size = len(cids)
-        K = 3
-
-        # CPU path: build V matrix, prior, ngram_boost (same as before)
-        if not use_gpu or self._vecs_t is None:
-            V = np.array([self.cs.concept_vectors[c] for c in cids], dtype=np.float32)
-            norms = np.linalg.norm(V, axis=1, keepdims=True)
-            norms[norms < 1e-10] = 1.0
-            V /= norms
-
-        total_freq = self._get_total_freq()
-        prior_arr = np.zeros(vocab_size, dtype=np.float32)
-        for i, c in enumerate(cids):
-            freq = self.lattice.concept_freq.get(c, 0)
-            prior_arr[i] = 0.02 / (K + 1) * (1.0 - min(freq / 1000, 1.0))
-
-        # Ngram+PMI boost
-        ngram_boost = {}
-        for (prev_cid,), counter in self.lattice.ngrams[2].items():
-            total_ng = sum(counter.values())
-            if total_ng < 1:
-                continue
-            boost_map = {}
-            for ncid, ncount in counter.items():
-                idx = cid_to_idx.get(ncid)
-                if idx is None:
-                    continue
-                prob = ncount / total_ng
-                count_next = self.lattice.concept_freq.get(ncid, 0)
-                if count_next < 1:
-                    pmi_w = 0.1
-                else:
-                    p_next_given_prev = ncount / total_ng
-                    p_next = count_next / total_freq
-                    pmi = math.log(max(p_next_given_prev, 1e-10) / max(p_next, 1e-10))
-                    pmi_w = max(min(pmi / 2.0 + 0.2, 2.0), 0.05)
-                boost_map[ncid] = (0.25 * prob + 0.5 * pmi_w) / (K + 1)
-            ngram_boost[prev_cid] = boost_map
-
-        total_log_prob = 0.0
-        vec_log_prob = 0.0
-        correct_top1 = 0
-        correct_top5 = 0
-        vec_correct_top1 = 0
-        n_eval = 0
-        t0 = time.time()
-
-        if use_gpu and self._torch_dirty:
-            self._ensure_torch()
-        use_cuda = use_gpu and self._vecs_t is not None
-        if use_cuda:
-            device = self._torch_device
-            V_gpu = (self._ema_vecs_t if self._ema_vecs_t is not None else self._vecs_t).float()
-
-        for start in range(0, n_positions, batch_size):
-            end = min(start + batch_size, n_positions)
-            batch_prev = all_ids[start:end]
-            batch_next = all_ids[start + 1:end + 1]
-            batch_n = len(batch_prev)
-
-            if use_cuda:
-                # GPU gather: extract prev vectors directly from _vecs_t
-                with torch.no_grad():
-                    prev_cids_t = torch.tensor(batch_prev, device=device)
-                    pv_t = self._vecs_t[prev_cids_t].float()  # (batch, D), already normalized
-                    sims_t = pv_t @ V_gpu.T  # (batch, vocab_size)
-                    sims_t = torch.clamp(sims_t, min=0)
-                    sims = sims_t.cpu().numpy()
-            else:
-                # CPU matmul (original path)
-                prev_vecs = np.array([
-                    self.cs.concept_vectors.get(c, np.zeros(self.cs.dim, dtype=np.float32))
-                    for c in batch_prev
-                ], dtype=np.float32)
-                pn = np.linalg.norm(prev_vecs, axis=1, keepdims=True)
-                pn[pn < 1e-10] = 1.0
-                prev_vecs /= pn
-                sims = prev_vecs @ V.T
-                sims = np.maximum(sims, 0)
-
-            for pos in range(batch_n):
-                prev_cid = batch_prev[pos]
-                next_cid = batch_next[pos]
-
-                scores = prior_arr.copy()
-                scores += 0.15 * sims[pos] / (K + 1)
-
-                boost = ngram_boost.get(prev_cid)
-                if boost:
-                    for ncid, bval in boost.items():
-                        idx = cid_to_idx.get(ncid)
-                        if idx is not None:
-                            scores[idx] += bval
-
-                scores -= scores.max()
-                scores = np.clip(scores, -50, 50)
-                exp_s = np.exp(scores)
-                probs = exp_s / exp_s.sum()
-
-                actual_idx = cid_to_idx.get(next_cid)
-                if actual_idx is not None:
-                    lp = np.log(max(probs[actual_idx], 1e-30))
-                    total_log_prob += lp
-                    if cids[np.argmax(scores)] == next_cid:
-                        correct_top1 += 1
-                    if next_cid in {cids[i] for i in np.argsort(-scores)[:5]}:
-                        correct_top5 += 1
-
-                    vec_scores = sims[pos]
-                    vec_scores -= vec_scores.max()
-                    vec_scores = np.clip(vec_scores, -50, 50)
-                    exp_v = np.exp(vec_scores)
-                    vprobs = exp_v / exp_v.sum()
-                    vlp = np.log(max(vprobs[actual_idx], 1e-30))
-                    vec_log_prob += vlp
-                    if cids[np.argmax(vec_scores)] == next_cid:
-                        vec_correct_top1 += 1
-
-                    n_eval += 1
-
-            if start % 500 == 0 and n_eval > 0:
-                elapsed = time.time() - t0
-                rate = end / max(elapsed, 1)
-                ppl = np.exp(-total_log_prob / n_eval)
-                vppl = np.exp(-vec_log_prob / n_eval)
-                acc1 = correct_top1 / n_eval
-                vacc1 = vec_correct_top1 / n_eval
-                print(f"  eval {end}/{n_positions} | {rate:.0f} tok/s | "
-                      f"PPL={ppl:.1f} acc@1={acc1:.3f} | "
-                      f"vecPPL={vppl:.1f} vacc@1={vacc1:.3f}")
-
-        elapsed = time.time() - t0
-        perplexity = np.exp(-total_log_prob / max(n_eval, 1))
-        vec_perplexity = np.exp(-vec_log_prob / max(n_eval, 1))
-        return {
-            'perplexity': float(perplexity),
-            'vec_perplexity': float(vec_perplexity),
-            'accuracy_top1': correct_top1 / max(n_eval, 1),
-            'accuracy_top5': correct_top5 / max(n_eval, 1),
-            'vec_accuracy_top1': vec_correct_top1 / max(n_eval, 1),
-            'n_tokens': n_eval,
-            'total_log_prob': float(total_log_prob),
-            'vec_log_prob': float(vec_log_prob),
-            'elapsed_s': float(elapsed),
-        }
+        """Delegate to STDPTrainer for evaluation."""
+        if self._trainer is None:
+            self._trainer = STDPTrainer(self)
+        return self._trainer.evaluate(corpus_path, max_lines=max_lines)
 
 
 class _AsyncPipeline:

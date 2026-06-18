@@ -18,6 +18,8 @@ from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from eva.symbolic.adaptive_error_tracker import AdaptiveErrorTracker
+from eva.symbolic.rng_registry import RNGRegistry
 from eva.symbolic.stdp_trainer import STDPTrainer
 
 # meta_t column indices (gpu_meta_l tuple order)
@@ -79,6 +81,7 @@ class CrystalGenerator:
         self.mmi_lambda = self.config.get('mmi_lambda', 0.2)
         self.max_grad_norm = self.config.get('max_grad_norm', 1.0)
 
+        self.rng_registry = RNGRegistry(master_seed=42)
         self.main_rng = random.Random(42)
         if not self.cs.concept_usage:
             self.cs.init_homeostasis()
@@ -86,8 +89,10 @@ class CrystalGenerator:
         self.hormones = HormonalSystem()
 
         # Per-concept prediction error EMA (Level 2: error-based PMI gate)
-        self.concept_error = OrderedDict()  # cid → EMA of (1 - cos(v_gen, v_ctx))
-        self.concept_error_decay = 0.9  # EMA decay
+        ce_max = min(3 * self.cs.vocab_size // 4, 100000)
+        self.concept_error_decay = 0.9  # EMA decay (kept for backward compat)
+        self.concept_error = AdaptiveErrorTracker(
+            decay=self.concept_error_decay, max_size=ce_max)
 
         self.train_lr = 0.01
 
@@ -208,21 +213,6 @@ class CrystalGenerator:
         if self._basis_t is None or self._basis_t.device != dev:
             self._basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(dev, non_blocking=True) if cs.fractal.basis is not None else None
 
-        if hasattr(cs.fractal, 'field_bits') and cs.fractal.field_bits:
-            sample_fb = next(iter(cs.fractal.field_bits.values()))
-            fb_bytes = len(np.asarray(sample_fb, dtype=np.uint8).ravel())
-        else:
-            fb_bytes = (getattr(cs, 'n_anchors', 1024) + 7) // 8
-        if fb_bytes == 0:
-            fb_bytes = (getattr(cs, 'n_anchors', 1024) + 7) // 8
-        fb_arr = np.zeros((V, fb_bytes), dtype=np.uint8)
-        if hasattr(cs.fractal, 'field_bits'):
-            for cid, fb in cs.fractal.field_bits.items():
-                fb_arr[cid] = np.asarray(fb, dtype=np.uint8).ravel()
-        if self._fb_t is None or self._fb_t.shape[0] != V or self._fb_t.device != dev:
-            self._fb_t = torch.empty(V, fb_bytes, device=dev, dtype=torch.uint8)
-        self._fb_t.copy_(torch.from_numpy(fb_arr), non_blocking=True)
-
         # Concept error tensor for vectorized GPU negative sampling
         ce_arr = np.zeros(V, dtype=np.float32)
         for cid, err in self.concept_error.items():
@@ -250,6 +240,33 @@ class CrystalGenerator:
         """Mark GPU tensors as stale; triggers rebuild on next _ensure_torch.
         Call after fluctuate_fractal() or any code-level change."""
         self._torch_dirty = True
+
+    def _ensure_fb_tensor(self, dev=None):
+        """Lazy-build _fb_t field bit tensor (only if field_gate is needed)."""
+        if not _HAS_TORCH:
+            return
+        if dev is None:
+            dev = self._torch_device
+        if dev is None:
+            return
+        if self._fb_t is not None and not self._torch_dirty and not self.cs.fractal._fb_dirty:
+            return
+        cs = self.cs
+        V = cs.vocab_size
+        if hasattr(cs.fractal, 'field_bits') and cs.fractal.field_bits:
+            sample_fb = next(iter(cs.fractal.field_bits.values()))
+            fb_bytes = len(np.asarray(sample_fb, dtype=np.uint8).ravel())
+        else:
+            fb_bytes = (getattr(cs, 'n_anchors', 1024) + 7) // 8
+        if fb_bytes == 0:
+            fb_bytes = (getattr(cs, 'n_anchors', 1024) + 7) // 8
+        fb_arr = np.zeros((V, fb_bytes), dtype=np.uint8)
+        if hasattr(cs.fractal, 'field_bits'):
+            for cid, fb in cs.fractal.field_bits.items():
+                fb_arr[cid] = np.asarray(fb, dtype=np.uint8).ravel()
+        if self._fb_t is None or self._fb_t.shape[0] != V or self._fb_t.device != dev:
+            self._fb_t = torch.empty(V, fb_bytes, device=dev, dtype=torch.uint8)
+        self._fb_t.copy_(torch.from_numpy(fb_arr), non_blocking=True)
 
     # ── Temperature ────────────────────────────────────────────
 
@@ -775,11 +792,7 @@ class CrystalGenerator:
             cnt_err.scatter_add_(0, inv_t, torch.ones(N, device=device))
             avg_err_cpu = (err_grouped / cnt_err.clamp(min=1)).cpu().numpy()
             for gi, gen_cid in enumerate(unique_gen):
-                err = float(avg_err_cpu[gi])
-                old = self.concept_error.get(gen_cid, err)
-                err_val = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
-                self.concept_error[gen_cid] = err_val
-                self.concept_error.move_to_end(gen_cid)
+                self.concept_error.update(gen_cid, float(avg_err_cpu[gi]))
 
         acc_cpu = acc.cpu().numpy()
         cnt_cpu = cnt.cpu().numpy()
@@ -921,10 +934,7 @@ class CrystalGenerator:
 
             # Per-concept prediction error tracking (Level 2, deduplicated)
             err = 1.0 - float(np.mean(y))
-            old = self.concept_error.get(gen_cid, err)
-            err_val = self.concept_error_decay * old + (1 - self.concept_error_decay) * err
-            self.concept_error[gen_cid] = err_val
-            self.concept_error.move_to_end(gen_cid)
+            self.concept_error.update(gen_cid, err)
 
             total_delta = ((ctx_mat * elr_arr[:, None]).sum(axis=0) -
                           v_gen * (y * elr_arr).sum())
@@ -1004,6 +1014,9 @@ class CrystalGenerator:
 
             # Field overlap filter
             # When _fb_t is None (no field_bits loaded), all negatives pass as valid
+            if field_gate:
+                if self._fb_t is None:
+                    self._ensure_fb_tensor(device)
             if field_gate and self._fb_t is not None:
                 ctx_fb = self._fb_t[ctx_t]
                 neg_fb = self._fb_t[neg_idxs]

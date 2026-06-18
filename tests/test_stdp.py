@@ -175,11 +175,8 @@ class TestSTDP:
 
     def test_concept_error_fifo(self, gen):
         for i in range(50):
-            gen.concept_error[i] = float(i) / 50.0
-        _ce_limit = min(3 * gen.cs.vocab_size // 4, 100000)
-        while len(gen.concept_error) > _ce_limit:
-            gen.concept_error.popitem(last=False)
-        assert len(gen.concept_error) <= _ce_limit
+            gen.concept_error.update(i, float(i) / 50.0)
+        assert len(gen.concept_error) <= gen.concept_error.max_size
 
 
 # ── 5. GPU/CPU parity ───────────────────────────────────────────

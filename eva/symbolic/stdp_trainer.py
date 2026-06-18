@@ -128,11 +128,7 @@ class STDPTrainer:
             gen.lattice.update(ids)
             gen._graph_cache.clear()
 
-        # Prune concept_error cache
-        _ce_limit = min(3 * cs.vocab_size // 4, 100000)
-        while len(gen.concept_error) > _ce_limit:
-            gen.concept_error.popitem(last=False)
-
+        # Prune concept_error cache (redundant — AdaptiveErrorTracker auto-prunes on update)
         if use_torch:
             gen._torch_dirty = True
 
@@ -172,6 +168,9 @@ class STDPTrainer:
 
                 field_weight = 1.0
                 if field_gate:
+                    if use_torch:
+                        if gen._fb_t is None:
+                            gen._ensure_fb_tensor(gen._torch_device)
                     if use_torch and gen._fb_t is not None:
                         overlap = int(torch.bitwise_and(gen._fb_t[ids[i]], gen._fb_t[ids[j]]).sum().item())
                     elif hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
@@ -236,10 +235,7 @@ class STDPTrainer:
             y = np.maximum(v_gen @ ctx_mat.T, 0.05)
 
             err = 1.0 - float(np.mean(y))
-            old = gen.concept_error.get(gen_cid, err)
-            err_val = gen.concept_error_decay * old + (1 - gen.concept_error_decay) * err
-            gen.concept_error[gen_cid] = err_val
-            gen.concept_error.move_to_end(gen_cid)
+            gen.concept_error.update(gen_cid, err)
 
             total_delta = ((ctx_mat * elr_arr[:, None]).sum(axis=0) -
                           v_gen * (y * elr_arr).sum())
@@ -383,11 +379,7 @@ class STDPTrainer:
             gen._ce_t[unique_gen] = ce_decay * gen._ce_t[unique_gen] + (1 - ce_decay) * avg_err
             avg_err_cpu = avg_err.cpu().numpy()
             for gi, gen_cid in enumerate(unique_gen):
-                err = float(avg_err_cpu[gi])
-                old = gen.concept_error.get(gen_cid, err)
-                err_val = ce_decay * old + (1 - ce_decay) * err
-                gen.concept_error[gen_cid] = err_val
-                gen.concept_error.move_to_end(gen_cid)
+                gen.concept_error.update(gen_cid, float(avg_err_cpu[gi]))
 
         acc_cpu = acc.cpu().numpy()
         cnt_cpu = cnt.cpu().numpy()

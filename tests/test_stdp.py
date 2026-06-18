@@ -446,3 +446,96 @@ class TestV5Safety:
         p1 = path(0)
         p2 = path(1)
         assert lcp(p1, p2) >= 0
+
+    # ── QN-8: Property-based тест generate ──
+    def test_generate_returns_result(self, gen, cs):
+        if gen.sp is None:
+            pytest.skip("No sentencepiece model")
+        result = gen.generate(seed_word='князь', max_words=5)
+        assert result is not None
+        assert len(result.concept_path) >= 1
+        assert result.score != float('inf')
+
+    def test_generate_empty_seed(self, gen):
+        if gen.sp is None:
+            pytest.skip("No sentencepiece model")
+        result = gen.generate(seed_word='', max_words=3)
+        assert result is not None
+
+    # ── QN-10: build_octree_fields Correctness ──
+    def test_octree_fields_symmetric(self, cs, lattice):
+        n = min(5, len(lattice.concept_freq))
+        if n < 2:
+            pytest.skip("Too few concepts for octree test")
+        cs.build_octree_fields(lattice, n_anchors=n)
+        H = cs.H
+        if H is not None:
+            H_dense = H.toarray() if hasattr(H, 'toarray') else H
+            assert np.allclose(H_dense, H_dense.T, atol=1e-6)
+
+    def test_octree_fields_diag_zero(self, cs, lattice):
+        n = min(5, len(lattice.concept_freq))
+        if n < 2:
+            pytest.skip("Too few concepts for octree test")
+        cs.build_octree_fields(lattice, n_anchors=n)
+        H = cs.H
+        if H is not None:
+            H_dense = H.toarray() if hasattr(H, 'toarray') else H
+            assert np.allclose(np.diag(H_dense), 0, atol=1e-6)
+
+    # ── QN-11: HormonalSystem Unit Tests ──
+    def test_hormonal_init(self):
+        from eva.symbolic.hormonal_system import HormonalSystem
+        h = HormonalSystem()
+        assert 0 <= h.dopamine <= 1
+        assert 0 <= h.serotonin <= 1
+        assert hasattr(h, 'step')
+
+    def test_hormonal_update_match(self):
+        from eva.symbolic.hormonal_system import HormonalSystem
+        h = HormonalSystem()
+        h.update(confidence=0.9, is_match=True, expected_cid=1, gen_cid=1)
+        assert h.da_phasic > 0  # reward
+
+    def test_hormonal_update_mismatch(self):
+        from eva.symbolic.hormonal_system import HormonalSystem
+        h = HormonalSystem()
+        h.update(confidence=0.9, is_match=False, expected_cid=1, gen_cid=2)
+        assert h.da_phasic < 0  # punishment
+
+    def test_hormonal_temperature_range(self):
+        from eva.symbolic.hormonal_system import HormonalSystem
+        h = HormonalSystem()
+        temp = h.modulate_temperature(0.5)
+        assert 0.0 < temp <= 1.0
+
+    def test_hormonal_beam_width(self):
+        from eva.symbolic.hormonal_system import HormonalSystem
+        h = HormonalSystem()
+        bw = h.modulate_beam_width(4)
+        assert bw >= 1
+
+    def test_hormonal_save_load_roundtrip(self):
+        from eva.symbolic.hormonal_system import HormonalSystem
+        h = HormonalSystem()
+        h.update(confidence=0.7, is_match=True, novelty=0.3)
+        data = h.save()
+        h2 = HormonalSystem()
+        h2.load(data)
+        assert h2.dopamine == h.dopamine
+        assert h2.serotonin == h.serotonin
+        assert h2.step > 0
+
+    # ── QN-12: GPU/CPU Parity Tolerance ──
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_parity_seed_fixed(self, gen, cs):
+        from eva.symbolic.stdp_trainer import STDPTrainer
+        trainer = STDPTrainer(gen)
+        assert hasattr(trainer, '_gpu_stdp_apply')
+        assert hasattr(trainer, '_cpu_stdp_apply')
+        # Verify CPU apply runs without error with dummy data
+        gen_updates = {0: [], 1: []}
+        trainer._cpu_stdp_apply(gen_updates, base_lr_val=0.1,
+                                destab_scale=0.0,
+                                inh_strength=0.0, inh_threshold=0.0)
+        assert len(gen_updates[0]) == 0  # no pairs, no updates

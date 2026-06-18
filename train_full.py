@@ -361,6 +361,8 @@ def _rescore_lines(lines, gen):
     return [l for _, l in sorted(zip(scores, lines))]
 
 
+from eva.symbolic.checkpoint_manager import CheckpointManager
+
 class TrainingPipeline:
     """Encapsulates the main training loop with batch scheduling, checkpoints, and reporting."""
     def __init__(self, gen, sp, cs, lattice, opt, cfg):
@@ -384,6 +386,10 @@ class TrainingPipeline:
         self.best_ckpt_name = None
         self.patience_counter = 0
         self.patience = 5
+        # AM-7: Async Checkpoint Manager
+        self.ckpt_mgr = CheckpointManager(
+            data_dir=os.path.dirname(cfg.cs_path),
+            cleanup_keep=cfg.checkpoint_keep if hasattr(cfg, 'checkpoint_keep') else 5)
 
     def run_epoch(self, epoch_train, start_line, epoch_num, t_start):
         gen = self.gen; cs = self.cs; lattice = self.lattice; opt = self.opt
@@ -451,12 +457,9 @@ class TrainingPipeline:
         self.ngram_last_total = ng_total
         print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} ngrams={ng_total}(+{ng_new})")
         ckpt_name = f"e{epoch}_l{idx}"
-        try:
-            cs.save(self.cfg.cs_path)
-            lattice.save(self.cfg.lattice_path)
-        except Exception as e:
-            print(f"FATAL: save failed: {e}")
-            import sys; sys.exit(1)
+        # AM-7: Async checkpoint save (non-blocking)
+        self.ckpt_mgr.save(ckpt_name, cs, lattice, opt)
+        self.ckpt_mgr.cleanup()
         n_upd = cs._update_count
         avg_delta = (cs._total_shift / max(n_upd, 1)) * 1e3
         cs._total_shift = 0.0; cs._update_count = 0
@@ -504,6 +507,7 @@ class TrainingPipeline:
         if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
             print(f"  Early stopping: patience={self.patience_counter}/{self.patience}, "
                   f"stuck={opt._full_stuck_counter}")
+            self.ckpt_mgr.wait()
             import sys; sys.exit(0)
 
 # Continuous curriculum: ramp max_len, context_window, neg_samples over first fraction

@@ -379,6 +379,11 @@ class TrainingPipeline:
         self.last_cos_time = 0.0
         self.last_cos_sim = (0.0, 0.0)
         self.ngram_last_total = 0
+        # TN-4: Early Stopping
+        self.best_score = float('inf')
+        self.best_ckpt_name = None
+        self.patience_counter = 0
+        self.patience = 5
 
     def run_epoch(self, epoch_train, start_line, epoch_num, t_start):
         gen = self.gen; cs = self.cs; lattice = self.lattice; opt = self.opt
@@ -481,6 +486,14 @@ class TrainingPipeline:
                     d = ppl - self.ppl_history[-2][1]
                     ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
                 print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
+                # TN-4: Early Stopping + Best Checkpoint
+                score = eval_vppl + (1.0 - eval_vacc1 if eval_vacc1 is not None else 0) * 50
+                if score < self.best_score:
+                    self.best_score = score
+                    self.best_ckpt_name = ckpt_name
+                    self.patience_counter = 0
+                else:
+                    self.patience_counter += 1
                 remaining = idx - 0 + 1
                 if remaining > 0 and remaining < epoch_lines:
                     epoch_train = globals().get('train_lines', [])
@@ -488,6 +501,10 @@ class TrainingPipeline:
                         epoch_train = _rescore_lines(epoch_train[remaining:], gen)
         opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
                  vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
+        if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
+            print(f"  Early stopping: patience={self.patience_counter}/{self.patience}, "
+                  f"stuck={opt._full_stuck_counter}")
+            import sys; sys.exit(0)
 
 # Continuous curriculum: ramp max_len, context_window, neg_samples over first fraction
 CURICULUM_FRACTION = 0.20

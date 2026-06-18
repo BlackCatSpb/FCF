@@ -319,13 +319,19 @@ class STDPTrainer:
     # ═══════════════════════════════════════════════════
 
     def _gpu_stdp_apply(self, gpu_ctx_l, gpu_tgt_l, gpu_meta_l, gpu_cid_gen,
-                        base_lr_val, field_gate, inh_strength, inh_threshold, destab_scale):
+                        base_lr_val, field_gate, inh_strength, inh_threshold, destab_scale,
+                        noise_scale=0.0):
         gen = self.gen
         cs = gen.cs
         device = gen._torch_device
         ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
         tgt_t = torch.tensor(gpu_tgt_l, dtype=torch.long, device=device)
         N = len(gpu_ctx_l)
+
+        if torch.cuda.is_available():
+            gen._prof_start = torch.cuda.Event(enable_timing=True)
+            gen._prof_end = torch.cuda.Event(enable_timing=True)
+            gen._prof_start.record()
 
         with torch.no_grad():
             meta_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
@@ -360,16 +366,26 @@ class STDPTrainer:
             cnt = torch.zeros(len(unique_gen), device=device)
             cnt.scatter_add_(0, inv_t, torch.ones(N, device=device))
 
+            # TN-6: Gradient Noise Injection
+            if noise_scale > 0:
+                acc += torch.randn_like(acc) * noise_scale * (elr_grouped[:, None] / elr_grouped.max().clamp(min=1))
+
             err_per_pair = 1.0 - y
             err_grouped = torch.zeros(len(unique_gen), device=device)
             err_grouped.scatter_add_(0, inv_t, err_per_pair)
             cnt_err = torch.zeros(len(unique_gen), device=device)
             cnt_err.scatter_add_(0, inv_t, torch.ones(N, device=device))
-            avg_err_cpu = (err_grouped / cnt_err.clamp(min=1)).cpu().numpy()
+            avg_err = err_grouped / cnt_err.clamp(min=1)
+            # G-16: In-place Concept Error EMA on GPU
+            if not hasattr(gen, '_ce_t') or gen._ce_t is None:
+                gen._ce_t = torch.zeros(gen._vecs_t.shape[0], device=device)
+            ce_decay = gen.concept_error_decay
+            gen._ce_t[unique_gen] = ce_decay * gen._ce_t[unique_gen] + (1 - ce_decay) * avg_err
+            avg_err_cpu = avg_err.cpu().numpy()
             for gi, gen_cid in enumerate(unique_gen):
                 err = float(avg_err_cpu[gi])
                 old = gen.concept_error.get(gen_cid, err)
-                err_val = gen.concept_error_decay * old + (1 - gen.concept_error_decay) * err
+                err_val = ce_decay * old + (1 - ce_decay) * err
                 gen.concept_error[gen_cid] = err_val
                 gen.concept_error.move_to_end(gen_cid)
 
@@ -381,7 +397,9 @@ class STDPTrainer:
             v = cs.concept_vectors.get(gen_cid)
             if v is None or cnt_cpu[gi] < 0.5:
                 continue
-            if destab_scale > 0 and gen.main_rng.random() < destab_scale * 0.3:
+            # TN-8: Adaptive Destab from Concept Error
+            _destab_p = destab_scale * 0.3 * (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0)
+            if destab_scale > 0 and gen.main_rng.random() < min(_destab_p, 0.8):
                 ppmi_candidates = gen.lattice.connections_of(
                     gen_cid, top_k=20, use_ppmi=True)
                 if ppmi_candidates:
@@ -391,12 +409,12 @@ class STDPTrainer:
                     v_ppmi = gen._destab_field_fallback(gen_cid, v)
                 if v_ppmi is not None:
                     y_ppmi = max(float(np.dot(v, v_ppmi)), 0.05)
-                    noise = (v_ppmi - y_ppmi * v)
-                    nlen = float(np.linalg.norm(noise))
+                    noise_vec = (v_ppmi - y_ppmi * v)
+                    nlen = float(np.linalg.norm(noise_vec))
                     if nlen > 1e-10:
-                        noise /= nlen
-                        mix = min(destab_scale, 0.5)
-                        acc_cpu[gi] = acc_cpu[gi] * (1 - mix) + noise * mix * elr_cpu[gi]
+                        noise_vec /= nlen
+                        mix = min(destab_scale * (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0), 0.5)
+                        acc_cpu[gi] = acc_cpu[gi] * (1 - mix) + noise_vec * mix * elr_cpu[gi]
 
             if cnt_cpu[gi] > 0 and elr_cpu[gi] > 0:
                 grad = acc_cpu[gi] / max(elr_cpu[gi], 1e-10)
@@ -417,6 +435,11 @@ class STDPTrainer:
 
         if inh_strength > 0 and len(unique_gen) >= 2:
             self._lateral_inhibition_gpu(unique_gen, inh_strength, inh_threshold, base_lr_val)
+
+        if torch.cuda.is_available() and hasattr(gen, '_prof_end'):
+            gen._prof_end.record()
+            gen._prof_end.synchronize()
+            gen._prof_ms = gen._prof_start.elapsed_time(gen._prof_end)
 
         return unique_gen
 

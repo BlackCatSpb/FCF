@@ -373,6 +373,8 @@ class FCFConfig:
     checkpoint_every: int = 500
     eval_every_fast: int = 1000
     eval_every_slow: int = 2000
+    eval_fast_lines: int = 64      # TN-9: lines for fast eval (PPL only)
+    eval_full_lines: int = 300     # TN-9: lines for full eval (all metrics)
     fluctuate_every: int = 2000
     decay_every_fast: int = 2000
     decay_every_slow: int = 3000
@@ -491,6 +493,14 @@ class FCFConfig:
         return cfg
 
     def __post_init__(self):
+        # AM-8: Configuration Schema Validation
+        assert self.dim > 0 and self.dim % 8 == 0, f"dim={self.dim} must be >0 and divisible by 8"
+        assert 0.0 <= self.destab_scale_end <= self.destab_scale_start <= 1.0
+        assert self.code_bound > 0
+        name_set = set()
+        for p in self.params:
+            assert p.name not in name_set, f"Duplicate param name: {p.name}"
+            name_set.add(p.name)
         # Конвертировать dict-правила обратно в объекты при загрузке из JSON
         for i, p in enumerate(self.params):
             if isinstance(p, dict):

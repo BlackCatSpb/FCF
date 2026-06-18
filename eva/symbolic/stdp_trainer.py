@@ -543,7 +543,8 @@ class STDPTrainer:
                 continue
             valid_idx = noise[gi][neg_mask]
             vg_i = gv[gi]
-            grad = (gen._vecs_t[valid_idx].float() - (sim[gi][neg_mask] * vg_i).unsqueeze(-1) * vg_i.unsqueeze(0)).mean(dim=0)
+            vg_i_2d = vg_i.unsqueeze(0)
+            grad = (gen._vecs_t[valid_idx].float() - (sim[gi][neg_mask][:, None] * vg_i_2d) * vg_i_2d).mean(dim=0)
             gn = grad.norm()
             if gn > 1e-10:
                 grad = grad / gn * min(gn, 1.0)

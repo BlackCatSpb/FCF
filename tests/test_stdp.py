@@ -402,3 +402,47 @@ class TestV5Safety:
         lat2 = SyntaxLattice()
         lat2.load(str(p))
         assert hasattr(lat2, 'ngrams')
+
+    # ── QN-14: Fuzzing _apply_vector_update ──
+    def test_apply_vector_update_nan_input(self, cs):
+        v = cs.concept_vectors.get(0)
+        nan_vec = np.full(cs.dim, float('nan'))
+        cs._apply_vector_update(0, nan_vec)
+        v2 = cs.concept_vectors.get(0)
+        assert v2 is not None
+
+    def test_apply_vector_update_zero_shift(self, cs):
+        v = cs.concept_vectors.get(0).copy()
+        cs._apply_vector_update(0, v)
+        v2 = cs.concept_vectors.get(0)
+        np.testing.assert_allclose(v, v2, atol=1e-6)
+
+    def test_apply_vector_update_extreme_shift(self, cs):
+        extreme = np.ones(cs.dim, dtype=np.float32) * 10.0
+        cs._apply_vector_update(0, extreme)
+        v = cs.concept_vectors.get(0)
+        assert v is not None
+        nv = np.linalg.norm(v)
+        assert abs(nv - 1.0) < 1e-5
+
+    # ── QN-15: Boundary Test FractalEncoding ──
+    def test_fractal_encoding_path_consistent(self):
+        from eva.symbolic.fractal_encoding import path, LEVELS
+        p = path(42)
+        assert len(p) == LEVELS
+        assert all(0 <= b <= 7 for b in p)
+
+    def test_fractal_encoding_path_deterministic(self):
+        from eva.symbolic.fractal_encoding import path
+        assert path(42) == path(42)
+
+    def test_fractal_encoding_lcp_same_path(self):
+        from eva.symbolic.fractal_encoding import path, lcp, LEVELS
+        p = path(0)
+        assert lcp(p, p) == LEVELS
+
+    def test_fractal_encoding_lcp_different(self):
+        from eva.symbolic.fractal_encoding import path, lcp
+        p1 = path(0)
+        p2 = path(1)
+        assert lcp(p1, p2) >= 0

@@ -382,7 +382,7 @@ class TrainingPipeline:
 
     def run_epoch(self, epoch_train, start_line, epoch_num, t_start):
         gen = self.gen; cs = self.cs; lattice = self.lattice; opt = self.opt
-        BATCH_SIZE = 32
+        BATCH_SIZE = self.cfg.batch_size_end
         batch_buffer = []
         n_trained = 0
         epoch_lines = len(epoch_train)
@@ -654,7 +654,8 @@ try:
         epoch_train = train_lines
         epoch_lines = total_lines
 
-        BATCH_SIZE = 32
+        bs_curve = lambda i: int(CFG.batch_size_start + (CFG.batch_size_end - CFG.batch_size_start) * _curriculum_p(i))
+        BATCH_SIZE = bs_curve(idx)
         batch_buffer = []
         batch_lr = None
         batch_destab = 0.0
@@ -681,6 +682,7 @@ try:
             batch_buffer.append(line)
             batch_lr = gen.train_lr
             batch_destab = destab_scale
+            BATCH_SIZE = bs_curve(idx)
 
             if len(batch_buffer) < BATCH_SIZE and idx < start_line + len(epoch_train) - 1:
                 # Check if periodic tasks are due — if so, flush early

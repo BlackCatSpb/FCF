@@ -375,6 +375,8 @@ class FCFConfig:
     eval_every_slow: int = 2000
     eval_fast_lines: int = 64      # TN-9: lines for fast eval (PPL only)
     eval_full_lines: int = 300     # TN-9: lines for full eval (all metrics)
+    batch_size_start: int = 8      # TN-5: initial batch size (warmup)
+    batch_size_end: int = 32       # TN-5: final batch size
     fluctuate_every: int = 2000
     decay_every_fast: int = 2000
     decay_every_slow: int = 3000

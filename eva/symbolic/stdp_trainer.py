@@ -29,19 +29,23 @@ class STDPTrainer:
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_strength=1.0,
                          pmi_gate_min=0.20, neg_samples=1, inh_strength=0.05, inh_threshold=0.10,
-                         neg_lr_ratio=0.5, field_gate=True, use_torch=None, destab_scale=0.0):
+                         neg_lr_ratio=0.5, field_gate=True, use_torch=None, destab_scale=0.0,
+                         momentum_mu=0.0):
         """Train on one text line. Returns number of STDP pairs built."""
         return self._train(text, base_lr, context_window, pmi_strength, pmi_gate_min,
                            neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
-                           field_gate, use_torch, destab_scale, batch=False)
+                           field_gate, use_torch, destab_scale, batch=False,
+                           momentum_mu=momentum_mu)
 
     def train_batch(self, texts, base_lr=None, context_window=2, pmi_strength=1.0,
                      pmi_gate_min=0.20, neg_samples=1, inh_strength=0.05, inh_threshold=0.10,
-                     neg_lr_ratio=0.5, field_gate=True, use_torch=None, destab_scale=0.0):
+                     neg_lr_ratio=0.5, field_gate=True, use_torch=None, destab_scale=0.0,
+                     momentum_mu=0.0):
         """Train on a batch of texts (GPU batched). Returns total pairs."""
         return self._train(texts, base_lr, context_window, pmi_strength, pmi_gate_min,
                            neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
-                           field_gate, use_torch, destab_scale, batch=True)
+                           field_gate, use_torch, destab_scale, batch=True,
+                           momentum_mu=momentum_mu)
 
     def evaluate(self, corpus_path, max_lines=500, use_torch=None):
         """Evaluate on a corpus: perplexity, accuracy, vector metrics."""
@@ -53,7 +57,7 @@ class STDPTrainer:
 
     def _train(self, inputs, base_lr, context_window, pmi_strength, pmi_gate_min,
                neg_samples, inh_strength, inh_threshold, neg_lr_ratio, field_gate,
-               use_torch, destab_scale, batch):
+               use_torch, destab_scale, batch, momentum_mu=0.0):
         gen = self.gen
         cs = gen.cs
         if base_lr is None:
@@ -102,7 +106,8 @@ class STDPTrainer:
         # ── GPU STDP / CPU STDP ──
         if use_torch and gpu_ctx_l:
             unique_gen = self._gpu_stdp_apply(gpu_ctx_l, gpu_tgt_l, gpu_meta_l, gpu_cid_gen,
-                base_lr, field_gate, inh_strength, inh_threshold, destab_scale)
+                base_lr, field_gate, inh_strength, inh_threshold, destab_scale,
+                momentum_mu=momentum_mu)
         else:
             self._cpu_stdp_apply(gen_updates, base_lr, destab_scale, inh_strength, inh_threshold)
 
@@ -316,7 +321,7 @@ class STDPTrainer:
 
     def _gpu_stdp_apply(self, gpu_ctx_l, gpu_tgt_l, gpu_meta_l, gpu_cid_gen,
                         base_lr_val, field_gate, inh_strength, inh_threshold, destab_scale,
-                        noise_scale=0.0):
+                        noise_scale=0.0, momentum_mu=0.0, nesterov=False):
         gen = self.gen
         cs = gen.cs
         device = gen._torch_device
@@ -347,20 +352,19 @@ class STDPTrainer:
             gen_cids_arr = np.array(gpu_cid_gen, dtype=np.int32)
             unique_gen, inv_idx = np.unique(gen_cids_arr, return_inverse=True)
             inv_t = torch.from_numpy(inv_idx).to(device, non_blocking=True)
+            D = cs.dim
 
-            elr_grouped = torch.zeros(len(unique_gen), device=device)
-            elr_grouped.scatter_add_(0, inv_t, effective_lr)
-
+            # G-12: Fused scatter-add — acc (D) and elr_grouped (1) in one tensor
             vc = gen._vecs_t[ctx_t].float()
             vg = gen._vecs_t[tgt_t].float()
             y = torch.clamp((vg * vc).sum(dim=1), min=0.05)
             pair_delta = vc * effective_lr[:, None] - vg * (y * effective_lr)[:, None]
-
-            D = cs.dim
-            acc = torch.zeros(len(unique_gen), D, dtype=torch.float32, device=device)
-            acc.scatter_add_(0, inv_t[:, None].expand(-1, D), pair_delta)
-            cnt = torch.zeros(len(unique_gen), device=device)
-            cnt.scatter_add_(0, inv_t, torch.ones(N, device=device))
+            fused_src = torch.cat([pair_delta, effective_lr[:, None]], dim=1)  # (N, D+1)
+            fused = torch.zeros(len(unique_gen), D + 1, dtype=torch.float32, device=device)
+            fused.scatter_add_(0, inv_t[:, None].expand(-1, D + 1), fused_src)
+            acc = fused[:, :D]
+            elr_grouped = fused[:, D]
+            cnt = torch.bincount(inv_t, minlength=len(unique_gen)).float()
 
             # TN-6: Gradient Noise Injection
             if noise_scale > 0:
@@ -381,6 +385,25 @@ class STDPTrainer:
             for gi, gen_cid in enumerate(unique_gen):
                 gen.concept_error.update(gen_cid, float(avg_err_cpu[gi]))
 
+        # SN-7: Momentum-Accumulated STDP
+        mom_cpu = None
+        if momentum_mu > 0:
+            if not hasattr(gen, '_mom_buf'):
+                gen._mom_buf = {}
+            avg_grad = acc / cnt[:, None].clamp(min=1)
+            mom_gpu = torch.zeros(len(unique_gen), D, dtype=torch.float32, device=device)
+            for gi, cid in enumerate(unique_gen):
+                cid_i = int(cid)
+                prev = gen._mom_buf.get(cid_i, None)
+                if prev is not None:
+                    prev_t = torch.from_numpy(prev).to(device, non_blocking=True)
+                    mom_gpu[gi] = momentum_mu * prev_t + (1 - momentum_mu) * avg_grad[gi]
+                else:
+                    mom_gpu[gi] = avg_grad[gi]
+            for gi, cid in enumerate(unique_gen):
+                gen._mom_buf[int(cid)] = mom_gpu[gi].cpu().numpy().astype(np.float32)
+            mom_cpu = mom_gpu.cpu().numpy()
+
         acc_cpu = acc.cpu().numpy()
         cnt_cpu = cnt.cpu().numpy()
         elr_cpu = elr_grouped.cpu().numpy()
@@ -389,9 +412,10 @@ class STDPTrainer:
             v = cs.concept_vectors.get(gen_cid)
             if v is None or cnt_cpu[gi] < 0.5:
                 continue
-            # TN-8: Adaptive Destab from Concept Error
-            _destab_p = destab_scale * 0.3 * (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0)
-            if destab_scale > 0 and gen.main_rng.random() < min(_destab_p, 0.8):
+            # SN-8: Concept-Error Adaptive Destabilization
+            ce = gen.concept_error.get(gen_cid, 0.0)
+            _destab_p = min(ce * 0.5 * max(destab_scale, 0.0), 0.5)
+            if destab_scale > 0 and gen.main_rng.random() < _destab_p:
                 ppmi_candidates = gen.lattice.connections_of(
                     gen_cid, top_k=20, use_ppmi=True)
                 if ppmi_candidates:
@@ -405,7 +429,7 @@ class STDPTrainer:
                     nlen = float(np.linalg.norm(noise_vec))
                     if nlen > 1e-10:
                         noise_vec /= nlen
-                        mix = min(destab_scale * (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0), 0.5)
+                        mix = min(ce * 0.5, 0.5)
                         acc_cpu[gi] = acc_cpu[gi] * (1 - mix) + noise_vec * mix * elr_cpu[gi]
 
             if cnt_cpu[gi] > 0 and elr_cpu[gi] > 0:
@@ -413,6 +437,9 @@ class STDPTrainer:
                 gn = float(np.linalg.norm(grad))
                 if gn > gen.max_grad_norm > 0:
                     grad = grad / gn * gen.max_grad_norm
+                # SN-7: use momentum-smoothed gradient when available
+                if mom_cpu is not None:
+                    grad = mom_cpu[gi]
                 v_new = v + grad * base_lr_val
             else:
                 v_new = v

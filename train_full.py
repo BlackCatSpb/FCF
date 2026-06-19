@@ -372,6 +372,7 @@ class TrainingPipeline:
             cleanup_keep=ckpt_keep)
         # TN-32: preserve curriculum progress after rescore
         self._rescore_cp = None
+        self._rescore_line = None  # TN-41: preserve LR schedule position after rescore
 
     def _checkpoint(self, epoch, idx, elapsed, epoch_lines, destab_scale, t_start,
                     epoch_train=None, start_line=None, global_step=0):
@@ -449,6 +450,7 @@ class TrainingPipeline:
             remaining = idx - start_line + 1
             if remaining > 0 and remaining < len(epoch_train):
                 self._rescore_cp = _curriculum_p(idx + 1)
+                self._rescore_line = idx  # TN-41: save LR schedule position
                 epoch_train = _rescore_lines(epoch_train[idx + 1:], gen)
                 idx = -1; start_line = 0
         if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
@@ -662,8 +664,9 @@ try:
                 idx += 1
                 continue
 
-            # LR warmup
-            gen.train_lr = get_lr(idx)
+            # LR warmup (TN-41: continue schedule after rescore via offset)
+            _lr_offset = pipeline._rescore_line if pipeline._rescore_line is not None else 0
+            gen.train_lr = get_lr(idx + _lr_offset)
 
             destab_pct = min(global_step / max(round(opt.p['destab_decay_lines'].current), 1), 1.0)
             destab_from = max(CFG.destab_scale_start, CFG.destab_scale_end)
@@ -718,9 +721,14 @@ try:
             elapsed = now - t_start
 
             # ---- Periodic tasks (line-based) ----
+            # TN-15: decay warmup ramp from 0.998 to target over decay_warmup_lines
+            _decay_pct = min(idx / max(CFG.decay_warmup_lines, 1), 1.0)
+            _decay_target = opt.p['decay_rate'].current
+            _decay_warmup = 0.998 + (_decay_target - 0.998) * _decay_pct
+
             if idx > 0 and idx - last_fluct_lines >= FLUCTUATE_EVERY:
                 cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
-                                     decay=opt.p['decay_rate'].current,
+                                     decay=_decay_warmup,
                                      repel_strength=opt.p['repel_strength'].current,
                                      generator=gen)
                 last_fluct_lines = idx
@@ -769,10 +777,15 @@ try:
                 if pipeline.opt._full_stuck_counter >= 5 and last_fluct_lines != idx:
                     print(f"  FULL_STUCK — forcing fluctuate")
                     cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
-                                         decay=opt.p['decay_rate'].current,
+                                         decay=_decay_warmup,
                                          repel_strength=opt.p['repel_strength'].current,
                                          generator=gen)
                     last_fluct_lines = idx
+                # TN-13: plateau-adaptive batch size (double when stuck)
+                if pipeline.opt._full_stuck_counter >= 3:
+                    BATCH_SIZE = min(BATCH_SIZE * 2, CFG.batch_size_end * 4)
+                    if pipeline.opt._full_stuck_counter >= 3 and pipeline.opt._full_stuck_counter < 5:
+                        print(f"  PLATEAU — doubling batch size to {BATCH_SIZE}")
                 print()
             idx += 1
 

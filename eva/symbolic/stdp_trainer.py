@@ -157,6 +157,17 @@ class STDPTrainer:
         cs = gen.cs
         T = len(ids)
         n_pairs = 0
+
+        # G-65/SN-48: Pre-compute field overlap matrix on GPU (one batch, no per-pair .item())
+        _overlap_lookup = None
+        if use_torch and field_gate and gen._fb_t is not None:
+            if gen._fb_t is None:
+                gen._ensure_fb_tensor(gen._torch_device)
+            ids_t = torch.tensor(ids, dtype=torch.long, device=gen._torch_device)
+            fb_t = gen._fb_t[ids_t]
+            overlap_mat = (fb_t.unsqueeze(1) & fb_t.unsqueeze(0)).sum(dim=-1).cpu().numpy()
+            _overlap_lookup = lambda i, j: int(overlap_mat[i, j])
+
         for i in range(T):
             start = max(0, i - context_window)
             end = min(T, i + context_window + 1)
@@ -178,11 +189,8 @@ class STDPTrainer:
 
                 field_weight = 1.0
                 if field_gate:
-                    if use_torch:
-                        if gen._fb_t is None:
-                            gen._ensure_fb_tensor(gen._torch_device)
-                    if use_torch and gen._fb_t is not None:
-                        overlap = int(torch.bitwise_and(gen._fb_t[ids[i]], gen._fb_t[ids[j]]).sum().item())
+                    if _overlap_lookup is not None:
+                        overlap = _overlap_lookup(i, j)
                     elif hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
                         overlap = cs.fractal.field_overlap(ids[i], ids[j])
                     else:
@@ -418,8 +426,10 @@ class STDPTrainer:
             destab_p = torch.clamp(gen._ce_t[unique_gen] * 0.5 * destab_scale, max=0.5)
             destab_mask = torch.rand(ng, device=device) < destab_p
             if destab_mask.any():
+                n_v = gen._vecs_t.shape[0]
+                unique_gen_t = torch.tensor(unique_gen, dtype=torch.long, device=device)
                 rand_idx = torch.randint(1, n_v, (ng,), device=device)
-                rand_idx = torch.where(rand_idx == unique_gen, (rand_idx + 1) % n_v, rand_idx)
+                rand_idx = torch.where(rand_idx == unique_gen_t, (rand_idx + 1) % n_v, rand_idx)
                 v_ppmi = gen._vecs_t[rand_idx].float()
                 v_self = gen._vecs_t[unique_gen].float()
                 y_ppmi = torch.clamp((v_self * v_ppmi).sum(dim=1), min=0.05)
@@ -434,51 +444,52 @@ class STDPTrainer:
 
         # Pure GPU per-concept loop: no CPU syncs, no .item(), no .numpy()
         valid_mask = cnt > 0.5
-        if valid_mask.any():
-            grad_gpu = acc / cnt[:, None].clamp(min=1)
-            gn_all = grad_gpu.norm(dim=1)
-            if gen.max_grad_norm > 0:
-                clip_mask = gn_all > gen.max_grad_norm
-                if clip_mask.any():
-                    grad_gpu[clip_mask] = grad_gpu[clip_mask] / gn_all[clip_mask, None] * gen.max_grad_norm
-            # SN-7: momentum already applied on GPU; _mom_t IS the smoothed gradient
-            if momentum_mu > 0 and gen._mom_t is not None:
-                grad_gpu = gen._mom_t[unique_gen]
-        else:
-            grad_gpu = None
+        elr_clamped = elr_grouped.clamp(min=1e-10)
+        grad_gpu = acc / elr_clamped[:, None]
+        gn_all = grad_gpu.norm(dim=1)
+        if gen.max_grad_norm > 0:
+            clip_mask = (gn_all > gen.max_grad_norm) & valid_mask
+            if clip_mask.any():
+                grad_gpu[clip_mask] = grad_gpu[clip_mask] / gn_all[clip_mask, None] * gen.max_grad_norm
+        # SN-7: momentum already applied on GPU; _mom_t IS the smoothed gradient
+        if momentum_mu > 0 and gen._mom_t is not None:
+            grad_gpu = gen._mom_t[unique_gen]
 
         _subspace_cids = []
         _subspace_grads = []
         _deferred_updates = []
-        if grad_gpu is not None:
-            for gi, gen_cid in enumerate(unique_gen):
-                if not valid_mask[gi] or elr_grouped[gi] <= 0:
-                    continue
-                if self.subspace_lr is not None and cs.fractal.basis is not None and gen._codes_t is not None:
-                    _subspace_cids.append(gen_cid)
-                    _subspace_grads.append(grad_gpu[gi].cpu().numpy())
-                else:
-                    v_gpu = gen._vecs_t[gen_cid].float()
-                    v_new_gpu = v_gpu + grad_gpu[gi] * base_lr_val
-                    nv = v_new_gpu.norm()
-                    if nv > 1e-10:
-                        v_new_gpu /= nv
-                    _deferred_updates.append((gen_cid, v_new_gpu))
+        for gi, gen_cid in enumerate(unique_gen):
+            if not valid_mask[gi] or elr_grouped[gi] <= 0:
+                continue
+            if self.subspace_lr is not None and cs.fractal.basis is not None and gen._codes_t is not None:
+                _subspace_cids.append(gen_cid)
+                _subspace_grads.append(grad_gpu[gi].cpu().numpy())
+            else:
+                v_gpu = gen._vecs_t[gen_cid].float()
+                v_new_gpu = v_gpu + grad_gpu[gi] * base_lr_val
+                nv = v_new_gpu.norm()
+                if nv > 1e-10:
+                    v_new_gpu /= nv
+                _deferred_updates.append((gen_cid, v_new_gpu))
 
         if _subspace_cids:
             cs._apply_subspace_update_batch(_subspace_cids, np.array(_subspace_grads, dtype=np.float32), base_lr_val, self.subspace_lr, gen)
 
-        # G-51: Batched _vecs_t write + fractal sync (deferred)
+        # G-51/G-62: Batched _vecs_t write + single D2H sync
         if _deferred_updates:
             cids_batch = [d[0] for d in _deferred_updates]
             vecs_batch = torch.stack([d[1] for d in _deferred_updates]).to(gen._vecs_t.dtype)
             gen._vecs_t[cids_batch] = vecs_batch
-            for cid, v_new_gpu in _deferred_updates:
-                cs._apply_vector_update(cid, v_new_gpu.cpu().numpy())
+            vecs_np = vecs_batch.cpu().numpy()
+            for k, cid in enumerate(cids_batch):
+                cs._apply_vector_update(cid, vecs_np[k])
 
         # AM-30: Batched EMA update outside per-concept loop
         if gen._vecs_t is not None and gen._ema_vecs_t is not None and gen._ema_steps >= 0:
-            gen._ema_vecs_t[unique_gen].lerp_(gen._vecs_t[unique_gen].float(), 1.0 - gen._ema_decay)
+            ema_updated = torch.lerp(gen._ema_vecs_t[unique_gen].float(),
+                                     gen._vecs_t[unique_gen].float(),
+                                     1.0 - gen._ema_decay)
+            gen._ema_vecs_t[unique_gen] = ema_updated.to(gen._ema_vecs_t.dtype)
             gen._ema_steps += len(unique_gen)
 
         if inh_strength > 0 and len(unique_gen) >= 2:
@@ -508,21 +519,29 @@ class STDPTrainer:
         n = len(gen_cids)
         mask_all = sim > inh_threshold * 2
         mask_all.fill_diagonal_(False)
+        _inh_updates = []
         for gi in range(n):
             gi_mask = mask_all[gi]
             if not gi_mask.any():
                 continue
-            inhibit_vec = (sim[gi][gi_mask] * gv[gi_mask] - (sim[gi][gi_mask]**2) * gv[gi]).sum(dim=0)
+            sv = sim[gi][gi_mask].unsqueeze(1)  # (k, 1)
+            inhibit_vec = (sv * gv[gi_mask] - (sv ** 2) * gv[gi]).sum(dim=0)
             nv = inhibit_vec.norm()
             if nv > 1e-10:
                 inhibit_vec /= nv
-                v_old = gen._vecs_t[gen_cids[gi]].float()
-                v_new = v_old + inhibit_vec * inh_strength * base_lr_val
+                v_old_gpu = gen._vecs_t[gen_cids[gi]].float()
+                v_new = v_old_gpu + inhibit_vec * inh_strength * base_lr_val
                 nn = v_new.norm()
                 if nn > 1e-10:
                     v_new /= nn
-                gen._vecs_t[gen_cids[gi]].copy_(v_new.to(gen._vecs_t.dtype))
-                cs._apply_vector_update(gen_cids[gi], v_new.cpu().numpy())
+                _inh_updates.append((gen_cids[gi], v_new))
+        if _inh_updates:
+            cids_batch = [d[0] for d in _inh_updates]
+            vecs_batch = torch.stack([d[1] for d in _inh_updates]).to(gen._vecs_t.dtype)
+            gen._vecs_t[cids_batch] = vecs_batch
+            vecs_np = vecs_batch.cpu().numpy()
+            for k, cid in enumerate(cids_batch):
+                cs._apply_vector_update(cid, vecs_np[k])
 
     # ═══════════════════════════════════════════════════
     # Negative sampling
@@ -544,7 +563,7 @@ class STDPTrainer:
             if field_gate:
                 ce = gen.concept_error.get(gen_cid, 0.0)
                 neg_lr *= (1.0 + ce * 2.0)
-            neg_candidates = gen.main_rng.sample(total_vocab, min(neg_samples, len(total_vocab)))
+            neg_candidates = gen.main_rng.choices(total_vocab, k=min(neg_samples, len(total_vocab)))
             for neg_cid in neg_candidates:
                 if neg_cid == gen_cid:
                     continue
@@ -618,8 +637,9 @@ class STDPTrainer:
             cids_batch = [d[0] for d in _neg_updates]
             vecs_batch = torch.stack([d[1] for d in _neg_updates]).to(gen._vecs_t.dtype)
             gen._vecs_t[cids_batch] = vecs_batch
-            for cid, v_new in _neg_updates:
-                cs._apply_vector_update(cid, v_new.cpu().numpy())
+            vecs_np = vecs_batch.cpu().numpy()
+            for k, cid in enumerate(cids_batch):
+                cs._apply_vector_update(cid, vecs_np[k])
 
     # ═══════════════════════════════════════════════════
     # Contrastive objective
@@ -798,8 +818,9 @@ class STDPTrainer:
                 cids_batch = [d[0] for d in _updates]
                 vecs_batch = torch.stack([d[1] for d in _updates]).to(gen._vecs_t.dtype)
                 gen._vecs_t[cids_batch] = vecs_batch
-                for cid, v_new in _updates:
-                    cs._apply_vector_update(cid, v_new.cpu().numpy())
+                vecs_np = vecs_batch.cpu().numpy()
+                for k, cid in enumerate(cids_batch):
+                    cs._apply_vector_update(cid, vecs_np[k])
 
     # ═══════════════════════════════════════════════════
     # Centroid pull
@@ -835,6 +856,7 @@ class STDPTrainer:
                         cs._apply_vector_update(cid, v_new)
             return
         device = gen._torch_device
+        _centroid_updates = []
         for ids in all_ids:
             if len(ids) < 3:
                 continue
@@ -852,7 +874,14 @@ class STDPTrainer:
             nv = v_new.norm(dim=1, keepdim=True).clamp(min=1e-10)
             v_new /= nv
             for i, cid in enumerate(ids_t.tolist()):
-                cs._apply_vector_update(cid, v_new[i].cpu().numpy())
+                _centroid_updates.append((cid, v_new[i]))
+        if _centroid_updates:
+            cids_batch = [d[0] for d in _centroid_updates]
+            vecs_batch = torch.stack([d[1] for d in _centroid_updates]).to(gen._vecs_t.dtype)
+            gen._vecs_t[cids_batch] = vecs_batch
+            vecs_np = vecs_batch.cpu().numpy()
+            for k, cid in enumerate(cids_batch):
+                cs._apply_vector_update(cid, vecs_np[k])
 
     # ═══════════════════════════════════════════════════
     # Evaluate

@@ -22,6 +22,8 @@ real_data/val_corpus.txt
 real_data/train_log.txt
 real_data/vis/
 real_data/_train_status.json
+real_data/_batch_timing.csv
+real_data/checkpoint_state.json
 real_data/*.tmp
 real_data/gen_*.txt
 real_data/gen_*.py

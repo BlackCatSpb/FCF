@@ -386,6 +386,7 @@ class FCFConfig:
     decay_every_fast: int = 2000
     decay_every_slow: int = 3000
     decay_every_pairs: int = 32000
+    decay_warmup_lines: int = 5000   # TN-15: ramp decay_rate from 0.998 to target
 
     # ── Гиперы FAST-режима ────────────────────
     fast_lr: float = 0.15

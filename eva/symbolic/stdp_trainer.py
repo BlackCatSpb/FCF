@@ -723,9 +723,9 @@ class STDPTrainer:
         if field_gate:
             contr_lrs *= (1.0 + gen._ce_t[gen_idxs] * 2.0)
 
-        g_vecs = gen._vecs_t[gen_idxs].float()
-        all_vecs = gen._vecs_t[:n_v].float()
-        sim = g_vecs @ all_vecs.T
+        g_vecs = gen._vecs_t[gen_idxs].float()  # fp32 — used in gradient loop below
+        all_vecs = gen._vecs_t[:n_v]            # fp16 — saves 224MB vs .float()
+        sim = (g_vecs.half() @ all_vecs.T).float()  # fp16 matmul → fp32 result
 
         # G-44: Pre-compute cooc masks as GPU boolean tensor
         cooc_masks = torch.zeros(ng, n_v, dtype=torch.bool, device=d)
@@ -736,9 +736,13 @@ class STDPTrainer:
                 cooc_masks[i, ctx_t] = True
 
         # G-44: Pre-compute field overlaps (ng, n_v) when field bits exist
+        # Chunked per concept to avoid (ng, V, fb_bytes) = 299MB intermediate
         if gen._fb_t is not None:
             fb_gen_all = gen._fb_t[gen_idxs]
-            fb_overlaps = (fb_gen_all.unsqueeze(1) & gen._fb_t.unsqueeze(0)).sum(dim=-1)
+            fb_overlaps = torch.zeros(ng, n_v, device=d, dtype=torch.long)
+            fb_t_exp = gen._fb_t.unsqueeze(0)  # (1, V, fb_bytes)
+            for i in range(ng):
+                fb_overlaps[i] = (fb_gen_all[i:i+1].unsqueeze(1) & fb_t_exp).sum(dim=-1)
         else:
             fb_overlaps = None
 

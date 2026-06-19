@@ -10,6 +10,7 @@
 
 V10 Р·Р°РєРѕРјРјРёС‡РµРЅ (2 РєРѕРјРјРёС‚Р°). **105 С‚РµСЃС‚РѕРІ РїСЂРѕС…РѕРґСЏС‚** (+26, +33%). Р­С‚Рѕ СЃР°РјС‹Р№ Р±РѕР»СЊС€РѕР№ РїСЂРѕРіСЂРµСЃСЃ Р·Р° РІСЃС‘ РІСЂРµРјСЏ.
 **V11.1 (024f1aa)**: РСЃРїСЂР°РІР»РµРЅС‹ TN-40 (P0), B1 (P1), SN-28 (P1), centroid parity (P2). Р’СЃРµ 105 С‚РµСЃС‚РѕРІ РїСЂРѕС…РѕРґСЏС‚.
+**V11.2 (a705223)**: Исправлены G-60/SN-45 (GPU destab), SN-43 (GPU neg sampling batched), SN-44 (GPU contrastive pure tensor). Все 105 тестов проходят.
 
 | РњРµС‚СЂРёРєР° | V10 | V11 | О” |
 |---------|:---:|:---:|:-:|
@@ -89,8 +90,7 @@ if mom_cpu is not None:
 **Fix**: РЈР±СЂР°С‚СЊ CPU momentum (СЃС‚СЂРѕРєРё 459-460), РѕСЃС‚Р°РІРёС‚СЊ С‚РѕР»СЊРєРѕ GPU `_mom_t`.
 **РЎР»РѕР¶РЅРѕСЃС‚СЊ**: 1
 
-### SN-43 (P1): GPU neg sampling вЂ” Python loop
-
+### SN-43 (P1): GPU neg sampling — Python loop
 **Р¤Р°Р№Р»**: `stdp_trainer.py:604`
 
 РџРѕСЃР»Рµ G-43 (РІРµРєС‚РѕСЂРёР·Р°С†РёСЏ) РѕСЃС‚Р°Р»СЃСЏ Python loop:
@@ -104,8 +104,7 @@ for gi, gen_cid in enumerate(unique_gen):
 **Fix**: Batched tensor ops в†’ РµРґРёРЅС‹Р№ GPU write-back.
 **РЎР»РѕР¶РЅРѕСЃС‚СЊ**: 3
 
-### SN-44 (P1): GPU contrastive вЂ” nested Python loops + .item()
-
+### SN-44 (P1): GPU contrastive — nested Python loops + .item()
 **Р¤Р°Р№Р»**: `stdp_trainer.py:735-792`
 
 РџРѕСЃР»Рµ G-44 РѕСЃС‚Р°Р»РёСЃСЊ Python loops:
@@ -158,9 +157,9 @@ Destab logic (RNG, PPMI, numpy) вЂ” РїРѕР»РЅРѕСЃС‚СЊСЋ CP
 | **TN-40** | crash РІ FLUCTUATE_EVERY (KeyError: noise_scale) ✅ FIXED in 024f1aa | **P0** | TD | 1 |
 | **B1** | Double momentum (GPU + CPU) вЂ” РёСЃРєР°Р¶РµРЅРёРµ РіСЂР°РґРёРµРЅС‚Р° ✅ FIXED in 024f1aa | P1 | GPU | 1 |
 | **SN-28** | Contrastive \`field_gate\` not propagated — ✅ FIXED in 024f1aa | P1 | NS | 3 |
-| **SN-43** | GPU neg sampling Python loop | P1 | NS | 3 |
-| **SN-44** | GPU contrastive nested Python loops + .item() | P1 | NS | 6 |
-| **SN-45/G-60** | GPU destab вЂ” С†РµР»РёРєРѕРј CPU | P1 | NS/GPU | 5 |
+| **SN-43** | GPU neg sampling Python loop ✅ FIXED in a705223 | P1 | NS | 3 |
+| **SN-44** | GPU contrastive nested Python loops + .item() ✅ FIXED in a705223 | P1 | NS | 6 |
+| **SN-45/G-60** | GPU destab — целиком CPU ✅ FIXED in a705223 | P1 | NS/GPU | 5 |
 | **SN-46** | Contrastive write-back CPU roundtrip | P3 | NS | 4 |
 | **SN-47** | CPU neg sampling `sample(total_vocab)` 146K | P3 | NS | 2 |
 | **SN-48** | GPU field overlap `.item()` sync | P3 | NS | 3 |
@@ -182,9 +181,9 @@ Destab logic (RNG, PPMI, numpy) вЂ” РїРѕР»РЅРѕСЃС‚СЊСЋ CP
 
 ### Р¤Р°Р·Р° 1 (P1 вЂ” 4 Р·Р°РґР°С‡Рё, ~1 РЅРµРґРµР»СЏ)
 
-3. **SN-43**: GPU neg sampling вЂ” batched write-back
-4. **SN-44**: GPU contrastive вЂ” pure tensor push
-5. **SN-45/G-60**: GPU destab
+3. **SN-43** ✅ FIXED in a705223: GPU neg sampling — batched write-back
+4. **SN-44** ✅ FIXED in a705223: GPU contrastive — pure tensor push
+5. **SN-45/G-60** ✅ FIXED in a705223: GPU destab
 6. **Centroid-bug** ✅ FIXED in 024f1aa: Fix `0.1` factor
 
 ### Р¤Р°Р·Р° 2 (P2 вЂ” 5 Р·Р°РґР°С‡)

@@ -320,7 +320,7 @@ Use `torch.rand` with `generator=gen._gpu_rng` to avoid global RNG sync.
 |----------|----|--------|------|--------|------------|
 | 1 | **B1** ✅ FIXED in 024f1aa — Fix double momentum | 0.5 day | None | Correctness | вЂ” |
 | 2 | **G-62** GPU `_apply_vector_update` | 3 days | Medium | **5вЂ“10Г—** on write path | S2,S3,S4,S10,S11,S12,S14,S15 |
-| 3 | **G-60** GPU Destabilization | 2 days | Medium | **2вЂ“5Г—** on STDP loop | S7,S8,S9 |
+| 3 | **G-60** ✅ FIXED in a705223 — GPU Destabilization | 2 days | Medium | **2–5×** on STDP loop | S7,S8,S9 |
 | 4 | **G-65** GPU field_gate in pairs | 1 day | Low | **1.5вЂ“2Г—** on pair building | S16 |
 | 5 | **G-63** GPU Contrastive vectorized | 3 days | High | **5вЂ“20Г—** on contrastive | S13 |
 | 6 | **G-61** Lazy CE sync | 1 day | Low | **1.2Г—** | S1,S7 |

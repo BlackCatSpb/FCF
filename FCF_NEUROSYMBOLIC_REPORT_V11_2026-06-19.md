@@ -117,7 +117,7 @@ CPU contrastive (`_contrastive_objective_cpu`) does NOT use `field_gate` at all 
 
 ## 4. New Issues Found вЂ” SN-43+
 
-### 4.1 [P2] SN-43: GPU Neg Sampling Still Has Per-Element Python Loop
+### 4.1 [P2] SN-43: GPU Neg Sampling Still Has Per-Element Python Loop ✅ FIXED in a705223
 
 **File:** `stdp_trainer.py:604-624`
 
@@ -141,7 +141,7 @@ for gi, gen_cid in enumerate(unique_gen):   # в†ђ Python loop
 
 **Fix:** Accumulate all neg-gradients into a single tensor, batch-normalize, batch-write `_vecs_t[gen_t[valid_mask]]`. Remove Python loop.
 
-### 4.2 [P2] SN-44: GPU Contrastive Nested Python Loops
+### 4.2 [P2] SN-44: GPU Contrastive Nested Python Loops ✅ FIXED in a705223
 
 **File:** `stdp_trainer.py:735-792`
 
@@ -167,7 +167,7 @@ for i in range(ng):                          # в†ђ outer Python loop
 
 **Fix:** Convert hard-negative filtering to tensor operations: use `cooc_masks` + `fb_overlaps` as boolean masks on `topk_idx`, select valid negatives via masked indexing, compute batch gradient in one shot.
 
-### 4.3 [P2] SN-45: Destab Logic Still CPU Per-Element
+### 4.3 [P2] SN-45: Destab Logic Still CPU Per-Element ✅ FIXED in a705223
 
 **File:** `stdp_trainer.py:433-451`
 
@@ -279,9 +279,9 @@ V10 proposed BatchNorm/LayerNorm for concept vectors to stabilize training. Not 
 
 | ID | Severity | Issue |
 |:---|:--------:|:------|
-| SN-43 | P2 | GPU neg sampling per-element Python loop + CPU write-back |
-| SN-44 | P2 | GPU contrastive nested Python loops + scalar syncs |
-| SN-45 | P2 | Destab logic CPU per-element (RNG, lattice, numpy) |
+| SN-43 | P2 ✅ FIXED in a705223 | GPU neg sampling per-element Python loop + CPU write-back |
+| SN-44 | P2 ✅ FIXED in a705223 | GPU contrastive nested Python loops + scalar syncs |
+| SN-45 | P2 ✅ FIXED in a705223 | Destab logic CPU per-element (RNG, lattice, numpy) |
 | SN-46 | P3 | Contrastive GPUв†’CPUв†’GPU roundtrip write-back |
 | SN-47 | P3 | CPU neg sampling re-samples vocabulary per concept |
 | SN-48 | P3 | GPU field overlap `.item()` sync per pair in `_build_pairs` |
@@ -290,17 +290,17 @@ V10 proposed BatchNorm/LayerNorm for concept vectors to stabilize training. Not 
 
 | Severity | Count | Key Issues |
 |:---------|:-----:|:-----------|
-| **P1** | 1 | SN-28 |
-| **P2** | 6 | SN-26.2, SN-33, SN-19, SN-43, SN-44, SN-45 |
+| **P1** | 0 | — |
+| **P2** | 3 | SN-26.2, SN-33, SN-19 |
 | **P3** | 4 | SN-41, SN-46, SN-47, SN-48 |
 
 ### 6.5 V10в†’V11 Delta
 
 - вњ… 11 V10 fixes verified (SN-35, SN-36, G-40, G-44, G-46, SN-39, AM-30, G-49, SN-38, SN-40, SN-42)
 - ❌ 4 V10 issues still open (SN-26.2, SN-33, SN-19, SN-41) — SN-28 ✅ FIXED in 024f1aa
-- рџ†• 6 new issues (SN-43..SN-48)
-- P1 count reduced: 4 в†’ 1 (SN-35/36 fixed and downgraded)
-- P2 count stable: 5 в†’ 6 (SN-43/44/45 added, SN-38/40/42 closed)
+- рџ†• 6 new issues (SN-43..SN-48) — SN-43/44/45 ✅ FIXED in a705223
+- P1 count reduced: 4 в†’ 1 в†’ 0 (SN-35/36 fixed, SN-28 FIXED in V11.1, all closed)
+- P2 count: 5 в†’ 6 в†’ 3 (SN-43/44/45 added in V11, then FIXED in V11.2)
 - P3 count stable: 4 в†’ 4 (SN-46/47/48 added, SN-38/40/42 closed)
 
 

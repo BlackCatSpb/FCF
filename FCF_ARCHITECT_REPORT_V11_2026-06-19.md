@@ -25,6 +25,7 @@
 3. в›” **P0: train_full.py:722 вЂ” `noise_scale` keyword argument РЅРµ СЃСѓС‰РµСЃС‚РІСѓРµС‚** вЂ” `fluctuate_fractal()` РїСЂРёРЅРёРјР°РµС‚ `fluctuation_amp`, Р° РЅРµ `noise_scale`. РџСЂРё РїРµСЂРІРѕРј С„Р»СѓРєС‚СѓР°С‚Рµ (РєР°Р¶РґС‹Рµ 2000 СЃС‚СЂРѕРє) вЂ” **TypeError: unexpected keyword argument 'noise_scale'**. `opt.p['noise_scale']` С‚Р°РєР¶Рµ KeyError (РїРµСЂРµРёРјРµРЅРѕРІР°РЅ РІ `gradient_noise_scale`).
 4. в›” **REG-V9-7 РёСЃРїСЂР°РІР»РµРЅ РЅРµ РїРѕР»РЅРѕСЃС‚СЊСЋ** вЂ” `gradient_noise_scale` РїРµСЂРµРґР°С‘С‚СЃСЏ РІ `train_batch` (вњ…), РЅРѕ РІС‹Р·РѕРІ `fluctuate_fractal` (train_full.py:722) РЅРµ РѕР±РЅРѕРІР»С‘РЅ
 5. ~5 600 `.item()`/batch РѕСЃС‚Р°Р»РѕСЃСЊ (Р±С‹Р»Рѕ ~16 500) вЂ” РІ РѕСЃРЅРѕРІРЅРѕРј РІ `_contrastive_objective_gpu`
+6. **V11.2 (a705223)**: Исправлены G-60/SN-45 (GPU destab), SN-43 (GPU neg sampling batched), SN-44 (GPU contrastive pure tensor). Все 105 тестов проходят.
 
 ---
 
@@ -284,6 +285,7 @@ cpu/gpu pair building РІ `_build_pairs` СЂР°Р·РґРµР»РµРЅС‹ 
 ### 5.13 AM-94: `fluctuation_amp` вЂ” decay
 
 РўРµРєСѓС‰Р°СЏ Р»РѕРіРёРєР°: `fluctuation_amp` РєРѕРЅСЃС‚Р°РЅС‚Р° РЅР° РІСЃС‘ РѕР±СѓС‡РµРЅРёРµ. Р”РѕР±Р°РІРёС‚СЊ cosine decay.
+**V11.2 note**: fluctuation_amp корректно используется в исправленном вызове fluctuate_fractal (a705223). Decay-логика остаётся как будущее улучшение.
 
 ### 5.14 AM-95: deprecate `_quiet` wrapper
 

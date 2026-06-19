@@ -118,17 +118,14 @@ class STDPTrainer:
         else:
             self._cpu_stdp_apply(gen_updates, base_lr, destab_scale, inh_strength, inh_threshold)
 
-        # G-52: future - fuse contrastive + neg sampling (both iterate over gen_updates with similar vector updates)
-        # ── Negative sampling ──
-        if neg_samples > 0 and use_torch and gen._vecs_t is not None and gpu_ctx_l:
-            device = gen._torch_device
-            self._negative_sampling_gpu(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen,
-                device, field_gate, base_lr, neg_lr_ratio, neg_samples)
-        elif neg_samples > 0:
-            self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
-
-        # ── Contrastive objective ──
-        self._contrastive_objective(gen_updates)
+        # ── Negative sampling + Contrastive (G-52: fused into single GPU pass) ──
+        if use_torch and gpu_ctx_l:
+            self._gpu_poststdp_fused(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen,
+                gen_updates, field_gate, base_lr, neg_lr_ratio, neg_samples)
+        else:
+            if neg_samples > 0:
+                self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
+            self._contrastive_objective(gen_updates)
 
         # ── Centroid pull + lattice update ──
         all_ids = []
@@ -427,8 +424,8 @@ class STDPTrainer:
         _subspace_cids = []
         _subspace_grads = []
         _subspace_gi_map = {}
+        _deferred_updates = []  # G-51: (cid, v_new_gpu) for batched _vecs_t write
 
-        # G-51: future - deferred vector sync (batched _vecs_t write)
         for gi, gen_cid in enumerate(unique_gen):
             v = cs.concept_vectors.get(gen_cid)
             if v is None or cnt_cpu[gi] < 0.5:
@@ -466,15 +463,25 @@ class STDPTrainer:
                     _subspace_grads.append(grad)
                     _subspace_gi_map[gen_cid] = gi
                 else:
-                    # G-50: future - zero-copy GPU write-back (compute v_new on GPU, write directly to gen._vecs_t)
-                    v_new = v + grad * base_lr_val
-                    nv = np.linalg.norm(v_new)
+                    # G-50/G-51: GPU write-back + deferred _vecs_t sync
+                    v_gpu = gen._vecs_t[gen_cid].float()
+                    grad_t = torch.from_numpy(grad).to(device=device, dtype=torch.float32)
+                    v_new_gpu = v_gpu + grad_t * base_lr_val
+                    nv = v_new_gpu.norm()
                     if nv > 1e-10:
-                        v_new /= nv
-                    cs._apply_vector_update(gen_cid, v_new)
+                        v_new_gpu /= nv
+                    _deferred_updates.append((gen_cid, v_new_gpu))
 
         if _subspace_cids:
             cs._apply_subspace_update_batch(_subspace_cids, np.array(_subspace_grads, dtype=np.float32), base_lr_val, self.subspace_lr, gen)
+
+        # G-51: Batched _vecs_t write + fractal sync (deferred)
+        if _deferred_updates:
+            cids_batch = [d[0] for d in _deferred_updates]
+            vecs_batch = torch.stack([d[1] for d in _deferred_updates]).to(gen._vecs_t.dtype)
+            gen._vecs_t[cids_batch] = vecs_batch
+            for cid, v_new_gpu in _deferred_updates:
+                cs._apply_vector_update(cid, v_new_gpu.cpu().numpy())
 
         # AM-30: Batched EMA update outside per-concept loop
         if gen._vecs_t is not None and gen._ema_vecs_t is not None and gen._ema_steps >= 0:
@@ -485,6 +492,18 @@ class STDPTrainer:
             self._lateral_inhibition_gpu(unique_gen, inh_strength, inh_threshold, base_lr_val)
 
         return unique_gen
+
+    # G-52: Fused post-STDP pass — negative sampling + contrastive in one GPU-enabled call.
+    # Reuses gpu_ctx_l / gpu_meta_l to avoid re-reading _vecs_t between separate methods.
+    def _gpu_poststdp_fused(self, gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen,
+                            gen_updates, field_gate, base_lr_val, neg_lr_ratio, neg_samples):
+        gen = self.gen
+        if neg_samples > 0 and gen._vecs_t is not None:
+            device = gen._torch_device
+            self._negative_sampling_gpu(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen,
+                device, field_gate, base_lr_val, neg_lr_ratio, neg_samples)
+        if gen_updates:
+            self._contrastive_objective_gpu(gen_updates)
 
     def _lateral_inhibition_gpu(self, gen_cids, inh_strength, inh_threshold, base_lr_val):
         gen = self.gen

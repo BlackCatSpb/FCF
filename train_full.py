@@ -587,22 +587,28 @@ def _write_viewer_html(path):
         f.write(TEMPLATE)
 
 def _final_save(cs, lattice, opt, epoch, total_lines):
-    """Save all training state."""
-    try:
-        cs.save(CFG.cs_path)
-        lattice.save(CFG.lattice_path)
-    except Exception as e:
-        print(f"FATAL: Checkpoint save failed: {e}")
-        sys.exit(1)
+    """Save all training state. Each operation protected individually."""
+    for _op_name, _op_fn, _op_args in [
+        ('cs.save', cs.save, (CFG.cs_path,)),
+        ('lattice.save', lattice.save, (CFG.lattice_path,)),
+    ]:
+        try:
+            _op_fn(*_op_args)
+        except Exception as e:
+            print(f"[WARN] {_op_name} failed: {e}", file=sys.stderr)
     try:
         state = opt.save_state()
         with open(CFG.cs_path.replace('.json', '.opt.json'), 'w', encoding='utf-8') as _of:
             json.dump(state, _of)
     except Exception as e:
         print(f"[WARN] opt.save_state failed: {e}", file=sys.stderr)
-    ckpt = {'epoch': epoch, 'line': total_lines, 'timestamp': time.time()}
-    with open(CFG.ckpt_state_path, 'w', encoding='utf-8') as f:
-        json.dump(ckpt, f)
+    try:
+        ckpt = {'epoch': epoch, 'line': total_lines, 'timestamp': time.time()}
+        with open(CFG.ckpt_state_path + '.tmp', 'w', encoding='utf-8') as f:
+            json.dump(ckpt, f)
+        os.replace(CFG.ckpt_state_path + '.tmp', CFG.ckpt_state_path)
+    except Exception as e:
+        print(f"[WARN] ckpt_state save failed: {e}", file=sys.stderr)
     for f in glob.glob(os.path.join(CFG.data_dir, 'points_*.html')):
         try:
             if os.path.isfile(f):
@@ -776,7 +782,10 @@ try:
 
 except KeyboardInterrupt:
     print("\n\n[EVA] Training interrupted — saving checkpoint...")
-    _final_save(cs, lattice, opt, _ckpt_epoch, idx)
+    try:
+        _final_save(cs, lattice, opt, _ckpt_epoch, idx)
+    except BaseException:
+        pass
     print("[EVA] Checkpoint saved. Exiting.")
     sys.exit(0)
 finally:

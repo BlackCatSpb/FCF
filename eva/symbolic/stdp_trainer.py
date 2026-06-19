@@ -560,7 +560,8 @@ class STDPTrainer:
             return
 
         gen_cids_arr = np.array(gpu_cid_gen, dtype=np.int32)
-        unique_gen = np.unique(gen_cids_arr)
+        unique_gen, inv_idx = np.unique(gen_cids_arr, return_inverse=True)
+        inv_t = torch.from_numpy(inv_idx).to(device, non_blocking=True)
         gen_t = torch.tensor(unique_gen, dtype=torch.long, device=device)
         gv = gen._vecs_t[gen_t].float()
 
@@ -569,12 +570,16 @@ class STDPTrainer:
         sim = (gv[:, None, :] * ngv).sum(dim=-1)
         mask = sim > 0.1
         device_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
-        elr_sum = (torch.clamp(device_t[:, _META_FW], min=0.05) *
-                   device_t[:, _META_DW] * device_t[:, _META_PMI] * device_t[:, _META_FIELD_W]).sum().item()
-        neg_lr = (elr_sum / max(len(gpu_ctx_l), 1)) * neg_lr_ratio * 0.3
+        # SN-22.3: Per-concept avg_elr on GPU (matching CPU per-concept avg_elr)
+        pair_elr = torch.clamp(device_t[:, _META_FW], min=0.05) * device_t[:, _META_DW] * device_t[:, _META_PMI] * device_t[:, _META_FIELD_W]
+        elr_per_gen = torch.zeros(len(unique_gen), device=device)
+        elr_per_gen.scatter_add_(0, inv_t, pair_elr)
+        cnt_per_gen = torch.zeros(len(unique_gen), device=device)
+        cnt_per_gen.scatter_add_(0, inv_t, torch.ones(len(gpu_cid_gen), device=device))
+        avg_elr_per_gen = elr_per_gen / cnt_per_gen.clamp(min=1)
 
         for gi, gen_cid in enumerate(unique_gen):
-            neg_lr_i = neg_lr
+            neg_lr_i = avg_elr_per_gen[gi].item() * neg_lr_ratio * 0.3
             # SN-22.2: Guard concept_error reweighting with field_gate (matching CPU parity)
             if field_gate:
                 ce = gen.concept_error.get(gen_cid, 0.0)

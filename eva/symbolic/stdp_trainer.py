@@ -125,7 +125,7 @@ class STDPTrainer:
         else:
             if neg_samples > 0:
                 self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
-            self._contrastive_objective(gen_updates)
+            self._contrastive_objective(gen_updates, field_gate)
 
         # ── Centroid pull + lattice update ──
         all_ids = []
@@ -455,9 +455,9 @@ class STDPTrainer:
                 gn = float(np.linalg.norm(grad))
                 if gn > gen.max_grad_norm > 0:
                     grad = grad / gn * gen.max_grad_norm
-                # SN-7: use momentum-smoothed gradient when available
+                # SN-7: momentum already applied on GPU (G-46); mom_cpu IS the smoothed gradient
                 if mom_cpu is not None:
-                    grad = momentum_mu * mom_cpu[gi] + (1 - momentum_mu) * grad
+                    grad = mom_cpu[gi]
                 if self.subspace_lr is not None and cs.fractal.basis is not None and gen._codes_t is not None:
                     _subspace_cids.append(gen_cid)
                     _subspace_grads.append(grad)
@@ -503,7 +503,7 @@ class STDPTrainer:
             self._negative_sampling_gpu(gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen,
                 device, field_gate, base_lr_val, neg_lr_ratio, neg_samples)
         if gen_updates:
-            self._contrastive_objective_gpu(gen_updates)
+            self._contrastive_objective_gpu(gen_updates, field_gate)
 
     def _lateral_inhibition_gpu(self, gen_cids, inh_strength, inh_threshold, base_lr_val):
         gen = self.gen
@@ -627,14 +627,14 @@ class STDPTrainer:
     # Contrastive objective
     # ═══════════════════════════════════════════════════
 
-    def _contrastive_objective(self, gen_updates):
+    def _contrastive_objective(self, gen_updates, field_gate=True):
         gen = self.gen
         if gen._vecs_t is not None and gen._use_torch:
-            self._contrastive_objective_gpu(gen_updates)
+            self._contrastive_objective_gpu(gen_updates, field_gate)
         else:
-            self._contrastive_objective_cpu(gen_updates)
+            self._contrastive_objective_cpu(gen_updates, field_gate)
 
-    def _contrastive_objective_cpu(self, gen_updates):
+    def _contrastive_objective_cpu(self, gen_updates, field_gate=True):
         gen = self.gen
         cs = gen.cs
         for gen_cid, updates in gen_updates.items():
@@ -643,7 +643,8 @@ class STDPTrainer:
                 continue
             avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
             contr_lr = avg_elr * 0.3
-            contr_lr *= (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0)
+            if field_gate:
+                contr_lr *= (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0)
 
             neighbours = cs.topk_similar_concepts(gen_cid, k=100, sample_size=2000)
             cooc_set = {ctx_cid for ctx_cid, _ in updates}
@@ -683,7 +684,7 @@ class STDPTrainer:
                 cs._apply_vector_update(gen_cid, v_new)
                 v_gen = cs.concept_vectors.get(gen_cid)
 
-    def _contrastive_objective_gpu(self, gen_updates):
+    def _contrastive_objective_gpu(self, gen_updates, field_gate=True):
         gen = self.gen
         cs = gen.cs
         d = gen._torch_device
@@ -698,7 +699,8 @@ class STDPTrainer:
         for i, gen_cid in enumerate(gen_cids):
             updates = gen_updates[gen_cid]
             avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
-            contr_lrs[i] = avg_elr * 0.3 * (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0)
+            ce_weight = 1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0 if field_gate else 1.0
+            contr_lrs[i] = avg_elr * 0.3 * ce_weight
 
         g_vecs = gen._vecs_t[gen_idxs].float()
         all_vecs = gen._vecs_t[:n_v].float()
@@ -837,7 +839,7 @@ class STDPTrainer:
             centroid = vecs.mean(dim=0)
             cn = centroid / centroid.norm().clamp(min=1e-10)
             sims = (vecs * cn).sum(dim=1)
-            pulls = 0.1 * (cn - sims[:, None] * vecs)
+            pulls = (cn - sims[:, None] * vecs)
             v_new = vecs + pulls * base_lr_val * 0.3
             nv = v_new.norm(dim=1, keepdim=True).clamp(min=1e-10)
             v_new /= nv

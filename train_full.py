@@ -719,7 +719,7 @@ try:
 
             # ---- Periodic tasks (line-based) ----
             if idx > 0 and idx - last_fluct_lines >= FLUCTUATE_EVERY:
-                cs.fluctuate_fractal(noise_scale=opt.p['noise_scale'].current,
+                cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
                                      decay=opt.p['decay_rate'].current,
                                      repel_strength=opt.p['repel_strength'].current,
                                      generator=gen)

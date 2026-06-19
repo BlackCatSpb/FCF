@@ -14,6 +14,12 @@ import numpy as np
 from collections import defaultdict, Counter
 import math, json, os, random
 from typing import Dict
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    torch = None
+    _HAS_TORCH = False
 
 
 class ConceptVectorStore:
@@ -209,13 +215,13 @@ class FractalField:
             v /= nv
         return v
 
-    def fluctuate(self, noise_scale=0.005, decay=0.999):
+    def fluctuate(self, fluctuation_amp=0.005, decay=0.999):
         """Apply autonomous drift to all latent codes."""
         if not hasattr(self, '_fluct_rng'):
             self._fluct_rng = np.random.RandomState(42)
         for cid in list(self.codes.keys()):
             c = self.codes[cid]
-            noise = self._fluct_rng.randn(self.latent_dim).astype(np.float32) * noise_scale
+            noise = self._fluct_rng.randn(self.latent_dim).astype(np.float32) * fluctuation_amp
             c[:] = c * decay + noise
         self._matrix_dirty = True
 
@@ -453,14 +459,14 @@ class ConceptSpace:
             print(f"  Octree fields: {len(seen_cids)}/{len(self.fractal.codes)} concepts, "
                   f"sizes: min={a.min()} max={a.max()} mean={a.mean():.1f}")
 
-    def fluctuate_fractal(self, noise_scale=0.003, decay=0.9995, repel_strength=0.0, generator=None):
+    def fluctuate_fractal(self, fluctuation_amp=0.003, decay=0.9995, repel_strength=0.0, generator=None):
         """Autonomous drift + optional centroid repulsion.
 
         Args:
             generator: Optional CrystalGenerator instance whose GPU tensors
                        to invalidate after the drift.
         """
-        self.fractal.fluctuate(noise_scale=noise_scale, decay=decay)
+        self.fractal.fluctuate(fluctuation_amp=fluctuation_amp, decay=decay)
         self._sync_from_fractal()
         if generator is not None:
             generator._invalidate_torch()
@@ -581,6 +587,55 @@ class ConceptSpace:
         self.fractal._matrix_dirty = True
         if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
             self._after_update_hook(cid, v_new)
+
+    def _apply_subspace_update_batch(self, cids, grads, base_lr_val, subspace_lr, gen):
+        """Batched GPU subspace update for multiple CIDs.
+        cids: list[int], grads: np.ndarray (N, D), gen: CrystalGenerator with torch tensors.
+        """
+        lr_c, lr_a, lr_m = subspace_lr
+        latent_dim = self.fractal.latent_dim
+        l_c = self.fractal.l_c
+        l_a = self.fractal.l_a
+        device = gen._torch_device
+
+        mask = torch.zeros(latent_dim, device=device, dtype=torch.float32)
+        mask[:l_c] = lr_c
+        mask[l_c:l_c + l_a] = lr_a
+        mask[l_c + l_a:] = lr_m
+
+        cids_t = torch.tensor(cids, dtype=torch.long, device=device)
+        grads_t = torch.from_numpy(grads).to(device, dtype=torch.float32)
+        codes = gen._codes_t[cids_t]
+        basis_t = gen._basis_t
+
+        code_grads = grads_t @ basis_t.T
+        code_grads *= mask
+        new_codes = codes + code_grads * base_lr_val
+
+        new_vecs = new_codes @ basis_t
+        nv = new_vecs.norm(dim=1, keepdim=True)
+        nv[nv < 1e-10] = 1.0
+        new_vecs /= nv
+
+        nc = new_codes.norm(dim=1, keepdim=True)
+        nc[nc < 1e-10] = 1.0
+        new_codes /= nc
+
+        new_vecs_np = new_vecs.cpu().numpy()
+        new_codes_np = new_codes.cpu().numpy()
+        for i, cid in enumerate(cids):
+            v_new = new_vecs_np[i]
+            code_new = new_codes_np[i]
+            v_old = self.concept_vectors.get(cid)
+            if v_old is not None:
+                shift = float(np.linalg.norm(v_new - v_old))
+                self._total_shift += shift
+                self._update_count += 1
+            self.set_vec(cid, v_new)
+            self.fractal.codes[cid] = code_new
+            if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
+                self._after_update_hook(cid, v_new)
+        self.fractal._matrix_dirty = True
 
     def _lateral_inhibition_fractal(self, winner_cid, strength=0.01, threshold=0.35, sample_size=None):
         """Lateral inhibition with correct Riemannian gradient, vectorised.

@@ -190,6 +190,9 @@ class HormonalSystem:
         focus = 1.0 - self.noradrenaline * 0.5
         return max(1, int(base_width * focus))
 
+    def reset(self):
+        self.__init__()
+
     def summary(self):
         return {
             "da": self.dopamine,

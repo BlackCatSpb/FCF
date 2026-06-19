@@ -315,9 +315,13 @@ class FCFConfig:
             AdaptRule('mean_cos > 0.01', 'repel_strength', 'scale', 1.10),
             AdaptRule('mean_cos < -0.005', 'repel_strength', 'scale', 0.90),
         ]),
-        ParamDef('noise_scale',    0.0002, 0.01,   0.001,  0.05, rules=[
-            AdaptRule('std_cos < 0.80*TARGET', 'noise_scale', 'scale', 1.15),
-            AdaptRule('std_cos > 1.30*TARGET', 'noise_scale', 'scale', 0.90),
+        ParamDef('gradient_noise_scale', 0.0,    0.01,   0.001,  0.05, rules=[
+            AdaptRule('std_cos < 0.80*TARGET', 'gradient_noise_scale', 'scale', 1.15),
+            AdaptRule('std_cos > 1.30*TARGET', 'gradient_noise_scale', 'scale', 0.90),
+        ]),
+        ParamDef('fluctuation_amp',   0.0002, 0.01,   0.003,  0.05, rules=[
+            AdaptRule('std_cos < 0.80*TARGET', 'fluctuation_amp', 'scale', 1.15),
+            AdaptRule('std_cos > 1.30*TARGET', 'fluctuation_amp', 'scale', 0.90),
         ]),
         ParamDef('inh_threshold',  0.05,   0.30,   0.10,   0.05, rules=[
             AdaptRule('est_frac > 0.15', 'inh_threshold', 'shift', 0.02),

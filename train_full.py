@@ -275,6 +275,14 @@ if RESUME is not None:
     opt_path = CFG.cs_path.replace('.json', f'_{resume_tag}.opt.json')
     if not os.path.exists(opt_path):
         opt_path = CFG.cs_path.replace('.json', '.opt.json')
+    if not os.path.exists(opt_path):
+        # TN-34: search with data_dir prefix (matches CheckpointManager naming)
+        opt_path = os.path.join(CFG.data_dir, f'concept_space_{resume_tag}.opt.json')
+    if not os.path.exists(opt_path):
+        # Broad fallback: any .opt.json in data_dir
+        opt_files = sorted(glob.glob(os.path.join(CFG.data_dir, '*.opt.json')))
+        if opt_files:
+            opt_path = opt_files[-1]
     if os.path.exists(opt_path):
         with open(opt_path, 'r', encoding='utf-8') as f:
             saved = json.load(f)
@@ -362,9 +370,11 @@ class TrainingPipeline:
         self.ckpt_mgr = CheckpointManager(
             data_dir=os.path.dirname(cfg.cs_path),
             cleanup_keep=ckpt_keep)
+        # TN-32: preserve curriculum progress after rescore
+        self._rescore_cp = None
 
     def _checkpoint(self, epoch, idx, elapsed, epoch_lines, destab_scale, t_start,
-                    epoch_train=None, start_line=None):
+                    epoch_train=None, start_line=None, global_step=0):
         gen = self.gen; cs = self.cs; lattice = self.lattice; opt = self.opt
         rate = idx / max(elapsed, 0.1)
         pct = 100 * idx / epoch_lines
@@ -380,6 +390,14 @@ class TrainingPipeline:
         # AM-7: Async checkpoint save (non-blocking)
         self.ckpt_mgr.save(ckpt_name, cs, lattice, opt)
         self.ckpt_mgr.cleanup()
+        # TN-31: Save checkpoint_state.json at every checkpoint
+        try:
+            ckpt = {'line': idx, 'epoch': epoch, 'global_step': global_step, 'timestamp': time.time()}
+            with open(self.cfg.ckpt_state_path + '.tmp', 'w', encoding='utf-8') as _f:
+                json.dump(ckpt, _f)
+            os.replace(self.cfg.ckpt_state_path + '.tmp', self.cfg.ckpt_state_path)
+        except Exception as e:
+            print(f"[WARN] checkpoint_state save failed: {e}", file=sys.stderr)
         n_upd = cs._update_count
         avg_delta = (cs._total_shift / max(n_upd, 1)) * 1e3
         cs._total_shift = 0.0; cs._update_count = 0
@@ -430,6 +448,7 @@ class TrainingPipeline:
         if epoch_train is not None and start_line is not None:
             remaining = idx - start_line + 1
             if remaining > 0 and remaining < len(epoch_train):
+                self._rescore_cp = _curriculum_p(idx + 1)
                 epoch_train = _rescore_lines(epoch_train[idx + 1:], gen)
                 idx = -1; start_line = 0
         if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
@@ -450,6 +469,15 @@ def _curriculum_p(idx):
 def _curriculum_max_len(idx, max_total=10**9):
     p = _curriculum_p(idx)
     return int(CURICULUM_MIN_LEN + (max_total - CURICULUM_MIN_LEN) * p)
+
+def _effective_cp(idx, pipeline):
+    cp = _curriculum_p(max(idx, 0))
+    if pipeline._rescore_cp is not None:
+        if cp >= pipeline._rescore_cp:
+            pipeline._rescore_cp = None
+        else:
+            cp = pipeline._rescore_cp
+    return cp
 
 if MAX_LINES > 0:
     train_lines = train_lines[:MAX_LINES]
@@ -627,8 +655,9 @@ try:
                 idx += 1
                 continue
 
-            # Continuous curriculum: skip lines exceeding current max_len
-            max_len = _curriculum_max_len(idx)
+            # TN-32: effective curriculum (preserved across rescore)
+            _eff_cp = _effective_cp(idx, pipeline)
+            max_len = int(CURICULUM_MIN_LEN + (10**9 - CURICULUM_MIN_LEN) * _eff_cp)
             if len(sp.encode(line)) > max_len:
                 idx += 1
                 continue
@@ -644,7 +673,7 @@ try:
             batch_buffer.append(line)
             batch_lr = gen.train_lr
             batch_destab = destab_scale
-            BATCH_SIZE = bs_curve(idx)
+            BATCH_SIZE = int(CFG.batch_size_start + (CFG.batch_size_end - CFG.batch_size_start) * _eff_cp)
 
             if len(batch_buffer) < BATCH_SIZE and idx < start_line + len(epoch_train) - 1:
                 # Check if periodic tasks are due — if so, flush early
@@ -655,7 +684,7 @@ try:
 
             # Flush batch
             _bt = time.time()
-            cp = _curriculum_p(idx)
+            cp = _eff_cp
             cw_target = int(round(opt.p['context_window'].current))
             ns_target = int(round(opt.p['neg_samples'].current))
             pg_target = opt.p['pmi_gate_min'].current
@@ -671,7 +700,7 @@ try:
                 inh_threshold=opt.p['inh_threshold'].current,
                 neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate,
                 use_torch=CFG.use_torch, destab_scale=batch_destab,
-                noise_scale=opt.p['noise_scale'].current,
+                gradient_noise_scale=opt.p['gradient_noise_scale'].current,
                 momentum_mu=CFG.momentum_mu)
             total_pairs_since_last_decay += n_pairs
             _batch_ms = (time.time() - _bt) * 1000
@@ -732,13 +761,14 @@ try:
 
             # ---- Line-based checkpoint + full report (AM-15/T-B2: via pipeline) ----
             if idx > 0 and idx % CHECKPOINT_EVERY == 0:
-                result = pipeline._checkpoint(epoch, idx, elapsed, epoch_lines, destab_scale, t_start, epoch_train, start_line)
+                pipeline.global_step = global_step
+                result = pipeline._checkpoint(epoch, idx, elapsed, epoch_lines, destab_scale, t_start, epoch_train, start_line, global_step)
                 if result is not None:
                     idx, start_line, epoch_train = result
                 gen.train_lr = pipeline.opt.p['full_lr'].current
                 if pipeline.opt._full_stuck_counter >= 5 and last_fluct_lines != idx:
                     print(f"  FULL_STUCK — forcing fluctuate")
-                    cs.fluctuate_fractal(noise_scale=opt.p['noise_scale'].current,
+                    cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
                                          decay=opt.p['decay_rate'].current,
                                          repel_strength=opt.p['repel_strength'].current,
                                          generator=gen)

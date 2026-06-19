@@ -70,7 +70,7 @@ class CrystalGenerator:
         self.max_words = self.config.get('max_words', 30)
         self.min_words = self.config.get('min_words', 3)
         self._graph_cache = OrderedDict()
-        self._graph_cache_max = 500
+        self._graph_cache_max = 5000
         self.base_concept_temp = self.config.get('concept_temp', 0.5)
         self.temperature = self.config.get('temperature', 1.0)
         self.theta_tau = self.config.get('theta_tau', 12.0)
@@ -84,7 +84,7 @@ class CrystalGenerator:
         self.max_grad_norm = self.config.get('max_grad_norm', 1.0)
 
         self.rng_registry = RNGRegistry(master_seed=42)
-        self.main_rng = random.Random(42)
+        self.main_rng = self.rng_registry.get('main')
         if not self.cs.concept_usage:
             self.cs.init_homeostasis()
         self.branch_rngs = {}
@@ -109,12 +109,15 @@ class CrystalGenerator:
         self._vecs_t = None
         self._fb_t = None
         self._ce_t = None
+        self._mom_t = None
         self._basis_t = None
+        self._codes_t = None
         self._ema_vecs_t = None  # EMA copy for stable eval/generation (TN-2)
         self._ema_decay = 0.999
         self._ema_steps = 0
         self._torch_dirty = False  # set True after fluctuate → trigger rebuild
         self._total_freq_cache = None
+        self._fused_buf = None  # G-49: pre-allocated fused buffer for scatter_add
 
         # Hook lattice mutations to invalidate total_freq cache
         _orig_update = self.lattice.update
@@ -216,6 +219,15 @@ class CrystalGenerator:
         if self._basis_t is None or self._basis_t.device != dev:
             self._basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(dev, non_blocking=True) if cs.fractal.basis is not None else None
 
+        # G-40: Latent codes tensor for batched subspace update
+        latent_dim = cs.fractal.latent_dim
+        codes_arr = np.zeros((V, latent_dim), dtype=np.float32)
+        for cid, code in cs.fractal.codes.items():
+            codes_arr[cid] = code
+        if self._codes_t is None or self._codes_t.shape[0] != V or self._codes_t.device != dev:
+            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float32)
+        self._codes_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
+
         # Concept error tensor for vectorized GPU negative sampling
         ce_arr = np.zeros(V, dtype=np.float32)
         for cid, err in self.concept_error.items():
@@ -231,6 +243,13 @@ class CrystalGenerator:
             self._ema_vecs_t.copy_(self._vecs_t.float())
         self._ema_steps = 0
 
+        if self._mom_t is None or self._mom_t.shape[0] != V or self._mom_t.device != dev:
+            self._mom_t = torch.zeros(V, D, device=dev, dtype=torch.float32)
+
+        # G-49: pre-allocate fused buffer for scatter_add
+        if self._fused_buf is None or self._fused_buf.shape[0] < V:
+            self._fused_buf = torch.zeros(V, D + 1, device=dev, dtype=torch.float32)
+
         self._torch_dirty = False
         self.cs.fractal._fb_dirty = False
         if dev.type == 'cuda':
@@ -242,6 +261,8 @@ class CrystalGenerator:
     def _invalidate_torch(self):
         """Mark GPU tensors as stale; triggers rebuild on next _ensure_torch.
         Call after fluctuate_fractal() or any code-level change."""
+        self._mom_t = None
+        self._codes_t = None
         self._torch_dirty = True
 
     def _sync_ema(self):
@@ -764,21 +785,21 @@ class CrystalGenerator:
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20, neg_samples=1,
                         inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=None,
-                        destab_scale=0.0, momentum_mu=0.9, noise_scale=0.0):
+                        destab_scale=0.0, momentum_mu=0.9, gradient_noise_scale=0.0, fluctuation_amp=0.003):
         """Delegate to STDPTrainer for STDP training on one text."""
         return self._trainer.train_from_text(text, base_lr, context_window, pmi_strength, pmi_gate_min,
                                               neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
                                               field_gate, use_torch, destab_scale,
-                                              momentum_mu=momentum_mu, noise_scale=noise_scale)
+                                              momentum_mu=momentum_mu, gradient_noise_scale=gradient_noise_scale)
 
     def train_batch(self, texts, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20,
                     neg_samples=1, inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5,
-                    field_gate=True, use_torch=None, destab_scale=0.0, momentum_mu=0.9, noise_scale=0.0):
+                    field_gate=True, use_torch=None, destab_scale=0.0, momentum_mu=0.9, gradient_noise_scale=0.0, fluctuation_amp=0.003):
         """Delegate to STDPTrainer for batched STDP training."""
         return self._trainer.train_batch(texts, base_lr, context_window, pmi_strength, pmi_gate_min,
                                           neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
                                           field_gate, use_torch, destab_scale,
-                                          momentum_mu=momentum_mu, noise_scale=noise_scale)
+                                          momentum_mu=momentum_mu, gradient_noise_scale=gradient_noise_scale)
 
     # ── Evaluation ────────────────────────────────────────────
 

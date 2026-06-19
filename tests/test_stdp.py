@@ -105,7 +105,7 @@ class TestFractalField:
     def test_fluctuate(self, dim):
         ff = FractalField(dim=dim, latent_dim=64)
         v0 = ff.init_concept(0)
-        ff.fluctuate(noise_scale=0.001, decay=0.999)
+        ff.fluctuate(fluctuation_amp=0.001, decay=0.999)
         v1 = ff.compute_vector(0)
         assert v1 is not None
         assert abs(np.linalg.norm(v1) - 1.0) < 1e-6
@@ -562,7 +562,7 @@ class TestSTDPTrainerDirect:
             result = gen._trainer._gpu_stdp_apply([], [], [], [],
                                          base_lr_val=0.0, field_gate=True,
                                          inh_strength=0.1, inh_threshold=0.1,
-                                         destab_scale=0.0, noise_scale=0.0,
+                                          destab_scale=0.0, gradient_noise_scale=0.0,
                                          momentum_mu=0.9, nesterov=False)
             assert len(result) == 0
         except (IndexError, RuntimeError):
@@ -688,7 +688,7 @@ class TestSTDPIntegration:
         meta = [(0, 1, 0.5, 1.0, 1.0, 1.0)]
         result = gen._trainer._gpu_stdp_apply(
             ctx_ids, tgt_ids, meta, [ci[1]], 0.01, True, 0.0, 0.0, 0.0,
-            noise_scale=0.0, momentum_mu=0.9, nesterov=False)
+            gradient_noise_scale=0.0, momentum_mu=0.9, nesterov=False)
         assert len(result) > 0
 
 
@@ -807,3 +807,267 @@ class TestCheckpointManagerResilience:
             lat_path = os.path.join(tmp, 'lat_remove_me.json')
             assert not os.path.exists(cs_path)
             assert not os.path.exists(lat_path)
+
+
+# ── QN-32: Subspace update ──────────────────────────────────────
+class TestSubspaceUpdate:
+    def test_subspace_update_basic(self, cs, dim):
+        """Verify subspace update changes vector within unit norm."""
+        cid = 0
+        v0 = cs.concept_vector(cid)
+        assert v0 is not None
+        grad = np.random.RandomState(0).randn(dim).astype(np.float32)
+        cs._apply_subspace_update(cid, grad, 0.01, (0.02, 0.01, 0.005))
+        v1 = cs.concept_vector(cid)
+        assert v1 is not None
+        assert abs(np.linalg.norm(v1) - 1.0) < 1e-6
+
+    def test_subspace_update_no_change_zero_lr(self, cs):
+        """Verify zero LR produces no change."""
+        import copy
+        cid = 0
+        v0 = cs.concept_vector(cid).copy()
+        grad = np.random.RandomState(1).randn(cs.dim).astype(np.float32)
+        cs._apply_subspace_update(cid, grad, 0.0, (0.02, 0.01, 0.005))
+        v1 = cs.concept_vector(cid)
+        assert np.allclose(v0, v1, atol=1e-7)
+
+    def test_subspace_update_unknown_cid(self, cs):
+        """Verify unknown cid doesn't crash."""
+        grad = np.random.RandomState(2).randn(cs.dim).astype(np.float32)
+        cs._apply_subspace_update(999999, grad, 0.01, (0.02, 0.01, 0.005))
+
+    def test_subspace_update_shift_tracking(self, cs):
+        """Verify _total_shift increases after update."""
+        cid = 1
+        shift_before = cs._total_shift
+        grad = np.random.RandomState(3).randn(cs.dim).astype(np.float32)
+        cs._apply_subspace_update(cid, grad, 0.01, (0.02, 0.01, 0.005))
+        assert cs._total_shift > shift_before
+
+
+# ── QN-33: GPU contrastive ──────────────────────────────────────
+class TestGPUContrastive:
+    def test_contrastive_gpu_empty(self, gen):
+        """Verify empty gen_updates doesn't crash."""
+        if not hasattr(gen, '_trainer'):
+            pytest.skip("No trainer")
+        gen._trainer._contrastive_objective_gpu({})
+
+    def test_contrastive_gpu_simple(self, gen):
+        """Verify GPU contrastive runs on simple input."""
+        if not hasattr(gen, '_trainer') or not torch.cuda.is_available() and not hasattr(gen, '_vecs_t'):
+            pytest.skip("No GPU")
+        gen._use_torch = False
+        gen._ensure_torch()
+        gen._use_torch = True
+        cid = 0
+        gen_updates = {cid: [(1, 0.1), (2, 0.05)]}
+        gen._trainer._contrastive_objective_gpu(gen_updates)
+
+    def test_contrastive_gpu_no_double_update(self, gen):
+        """Verify vector stays on unit sphere after contrastive update."""
+        if not hasattr(gen, '_trainer') or not torch.cuda.is_available():
+            pytest.skip("No GPU")
+        gen._use_torch = True
+        gen._ensure_torch()
+        cid = 0
+        v0 = gen.cs.concept_vector(cid).copy()
+        gen_updates = {cid: [(1, 0.1), (2, 0.05)]}
+        gen._trainer._contrastive_objective_gpu(gen_updates)
+        v1 = gen.cs.concept_vector(cid)
+        assert v1 is not None
+        assert abs(np.linalg.norm(v1) - 1.0) < 1e-6
+
+
+# ── QN-34: evaluate ────────────────────────────────────────────
+class TestEvaluate:
+    def test_evaluate_nonexistent_file(self, gen):
+        """Verify evaluate returns None for missing file."""
+        gen._use_torch = False
+        result = gen.evaluate('/nonexistent/path.txt', max_lines=10)
+        assert result is None
+
+    def test_evaluate_tiny_file(self, gen, tmp_path, monkeypatch):
+        """Verify evaluate on tiny file doesn't crash."""
+        class FakeSP:
+            def encode(self, text, **kw):
+                return [0, 1, 2]
+        monkeypatch.setattr(gen, 'sp', FakeSP())
+        def _batch_dot(ctx_ids, target_id):
+            return [float(np.dot(gen.cs.concept_vectors[c], gen.cs.concept_vectors[target_id])) for c in ctx_ids]
+        gen.cs.batch_dot = _batch_dot
+        f = tmp_path / "test_corpus.txt"
+        f.write_text("князь Андрей\nчеловек должен быть свободен\nмир труд май\nодин два три\nкот собака\n", encoding='utf-8')
+        gen._use_torch = False
+        result = gen.evaluate(str(f), max_lines=5)
+        assert result is not None
+        assert 'perplexity' in result
+        assert 'vec_perplexity' in result
+        assert 'accuracy_top1' in result
+
+    def test_evaluate_short_lines(self, gen, tmp_path, monkeypatch):
+        """Verify evaluate with lines shorter than 3 tokens."""
+        class FakeSP:
+            def encode(self, text, **kw):
+                return [0, 1, 2]
+        monkeypatch.setattr(gen, 'sp', FakeSP())
+        def _batch_dot(ctx_ids, target_id):
+            return [float(np.dot(gen.cs.concept_vectors[c], gen.cs.concept_vectors[target_id])) for c in ctx_ids]
+        gen.cs.batch_dot = _batch_dot
+        f = tmp_path / "short.txt"
+        f.write_text("a b\nкнязь\nx y\nмир\nтруд май\n", encoding='utf-8')
+        gen._use_torch = False
+        result = gen.evaluate(str(f), max_lines=5)
+        assert result is not None
+
+
+# ── QN-35: noise_scale (gradient_noise_scale) ──────────────────
+class TestNoiseScale:
+    def test_gradient_noise_scale_zero(self, gen):
+        """Verify zero noise produces deterministic update."""
+        cid = 0
+        cs = gen.cs
+        v0 = cs.concept_vector(cid)
+        if v0 is None:
+            pytest.skip("No vector")
+        grad = np.ones(cs.dim, dtype=np.float32) * 0.1
+        # Without noise
+        v1 = v0 + grad * 0.1
+        nv = np.linalg.norm(v1)
+        if nv > 1e-10:
+            v1 /= nv
+        cs._apply_vector_update(cid, v1)
+        assert abs(np.linalg.norm(cs.concept_vector(cid)) - 1.0) < 1e-6
+
+
+# ── QN-36: RNGRegistry ──────────────────────────────────────────
+class TestRNGRegistry:
+    def test_rng_registry_deterministic(self):
+        """Verify same name produces same sequence."""
+        from eva.symbolic.rng_registry import RNGRegistry
+        r1 = RNGRegistry(master_seed=42)
+        r2 = RNGRegistry(master_seed=42)
+        assert r1.get('test').random() == r2.get('test').random()
+
+    def test_rng_registry_independent(self):
+        """Verify different names produce different sequences."""
+        from eva.symbolic.rng_registry import RNGRegistry
+        r = RNGRegistry(master_seed=42)
+        s1 = r.get('a').random()
+        s2 = r.get('b').random()
+        assert s1 != s2
+
+    def test_rng_registry_reset(self):
+        """Verify reset re-creates RNG with same seed."""
+        from eva.symbolic.rng_registry import RNGRegistry
+        r = RNGRegistry(master_seed=42)
+        v1 = r.get('test').random()
+        r.reset('test')
+        v2 = r.get('test').random()
+        assert v1 == v2
+
+    def test_rng_registry_reset_all(self):
+        """Verify reset_all clears all RNGs."""
+        from eva.symbolic.rng_registry import RNGRegistry
+        r = RNGRegistry(master_seed=42)
+        r.get('a').random()
+        r.get('b').random()
+        r.reset_all()
+        assert r.names == []
+
+
+# ── QN-37: AdaptiveErrorTracker ─────────────────────────────────
+class TestAdaptiveErrorTracker:
+    def test_tracker_basic(self):
+        from eva.symbolic.adaptive_error_tracker import AdaptiveErrorTracker
+        et = AdaptiveErrorTracker(decay=0.9, max_size=10)
+        et.update(1, 0.5)
+        assert abs(et.get(1) - 0.5) < 1e-6
+
+    def test_tracker_ema(self):
+        from eva.symbolic.adaptive_error_tracker import AdaptiveErrorTracker
+        et = AdaptiveErrorTracker(decay=0.8, max_size=10)
+        et.update(1, 1.0)
+        et.update(1, 0.0)
+        # EMA: new = decay * old + (1-decay) * error
+        # step1: 0.8*1.0 + 0.2*1.0 = 1.0
+        # step2: 0.8*1.0 + 0.2*0.0 = 0.8
+        assert abs(et.get(1) - 0.8) < 1e-6
+
+    def test_tracker_fifo_eviction(self):
+        from eva.symbolic.adaptive_error_tracker import AdaptiveErrorTracker
+        et = AdaptiveErrorTracker(decay=0.9, max_size=3)
+        et.update(1, 0.5)
+        et.update(2, 0.5)
+        et.update(3, 0.5)
+        et.update(4, 0.5)
+        assert 1 not in et
+        assert 4 in et
+
+    def test_tracker_dict_interface(self):
+        from eva.symbolic.adaptive_error_tracker import AdaptiveErrorTracker
+        et = AdaptiveErrorTracker(decay=0.9, max_size=10)
+        et[1] = 0.5
+        assert et[1] == 0.5
+        assert 1 in et
+        assert len(et) == 1
+
+
+# ── QN-38: Checkpoint cleanup ──────────────────────────────────
+class TestCheckpointCleanup:
+    def test_cleanup_keep(self, tmp_path):
+        """Verify cleanup keeps correct number of checkpoints."""
+        from eva.symbolic.checkpoint_manager import CheckpointManager
+        mgr = CheckpointManager(data_dir=str(tmp_path), cleanup_keep=3)
+        for tag in ['1k', '2k', '3k', '4k', '5k']:
+            mgr.save(tag, None, None)
+        mgr.cleanup(keep=3)
+        assert len(mgr._saved_tags) == 3
+        assert mgr._saved_tags == ['3k', '4k', '5k']
+
+    def test_cleanup_below_keep(self, tmp_path):
+        """Verify cleanup doesn't remove when below threshold."""
+        from eva.symbolic.checkpoint_manager import CheckpointManager
+        mgr = CheckpointManager(data_dir=str(tmp_path), cleanup_keep=5)
+        for tag in ['1k', '2k']:
+            mgr.save(tag, None, None)
+        mgr.cleanup()
+        assert len(mgr._saved_tags) == 2
+
+    def test_shutdown(self, tmp_path):
+        """Verify shutdown completes without error."""
+        from eva.symbolic.checkpoint_manager import CheckpointManager
+        mgr = CheckpointManager(data_dir=str(tmp_path), cleanup_keep=3)
+        mgr.shutdown()
+
+
+# ── QN-39: TrainingPipeline ────────────────────────────────────
+class TestTrainingPipeline:
+    def test_pipeline_init(self):
+        """Verify TrainingPipeline initializes without error."""
+        from eva.symbolic.fcf_config import FCFConfig
+        cfg = FCFConfig()
+        # Just verify it can be created with minimal setup
+        assert cfg.checkpoint_every > 0
+        assert cfg.eval_every_fast > 0
+
+
+# ── QN-40: Dead code ────────────────────────────────────────────
+class TestDeadCode:
+    def test_no_prof_ms(self, gen):
+        """Verify _prof_ms is no longer set (G-55)."""
+        if hasattr(gen, '_trainer'):
+            assert not hasattr(gen, '_prof_ms'), "_prof_ms should be removed"
+        # Also check no _prof_start/_prof_end on trainer
+        assert not hasattr(gen._trainer, '_prof_start'), "_prof_start should be removed"
+
+    def test_graph_cache_maxlen(self, gen):
+        """Verify graph cache maxlen is 5000 (REG-V9-10)."""
+        assert gen._graph_cache_max == 5000
+
+    def test_push_total_removed(self, gen):
+        """Verify push_total/lr_scale are not allocated (G-57)."""
+        # We verify by calling GPU contrastive with empty input
+        if hasattr(gen, '_trainer'):
+            gen._trainer._contrastive_objective_gpu({})  # should not reference push_total

@@ -64,8 +64,8 @@ class CheckpointManager:
 
     def _sync_save(self, tag, cs, lattice, opt, extras):
         """Synchronous save (runs in thread pool)."""
-        cs_path = os.path.join(self.data_dir, f'cs_{tag}.npz')
-        lat_path = os.path.join(self.data_dir, f'lat_{tag}.npz')
+        cs_path = os.path.join(self.data_dir, f'concept_space_{tag}.json')
+        lat_path = os.path.join(self.data_dir, f'syntax_lattice_{tag}.json')
         tmp_cs = cs_path + '.tmp'
         tmp_lat = lat_path + '.tmp'
         try:
@@ -83,10 +83,13 @@ class CheckpointManager:
                     pass
             return
         if opt is not None:
-            opt_path = os.path.join(self.data_dir, f'opt_{tag}.json')
+            opt_path = os.path.join(self.data_dir, f'concept_space_{tag}.opt.json')
             tmp_opt = opt_path + '.tmp'
             try:
-                opt.save_state(tmp_opt)
+                import json
+                state = opt.save_state()
+                with open(tmp_opt, 'w', encoding='utf-8') as f:
+                    json.dump(state, f)
                 os.replace(tmp_opt, opt_path)
             except Exception as e:
                 print(f"[CheckpointManager] opt save({tag}) failed: {e}")
@@ -104,16 +107,11 @@ class CheckpointManager:
 
     def _remove_tag(self, tag):
         """Remove all files associated with a tag."""
-        for prefix in ['cs_', 'lat_', 'opt_']:
-            path = os.path.join(self.data_dir, f'{prefix}{tag}.npz')
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            json_path = os.path.join(self.data_dir, f'{prefix}{tag}.json')
-            if os.path.exists(json_path):
-                try:
-                    os.remove(json_path)
-                except OSError:
-                    pass
+        for prefix in ['concept_space_', 'syntax_lattice_']:
+            for ext in ['.json', '.npz', '.codes.npz', '.opt.json']:
+                path = os.path.join(self.data_dir, f'{prefix}{tag}{ext}')
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass

@@ -419,7 +419,8 @@ class SyntaxLattice:
 
     def save(self, path):
         """Save to hybrid binary+JSON format."""
-        binary_path = path.replace('.json', '.lattice.npz')
+        clean = path[:-4] if path.endswith('.tmp') else path
+        binary_path = clean.replace('.json', '.lattice.npz')
         # N-grams → npz jagged arrays
         npz_data = {}
         for n in sorted(self.ngrams.keys()):

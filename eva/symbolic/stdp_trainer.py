@@ -20,8 +20,9 @@ class STDPTrainer:
     """STDP training logic for CrystalGenerator.
     Operates on gen.cs, gen.lattice, gen._vecs_t, gen.hormones, gen.concept_error.
     """
-    def __init__(self, gen):
+    def __init__(self, gen, subspace_lr=None):
         self.gen = gen
+        self.subspace_lr = subspace_lr  # (lr_c, lr_a, lr_m) or None for uniform LR
 
     # ═══════════════════════════════════════════════════
     # Public API
@@ -30,22 +31,22 @@ class STDPTrainer:
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_strength=1.0,
                          pmi_gate_min=0.20, neg_samples=1, inh_strength=0.05, inh_threshold=0.10,
                          neg_lr_ratio=0.5, field_gate=True, use_torch=None, destab_scale=0.0,
-                         momentum_mu=0.0):
+                         momentum_mu=0.9, noise_scale=0.0):
         """Train on one text line. Returns number of STDP pairs built."""
         return self._train(text, base_lr, context_window, pmi_strength, pmi_gate_min,
                            neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
                            field_gate, use_torch, destab_scale, batch=False,
-                           momentum_mu=momentum_mu)
+                           momentum_mu=momentum_mu, noise_scale=noise_scale)
 
     def train_batch(self, texts, base_lr=None, context_window=2, pmi_strength=1.0,
                      pmi_gate_min=0.20, neg_samples=1, inh_strength=0.05, inh_threshold=0.10,
                      neg_lr_ratio=0.5, field_gate=True, use_torch=None, destab_scale=0.0,
-                     momentum_mu=0.0):
+                     momentum_mu=0.9, noise_scale=0.0):
         """Train on a batch of texts (GPU batched). Returns total pairs."""
         return self._train(texts, base_lr, context_window, pmi_strength, pmi_gate_min,
                            neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
                            field_gate, use_torch, destab_scale, batch=True,
-                           momentum_mu=momentum_mu)
+                           momentum_mu=momentum_mu, noise_scale=noise_scale)
 
     def evaluate(self, corpus_path, max_lines=500, use_torch=None):
         """Evaluate on a corpus: perplexity, accuracy, vector metrics."""
@@ -57,7 +58,7 @@ class STDPTrainer:
 
     def _train(self, inputs, base_lr, context_window, pmi_strength, pmi_gate_min,
                neg_samples, inh_strength, inh_threshold, neg_lr_ratio, field_gate,
-               use_torch, destab_scale, batch, momentum_mu=0.0):
+               use_torch, destab_scale, batch, momentum_mu=0.9, noise_scale=0.0):
         gen = self.gen
         cs = gen.cs
         if base_lr is None:
@@ -78,9 +79,9 @@ class STDPTrainer:
         gpu_meta_l = []
         gpu_cid_ctx = []
         gpu_cid_gen = []
-        total_freq = gen.lattice.total_freq
         cid_to_idx = {}
         total_pairs = 0
+        total_freq = gen._get_total_freq()
 
         for text in inputs:
             ids = gen._encode_input(text)
@@ -107,7 +108,7 @@ class STDPTrainer:
         if use_torch and gpu_ctx_l:
             unique_gen = self._gpu_stdp_apply(gpu_ctx_l, gpu_tgt_l, gpu_meta_l, gpu_cid_gen,
                 base_lr, field_gate, inh_strength, inh_threshold, destab_scale,
-                momentum_mu=momentum_mu)
+                noise_scale=noise_scale, momentum_mu=momentum_mu)
         else:
             self._cpu_stdp_apply(gen_updates, base_lr, destab_scale, inh_strength, inh_threshold)
 
@@ -139,6 +140,20 @@ class STDPTrainer:
 
         return total_pairs
 
+    def _subspace_update(self, grad, v_gen, base_lr_val):
+        cs = self.gen.cs
+        if self.subspace_lr is None or cs.fractal.basis is None:
+            return v_gen + grad * base_lr_val
+        lr_c, lr_a, lr_m = self.subspace_lr
+        basis = cs.fractal.basis
+        latent_dim = basis.shape[0]
+        mask_c = np.zeros(latent_dim, dtype=np.float32); mask_c[:cs.l_c] = 1.0
+        mask_a = np.zeros(latent_dim, dtype=np.float32); mask_a[cs.l_c:cs.l_c + cs.l_a] = 1.0
+        mask_m = np.zeros(latent_dim, dtype=np.float32); mask_m[cs.l_c + cs.l_a:] = 1.0
+        code_grad = grad @ basis.T
+        code_grad *= (lr_c * mask_c + lr_a * mask_a + lr_m * mask_m)
+        return v_gen + (code_grad @ basis) * base_lr_val
+
     # ═══════════════════════════════════════════════════
     # Pair building
     # ═══════════════════════════════════════════════════
@@ -165,7 +180,7 @@ class STDPTrainer:
                 fb = gen.lattice.concept_freq.get(ids[j], 0)
                 freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
 
-                pmi_w_raw = gen._pmi_weight(ids[i], ids[j], distance=dist, total_freq=total_freq,
+                pmi_w_raw = gen._pmi_weight(ids[i], ids[j], distance=dist,
                                               min_weight=pmi_gate_min)
                 _skip, pmi_w = gen._apply_pmi_gate(pmi_w_raw, pmi_strength, pmi_gate_min, ids[j])
                 if _skip:
@@ -268,15 +283,14 @@ class STDPTrainer:
                             mix = min(destab_scale, 0.5)
                             grad = grad * (1 - mix) + noise * mix
 
-                v_new = v_gen + grad * base_lr_val
-            else:
-                v_new = v_gen
-
-            nv = np.linalg.norm(v_new)
-            if nv > 1e-10:
-                v_new /= nv
-
-            cs._apply_vector_update(gen_cid, v_new)
+                if self.subspace_lr is not None and cs.fractal.basis is not None and cs.fractal.codes.get(gen_cid) is not None:
+                    cs._apply_subspace_update(gen_cid, grad, base_lr_val, self.subspace_lr)
+                else:
+                    v_new = v_gen + grad * base_lr_val
+                    nv = np.linalg.norm(v_new)
+                    if nv > 1e-10:
+                        v_new /= nv
+                    cs._apply_vector_update(gen_cid, v_new)
 
         # Lateral inhibition
         if inh_strength > 0:
@@ -440,18 +454,20 @@ class STDPTrainer:
                 # SN-7: use momentum-smoothed gradient when available
                 if mom_cpu is not None:
                     grad = mom_cpu[gi]
-                v_new = v + grad * base_lr_val
-            else:
-                v_new = v
-
-            nv = np.linalg.norm(v_new)
-            if nv > 1e-10:
-                v_new /= nv
-
-            cs._apply_vector_update(gen_cid, v_new)
-            if gen._vecs_t is not None:
-                gen._vecs_t[gen_cid] = torch.from_numpy(v_new).to(device=device, dtype=gen._vecs_t.dtype, non_blocking=True)
-
+                # T-B3/SN-B1: EMA BEFORE any update (uses old _vecs_t)
+                if gen._vecs_t is not None and gen._ema_vecs_t is not None and gen._ema_steps >= 0:
+                    ema_decay = gen._ema_decay
+                    gen._ema_vecs_t[gen_cid] = ema_decay * gen._ema_vecs_t[gen_cid] + (1 - ema_decay) * gen._vecs_t[gen_cid].float()
+                    gen._ema_steps += 1
+                if self.subspace_lr is not None and cs.fractal.basis is not None and cs.fractal.codes.get(gen_cid) is not None:
+                    cs._apply_subspace_update(gen_cid, grad, base_lr_val, self.subspace_lr)
+                else:
+                    v_new = v + grad * base_lr_val
+                    nv = np.linalg.norm(v_new)
+                    if nv > 1e-10:
+                        v_new /= nv
+                    cs._apply_vector_update(gen_cid, v_new)
+        
         if inh_strength > 0 and len(unique_gen) >= 2:
             self._lateral_inhibition_gpu(unique_gen, inh_strength, inh_threshold, base_lr_val)
 
@@ -488,7 +504,6 @@ class STDPTrainer:
                 if nn > 1e-10:
                     v_new /= nn
                 cs._apply_vector_update(gen_cids[gi], v_new)
-                gen._vecs_t[gen_cids[gi]] = torch.from_numpy(v_new).to(device=device, dtype=gen._vecs_t.dtype, non_blocking=True)
 
     # ═══════════════════════════════════════════════════
     # Negative sampling
@@ -506,6 +521,10 @@ class STDPTrainer:
                 continue
             avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
             neg_lr = avg_elr * neg_lr_ratio * 0.3
+            # SN-B2: concept_error reweighting (applied only when field_gate=True, matching original intent)
+            if field_gate:
+                ce = gen.concept_error.get(gen_cid, 0.0)
+                neg_lr *= (1.0 + ce * 2.0)
             neg_candidates = gen.main_rng.sample(total_vocab, min(neg_samples, len(total_vocab)))
             for neg_cid in neg_candidates:
                 if neg_cid == gen_cid:
@@ -542,40 +561,36 @@ class STDPTrainer:
         gv = gen._vecs_t[gen_t].float()
 
         noise = torch.randint(0, n_v, (len(unique_gen), n_neg), device=device)
-        all_cands = noise[..., 0]
-        for ni in range(1, n_neg):
-            cand = torch.randint(0, n_v, (len(unique_gen),), device=device)
-            all_cands = torch.stack([all_cands, cand], dim=0)
-        all_cands = all_cands.T
-
         ngv = gen._vecs_t[noise].float()
         sim = (gv[:, None, :] * ngv).sum(dim=-1)
         mask = sim > 0.1
         device_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
         elr_sum = (torch.clamp(device_t[:, _META_FW], min=0.05) *
                    device_t[:, _META_DW] * device_t[:, _META_PMI] * device_t[:, _META_FIELD_W]).sum().item()
-        neg_lr = (elr_sum / max(len(gpu_ctx_l), 1)) * neg_lr_ratio * 0.2
+        neg_lr = (elr_sum / max(len(gpu_ctx_l), 1)) * neg_lr_ratio * 0.3
 
         for gi, gen_cid in enumerate(unique_gen):
+            neg_lr_i = neg_lr
+            ce = gen.concept_error.get(gen_cid, 0.0)
+            neg_lr_i *= (1.0 + ce * 2.0)
             neg_mask = mask[gi]
             if not neg_mask.any():
                 continue
             valid_idx = noise[gi][neg_mask]
             vg_i = gv[gi]
             vg_i_2d = vg_i.unsqueeze(0)
-            grad = (gen._vecs_t[valid_idx].float() - (sim[gi][neg_mask][:, None] * vg_i_2d) * vg_i_2d).mean(dim=0)
+            grad = (gen._vecs_t[valid_idx].float() - sim[gi][neg_mask][:, None] * vg_i_2d).mean(dim=0)
             gn = grad.norm()
             if gn > 1e-10:
                 grad = grad / gn * min(gn, 1.0)
                 v_np = cs.concept_vectors.get(gen_cid)
                 if v_np is None:
                     continue
-                v_new = v_np - grad.cpu().numpy() * neg_lr
+                v_new = v_np - grad.cpu().numpy() * neg_lr_i
                 nn = np.linalg.norm(v_new)
                 if nn > 1e-10:
                     v_new /= nn
                 cs._apply_vector_update(gen_cid, v_new)
-                gen._vecs_t[gen_cid] = torch.from_numpy(v_new).to(device=device, dtype=gen._vecs_t.dtype, non_blocking=True)
 
     # ═══════════════════════════════════════════════════
     # Contrastive objective
@@ -615,6 +630,16 @@ class STDPTrainer:
                 v_neg = cs.concept_vectors.get(neg_cid)
                 if v_neg is None:
                     continue
+                # SN-16: Field-Aware Contrastive Decoupling
+                overlap = 0
+                fb_gen = gen.cs.fractal.field_bits.get(gen_cid)
+                fb_neg = gen.cs.fractal.field_bits.get(neg_cid)
+                if fb_gen is not None and fb_neg is not None:
+                    overlap = int((fb_gen & fb_neg).sum())
+                if overlap == 0 and cos_val > 0.05:
+                    pass  # aggressive push for cross-field
+                elif overlap > 0 and cos_val > 0.3:
+                    continue  # skip gentle push for same-field beyond threshold
                 contr_grad = cos_val * v_neg - v_gen
                 gn = float(np.linalg.norm(contr_grad))
                 if gn > gen.max_grad_norm > 0:
@@ -634,62 +659,99 @@ class STDPTrainer:
         if not gen_cids:
             return
         n_v = gen._vecs_t.shape[0]
+        ng = len(gen_cids)
 
-        contr_lrs = []
-        gen_idxs = []
-        for gen_cid in gen_cids:
+        contr_lrs = torch.zeros(ng, device=d)
+        gen_idxs = gen_cids[:]
+        for i, gen_cid in enumerate(gen_cids):
             updates = gen_updates[gen_cid]
             avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
-            contr_lr = avg_elr * 0.3
-            contr_lr *= (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0)
-            contr_lrs.append(contr_lr)
-            gen_idxs.append(gen_cid)
+            contr_lrs[i] = avg_elr * 0.3 * (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0)
 
         g_vecs = gen._vecs_t[gen_idxs].float()
         all_vecs = gen._vecs_t[:n_v].float()
         sim = g_vecs @ all_vecs.T
 
-        cooc_sets = {gc: {ctx for ctx, _ in gen_updates[gc]} for gc in gen_cids}
         with torch.no_grad():
-            for i, gen_cid in enumerate(gen_cids):
-                contr_lr = contr_lrs[i]
-                gi_sim = sim[i]
-                topk = gi_sim.topk(min(2000, n_v))
-                neg_cands = [(int(topk.indices[j].item()), float(topk.values[j].item())) for j in range(min(2000, n_v))]
-                hard_negatives = []
-                cooc_set = cooc_sets[gen_cid]
-                for neg_cid, cos_val in neg_cands:
-                    if neg_cid == gen_cid or neg_cid in cooc_set:
-                        continue
-                    if gen.lattice.connection_strength(gen_cid, neg_cid) > 0.1:
-                        continue
-                    if cos_val > 0.05 and cos_val < 0.5:
-                        hard_negatives.append((neg_cid, cos_val))
-                        if len(hard_negatives) >= 5:
-                            break
+            topk = sim.topk(min(2000, n_v), dim=-1)
+            topk_idx = topk.indices
+            topk_val = topk.values
 
-                if not hard_negatives:
-                    continue
-                v_gen = cs.concept_vectors.get(gen_cid)
-                if v_gen is None:
-                    continue
-                v_gen_t = torch.from_numpy(v_gen).to(device=d, dtype=torch.float32)
-                for neg_cid, cos_val in hard_negatives:
-                    v_neg = cs.concept_vectors.get(neg_cid)
-                    if v_neg is None:
-                        continue
-                    v_neg_t = torch.from_numpy(v_neg).to(device=d, dtype=torch.float32)
-                    contr_grad = cos_val * v_neg_t - v_gen_t
-                    gn = contr_grad.norm()
-                    if gn > gen.max_grad_norm > 0:
-                        contr_grad = contr_grad / gn * gen.max_grad_norm
-                    push = contr_grad * contr_lr
-                    v_new = v_gen_t + push
-                    nv = v_new.norm()
-                    if nv > 1e-10:
-                        v_new /= nv
-                    cs._apply_vector_update(gen_cid, v_new.cpu().numpy())
-                    gen._vecs_t[gen_cid] = v_new.to(dtype=gen._vecs_t.dtype)
+            mask_self = topk_idx == torch.arange(ng, device=d)[:, None]
+            valid = ~mask_self
+
+            if valid.any():
+                max_hard = min(5, topk_idx.shape[1])
+                best_idx = topk_idx[:, :max_hard]
+                best_val = topk_val[:, :max_hard]
+
+                push_total = torch.zeros(ng, g_vecs.shape[1], device=d)
+                lr_scale = torch.zeros(ng, device=d)
+                for i in range(ng):
+                    hn = []
+                    for j in range(max_hard):
+                        neg_cid = int(best_idx[i, j].item())
+                        if neg_cid == gen_idxs[i]:
+                            continue
+                        cooc_set = {ctx for ctx, _ in gen_updates[gen_idxs[i]]}
+                        if neg_cid in cooc_set:
+                            continue
+                        if gen.lattice.connection_strength(gen_idxs[i], neg_cid) > 0.1:
+                            continue
+                        cos_val = float(best_val[i, j].item())
+                        # SN-16: Field-Aware Contrastive Decoupling
+                        overlap = 0
+                        if gen._fb_t is not None:
+                            fb_gen = gen._fb_t[gen_idxs[i]]
+                            fb_neg = gen._fb_t[neg_cid]
+                            overlap = int(torch.bitwise_and(fb_gen, fb_neg).sum().item())
+                        max_cos_upper = 0.3 if overlap > 0 else 0.999
+                        if cos_val > 0.05 and cos_val < max_cos_upper:
+                            hn.append(neg_cid)
+                            if len(hn) >= 5:
+                                break
+                    # TN-14: Field-Aware Contrastive Regularization (cross-field penalty)
+                    v_local = g_vecs[i].clone()
+                    if gen._fb_t is not None:
+                        reg_lam = 0.05
+                        reg_thresh = 0.2
+                        for j in range(min(50, topk_idx.shape[1])):
+                            rcid = int(topk_idx[i, j].item())
+                            if rcid == gen_idxs[i]:
+                                continue
+                            rc = set(ctx for ctx, _ in gen_updates.get(gen_idxs[i], []))
+                            if rcid in rc:
+                                continue
+                            rcos = float(topk_val[i, j].item())
+                            if rcos > reg_thresh:
+                                fb_gn = gen._fb_t[gen_idxs[i]]
+                                fb_rn = gen._fb_t[rcid]
+                                ro = int(torch.bitwise_and(fb_gn, fb_rn).sum().item())
+                                if ro == 0:
+                                    v_repel = gen._vecs_t[rcid].float()
+                                    rep_grad = rcos * v_repel - v_local
+                                    rn = rep_grad.norm()
+                                    if rn > gen.max_grad_norm > 0:
+                                        rep_grad = rep_grad / rn * gen.max_grad_norm
+                                    v_local = v_local + rep_grad * contr_lrs[i] * reg_lam
+                    if hn:
+                        v_neg = gen._vecs_t[hn].float()
+                        cos_v = best_val[i, :len(hn)]
+                        grad = (cos_v[:, None] * v_neg).mean(dim=0) - v_local
+                        gn = grad.norm()
+                        if gn > gen.max_grad_norm > 0:
+                            grad = grad / gn * gen.max_grad_norm
+                        push = grad * contr_lrs[i]
+                        v_new = v_local + push
+                        nv = v_new.norm()
+                        if nv > 1e-10:
+                            v_new /= nv
+                        cs._apply_vector_update(gen_idxs[i], v_new.cpu().numpy())
+                    elif (v_local != g_vecs[i]).any():
+                        nv = v_local.norm()
+                        if nv > 1e-10:
+                            v_local /= nv
+                        cs._apply_vector_update(gen_idxs[i], v_local.cpu().numpy())
 
     # ═══════════════════════════════════════════════════
     # Centroid pull

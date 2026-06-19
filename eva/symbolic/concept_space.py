@@ -553,6 +553,35 @@ class ConceptSpace:
         if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
             self._after_update_hook(cid, v_new)
 
+    def _apply_subspace_update(self, cid, grad, base_lr_val, subspace_lr):
+        v_old = self.concept_vectors.get(cid)
+        code = self.fractal.codes.get(cid)
+        if code is None or self.fractal.basis is None:
+            return
+        lr_c, lr_a, lr_m = subspace_lr
+        basis = self.fractal.basis
+        latent_dim = basis.shape[0]
+        mask_c = np.zeros(latent_dim, dtype=np.float32); mask_c[:self.l_c] = 1.0
+        mask_a = np.zeros(latent_dim, dtype=np.float32); mask_a[self.l_c:self.l_c + self.l_a] = 1.0
+        mask_m = np.zeros(latent_dim, dtype=np.float32); mask_m[self.l_c + self.l_a:] = 1.0
+        code_grad = grad @ basis.T
+        code_grad *= (lr_c * mask_c + lr_a * mask_a + lr_m * mask_m)
+        code_new = code + code_grad * base_lr_val
+        v_new = code_new @ basis
+        nv = np.linalg.norm(v_new)
+        if nv > 1e-10:
+            v_new /= nv
+            code_new /= nv
+        if v_old is not None:
+            shift = float(np.linalg.norm(v_new - v_old))
+            self._total_shift += shift
+            self._update_count += 1
+        self.set_vec(cid, v_new)
+        self.fractal.codes[cid] = code_new
+        self.fractal._matrix_dirty = True
+        if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
+            self._after_update_hook(cid, v_new)
+
     def _lateral_inhibition_fractal(self, winner_cid, strength=0.01, threshold=0.35, sample_size=None):
         """Lateral inhibition with correct Riemannian gradient, vectorised.
 
@@ -732,7 +761,8 @@ class ConceptSpace:
             use_pq: if True, save PQ-compressed format (much smaller).
         """
         # Binary .npz for fractal codes
-        binary_path = path.replace('.json', '.codes.npz')
+        clean = path[:-4] if path.endswith('.tmp') else path
+        binary_path = clean.replace('.json', '.codes.npz')
         data = {
             'dim': self.dim,
             'vocab_size': self.vocab_size,

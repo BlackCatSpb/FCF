@@ -96,8 +96,9 @@ class CrystalGenerator:
 
         self.train_lr = 0.01
 
-        # STDPTrainer — delegated training methods
-        self._trainer = None
+        # STDPTrainer — delegated training methods (created eagerly for AM-24)
+        self._trainer = STDPTrainer(self)
+        self._use_torch = _HAS_TORCH and torch.cuda.is_available()
 
         # Torch state (lazy init, invalidated by fluctuate_fractal)
         self._torch_device = None
@@ -152,7 +153,7 @@ class CrystalGenerator:
     def _on_vector_update(self, cid, v_new):
         """Hook called by ConceptSpace._apply_vector_update to keep _vecs_t in sync."""
         if self._vecs_t is not None:
-            self._vecs_t[cid] = torch.from_numpy(v_new.astype(np.float32)).to(self._vecs_t.device).to(self._vecs_t.dtype)
+            self._vecs_t[cid].copy_(torch.from_numpy(v_new).to(device=self._vecs_t.device, dtype=self._vecs_t.dtype, non_blocking=True))
 
     def _ensure_torch(self, device=None):
         """Precompute GPU tensors for batched training. Rebuilds if dirty."""
@@ -240,6 +241,20 @@ class CrystalGenerator:
         """Mark GPU tensors as stale; triggers rebuild on next _ensure_torch.
         Call after fluctuate_fractal() or any code-level change."""
         self._torch_dirty = True
+
+    def _sync_ema(self):
+        """SN-18: Copy EMA vectors → _vecs_t for stable eval/generation.
+        Saves original _vecs_t backup internally. Call restore_vectors() after eval."""
+        if self._ema_vecs_t is None or self._vecs_t is None:
+            return
+        self._eval_backup = self._vecs_t.float().clone()
+        self._vecs_t.copy_(self._ema_vecs_t.to(self._vecs_t.dtype))
+
+    def _restore_vectors(self):
+        """SN-18: Restore _vecs_t from backup saved by _sync_ema()."""
+        if hasattr(self, '_eval_backup') and self._eval_backup is not None and self._vecs_t is not None:
+            self._vecs_t.copy_(self._eval_backup.to(self._vecs_t.dtype))
+            self._eval_backup = None
 
     def _ensure_fb_tensor(self, dev=None):
         """Lazy-build _fb_t field bit tensor (only if field_gate is needed)."""
@@ -740,473 +755,30 @@ class CrystalGenerator:
             pmi_w = 1.0
         return False, pmi_w
 
-    # ── Training ───────────────────────────────────────────────
-
-    def _gpu_stdp_apply(self, gpu_ctx_l: List[int], gpu_tgt_l: List[int], gpu_meta_l: List[Tuple[float, ...]], gpu_cid_gen: List[int], base_lr_val: float,
-                         field_gate: bool, inh_strength: float, inh_threshold: float, destab_scale: float) -> np.ndarray:
-        """GPU batched STDP: field overlaps, LR compute, scatter_add, updates, lateral inhibition."""
-        cs = self.cs
-        device = self._torch_device
-        ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
-        tgt_t = torch.tensor(gpu_tgt_l, dtype=torch.long, device=device)
-        N = len(gpu_ctx_l)
-
-        with torch.no_grad():
-            meta_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
-            i_pos = meta_t[:, _META_I]
-            j_pos = meta_t[:, _META_J]
-            dist = j_pos - i_pos
-            pmi_w_t = meta_t[:, _META_PMI]
-            dw_t = meta_t[:, _META_DW]
-            fw_t = meta_t[:, _META_FW]
-            field_w_t = meta_t[:, _META_FIELD_W]
-
-            lr = torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w_t
-            lr *= (0.5 + self.hormones.acetylcholine * 0.5) * (0.5 + self.hormones.dopamine * 0.5)
-            theta = torch.exp(-torch.clamp(dist, max=5.0) / max(self.theta_tau, 1.0))
-            effective_lr = lr * torch.clamp(theta, min=0.1)
-
-            gen_cids_arr = np.array(gpu_cid_gen, dtype=np.int32)
-            unique_gen, inv_idx = np.unique(gen_cids_arr, return_inverse=True)
-            inv_t = torch.from_numpy(inv_idx).to(device, non_blocking=True)
-
-            elr_grouped = torch.zeros(len(unique_gen), device=device)
-            elr_grouped.scatter_add_(0, inv_t, effective_lr)
-
-            vc = self._vecs_t[ctx_t].float()
-            vg = self._vecs_t[tgt_t].float()
-            y = torch.clamp((vg * vc).sum(dim=1), min=0.05)
-            pair_delta = vc * effective_lr[:, None] - vg * (y * effective_lr)[:, None]
-
-            D = cs.dim
-            acc = torch.zeros(len(unique_gen), D, dtype=torch.float32, device=device)
-            acc.scatter_add_(0, inv_t[:, None].expand(-1, D), pair_delta)
-            cnt = torch.zeros(len(unique_gen), device=device)
-            cnt.scatter_add_(0, inv_t, torch.ones(N, device=device))
-
-            # Per-concept prediction error tracking (Level 2, deduplicated)
-            err_per_pair = 1.0 - y
-            err_grouped = torch.zeros(len(unique_gen), device=device)
-            err_grouped.scatter_add_(0, inv_t, err_per_pair)
-            cnt_err = torch.zeros(len(unique_gen), device=device)
-            cnt_err.scatter_add_(0, inv_t, torch.ones(N, device=device))
-            avg_err_cpu = (err_grouped / cnt_err.clamp(min=1)).cpu().numpy()
-            for gi, gen_cid in enumerate(unique_gen):
-                self.concept_error.update(gen_cid, float(avg_err_cpu[gi]))
-
-        acc_cpu = acc.cpu().numpy()
-        cnt_cpu = cnt.cpu().numpy()
-        elr_cpu = elr_grouped.cpu().numpy()
-
-        # Apply updates + lateral inhibition (batched on GPU)
-        gen_vecs = []
-        gen_cids_list = []
-        for gi, gen_cid in enumerate(unique_gen):
-            v = cs.concept_vectors.get(gen_cid)
-            if v is None or cnt_cpu[gi] < 0.5:
-                continue
-            if destab_scale > 0 and self.main_rng.random() < destab_scale * 0.3:
-                ppmi_candidates = self.lattice.connections_of(
-                    gen_cid, top_k=20, use_ppmi=True)
-                if ppmi_candidates:
-                    ppmi_cid = ppmi_candidates[self.main_rng.randint(0, len(ppmi_candidates) - 1)][0]
-                    v_ppmi = cs.concept_vectors.get(ppmi_cid)
-                else:
-                    v_ppmi = self._destab_field_fallback(gen_cid, v)
-                if v_ppmi is not None:
-                    y_ppmi = max(float(np.dot(v, v_ppmi)), 0.05)
-                    noise = (v_ppmi - y_ppmi * v)
-                    nlen = float(np.linalg.norm(noise))
-                    if nlen > 1e-10:
-                        noise /= nlen
-                        mix = min(destab_scale, 0.5)
-                        acc_cpu[gi] = acc_cpu[gi] * (1 - mix) + noise * mix
-
-            grad = acc_cpu[gi] / max(elr_cpu[gi], 1e-10)
-            gn = float(np.linalg.norm(grad))
-            if gn > self.max_grad_norm > 0:
-                grad = grad / gn * self.max_grad_norm
-            v_new = v + grad * base_lr_val
-            nv = np.linalg.norm(v_new)
-            if nv > 1e-10:
-                v_new /= nv
-            cs._apply_vector_update(gen_cid, v_new)
-            gen_vecs.append(v_new)
-            gen_cids_list.append(gen_cid)
-
-        # EMA update for affected CIDs (Polyak averaging)
-        self._ema_steps += 1
-        if self._ema_vecs_t is not None and gen_cids_list:
-            ema_cids = torch.tensor(gen_cids_list, device=device)
-            with torch.no_grad():
-                self._ema_vecs_t[ema_cids] = (
-                    self._ema_decay * self._ema_vecs_t[ema_cids]
-                    + (1 - self._ema_decay) * torch.from_numpy(np.array(gen_vecs, dtype=np.float32)).to(device, non_blocking=True)
-                )
-
-        # Lateral inhibition: CPU (sampling) for small batches (<50 gen), GPU (full-V) for large
-        if gen_vecs and inh_strength > 0:
-            if len(gen_vecs) < 50:
-                for gi, gen_cid in enumerate(gen_cids_list):
-                    total_elr = float(elr_cpu[gi])
-                    str_val = inh_strength * total_elr
-                    if str_val < 1e-8:
-                        continue
-                    cs._lateral_inhibition_fractal(
-                        gen_cid,
-                        strength=str_val,
-                        threshold=max(inh_threshold, 0.01),
-                        sample_size=min(100, len(cs.concept_vectors)),
-                    )
-            else:
-                gen_cids_t = torch.tensor(gen_cids_list, device=device)
-                gv_t = torch.from_numpy(np.array(gen_vecs, dtype=np.float32)).to(device, non_blocking=True)
-                if self._vecs_t.dtype == torch.float16:
-                    gv_t = gv_t.half()
-                self._vecs_t[gen_cids_t] = gv_t
-                gv_all = self._vecs_t
-                sims = gv_t @ gv_all.T
-                for gi, gen_cid in enumerate(gen_cids_list):
-                    threshold = max(inh_threshold, 0.01)
-                    total_elr = float(elr_cpu[gi])
-                    str_val = inh_strength * total_elr
-                    if str_val < 1e-8:
-                        continue
-                    below = sims[gi] < -0.5
-                    above = sims[gi] > threshold
-                    inhibit = above & ~below
-                    if inhibit.sum() < 1:
-                        continue
-                    targets = torch.where(inhibit)[0]
-                    if len(targets) > 100:
-                        top_sim, top_idx = torch.topk(sims[gi], k=100)
-                        targets = top_idx[top_sim > threshold]
-                    if len(targets) < 1:
-                        continue
-                    v_self = gv_t[gi]
-                    v_opp = gv_all[targets]
-                    dot = (v_self * v_opp).sum(dim=1)
-                    delta = str_val * (dot[:, None] * v_opp - v_self[None, :])
-                    delta_cpu = delta.cpu().numpy()
-                    target_cids = targets.cpu().numpy()
-                    unique_cids, inv_idx = np.unique(target_cids, return_inverse=True)
-                    delta_sum = np.zeros((len(unique_cids), delta_cpu.shape[1]), dtype=np.float32)
-                    np.add.at(delta_sum, inv_idx, delta_cpu)
-                    for ui, ucid in enumerate(unique_cids):
-                        v_t = cs.concept_vectors.get(int(ucid))
-                        if v_t is not None:
-                            v_new_t = v_t + delta_sum[ui]
-                            nt = np.linalg.norm(v_new_t)
-                            if nt > 1e-10:
-                                v_new_t /= nt
-                            cs._apply_vector_update(int(ucid), v_new_t)
-
-        return unique_gen
-
-    def _cpu_stdp_apply(self, gen_updates: Dict[int, List[Tuple[int, float]]], base_lr_val: float, destab_scale: float, inh_strength: float, inh_threshold: float) -> None:
-        """One combined STDP update per unique gen_cid (batched numpy) with destab support."""
-        cs = self.cs
-        best_gen_cid = None
-        best_total_elr = 0.0
-        for gen_cid, updates in gen_updates.items():
-            v_gen = cs.concept_vectors.get(gen_cid)
-            if v_gen is None or not updates:
-                continue
-
-            n_updates = len(updates)
-            ctx_cids, elrs = zip(*updates)
-            valid_ctx = []
-            valid_elr = []
-            for cid, elr in zip(ctx_cids, elrs):
-                v = cs.concept_vectors.get(cid)
-                if v is not None:
-                    valid_ctx.append(v)
-                    valid_elr.append(elr)
-
-            if not valid_ctx:
-                continue
-
-            ctx_mat = np.array(valid_ctx, dtype=np.float32)
-            elr_arr = np.array(valid_elr, dtype=np.float32)
-            total_elr = float(elr_arr.sum())
-
-            y = np.maximum(v_gen @ ctx_mat.T, 0.05)
-
-            # Per-concept prediction error tracking (Level 2, deduplicated)
-            err = 1.0 - float(np.mean(y))
-            self.concept_error.update(gen_cid, err)
-
-            total_delta = ((ctx_mat * elr_arr[:, None]).sum(axis=0) -
-                          v_gen * (y * elr_arr).sum())
-
-            if n_updates > 0 and total_elr > 0:
-                grad = total_delta / max(total_elr, 1e-10)
-                gn = float(np.linalg.norm(grad))
-                if gn > self.max_grad_norm > 0:
-                    grad = grad / gn * self.max_grad_norm
-
-                if destab_scale > 0 and self.main_rng.random() < destab_scale * 0.3:
-                    ppmi_candidates = self.lattice.connections_of(
-                        gen_cid, top_k=20, use_ppmi=True)
-                    if ppmi_candidates:
-                        ppmi_cid = ppmi_candidates[self.main_rng.randint(0, len(ppmi_candidates) - 1)][0]
-                        v_ppmi = cs.concept_vectors.get(ppmi_cid)
-                    else:
-                        v_ppmi = self._destab_field_fallback(gen_cid, v_gen)
-                    if v_ppmi is not None:
-                        y_ppmi = max(float(np.dot(v_gen, v_ppmi)), 0.05)
-                        noise = (v_ppmi - y_ppmi * v_gen)
-                        nlen = float(np.linalg.norm(noise))
-                        if nlen > 1e-10:
-                            noise /= nlen
-                            mix = min(destab_scale, 0.5)
-                            grad = grad * (1 - mix) + noise * mix
-
-                v_new = v_gen + grad * base_lr_val
-            else:
-                v_new = v_gen
-
-            nv = np.linalg.norm(v_new)
-            if nv > 1e-10:
-                v_new /= nv
-
-            cs._apply_vector_update(gen_cid, v_new)
-
-            if total_elr > best_total_elr:
-                best_total_elr = total_elr
-                best_gen_cid = gen_cid
-
-        # ── Lateral inhibition (all gen_cids with sufficient elr) ──
-        if not inh_strength > 0:
-            return
-
-        for gen_cid, updates in gen_updates.items():
-            v_gen = cs.concept_vectors.get(gen_cid)
-            if v_gen is None or not updates:
-                continue
-            total_elr = sum(elr for _, elr in updates)
-            str_val = inh_strength * total_elr
-            if str_val < 1e-8:
-                continue
-            cs._lateral_inhibition_fractal(
-                gen_cid,
-                strength=str_val,
-                threshold=max(inh_threshold, 0.01),
-                sample_size=min(100, len(cs.concept_vectors)),
-            )
-
-    def _negative_sampling_gpu(self, gpu_ctx_l, gpu_meta_l, gpu_cid_ctx, gpu_cid_gen, device, field_gate, base_lr_val, neg_lr_ratio, neg_samples):
-        """GPU-vectorized negative sampling (fully batched)."""
-        cs = self.cs
-        n_pairs = len(gpu_ctx_l)
-        if n_pairs == 0:
-            return
-
-        ctx_t = torch.tensor(gpu_ctx_l, dtype=torch.long, device=device)
-
-        with torch.no_grad():
-            # Filter to valid CIDs only
-            valid_idxs = [i for i, cid in enumerate(self._torch_cid_order) if self.cs.concept_vectors.valid[int(cid)]]
-            if len(valid_idxs) < 2:
-                return
-            valid_t = torch.tensor(valid_idxs, device=device)
-            neg_idxs = valid_t[torch.randint(0, len(valid_t), (n_pairs, neg_samples), device=device)]
-
-            # Field overlap filter
-            # When _fb_t is None (no field_bits loaded), all negatives pass as valid
-            if field_gate:
-                if self._fb_t is None:
-                    self._ensure_fb_tensor(device)
-            if field_gate and self._fb_t is not None:
-                ctx_fb = self._fb_t[ctx_t]
-                neg_fb = self._fb_t[neg_idxs]
-                neg_ovs = (ctx_fb.unsqueeze(1) & neg_fb).sum(dim=2)
-                valid_mask = neg_ovs == 0
-            else:
-                valid_mask = torch.ones(n_pairs, neg_samples, dtype=torch.bool, device=device)
-
-            # Flatten: collect all valid (pair, neg) combos
-            valid_idx = torch.nonzero(valid_mask)  # (N_valid, 2) — [pi, ni]
-            if valid_idx.numel() == 0:
-                return
-            valid_pi = valid_idx[:, 0]
-            valid_ni = valid_idx[:, 1]
-            n_valid = len(valid_pi)
-
-            # LR per valid sample (vectorized from meta)
-            meta_arr = np.array(gpu_meta_l, dtype=np.float32)
-            i_arr = meta_arr[:, _META_I].astype(np.int32)
-            j_arr = meta_arr[:, _META_J].astype(np.int32)
-            dist_arr = np.abs(j_arr - i_arr)
-            theta_gate_arr = np.exp(-np.minimum(dist_arr, 5.0) / max(self.theta_tau, 1.0))
-            neg_elr_arr = np.maximum(meta_arr[:, _META_FW], 0.05) * meta_arr[:, _META_DW] * meta_arr[:, _META_PMI] * meta_arr[:, _META_FIELD_W] * neg_lr_ratio * np.maximum(theta_gate_arr, 0.1)
-            neg_elr_arr *= (0.5 + self.hormones.acetylcholine * 0.5) * (0.5 + self.hormones.dopamine * 0.5)
-            # Adaptive concept_error weighting: high error → stronger push-away (vectorized GPU)
-            valid_elr_t = torch.from_numpy(neg_elr_arr[valid_pi.cpu().numpy()]).to(device, non_blocking=True)
-            if hasattr(self, '_ce_t') and self._ce_t is not None:
-                gpu_cid_gen_t = torch.tensor(gpu_cid_gen, device=device)
-                valid_ce = self._ce_t[gpu_cid_gen_t][valid_pi]  # (n_valid,)
-                valid_ce = valid_ce.to(dtype=valid_elr_t.dtype)
-                valid_elr_t *= (1.0 + valid_ce * 2.0)
-
-            # Gather neg CIDs and vectors from _vecs_t
-            # _torch_cid_order = list(range(V)), so neg_idxs are already CIDs
-            valid_neg_cids = neg_idxs[valid_pi, valid_ni]  # (n_valid,)
-            valid_ctx_cids = torch.tensor(gpu_cid_ctx, device=device)[valid_pi]  # (n_valid,)
-
-            v_neg = self._vecs_t[valid_neg_cids].float()   # (n_valid, D)
-            v_ctx = self._vecs_t[valid_ctx_cids].float()    # (n_valid, D)
-
-            # Vectorized push-away: shift = (y * v_neg - v_ctx) * elr
-            sims = (v_neg * v_ctx).sum(dim=1, keepdim=True).clamp(min=0.05)  # (n_valid, 1)
-            shifts = (sims * v_neg - v_ctx) * valid_elr_t[:, None]  # (n_valid, D)
-
-            # Accumulate shifts + total_elr by unique neg CID (scatter_add_), normalize, apply base_lr_val
-            unique_neg_cids, inverse = torch.unique(valid_neg_cids, return_inverse=True)
-            n_unique = len(unique_neg_cids)
-            D = v_neg.shape[1]
-            acc_shifts = torch.zeros(n_unique, D, device=device, dtype=shifts.dtype)
-            acc_shifts.scatter_add_(0, inverse[:, None].expand(-1, D), shifts)
-            acc_elr = torch.zeros(n_unique, device=device, dtype=valid_elr_t.dtype)
-            acc_elr.scatter_add_(0, inverse, valid_elr_t)
-
-            # Normalize by total_elr, then apply base_lr_val as step size (matching CPU STDP pattern)
-            v_cur = self._vecs_t[unique_neg_cids].float()  # (n_unique, D)
-            grad = acc_shifts / acc_elr[:, None].clamp(min=1e-10)
-            if self.max_grad_norm > 0:
-                gn = torch.norm(grad, dim=1, keepdim=True).clamp(min=1e-10)
-                grad = torch.where(gn > self.max_grad_norm, grad / gn * self.max_grad_norm, grad)
-            v_new = v_cur + grad * base_lr_val
-            norms = torch.norm(v_new, dim=1, keepdim=True).clamp(min=1e-10)
-            v_new = v_new / norms
-
-            # Apply — one _apply_vector_update per unique neg CID
-            for ui in range(n_unique):
-                cs._apply_vector_update(int(unique_neg_cids[ui]), v_new[ui].cpu().numpy())
-
-    def _negative_sampling_cpu(self, gen_updates, neg_lr_ratio, field_gate, neg_samples):
-        """Original negative sampling (non-torch path)."""
-        cs = self.cs
-        for gen_cid, updates in gen_updates.items():
-            for prev_cid, elr in updates:
-                neg_elr = elr * neg_lr_ratio
-                neg_elr *= (1.0 + self.concept_error.get(gen_cid, 0.0) * 2.0)
-                v_ctx = cs.get_vec(prev_cid)
-                if v_ctx is None:
-                    continue
-                for _ in range(neg_samples):
-                    neg_cid = cs.rng.randint(0, cs.vocab_size)
-                    v_neg = cs.get_vec(neg_cid)
-                    if v_neg is None:
-                        continue
-                    if field_gate and hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
-                        neg_overlap = cs.fractal.field_overlap(prev_cid, neg_cid)
-                        if neg_overlap > 0:
-                            continue
-                    y = max(float(np.dot(v_neg, v_ctx)), 0.05)
-                    grad = y * v_neg - v_ctx
-                    gn = float(np.linalg.norm(grad))
-                    if gn > self.max_grad_norm > 0:
-                        grad = grad / gn * self.max_grad_norm
-                    shift = grad * neg_elr
-                    v_new = v_neg + shift
-                    nv = np.linalg.norm(v_new)
-                    if nv > 1e-10:
-                        v_new /= nv
-                    cs._apply_vector_update(neg_cid, v_new)
-
-    def _contrastive_objective(self, gen_updates):
-        """Hard-negative mining via PPMI: push similar non-co-occurring pairs.
-        Uses GPU tensor ops when _vecs_t is available for 10-15x throughput."""
-        if self._vecs_t is not None and self._use_torch:
-            self._contrastive_objective_gpu(gen_updates)
-        else:
-            self._contrastive_objective_cpu(gen_updates)
-
-    def _contrastive_objective_cpu(self, *a, **kw):
-        if self._trainer is None: self._trainer = STDPTrainer(self)
-        return self._trainer._contrastive_objective_cpu(*a, **kw)
-
-    def _contrastive_objective_gpu(self, *a, **kw):
-        if self._trainer is None: self._trainer = STDPTrainer(self)
-        return self._trainer._contrastive_objective_gpu(*a, **kw)
 
     def train_from_text(self, text, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20, neg_samples=1,
                         inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5, field_gate=True, use_torch=None,
-                        destab_scale=0.0):
+                        destab_scale=0.0, momentum_mu=0.9, noise_scale=0.0):
         """Delegate to STDPTrainer for STDP training on one text."""
-        if self._trainer is None:
-            self._trainer = STDPTrainer(self)
         return self._trainer.train_from_text(text, base_lr, context_window, pmi_strength, pmi_gate_min,
                                               neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
-                                              field_gate, use_torch, destab_scale)
+                                              field_gate, use_torch, destab_scale,
+                                              momentum_mu=momentum_mu, noise_scale=noise_scale)
 
     def train_batch(self, texts, base_lr=None, context_window=2, pmi_strength=1.0, pmi_gate_min=0.20,
                     neg_samples=1, inh_strength=0.05, inh_threshold=0.10, neg_lr_ratio=0.5,
-                    field_gate=True, use_torch=None, destab_scale=0.0):
+                    field_gate=True, use_torch=None, destab_scale=0.0, momentum_mu=0.9, noise_scale=0.0):
         """Delegate to STDPTrainer for batched STDP training."""
-        if self._trainer is None:
-            self._trainer = STDPTrainer(self)
         return self._trainer.train_batch(texts, base_lr, context_window, pmi_strength, pmi_gate_min,
                                           neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
-                                          field_gate, use_torch, destab_scale)
-
-    # ── Training internals (forwarded to STDPTrainer for test compatibility) ──
-
-    def _cpu_stdp_apply(self, *a, **kw):
-        if self._trainer is None: self._trainer = STDPTrainer(self)
-        return self._trainer._cpu_stdp_apply(*a, **kw)
-
-    def _gpu_stdp_apply(self, *a, **kw):
-        if self._trainer is None: self._trainer = STDPTrainer(self)
-        return self._trainer._gpu_stdp_apply(*a, **kw)
-
-    def _negative_sampling_cpu(self, *a, **kw):
-        if self._trainer is None: self._trainer = STDPTrainer(self)
-        return self._trainer._negative_sampling_cpu(*a, **kw)
-
-    def _negative_sampling_gpu(self, *a, **kw):
-        if self._trainer is None: self._trainer = STDPTrainer(self)
-        return self._trainer._negative_sampling_gpu(*a, **kw)
-
-    def _contrastive_objective(self, *a, **kw):
-        if self._trainer is None: self._trainer = STDPTrainer(self)
-        return self._trainer._contrastive_objective(*a, **kw)
+                                          field_gate, use_torch, destab_scale,
+                                          momentum_mu=momentum_mu, noise_scale=noise_scale)
 
     # ── Evaluation ────────────────────────────────────────────
 
     def evaluate(self, corpus_path, max_lines=None, batch_size=500, use_gpu=True):
         """Delegate to STDPTrainer for evaluation."""
-        if self._trainer is None:
-            self._trainer = STDPTrainer(self)
         return self._trainer.evaluate(corpus_path, max_lines=max_lines)
-
-
-class _AsyncPipeline:
-    """2-stage CPU->GPU pipeline with prefetch depth 2.
-    Overlaps CPU pair-building with GPU STDP compute via CUDA stream.
-    """
-    def __init__(self, gen, depth=2):
-        self.gen = gen
-        self.depth = depth
-        self._stream = None
-        self._queue = []
-        self._event = None
-
-    def submit(self, text, **kw):
-        self._queue.append((text, kw))
-        if len(self._queue) > self.depth:
-            return self._process(*self._queue.pop(0))
-        return None
-
-    def _process(self, text, kw):
-        return self.gen.train_from_text(text, **kw)
-
-    def drain(self):
-        results = []
-        while self._queue:
-            results.append(self._process(*self._queue.pop(0)))
-        return results
 
 
 if __name__ == '__main__':

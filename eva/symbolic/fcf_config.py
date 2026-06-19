@@ -375,6 +375,7 @@ class FCFConfig:
     eval_every_slow: int = 2000
     eval_fast_lines: int = 64      # TN-9: lines for fast eval (PPL only)
     eval_full_lines: int = 300     # TN-9: lines for full eval (all metrics)
+    eval_every_full: int = 5000   # TN-12: full eval interval (fast eval at eval_every_fast)
     batch_size_start: int = 8      # TN-5: initial batch size (warmup)
     batch_size_end: int = 32       # TN-5: final batch size
     fluctuate_every: int = 2000
@@ -402,7 +403,7 @@ class FCFConfig:
     # ── Destabilisation (PPMI noise) ──────────
     destab_scale_start: float = 0.6
     destab_scale_end: float = 0.02
-    destab_decay_lines: int = 30000  # used via opt.p['destab_decay_lines'], not directly
+    # NOTE: destab_decay_lines is a ParamDef in params list (opt.p['destab_decay_lines'])
 
     # ── Drift guard ───────────────────────────
     code_bound: float = 10.0

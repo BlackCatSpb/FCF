@@ -386,66 +386,16 @@ class TrainingPipeline:
         self.best_ckpt_name = None
         self.patience_counter = 0
         self.patience = 5
+        # TN-12: Switched Evaluation cycle counter
+        self._eval_count = 0
         # AM-7: Async Checkpoint Manager
+        ckpt_keep = getattr(cfg, 'cleanup_keep', 5)
         self.ckpt_mgr = CheckpointManager(
             data_dir=os.path.dirname(cfg.cs_path),
-            cleanup_keep=cfg.checkpoint_keep if hasattr(cfg, 'checkpoint_keep') else 5)
+            cleanup_keep=ckpt_keep)
 
-    def run_epoch(self, epoch_train, start_line, epoch_num, t_start):
-        gen = self.gen; cs = self.cs; lattice = self.lattice; opt = self.opt
-        BATCH_SIZE = self.cfg.batch_size_end
-        batch_buffer = []
-        n_trained = 0
-        epoch_lines = len(epoch_train)
-        CHECKPOINT_EVERY = self.cfg.checkpoint_every
-        EVAL_EVERY = self.cfg.eval_every_fast
-        FLUCTUATE_EVERY = self.cfg.fluctuate_every
-        idx = start_line
-        for idx, line in enumerate(epoch_train[start_line:], start=start_line):
-            if not line: continue
-            max_len = _curriculum_max_len(idx)
-            if len(self.sp.encode(line)) > max_len: continue
-            gen.train_lr = get_lr(idx)
-            destab_pct = min(self.global_step / max(round(opt.p['destab_decay_lines'].current), 1), 1.0)
-            destab_from = max(self.cfg.destab_scale_start, self.cfg.destab_scale_end)
-            destab_to = min(self.cfg.destab_scale_start, self.cfg.destab_scale_end)
-            destab_scale = destab_from + (destab_to - destab_from) * destab_pct
-            batch_buffer.append(line)
-            batch_lr = gen.train_lr
-            if len(batch_buffer) < BATCH_SIZE and idx < start_line + epoch_lines - 1:
-                if (idx + 1 - self.last_fluct_lines) < FLUCTUATE_EVERY:
-                    if self.total_pairs_since_last_decay < self.cfg.decay_every_pairs:
-                        continue
-            _bt = time.time()
-            cp = _curriculum_p(idx)
-            cw_ramp = max(1, int(round(opt.p['context_window'].current * cp)))
-            ns_ramp = int(round(opt.p['neg_samples'].current * cp))
-            pg_ramp = opt.p['pmi_gate_min'].current * cp
-            n_pairs = gen.train_batch(batch_buffer, pmi_strength=opt.p['pmi_strength'].current,
-                pmi_gate_min=pg_ramp, base_lr=batch_lr, neg_samples=ns_ramp,
-                context_window=cw_ramp, inh_strength=opt.p['inh_strength'].current,
-                inh_threshold=opt.p['inh_threshold'].current, neg_lr_ratio=self.cfg.neg_lr_ratio,
-                field_gate=self.cfg.field_gate, use_torch=self.cfg.use_torch, destab_scale=destab_scale)
-            self.total_pairs_since_last_decay += n_pairs
-            self.global_step += 1
-            n_trained += len(batch_buffer)
-            batch_buffer = []
-            now = time.time()
-            elapsed = now - t_start
-            if now - self.last_stat_time >= 1.0:
-                rate = idx / max(elapsed, 0.1)
-                pct = 100 * idx / epoch_lines
-                eta_s = ""
-                if rate >= 0.1:
-                    eta = (epoch_lines - idx) / rate
-                    eta_h, eta_m = int(eta // 3600), int((eta % 3600) // 60)
-                    eta_s = f"ETA {eta_h}h{eta_m:02d}m"
-                if idx > 0 and idx % CHECKPOINT_EVERY == 0:
-                    self._checkpoint(epoch_num, idx, elapsed, epoch_lines, destab_scale, t_start)
-                self.last_stat_time = now
-        return idx, n_trained
-
-    def _checkpoint(self, epoch, idx, elapsed, epoch_lines, destab_scale, t_start):
+    def _checkpoint(self, epoch, idx, elapsed, epoch_lines, destab_scale, t_start,
+                    epoch_train=None, start_line=None):
         gen = self.gen; cs = self.cs; lattice = self.lattice; opt = self.opt
         rate = idx / max(elapsed, 0.1)
         pct = 100 * idx / epoch_lines
@@ -456,7 +406,8 @@ class TrainingPipeline:
         ng_new = ng_total - self.ngram_last_total
         self.ngram_last_total = ng_total
         print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} ngrams={ng_total}(+{ng_new})")
-        ckpt_name = f"e{epoch}_l{idx}"
+        ckpt_k = idx // 1000
+        ckpt_name = f"{ckpt_k}k"
         # AM-7: Async checkpoint save (non-blocking)
         self.ckpt_mgr.save(ckpt_name, cs, lattice, opt)
         self.ckpt_mgr.cleanup()
@@ -476,39 +427,48 @@ class TrainingPipeline:
             _quiet(save_3d_vis, cs, self.sp, ckpt_name)
         eval_vppl = eval_acc1 = eval_vacc1 = None
         if idx > 0 and idx % self.cfg.eval_every_fast == 0:
-            eval_result = _quiet(gen.evaluate, self.cfg.val_corpus_path, max_lines=self.cfg.eval_max_lines)
+            self._eval_count += 1
+            is_full = (self._eval_count * self.cfg.eval_every_fast) % self.cfg.eval_every_full == 0
+            max_lines = self.cfg.eval_full_lines if is_full else self.cfg.eval_fast_lines
+            eval_result = _quiet(gen.evaluate, self.cfg.val_corpus_path, max_lines=max_lines)
             if eval_result is not None:
-                ppl = eval_result['perplexity']
-                eval_vppl = eval_result['vec_perplexity']
-                eval_acc1 = eval_result['accuracy_top1']
-                eval_vacc1 = eval_result['vec_accuracy_top1']
-                self.ppl_history.append((idx, ppl))
-                self.vppl_history.append((idx, eval_vppl))
-                ppl_trend = ''
-                if len(self.ppl_history) >= 2:
-                    d = ppl - self.ppl_history[-2][1]
-                    ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
-                print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
-                # TN-4: Early Stopping + Best Checkpoint
-                score = eval_vppl + (1.0 - eval_vacc1 if eval_vacc1 is not None else 0) * 50
-                if score < self.best_score:
-                    self.best_score = score
-                    self.best_ckpt_name = ckpt_name
-                    self.patience_counter = 0
+                eval_vppl = eval_result.get('vec_perplexity')
+                if is_full:
+                    ppl = eval_result.get('perplexity')
+                    eval_acc1 = eval_result.get('accuracy_top1')
+                    eval_vacc1 = eval_result.get('vec_accuracy_top1')
+                    self.ppl_history.append((idx, ppl))
+                    self.vppl_history.append((idx, eval_vppl))
+                    ppl_trend = ''
+                    if len(self.ppl_history) >= 2:
+                        d = ppl - self.ppl_history[-2][1]
+                        ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
+                    print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
+                    # TN-4: Early Stopping + Best Checkpoint
+                    score = eval_vppl + (1.0 - eval_vacc1 if eval_vacc1 is not None else 0) * 50
+                    if score < self.best_score:
+                        self.best_score = score
+                        self.best_ckpt_name = ckpt_name
+                        self.patience_counter = 0
+                    else:
+                        self.patience_counter += 1
                 else:
-                    self.patience_counter += 1
-                remaining = idx - 0 + 1
-                if remaining > 0 and remaining < epoch_lines:
-                    epoch_train = globals().get('train_lines', [])
-                    if remaining < len(epoch_train):
-                        epoch_train = _rescore_lines(epoch_train[remaining:], gen)
+                    self.vppl_history.append((idx, eval_vppl))
+                    print(f"  vPPL={eval_vppl:.0f} (fast)")
         opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
                  vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
+        # T-B1: Self-paced learning rescore (only in run_epoch path)
+        if epoch_train is not None and start_line is not None:
+            remaining = idx - start_line + 1
+            if remaining > 0 and remaining < len(epoch_train):
+                epoch_train = _rescore_lines(epoch_train[remaining:], gen)
+                idx = -1; start_line = -1
         if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
             print(f"  Early stopping: patience={self.patience_counter}/{self.patience}, "
                   f"stuck={opt._full_stuck_counter}")
             self.ckpt_mgr.wait()
             import sys; sys.exit(0)
+        return idx, start_line, epoch_train
 
 # Continuous curriculum: ramp max_len, context_window, neg_samples over first fraction
 CURICULUM_FRACTION = 0.20
@@ -635,7 +595,9 @@ def _final_save(cs, lattice, opt, epoch, total_lines):
         print(f"FATAL: Checkpoint save failed: {e}")
         sys.exit(1)
     try:
-        opt.save_state(CFG.data_dir)
+        state = opt.save_state()
+        with open(CFG.cs_path.replace('.json', '.opt.json'), 'w', encoding='utf-8') as _of:
+            json.dump(state, _of)
     except Exception as e:
         print(f"[WARN] opt.save_state failed: {e}", file=sys.stderr)
     ckpt = {'epoch': epoch, 'line': total_lines, 'timestamp': time.time()}
@@ -659,9 +621,13 @@ if RESUME is not None:
 
 _ckpt_epoch = current_epoch
 idx = start_line
+# AM-15/T-B2: Activate TrainingPipeline
+pipeline = TrainingPipeline(gen, sp, cs, lattice, opt, CFG)
+pipeline.ngram_last_total = sum(len(v) for v in lattice.ngrams.values())
 try:
     for epoch in range(current_epoch, total_epochs + 1):
         _ckpt_epoch = epoch
+        pipeline.total_pairs_since_last_decay = 0
         if epoch > current_epoch:
             print(f"\n{'='*60}")
             print(f"EPOCH {epoch} / {total_epochs}")
@@ -682,14 +648,17 @@ try:
         batch_destab = 0.0
 
         idx = start_line
-        for idx, line in enumerate(epoch_train[start_line:], start=start_line):
+        while idx < len(epoch_train):
+            line = epoch_train[idx]
             global_step += 1
             if not line:
+                idx += 1
                 continue
 
             # Continuous curriculum: skip lines exceeding current max_len
             max_len = _curriculum_max_len(idx)
             if len(sp.encode(line)) > max_len:
+                idx += 1
                 continue
 
             # LR warmup
@@ -729,7 +698,9 @@ try:
                 inh_strength=opt.p['inh_strength'].current,
                 inh_threshold=opt.p['inh_threshold'].current,
                 neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate,
-                use_torch=CFG.use_torch, destab_scale=batch_destab)
+                use_torch=CFG.use_torch, destab_scale=batch_destab,
+                noise_scale=opt.p['noise_scale'].current,
+                momentum_mu=0.9)
             total_pairs_since_last_decay += n_pairs
             _batch_ms = (time.time() - _bt) * 1000
             _n = len(batch_buffer)
@@ -787,94 +758,13 @@ try:
                     pass
                 last_stat_time = now
 
-            # ---- Line-based checkpoint + full report ----
+            # ---- Line-based checkpoint + full report (AM-15/T-B2: via pipeline) ----
             if idx > 0 and idx % CHECKPOINT_EVERY == 0:
-                rate = idx / max(elapsed, 0.1)
-                pct = 100 * idx / epoch_lines
-                if rate >= 0.1:
-                    eta = (epoch_lines - idx) / rate
-                    eta_h, eta_m = int(eta // 3600), int((eta % 3600) // 60)
-                    eta_s = f"ETA {eta_h}h{eta_m:02d}m"
-                else:
-                    eta_s = "ETA ---"
-                print(f"\n[{pct:5.1f}%] {idx:7d}L | {rate:4.0f} L/s | {eta_s}")
-                mean_sim, std_sim = mean_cosine_sim(cs)
-                ok, total_c = check_consistency(cs)
-                ng_total = sum(len(v) for v in lattice.ngrams.values())
-                ng_new = ng_total - ngram_last_total
-                ngram_last_total = ng_total
-
-                ckpt_name = f"{idx // 1000}k"
-                cs_num = CFG.cs_path.replace('.json', f'_{ckpt_name}.json')
-                lat_num = CFG.lattice_path.replace('.json', f'_{ckpt_name}.json')
-                print()
-                reortho = cs.fractal.check_basis_health()
-                if reortho:
-                    gen._invalidate_torch()
-                    print(f"  Basis re-orthogonalized")
-                try:
-                    cs.save(cs_num)
-                    lattice.save(lat_num)
-                except Exception as e:
-                    print(f"FATAL: Checkpoint save failed: {e}")
-                    sys.exit(1)
-                opt_state_path = CFG.cs_path.replace('.json', f'_{ckpt_name}.opt.json')
-                with open(opt_state_path + '.tmp', 'w', encoding='utf-8') as f:
-                    json.dump(opt.save_state(), f, ensure_ascii=False)
-                os.replace(opt_state_path + '.tmp', opt_state_path)
-                save_checkpoint_state(idx, epoch=_ckpt_epoch)
-                cleanup_old_checkpoints(keep=CFG.cleanup_keep)
-                if idx % CFG.periodic_save_every == 0:
-                    try:
-                        cs.save(CFG.cs_path)
-                        lattice.save(CFG.lattice_path)
-                    except Exception as e:
-                        print(f"FATAL: Periodic save failed: {e}")
-                        sys.exit(1)
-
-                n_upd = cs._update_count
-                avg_delta = (cs._total_shift / max(n_upd, 1)) * 1e3
-                cs._total_shift = 0.0
-                cs._update_count = 0
-
-                n_code_out, max_code_abs = cs.check_code_range(bound=CFG.code_bound)
-                vec_ok, vec_total, vec_max_dev = cs.validate_vector_norms()
-                if n_code_out > 0 or vec_max_dev > CFG.vec_dev_warn:
-                    print(f"  CODE_DRIFT n_out={n_code_out} max|code|={max_code_abs:.1f} vec_dev={vec_max_dev:.6f}")
-
-                seed = CFG.test_seeds[zlib.crc32(str(idx).encode()) % len(CFG.test_seeds)]
-                result = gen.generate(seed_word=seed, max_words=CFG.gen_max_words)
-                txt = result.text.replace('\n', ' ').strip()
-                print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} | gen({seed}): {txt}")
-
-                # 3D PCA visualization every 5th checkpoint
-                if idx % (CHECKPOINT_EVERY * 5) == 0:
-                    _quiet(save_3d_vis, cs, sp, ckpt_name)
-
-                eval_vppl = eval_acc1 = eval_vacc1 = None
-                if idx > 0 and idx % EVAL_EVERY_F == 0:
-                    eval_result = _quiet(gen.evaluate, CFG.val_corpus_path, max_lines=CFG.eval_max_lines)
-                    if eval_result is not None:
-                        ppl = eval_result['perplexity']
-                        eval_vppl = eval_result['vec_perplexity']
-                        eval_acc1 = eval_result['accuracy_top1']
-                        eval_vacc1 = eval_result['vec_accuracy_top1']
-                        ppl_history.append((idx, ppl))
-                        vppl_history.append((idx, eval_vppl))
-                        ppl_trend = ''
-                        if len(ppl_history) >= 2:
-                            d = ppl - ppl_history[-2][1]
-                            ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
-                        print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
-                    # Self-paced learning: re-rank remaining lines by concept_error
-                    remaining = idx - start_line + 1
-                    if remaining > 0 and remaining < len(epoch_train):
-                        epoch_train = _rescore_lines(epoch_train[idx - start_line + 1:], gen)
-
-                opt_changes = opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
-                         vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
-                gen.train_lr = opt.p['full_lr'].current
-                if opt_changes.get('full_stuck') and last_fluct_lines != idx:
+                result = pipeline._checkpoint(epoch, idx, elapsed, epoch_lines, destab_scale, t_start, epoch_train, start_line)
+                if result is not None:
+                    idx, start_line, epoch_train = result
+                gen.train_lr = pipeline.opt.p['full_lr'].current
+                if pipeline.opt._full_stuck_counter >= 5 and last_fluct_lines != idx:
                     print(f"  FULL_STUCK — forcing fluctuate")
                     cs.fluctuate_fractal(noise_scale=opt.p['noise_scale'].current,
                                          decay=opt.p['decay_rate'].current,
@@ -882,6 +772,7 @@ try:
                                          generator=gen)
                     last_fluct_lines = idx
                 print()
+            idx += 1
 
 except KeyboardInterrupt:
     print("\n\n[EVA] Training interrupted — saving checkpoint...")

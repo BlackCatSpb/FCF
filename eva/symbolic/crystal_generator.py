@@ -69,7 +69,8 @@ class CrystalGenerator:
 
         self.max_words = self.config.get('max_words', 30)
         self.min_words = self.config.get('min_words', 3)
-        self._graph_cache = {}
+        self._graph_cache = OrderedDict()
+        self._graph_cache_max = 500
         self.base_concept_temp = self.config.get('concept_temp', 0.5)
         self.temperature = self.config.get('temperature', 1.0)
         self.theta_tau = self.config.get('theta_tau', 12.0)
@@ -555,7 +556,11 @@ class CrystalGenerator:
         sources = list(set(cids))  # unique context tokens
         sources_key = tuple(sorted(set(sources)))
         if sources_key not in self._graph_cache:
+            if len(self._graph_cache) >= self._graph_cache_max:
+                self._graph_cache.popitem(last=False)
             self._graph_cache[sources_key] = self._graph_search(sources, B=1.2, max_candidates=30)
+        else:
+            self._graph_cache.move_to_end(sources_key)
         graph_candidates = self._graph_cache[sources_key]
 
         # 2. N-gram syntax (filter to semantic tokens only)

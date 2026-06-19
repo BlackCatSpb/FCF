@@ -24,6 +24,12 @@ class STDPTrainer:
     def __init__(self, gen, subspace_lr=None):
         self.gen = gen
         self.subspace_lr = subspace_lr  # (lr_c, lr_a, lr_m) or None for uniform LR
+        # G-45: Persistent CUDA events (created once, reused across batches)
+        if torch.cuda.is_available():
+            self._prof_start = torch.cuda.Event(enable_timing=True)
+            self._prof_end = torch.cuda.Event(enable_timing=True)
+        else:
+            self._prof_start = self._prof_end = None
 
     # ═══════════════════════════════════════════════════
     # Public API
@@ -339,10 +345,8 @@ class STDPTrainer:
         tgt_t = torch.tensor(gpu_tgt_l, dtype=torch.long, device=device)
         N = len(gpu_ctx_l)
 
-        if torch.cuda.is_available():
-            gen._prof_start = torch.cuda.Event(enable_timing=True)
-            gen._prof_end = torch.cuda.Event(enable_timing=True)
-            gen._prof_start.record()
+        if self._prof_start is not None:
+            self._prof_start.record()
 
         with torch.no_grad():
             meta_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
@@ -457,8 +461,7 @@ class STDPTrainer:
                     grad = momentum_mu * mom_cpu[gi] + (1 - momentum_mu) * grad
                 # T-B3/SN-B1: EMA BEFORE any update (uses old _vecs_t)
                 if gen._vecs_t is not None and gen._ema_vecs_t is not None and gen._ema_steps >= 0:
-                    ema_decay = gen._ema_decay
-                    gen._ema_vecs_t[gen_cid] = ema_decay * gen._ema_vecs_t[gen_cid] + (1 - ema_decay) * gen._vecs_t[gen_cid].float()
+                    gen._ema_vecs_t[gen_cid].lerp_(gen._vecs_t[gen_cid].float(), 1.0 - gen._ema_decay)
                     gen._ema_steps += 1
                 if self.subspace_lr is not None and cs.fractal.basis is not None and cs.fractal.codes.get(gen_cid) is not None:
                     cs._apply_subspace_update(gen_cid, grad, base_lr_val, self.subspace_lr)
@@ -472,10 +475,10 @@ class STDPTrainer:
         if inh_strength > 0 and len(unique_gen) >= 2:
             self._lateral_inhibition_gpu(unique_gen, inh_strength, inh_threshold, base_lr_val)
 
-        if torch.cuda.is_available() and hasattr(gen, '_prof_end'):
-            gen._prof_end.record()
-            gen._prof_end.synchronize()
-            gen._prof_ms = gen._prof_start.elapsed_time(gen._prof_end)
+        if self._prof_end is not None:
+            self._prof_end.record()
+            self._prof_end.synchronize()
+            self.gen._prof_ms = self._prof_start.elapsed_time(self._prof_end)
 
         return unique_gen
 
@@ -582,7 +585,7 @@ class STDPTrainer:
             valid_idx = noise[gi][neg_mask]
             vg_i = gv[gi]
             vg_i_2d = vg_i.unsqueeze(0)
-            grad = (gen._vecs_t[valid_idx].float() - sim[gi][neg_mask][:, None] * vg_i_2d).mean(dim=0)
+            grad = (gen._vecs_t[valid_idx].float() - sim[gi][neg_mask][:, None] * vg_i_2d).sum(dim=0)
             gn = grad.norm()
             if gn > 1e-10:
                 grad = grad / gn * min(gn, 1.0)

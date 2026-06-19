@@ -1,75 +1,76 @@
-# FCF V11 — Сводный отчёт коллегии AI-агентов
+﻿# FCF V11 вЂ” РЎРІРѕРґРЅС‹Р№ РѕС‚С‡С‘С‚ РєРѕР»Р»РµРіРёРё AI-Р°РіРµРЅС‚РѕРІ
 
-**Дата**: 2026-06-19
-**Версия**: V11 (аудит V10 коммитов: 525688b + d36a780)
-**Состав**: Architect-AI, Neuro-Symbolic Specialist, GPU-Opt Agent, Training-Dynamics Agent, Quality-Safety Agent
+**Р”Р°С‚Р°**: 2026-06-19
+**Р’РµСЂСЃРёСЏ**: V11 (Р°СѓРґРёС‚ V10 РєРѕРјРјРёС‚РѕРІ: 525688b + d36a780)
+**РЎРѕСЃС‚Р°РІ**: Architect-AI, Neuro-Symbolic Specialist, GPU-Opt Agent, Training-Dynamics Agent, Quality-Safety Agent
 
 ---
 
 ## Executive Summary
 
-V10 закоммичен (2 коммита). **105 тестов проходят** (+26, +33%). Это самый большой прогресс за всё время.
+V10 Р·Р°РєРѕРјРјРёС‡РµРЅ (2 РєРѕРјРјРёС‚Р°). **105 С‚РµСЃС‚РѕРІ РїСЂРѕС…РѕРґСЏС‚** (+26, +33%). Р­С‚Рѕ СЃР°РјС‹Р№ Р±РѕР»СЊС€РѕР№ РїСЂРѕРіСЂРµСЃСЃ Р·Р° РІСЃС‘ РІСЂРµРјСЏ.
+**V11.1 (024f1aa)**: РСЃРїСЂР°РІР»РµРЅС‹ TN-40 (P0), B1 (P1), SN-28 (P1), centroid parity (P2). Р’СЃРµ 105 С‚РµСЃС‚РѕРІ РїСЂРѕС…РѕРґСЏС‚.
 
-| Метрика | V10 | V11 | Δ |
+| РњРµС‚СЂРёРєР° | V10 | V11 | О” |
 |---------|:---:|:---:|:-:|
-| P0 | 0 | **1** (НОВЫЙ) | +1 |
-| P1 | 10 | **4** | −6 |
-| P2 | 22 | **12** | −10 |
-| GPU-оптимизации (G-40..G-52) | 0/13 | **13/13** | +13 |
-| Тесты (QN-32..QN-40) | 0/9 | **9/9** | +9 |
-| STR | ~52% | ~48% | −4% (новый код) |
-| Syncs/batch | ~20,000 | ~1,000-5,000 | −75% |
+| P0 | 0 | **1** (РќРћР’Р«Р™) | +1 |
+| P1 | 10 | **4** | в€’6 |
+| P2 | 22 | **12** | в€’10 |
+| GPU-РѕРїС‚РёРјРёР·Р°С†РёРё (G-40..G-52) | 0/13 | **13/13** | +13 |
+| РўРµСЃС‚С‹ (QN-32..QN-40) | 0/9 | **9/9** | +9 |
+| STR | ~52% | ~48% | в€’4% (РЅРѕРІС‹Р№ РєРѕРґ) |
+| Syncs/batch | ~20,000 | ~1,000-5,000 | в€’75% |
 
-**Главные находки V11:**
-1. 🔴 **P0: crash в FLUCTUATE_EVERY** — `train_full.py:722` вызывает `noise_scale` (переименован в `fluctuation_amp`). Первый же периодический флуктуат упадёт с KeyError.
-2. 🔴 **B1 (HIGH): Double momentum** — `stdp_trainer.py` применяет momentum к GPU `avg_grad`, затем снова в per-element CPU цикле. Градиент искажён: `µ²·old + µ·(1-µ)·avg + (1-µ)·grad`.
-3. ✅ **Все 13 GPU-оптимизаций G-40..G-52 реализованы** — batched subspace, full GPU lateral, vec neg sampling, fused contrastive, zero-copy, deferred sync.
-4. ✅ **Все 9 тестов QN-32..QN-40 реализованы** — +267 строк, 26 тестов.
-5. ⚠️ **STR упал 52→48%** — новый GPU-код (G-40..G-52) без тестов.
+**Р“Р»Р°РІРЅС‹Рµ РЅР°С…РѕРґРєРё V11:**
+1. рџ”ґ **P0: crash РІ FLUCTUATE_EVERY** вЂ” `train_full.py:722` РІС‹Р·С‹РІР°РµС‚ `noise_scale` (РїРµСЂРµРёРјРµРЅРѕРІР°РЅ РІ `fluctuation_amp`). РџРµСЂРІС‹Р№ Р¶Рµ РїРµСЂРёРѕРґРёС‡РµСЃРєРёР№ С„Р»СѓРєС‚СѓР°С‚ СѓРїР°РґС‘С‚ СЃ KeyError.
+2. рџ”ґ **B1 (HIGH): Double momentum** вЂ” `stdp_trainer.py` РїСЂРёРјРµРЅСЏРµС‚ momentum Рє GPU `avg_grad`, Р·Р°С‚РµРј СЃРЅРѕРІР° РІ per-element CPU С†РёРєР»Рµ. Р“СЂР°РґРёРµРЅС‚ РёСЃРєР°Р¶С‘РЅ: `ВµВІВ·old + ВµВ·(1-Вµ)В·avg + (1-Вµ)В·grad`.
+3. вњ… **Р’СЃРµ 13 GPU-РѕРїС‚РёРјРёР·Р°С†РёР№ G-40..G-52 СЂРµР°Р»РёР·РѕРІР°РЅС‹** вЂ” batched subspace, full GPU lateral, vec neg sampling, fused contrastive, zero-copy, deferred sync.
+4. вњ… **Р’СЃРµ 9 С‚РµСЃС‚РѕРІ QN-32..QN-40 СЂРµР°Р»РёР·РѕРІР°РЅС‹** вЂ” +267 СЃС‚СЂРѕРє, 26 С‚РµСЃС‚РѕРІ.
+5. вљ пёЏ **STR СѓРїР°Р» 52в†’48%** вЂ” РЅРѕРІС‹Р№ GPU-РєРѕРґ (G-40..G-52) Р±РµР· С‚РµСЃС‚РѕРІ.
 
 ---
 
 ## 1. V10 Commit Verification
 
-### Исправлено (всё подтверждено в коде)
+### РСЃРїСЂР°РІР»РµРЅРѕ (РІСЃС‘ РїРѕРґС‚РІРµСЂР¶РґРµРЅРѕ РІ РєРѕРґРµ)
 
-| Группа | Статус | Детали |
+| Р“СЂСѓРїРїР° | РЎС‚Р°С‚СѓСЃ | Р”РµС‚Р°Р»Рё |
 |--------|:------:|--------|
-| Phase 0 (TN-31, G-57, SN-35/36) | ✅ 3/3 | checkpoint_state, dead tensors, CPU parity |
-| Phase 1 (REG-V9-7, G-46, G-42) | ⚠️ 3/4 | REG-V9-7: 2/3 call sites обновлены (см. P0) |
-| GPU G-40..G-52 | ✅ **13/13** | Все реализованы |
-| Code Quality (AM-25,29,30,31,33,39) | ✅ 6/6 | CPU path legacy, RNG, EMA, CE, hormone, SN-39 |
-| Tests QN-32..QN-40 | ✅ **9/9** | +26 тестов |
-| 105 тестов проходят | ✅ | |
+| Phase 0 (TN-31, G-57, SN-35/36) | вњ… 3/3 | checkpoint_state, dead tensors, CPU parity |
+| Phase 1 (REG-V9-7, G-46, G-42) | вљ пёЏ 3/4 | REG-V9-7: 2/3 call sites РѕР±РЅРѕРІР»РµРЅС‹ (СЃРј. P0) |
+| GPU G-40..G-52 | вњ… **13/13** | Р’СЃРµ СЂРµР°Р»РёР·РѕРІР°РЅС‹ |
+| Code Quality (AM-25,29,30,31,33,39) | вњ… 6/6 | CPU path legacy, RNG, EMA, CE, hormone, SN-39 |
+| Tests QN-32..QN-40 | вњ… **9/9** | +26 С‚РµСЃС‚РѕРІ |
+| 105 С‚РµСЃС‚РѕРІ РїСЂРѕС…РѕРґСЏС‚ | вњ… | |
 
 ---
 
-## 2. P0 — Критические баги (1)
+## 2. P0 вЂ” РљСЂРёС‚РёС‡РµСЃРєРёРµ Р±Р°РіРё (1)
 
-### TN-40: Crash в fluctuate_fractal — noise_scale KeyError
+### TN-40: Crash РІ fluctuate_fractal вЂ” noise_scale KeyError
 
-**Файл**: `train_full.py:722`
-**Severity**: P0 — **первый же FLUCTUATE_EVERY упадёт**
+**Р¤Р°Р№Р»**: `train_full.py:722`
+**Severity**: P0 вЂ” **РїРµСЂРІС‹Р№ Р¶Рµ FLUCTUATE_EVERY СѓРїР°РґС‘С‚**
 
 ```python
 cs.fluctuate_fractal(noise_scale=opt.p['noise_scale'].current, ...)
-# KeyError: 'noise_scale'  (переименован в 'fluctuation_amp')
+# KeyError: 'noise_scale'  (РїРµСЂРµРёРјРµРЅРѕРІР°РЅ РІ 'fluctuation_amp')
 ```
 
-REG-V9-7 (V10) разделил `noise_scale` на `gradient_noise_scale` + `fluctuation_amp` в fcf_config.py и в `opt.p`, но строка 722 осталась с `noise_scale`. Батч-тренировка не падает (использует `gradient_noise_scale`), но периодический флуктуат — падает.
+REG-V9-7 (V10) СЂР°Р·РґРµР»РёР» `noise_scale` РЅР° `gradient_noise_scale` + `fluctuation_amp` РІ fcf_config.py Рё РІ `opt.p`, РЅРѕ СЃС‚СЂРѕРєР° 722 РѕСЃС‚Р°Р»Р°СЃСЊ СЃ `noise_scale`. Р‘Р°С‚С‡-С‚СЂРµРЅРёСЂРѕРІРєР° РЅРµ РїР°РґР°РµС‚ (РёСЃРїРѕР»СЊР·СѓРµС‚ `gradient_noise_scale`), РЅРѕ РїРµСЂРёРѕРґРёС‡РµСЃРєРёР№ С„Р»СѓРєС‚СѓР°С‚ вЂ” РїР°РґР°РµС‚.
 
-**Fix**: `noise_scale=` → `fluctuation_amp=`.
-**Сложность**: 1 строка
+**Fix**: `noise_scale=` в†’ `fluctuation_amp=`.
+**РЎР»РѕР¶РЅРѕСЃС‚СЊ**: 1 СЃС‚СЂРѕРєР°
 
 ---
 
-## 3. P1 — Критические проблемы (4)
+## 3. P1 вЂ” РљСЂРёС‚РёС‡РµСЃРєРёРµ РїСЂРѕР±Р»РµРјС‹ (4)
 
-### B1 (P1): Double momentum — градиент искажён
+### B1 (P1): Double momentum вЂ” РіСЂР°РґРёРµРЅС‚ РёСЃРєР°Р¶С‘РЅ
 
-**Файл**: `stdp_trainer.py:416 + 459-460`
+**Р¤Р°Р№Р»**: `stdp_trainer.py:416 + 459-460`
 
-Строка 416 применяет momentum к GPU `avg_grad`:
+РЎС‚СЂРѕРєР° 416 РїСЂРёРјРµРЅСЏРµС‚ momentum Рє GPU `avg_grad`:
 ```python
 if gen._mom_t is not None and momentum_mu > 0:
     gen._mom_t[gen_cid] *= momentum_mu
@@ -77,22 +78,22 @@ if gen._mom_t is not None and momentum_mu > 0:
     avg_grad = gen._mom_t[gen_cid]
 ```
 
-Строки 459-460 применяют momentum СНОВА в per-element CPU цикле:
+РЎС‚СЂРѕРєРё 459-460 РїСЂРёРјРµРЅСЏСЋС‚ momentum РЎРќРћР’Рђ РІ per-element CPU С†РёРєР»Рµ:
 ```python
 if mom_cpu is not None:
-    grad = mom_cpu[gi]  # ← уже содержит momentum!
+    grad = mom_cpu[gi]  # в†ђ СѓР¶Рµ СЃРѕРґРµСЂР¶РёС‚ momentum!
 ```
 
-**Эффект**: `µ²·old + µ·(1-µ)·avg + (1-µ)·grad`. Momentum применяется дважды.
+**Р­С„С„РµРєС‚**: `ВµВІВ·old + ВµВ·(1-Вµ)В·avg + (1-Вµ)В·grad`. Momentum РїСЂРёРјРµРЅСЏРµС‚СЃСЏ РґРІР°Р¶РґС‹.
 
-**Fix**: Убрать CPU momentum (строки 459-460), оставить только GPU `_mom_t`.
-**Сложность**: 1
+**Fix**: РЈР±СЂР°С‚СЊ CPU momentum (СЃС‚СЂРѕРєРё 459-460), РѕСЃС‚Р°РІРёС‚СЊ С‚РѕР»СЊРєРѕ GPU `_mom_t`.
+**РЎР»РѕР¶РЅРѕСЃС‚СЊ**: 1
 
-### SN-43 (P1): GPU neg sampling — Python loop
+### SN-43 (P1): GPU neg sampling вЂ” Python loop
 
-**Файл**: `stdp_trainer.py:604`
+**Р¤Р°Р№Р»**: `stdp_trainer.py:604`
 
-После G-43 (векторизация) остался Python loop:
+РџРѕСЃР»Рµ G-43 (РІРµРєС‚РѕСЂРёР·Р°С†РёСЏ) РѕСЃС‚Р°Р»СЃСЏ Python loop:
 ```python
 for gi, gen_cid in enumerate(unique_gen):
     neg_lr_i = ...  # per-concept
@@ -100,113 +101,120 @@ for gi, gen_cid in enumerate(unique_gen):
     cs._apply_vector_update(gen_cid, ...)  # CPU write-back
 ```
 
-**Fix**: Batched tensor ops → единый GPU write-back.
-**Сложность**: 3
+**Fix**: Batched tensor ops в†’ РµРґРёРЅС‹Р№ GPU write-back.
+**РЎР»РѕР¶РЅРѕСЃС‚СЊ**: 3
 
-### SN-44 (P1): GPU contrastive — nested Python loops + .item()
+### SN-44 (P1): GPU contrastive вЂ” nested Python loops + .item()
 
-**Файл**: `stdp_trainer.py:735-792`
+**Р¤Р°Р№Р»**: `stdp_trainer.py:735-792`
 
-После G-44 остались Python loops:
+РџРѕСЃР»Рµ G-44 РѕСЃС‚Р°Р»РёСЃСЊ Python loops:
 ```python
 for i in range(ng):
     for j in range(min(100, topk_idx.shape[1])):
         rcos = float(topk_val[i, j].item())  # ~500 syncs/step
 ```
 
-~5,600 `.item()` syncs/batch (было ~16,500 в V10, прогресс есть).
+~5,600 `.item()` syncs/batch (Р±С‹Р»Рѕ ~16,500 РІ V10, РїСЂРѕРіСЂРµСЃСЃ РµСЃС‚СЊ).
 **Fix**: Pure tensor batched push.
-**Сложность**: 6
+**РЎР»РѕР¶РЅРѕСЃС‚СЊ**: 6
 
-### G-60/SN-45 (P1): GPU destab — целиком на CPU
+### G-60/SN-45 (P1): GPU destab вЂ” С†РµР»РёРєРѕРј РЅР° CPU
 
-**Файл**: `stdp_trainer.py`
+**Р¤Р°Р№Р»**: `stdp_trainer.py`
 
-Destab logic (RNG, PPMI, numpy) — полностью CPU per-concept. В GPU-пути не векторизован.
-**Fix**: GPU destab через `_vecs_t` и `_ce_t`.
-**Сложность**: 5
+Destab logic (RNG, PPMI, numpy) вЂ” РїРѕР»РЅРѕСЃС‚СЊСЋ CPU per-concept. Р’ GPU-РїСѓС‚Рё РЅРµ РІРµРєС‚РѕСЂРёР·РѕРІР°РЅ.
+**Fix**: GPU destab С‡РµСЂРµР· `_vecs_t` Рё `_ce_t`.
+**РЎР»РѕР¶РЅРѕСЃС‚СЊ**: 5
 
 ---
 
-## 4. P2 — Проблемы средней критичности (12)
+## 4. P2 вЂ” РџСЂРѕР±Р»РµРјС‹ СЃСЂРµРґРЅРµР№ РєСЂРёС‚РёС‡РЅРѕСЃС‚Рё (12)
 
 ### GPU (5)
 - SN-46 (P3): Contrastive write-back CPU roundtrip
-- SN-47 (P3): CPU neg sampling `sample(total_vocab)` — 146K per-concept
-- SN-48 (P3): GPU field overlap `.item()` sync в `_build_pairs`
-- G-65: GPU field overlap в `_build_pairs`
-- G-62: GPU `_apply_vector_update` без `.cpu().numpy()`
+- SN-47 (P3): CPU neg sampling `sample(total_vocab)` вЂ” 146K per-concept
+- SN-48 (P3): GPU field overlap `.item()` sync РІ `_build_pairs`
+- G-65: GPU field overlap РІ `_build_pairs`
+- G-62: GPU `_apply_vector_update` Р±РµР· `.cpu().numpy()`
 
 ### Training Dynamics (4)
-- TN-32 (P2): `idx=-1` сбрасывает curriculum после rescore
+- TN-32 (P2): `idx=-1` СЃР±СЂР°СЃС‹РІР°РµС‚ curriculum РїРѕСЃР»Рµ rescore
 - TN-13 (P2): Progressive batch size not implemented
 - TN-15 (P2): Decay warmup not implemented
 - TN-41 (P2): LR warmup restarts after rescore
 
 ### Quality (3)
-- QN-49..QN-58 (10 сьютов, ~22 теста): не реализованы
-- STR ~48% (упал из-за нового GPU-кода)
-- Centroid parity bug: лишний `0.1` фактор в GPU `_centroid_pull_batch`
+- QN-49..QN-58 (10 СЃСЊСЋС‚РѕРІ, ~22 С‚РµСЃС‚Р°): РЅРµ СЂРµР°Р»РёР·РѕРІР°РЅС‹
+- STR ~48% (СѓРїР°Р» РёР·-Р·Р° РЅРѕРІРѕРіРѕ GPU-РєРѕРґР°)
+- Centroid parity bug: Р»РёС€РЅРёР№ `0.1` С„Р°РєС‚РѕСЂ РІ GPU `_centroid_pull_batch`
 
 ---
 
-## 5. НОВЫЕ проблемы V11
+## 5. РќРћР’Р«Р• РїСЂРѕР±Р»РµРјС‹ V11
 
-| ID | Проблема | P | Агент | Сложность |
+| ID | РџСЂРѕР±Р»РµРјР° | P | РђРіРµРЅС‚ | РЎР»РѕР¶РЅРѕСЃС‚СЊ |
 |:--:|----------|:-:|:-----:|:---------:|
-| **TN-40** | crash в FLUCTUATE_EVERY (KeyError: noise_scale) | **P0** | TD | 1 |
-| **B1** | Double momentum (GPU + CPU) — искажение градиента | P1 | GPU | 1 |
+| **TN-40** | crash РІ FLUCTUATE_EVERY (KeyError: noise_scale) ✅ FIXED in 024f1aa | **P0** | TD | 1 |
+| **B1** | Double momentum (GPU + CPU) вЂ” РёСЃРєР°Р¶РµРЅРёРµ РіСЂР°РґРёРµРЅС‚Р° ✅ FIXED in 024f1aa | P1 | GPU | 1 |
+| **SN-28** | Contrastive \`field_gate\` not propagated — ✅ FIXED in 024f1aa | P1 | NS | 3 |
 | **SN-43** | GPU neg sampling Python loop | P1 | NS | 3 |
 | **SN-44** | GPU contrastive nested Python loops + .item() | P1 | NS | 6 |
-| **SN-45/G-60** | GPU destab — целиком CPU | P1 | NS/GPU | 5 |
+| **SN-45/G-60** | GPU destab вЂ” С†РµР»РёРєРѕРј CPU | P1 | NS/GPU | 5 |
 | **SN-46** | Contrastive write-back CPU roundtrip | P3 | NS | 4 |
 | **SN-47** | CPU neg sampling `sample(total_vocab)` 146K | P3 | NS | 2 |
 | **SN-48** | GPU field overlap `.item()` sync | P3 | NS | 3 |
-| **G-62** | GPU `_apply_vector_update` без `.cpu().numpy()` | P2 | GPU | 5 |
-| **G-65** | GPU field overlap в `_build_pairs` | P2 | GPU | 4 |
+| **G-62** | GPU `_apply_vector_update` Р±РµР· `.cpu().numpy()` | P2 | GPU | 5 |
+| **G-65** | GPU field overlap РІ `_build_pairs` | P2 | GPU | 4 |
 | **TN-41** | LR warmup restarts after rescore | P2 | TD | 2 |
-| **Centroid-bug** | Лишний `0.1` в GPU centroid_pull_batch | P2 | QA | 1 |
+| **Centroid-bug | Лишний `0.1` в GPU centroid_pull_batch ✅ FIXED in 024f1aa| P2 | QA | 1 |
 
 ---
 
-## 6. Рекомендуемый план работ
+## 6. Р РµРєРѕРјРµРЅРґСѓРµРјС‹Р№ РїР»Р°РЅ СЂР°Р±РѕС‚
 
-### Фаза 0 (НЕМЕДЛЕННО — 2 задачи, 10 минут)
+### Р¤Р°Р·Р° 0 (РќР•РњР•Р”Р›Р•РќРќРћ вЂ” 2 Р·Р°РґР°С‡Рё, 10 РјРёРЅСѓС‚)
 
-1. **TN-40**: `noise_scale=` → `fluctuation_amp=` (train_full.py:722) — 1 строка
-2. **B1**: Убрать CPU momentum (stdp_trainer.py:459-460) — 2 строки
+1. **TN-40** ✅ FIXED in 024f1aa: `noise_scale=` в†’ `fluctuation_amp=` (train_full.py:722) вЂ” 1 СЃС‚СЂРѕРєР°
+2. **B1** ✅ FIXED in 024f1aa: РЈР±СЂР°С‚СЊ CPU momentum (stdp_trainer.py:459-460) вЂ” 2 СЃС‚СЂРѕРєРё
+3. **SN-28** ✅ FIXED in 024f1aa: Propagate \ield_gate\ to GPU contrastive
 
-### Фаза 1 (P1 — 4 задачи, ~1 неделя)
 
-3. **SN-43**: GPU neg sampling — batched write-back
-4. **SN-44**: GPU contrastive — pure tensor push
+### Р¤Р°Р·Р° 1 (P1 вЂ” 4 Р·Р°РґР°С‡Рё, ~1 РЅРµРґРµР»СЏ)
+
+3. **SN-43**: GPU neg sampling вЂ” batched write-back
+4. **SN-44**: GPU contrastive вЂ” pure tensor push
 5. **SN-45/G-60**: GPU destab
-6. **Centroid-bug**: Fix `0.1` factor
+6. **Centroid-bug** ✅ FIXED in 024f1aa: Fix `0.1` factor
 
-### Фаза 2 (P2 — 5 задач)
+### Р¤Р°Р·Р° 2 (P2 вЂ” 5 Р·Р°РґР°С‡)
 
 7-11: G-62 (vec update), G-65 (field overlap), TN-32 (idx fix), TN-13 (BS plateaus), TN-15 (decay warmup)
 
-### Фаза 3 (тесты — 3 задачи)
+### Р¤Р°Р·Р° 3 (С‚РµСЃС‚С‹ вЂ” 3 Р·Р°РґР°С‡Рё)
 
-12-14: QN-49..QN-58 (22 теста для GPU-кода)
-
----
-
-## 7. Прогресс V10→V11
-
-### Сделано (огромный прогресс)
-- ✅ **13/13 GPU-оптимизаций** (G-40..G-52) — код ускорен в 2-20×
-- ✅ **9/9 тестовых сьютов** (QN-32..QN-40) — +26 тестов, +267 строк
-- ✅ Phase 0 (TN-31, G-57, SN-35/36)
-- ✅ Phase 1 (G-46, G-42)
-- ✅ Code quality (AM-25,29,30,31,33,39)
-
-### Нужно исправить
-- 🔴 2 критических бага (TN-40 crash, B1 double momentum)
-- ⬇️ 10 P1/P2 проблем (SN-43/44/45, G-60/62/65, TN-32/13/15, centroid)
-- 📋 22 новых теста для нового GPU-кода (QN-49..QN-58)
+12-14: QN-49..QN-58 (22 С‚РµСЃС‚Р° РґР»СЏ GPU-РєРѕРґР°)
 
 ---
 
-*Отчёт составлен коллегией AI-агентов: Architect-AI, Neuro-Symbolic Specialist, GPU-Opt Agent, Training-Dynamics Agent, Quality-Safety Agent*
+## 7. РџСЂРѕРіСЂРµСЃСЃ V10в†’V11
+
+### РЎРґРµР»Р°РЅРѕ (РѕРіСЂРѕРјРЅС‹Р№ РїСЂРѕРіСЂРµСЃСЃ)
+- вњ… **13/13 GPU-РѕРїС‚РёРјРёР·Р°С†РёР№** (G-40..G-52) вЂ” РєРѕРґ СѓСЃРєРѕСЂРµРЅ РІ 2-20Г—
+- вњ… **9/9 С‚РµСЃС‚РѕРІС‹С… СЃСЊСЋС‚РѕРІ** (QN-32..QN-40) вЂ” +26 С‚РµСЃС‚РѕРІ, +267 СЃС‚СЂРѕРє
+- вњ… Phase 0 (TN-31, G-57, SN-35/36)
+- вњ… Phase 1 (G-46, G-42)
+- вњ… Code quality (AM-25,29,30,31,33,39)
+
+### РќСѓР¶РЅРѕ РёСЃРїСЂР°РІРёС‚СЊ
+- рџ”ґ 2 РєСЂРёС‚РёС‡РµСЃРєРёС… Р±Р°РіР° (TN-40 crash, B1 double momentum)
+- в¬‡пёЏ 10 P1/P2 РїСЂРѕР±Р»РµРј (SN-43/44/45, G-60/62/65, TN-32/13/15, centroid)
+- рџ“‹ 22 РЅРѕРІС‹С… С‚РµСЃС‚Р° РґР»СЏ РЅРѕРІРѕРіРѕ GPU-РєРѕРґР° (QN-49..QN-58)
+
+---
+
+*РћС‚С‡С‘С‚ СЃРѕСЃС‚Р°РІР»РµРЅ РєРѕР»Р»РµРіРёРµР№ AI-Р°РіРµРЅС‚РѕРІ: Architect-AI, Neuro-Symbolic Specialist, GPU-Opt Agent, Training-Dynamics Agent, Quality-Safety Agent*
+
+
+
+

@@ -561,9 +561,9 @@ class ConceptSpace:
         lr_c, lr_a, lr_m = subspace_lr
         basis = self.fractal.basis
         latent_dim = basis.shape[0]
-        mask_c = np.zeros(latent_dim, dtype=np.float32); mask_c[:self.l_c] = 1.0
-        mask_a = np.zeros(latent_dim, dtype=np.float32); mask_a[self.l_c:self.l_c + self.l_a] = 1.0
-        mask_m = np.zeros(latent_dim, dtype=np.float32); mask_m[self.l_c + self.l_a:] = 1.0
+        mask_c = np.zeros(latent_dim, dtype=np.float32); mask_c[:self.fractal.l_c] = 1.0
+        mask_a = np.zeros(latent_dim, dtype=np.float32); mask_a[self.fractal.l_c:self.fractal.l_c + self.fractal.l_a] = 1.0
+        mask_m = np.zeros(latent_dim, dtype=np.float32); mask_m[self.fractal.l_c + self.fractal.l_a:] = 1.0
         code_grad = grad @ basis.T
         code_grad *= (lr_c * mask_c + lr_a * mask_a + lr_m * mask_m)
         code_new = code + code_grad * base_lr_val
@@ -571,7 +571,7 @@ class ConceptSpace:
         nv = np.linalg.norm(v_new)
         if nv > 1e-10:
             v_new /= nv
-            code_new /= nv
+            code_new /= np.linalg.norm(code_new)
         if v_old is not None:
             shift = float(np.linalg.norm(v_new - v_old))
             self._total_shift += shift

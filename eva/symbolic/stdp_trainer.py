@@ -14,6 +14,7 @@ _META_PMI = 2
 _META_DW = 3
 _META_FW = 4
 _META_FIELD_W = 5
+_META_SLOW = 6
 
 
 class STDPTrainer:
@@ -140,20 +141,6 @@ class STDPTrainer:
 
         return total_pairs
 
-    def _subspace_update(self, grad, v_gen, base_lr_val):
-        cs = self.gen.cs
-        if self.subspace_lr is None or cs.fractal.basis is None:
-            return v_gen + grad * base_lr_val
-        lr_c, lr_a, lr_m = self.subspace_lr
-        basis = cs.fractal.basis
-        latent_dim = basis.shape[0]
-        mask_c = np.zeros(latent_dim, dtype=np.float32); mask_c[:cs.l_c] = 1.0
-        mask_a = np.zeros(latent_dim, dtype=np.float32); mask_a[cs.l_c:cs.l_c + cs.l_a] = 1.0
-        mask_m = np.zeros(latent_dim, dtype=np.float32); mask_m[cs.l_c + cs.l_a:] = 1.0
-        code_grad = grad @ basis.T
-        code_grad *= (lr_c * mask_c + lr_a * mask_a + lr_m * mask_m)
-        return v_gen + (code_grad @ basis) * base_lr_val
-
     # ═══════════════════════════════════════════════════
     # Pair building
     # ═══════════════════════════════════════════════════
@@ -217,9 +204,18 @@ class STDPTrainer:
                         continue
                     gpu_ctx_l.append(ci)
                     gpu_tgt_l.append(cj)
-                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight))
+                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 0.0))
                     gpu_cid_ctx.append(ids[i])
                     gpu_cid_gen.append(ids[j])
+                    # SN-25: Add slow STDP pair to GPU lists (matches CPU slow_lr > 1e-6 gate)
+                    theta_slow = math.exp(-min(abs(j-i), 10) / max(gen.theta_tau * 3.0, 1.0))
+                    slow_lr = lr * max(theta_slow, 0.02) * 0.3
+                    if slow_lr > 1e-6:
+                        gpu_ctx_l.append(ci)
+                        gpu_tgt_l.append(cj)
+                        gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 1.0))
+                        gpu_cid_ctx.append(ids[i])
+                        gpu_cid_gen.append(ids[j])
 
         return n_pairs
 
@@ -360,8 +356,13 @@ class STDPTrainer:
 
             lr = torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w_t
             lr *= (0.5 + gen.hormones.acetylcholine * 0.5) * (0.5 + gen.hormones.dopamine * 0.5)
-            theta = torch.exp(-torch.clamp(dist, max=5.0) / max(gen.theta_tau, 1.0))
-            effective_lr = lr * torch.clamp(theta, min=0.1)
+            # SN-25: Handle slow vs fast STDP theta
+            dist_clamped = torch.clamp(dist, max=10.0)
+            theta_fast = torch.exp(-dist_clamped.clamp(max=5.0) / max(gen.theta_tau, 1.0))
+            theta_slow = torch.exp(-dist_clamped / max(gen.theta_tau * 3.0, 1.0))
+            slow_mask = meta_t[:, _META_SLOW] if meta_t.shape[1] > _META_SLOW else torch.zeros(N, device=device)
+            theta = (1 - slow_mask) * torch.clamp(theta_fast, min=0.1) + slow_mask * torch.clamp(theta_slow, min=0.02) * 0.3
+            effective_lr = lr * theta
 
             gen_cids_arr = np.array(gpu_cid_gen, dtype=np.int32)
             unique_gen, inv_idx = np.unique(gen_cids_arr, return_inverse=True)
@@ -453,7 +454,7 @@ class STDPTrainer:
                     grad = grad / gn * gen.max_grad_norm
                 # SN-7: use momentum-smoothed gradient when available
                 if mom_cpu is not None:
-                    grad = mom_cpu[gi]
+                    grad = momentum_mu * mom_cpu[gi] + (1 - momentum_mu) * grad
                 # T-B3/SN-B1: EMA BEFORE any update (uses old _vecs_t)
                 if gen._vecs_t is not None and gen._ema_vecs_t is not None and gen._ema_steps >= 0:
                     ema_decay = gen._ema_decay
@@ -571,8 +572,10 @@ class STDPTrainer:
 
         for gi, gen_cid in enumerate(unique_gen):
             neg_lr_i = neg_lr
-            ce = gen.concept_error.get(gen_cid, 0.0)
-            neg_lr_i *= (1.0 + ce * 2.0)
+            # SN-22.2: Guard concept_error reweighting with field_gate (matching CPU parity)
+            if field_gate:
+                ce = gen.concept_error.get(gen_cid, 0.0)
+                neg_lr_i *= (1.0 + ce * 2.0)
             neg_mask = mask[gi]
             if not neg_mask.any():
                 continue

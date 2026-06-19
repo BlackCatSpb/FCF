@@ -29,6 +29,7 @@ _META_PMI = 2
 _META_DW = 3
 _META_FW = 4
 _META_FIELD_W = 5
+_META_SLOW = 6
 try:
     import torch
     _HAS_TORCH = True

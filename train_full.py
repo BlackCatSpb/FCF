@@ -74,51 +74,18 @@ V = sp.vocab_size()
 
 # ── Helpers ─────────────────────────────────────────────────────
 
-def save_checkpoint_state(line_idx, epoch=1):
-    with open(CFG.ckpt_state_path + '.tmp', 'w', encoding='utf-8') as f:
-        json.dump({'line': line_idx, 'epoch': epoch, 'timestamp': time.time()}, f)
-    os.replace(CFG.ckpt_state_path + '.tmp', CFG.ckpt_state_path)
-
 def load_checkpoint_state():
     if os.path.exists(CFG.ckpt_state_path):
         try:
             with open(CFG.ckpt_state_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            return data.get('line'), data.get('epoch', 1)
+            return data.get('line'), data.get('epoch', 1), data.get('global_step', 0)
         except (json.JSONDecodeError, Exception) as e:
             print(f"[WARN] Corrupted checkpoint state ({e}), starting fresh",
                   file=sys.stderr)
-            return None, None
-    return None, None
+            return None, None, 0
+    return None, None, 0
 
-def cleanup_old_checkpoints(keep=None):
-    if keep is None:
-        keep = CFG.cleanup_keep
-    base_dir = CFG.data_dir
-    files = []
-    for p in glob.glob(os.path.join(base_dir, 'concept_space_*k.json')):
-        m = re.search(r'_(\d+)k\.json$', os.path.basename(p))
-        if m:
-            files.append((p, os.path.getmtime(p), int(m.group(1))))
-    files.sort(key=lambda x: -x[1])
-    files = files[:keep]
-    keep_ks = set(f[2] for f in files)
-    for p in glob.glob(os.path.join(base_dir, 'concept_space_*k.json')):
-        m = re.search(r'_(\d+)k\.json$', os.path.basename(p))
-        if m and int(m.group(1)) not in keep_ks:
-            k_label = m.group(1)
-            for ext in ['.json', '.codes.npz', '.opt.json']:
-                fp = os.path.join(base_dir, f'concept_space_{k_label}k{ext}')
-                try:
-                    if os.path.exists(fp): os.remove(fp)
-                except OSError as e:
-                    print(f"[WARN] cleanup: {e}", file=sys.stderr)
-            for ext in ['.json', '.lattice.npz', '.meta.json', '.opt.json']:
-                fp = os.path.join(base_dir, f'syntax_lattice_{k_label}k{ext}')
-                try:
-                    if os.path.exists(fp): os.remove(fp)
-                except OSError as e:
-                    print(f"[WARN] cleanup: {e}", file=sys.stderr)
 # ── Parse args ──────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
@@ -145,15 +112,17 @@ if FRESH:
 if FAST:
     print("FAST mode: base_lr=0.15, neg_samples=3, decay_every=250, eval_every=1000")
 
+resume_global_step = 0
 if RESUME is not None:
     if RESUME == '':
-        rl, r_epoch = load_checkpoint_state()
+        rl, r_epoch, r_global_step = load_checkpoint_state()
         if rl is None:
             print("No checkpoint found — starting fresh.")
             RESUME = None
         else:
             resume_line = rl
             resume_epoch = r_epoch
+            resume_global_step = r_global_step
             ckpt_k = resume_line // 1000
             resume_tag = f"{ckpt_k}k"
             print(f"\nAuto-resuming from line {resume_line} (checkpoint_state.json) — loading {resume_tag}")
@@ -457,12 +426,12 @@ class TrainingPipeline:
                     print(f"  vPPL={eval_vppl:.0f} (fast)")
         opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
                  vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
-        # T-B1: Self-paced learning rescore (only in run_epoch path)
+        # T-B1: Self-paced learning rescore
         if epoch_train is not None and start_line is not None:
             remaining = idx - start_line + 1
             if remaining > 0 and remaining < len(epoch_train):
-                epoch_train = _rescore_lines(epoch_train[remaining:], gen)
-                idx = -1; start_line = -1
+                epoch_train = _rescore_lines(epoch_train[idx + 1:], gen)
+                idx = -1; start_line = 0
         if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
             print(f"  Early stopping: patience={self.patience_counter}/{self.patience}, "
                   f"stuck={opt._full_stuck_counter}")
@@ -507,8 +476,6 @@ total_lines = len(train_lines)
 CHECKPOINT_EVERY = CFG.checkpoint_every
 EVAL_EVERY_F = CFG.eval_every_fast if FAST else CFG.eval_every_slow
 FLUCTUATE_EVERY = CFG.fluctuate_every
-DECAY_EVERY = CFG.decay_every_fast if FAST else CFG.decay_every_slow
-
 n_trained = 0
 ngram_last_total = 0
 ppl_history = []
@@ -518,7 +485,7 @@ last_cos_time = 0.0
 last_cos_sim = (0.0, 0.0)
 last_fluct_lines = 0
 
-global_step = 0
+global_step = resume_global_step if RESUME is not None else 0
 last_decay_pairs = 0
 total_pairs_since_last_decay = 0
 
@@ -586,7 +553,7 @@ def _write_viewer_html(path):
     with open(path, 'w', encoding='utf-8') as f:
         f.write(TEMPLATE)
 
-def _final_save(cs, lattice, opt, epoch, total_lines):
+def _final_save(cs, lattice, opt, epoch, total_lines, global_step=0):
     """Save all training state. Each operation protected individually."""
     for _op_name, _op_fn, _op_args in [
         ('cs.save', cs.save, (CFG.cs_path,)),
@@ -603,7 +570,7 @@ def _final_save(cs, lattice, opt, epoch, total_lines):
     except Exception as e:
         print(f"[WARN] opt.save_state failed: {e}", file=sys.stderr)
     try:
-        ckpt = {'epoch': epoch, 'line': total_lines, 'timestamp': time.time()}
+        ckpt = {'epoch': epoch, 'line': total_lines, 'global_step': global_step, 'timestamp': time.time()}
         with open(CFG.ckpt_state_path + '.tmp', 'w', encoding='utf-8') as f:
             json.dump(ckpt, f)
         os.replace(CFG.ckpt_state_path + '.tmp', CFG.ckpt_state_path)
@@ -615,7 +582,6 @@ def _final_save(cs, lattice, opt, epoch, total_lines):
                 os.remove(f)
         except:
             pass
-    cleanup_old_checkpoints(keep=CFG.cleanup_keep)
 
 # Determine starting line and epoch
 start_line = resume_line if RESUME is not None else 0
@@ -706,7 +672,7 @@ try:
                 neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate,
                 use_torch=CFG.use_torch, destab_scale=batch_destab,
                 noise_scale=opt.p['noise_scale'].current,
-                momentum_mu=0.9)
+                momentum_mu=CFG.momentum_mu)
             total_pairs_since_last_decay += n_pairs
             _batch_ms = (time.time() - _bt) * 1000
             _n = len(batch_buffer)
@@ -783,7 +749,7 @@ try:
 except KeyboardInterrupt:
     print("\n\n[EVA] Training interrupted — saving checkpoint...")
     try:
-        _final_save(cs, lattice, opt, _ckpt_epoch, idx)
+        _final_save(cs, lattice, opt, _ckpt_epoch, idx, global_step)
     except BaseException:
         pass
     print("[EVA] Checkpoint saved. Exiting.")
@@ -799,7 +765,7 @@ finally:
     sys.stdout = old_stdout
 
 # Final save
-_final_save(cs, lattice, opt, _ckpt_epoch, idx)
+_final_save(cs, lattice, opt, _ckpt_epoch, idx, global_step)
 
 # ── Final diagnostics ───────────────────────────────────────────
 

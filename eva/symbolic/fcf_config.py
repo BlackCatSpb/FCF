@@ -418,6 +418,7 @@ class FCFConfig:
     # ── Engine ────────────────────────────────
     use_torch: bool = True
     field_gate: bool = True
+    momentum_mu: float = 0.9
 
     # ── Seeds для генерации на чекпоинтах ─────
     gen_max_words: int = 25

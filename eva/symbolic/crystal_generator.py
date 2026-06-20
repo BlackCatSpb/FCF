@@ -246,9 +246,10 @@ class CrystalGenerator:
         if self._mom_t is None or self._mom_t.shape[0] != V or self._mom_t.device != dev:
             self._mom_t = torch.zeros(V, D, device=dev, dtype=torch.float32)
 
-        # G-49: pre-allocate fused buffer for scatter_add
-        if self._fused_buf is None or self._fused_buf.shape[0] < V:
-            self._fused_buf = torch.zeros(V, D + 1, device=dev, dtype=torch.float32)
+        # G-49: pre-allocate fused buffer for scatter_add (grows on demand, not full V)
+        if self._fused_buf is None or self._fused_buf.shape[1] != D + 1 or self._fused_buf.device != dev:
+            init_rows = min(V, 4096)
+            self._fused_buf = torch.zeros(init_rows, D + 1, device=dev, dtype=torch.float32)
 
         self._torch_dirty = False
         self.cs.fractal._fb_dirty = False

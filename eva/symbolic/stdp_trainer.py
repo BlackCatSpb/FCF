@@ -385,8 +385,10 @@ class STDPTrainer:
             y = torch.clamp((vg * vc).sum(dim=1), min=0.05)
             pair_delta = vc * effective_lr[:, None] - vg * (y * effective_lr)[:, None]
             fused_src = torch.cat([pair_delta, effective_lr[:, None]], dim=1)  # (N, D+1)
-            # G-49: reuse pre-allocated fused buffer
+            # G-49: reuse pre-allocated fused buffer (grow on demand)
             ng = len(unique_gen)
+            if gen._fused_buf.shape[0] < ng:
+                gen._fused_buf = torch.zeros(ng * 2, D + 1, device=device, dtype=torch.float32)
             buf = gen._fused_buf[:ng]
             buf.zero_()
             buf.scatter_add_(0, inv_t[:, None].expand(-1, D + 1), fused_src)

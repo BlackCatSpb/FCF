@@ -127,8 +127,8 @@ class CrystalGenerator:
         self.lattice.update = _cached_update
 
         _orig_decay = self.lattice.decay_all
-        def _cached_decay(min_freq=0.01):
-            _orig_decay(min_freq)
+        def _cached_decay(min_freq=0.01, **kwargs):
+            _orig_decay(min_freq, **kwargs)
             self._total_freq_cache = None
         self.lattice.decay_all = _cached_decay
 

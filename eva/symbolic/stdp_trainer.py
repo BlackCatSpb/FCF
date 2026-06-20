@@ -419,9 +419,10 @@ class STDPTrainer:
         # G-46: Persistent _mom_t tensor (replace CPU dict)
         if momentum_mu > 0:
             if gen._mom_t is None:
-                gen._mom_t = torch.zeros(gen._vecs_t.shape[0], D, device=device, dtype=torch.float32)
+                gen._mom_t = torch.zeros(gen._vecs_t.shape[0], D, device=device, dtype=torch.float16)
             avg_grad = acc / cnt[:, None].clamp(min=1)
-            gen._mom_t[unique_gen] = momentum_mu * gen._mom_t[unique_gen] + (1 - momentum_mu) * avg_grad
+            mom_new = momentum_mu * gen._mom_t[unique_gen] + (1 - momentum_mu) * avg_grad
+            gen._mom_t[unique_gen] = mom_new.to(torch.float16)
 
         # G-60/SN-45: GPU destabilization (replaces CPU per-element loop with tensor ops)
         if destab_scale > 0:

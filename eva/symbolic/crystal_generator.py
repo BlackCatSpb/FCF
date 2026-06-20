@@ -236,15 +236,15 @@ class CrystalGenerator:
             self._ce_t = torch.empty(V, device=dev, dtype=torch.float32)
         self._ce_t.copy_(torch.from_numpy(ce_arr), non_blocking=True)
 
-        # Initialize EMA as a copy of vecs_t (FP32 for precision)
+        # Initialize EMA as a copy of vecs_t (fp16 to save 112MB)
         if self._ema_vecs_t is None or self._ema_vecs_t.shape[0] != V or self._ema_vecs_t.device != dev:
-            self._ema_vecs_t = self._vecs_t.float().clone()
+            self._ema_vecs_t = self._vecs_t.clone()
         else:
-            self._ema_vecs_t.copy_(self._vecs_t.float())
+            self._ema_vecs_t.copy_(self._vecs_t)
         self._ema_steps = 0
 
         if self._mom_t is None or self._mom_t.shape[0] != V or self._mom_t.device != dev:
-            self._mom_t = torch.zeros(V, D, device=dev, dtype=torch.float32)
+            self._mom_t = torch.zeros(V, D, device=dev, dtype=torch.float16)
 
         # G-49: pre-allocate fused buffer for scatter_add (grows on demand, not full V)
         if self._fused_buf is None or self._fused_buf.shape[1] != D + 1 or self._fused_buf.device != dev:

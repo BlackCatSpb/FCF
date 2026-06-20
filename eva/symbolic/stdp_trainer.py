@@ -138,9 +138,9 @@ class STDPTrainer:
             gen.lattice.update(ids)
             gen._graph_cache.clear()
 
-        # Prune concept_error cache (redundant — AdaptiveErrorTracker auto-prunes on update)
-        if use_torch:
-            gen._torch_dirty = True
+        # _torch_dirty is NOT set here — would force full tensor rebuild every batch
+        # (_build_torch_tensors iterates all 146K codes, O(V·D) CPU + 636MB PCIe xfer)
+        # Only _invalidate_torch() (after fluctuate) should set it.
 
         return total_pairs
 

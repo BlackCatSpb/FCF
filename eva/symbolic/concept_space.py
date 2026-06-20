@@ -830,6 +830,7 @@ class ConceptSpace:
         data['inhibition_step'] = self._inhibition_step
         data['total_shift'] = self._total_shift
         data['update_count'] = self._update_count
+        data['usage_decay_steps'] = getattr(self, '_usage_decay_steps', 0)
 
         with open(path + '.tmp', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
@@ -861,6 +862,7 @@ class ConceptSpace:
         obj._inhibition_step = data.get('inhibition_step', 0)
         obj._total_shift = data.get('total_shift', 0.0)
         obj._update_count = data.get('update_count', 0)
+        obj._usage_decay_steps = data.get('usage_decay_steps', 0)
 
         if 'fractal' in data:
             base_dir = os.path.dirname(path)

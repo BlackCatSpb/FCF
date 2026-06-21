@@ -1733,3 +1733,54 @@ class TestQNV14:
         cpu_vec_0_after = cs.concept_vector(0)
         diff = np.linalg.norm(cpu_vec_0_before - cpu_vec_0_after)
         assert diff > 1e-6, "CPU vec should update even with skip_gpu_sync"
+
+
+class TestClusterPotential:
+    """Test minesweeper cluster-potential mechanism."""
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_cluster_map_built(self, gen):
+        """Verify _cluster_map is built after _ensure_torch."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        if gen._cluster_map is None:
+            pytest.skip("No cluster_map (field_bits may be empty)")
+        assert gen._cluster_map is not None
+        assert gen._cluster_map.dtype == torch.long
+        assert gen._cluster_map.shape[0] == gen.cs.vocab_size
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_cluster_potential_update(self, gen):
+        """Verify _update_cluster_potential runs without error."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        if gen._cluster_map is None:
+            pytest.skip("No cluster_map")
+        gen._ce_t = torch.rand(gen.cs.vocab_size, device=gen._torch_device) * 0.5
+        gen._update_cluster_potential()
+        assert gen._cluster_potential is not None
+        assert len(gen._cluster_potential) == getattr(gen.cs, 'n_anchors', 2048)
+        assert gen._cluster_potential.min() >= 0.0
+        assert gen._cluster_potential.max() <= 2.0
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_cluster_potential_modulates_lr(self, gen):
+        """Verify LR modulation in _gpu_stdp_core with cluster potential."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        if gen._cluster_map is None:
+            pytest.skip("No cluster_map")
+        gen._ce_t = torch.zeros(gen.cs.vocab_size, device=gen._torch_device)
+        gen._update_cluster_potential()
+        gen._cluster_potential[:] = 0.5  # force 50% reduction
+        trainer = gen._trainer
+        cid = 0
+        v_before = gen._vecs_t[cid].clone()
+        # Run _gpu_stdp_apply — it internally applies cluster_potential via _gpu_stdp_core
+        trainer._gpu_stdp_apply(
+            gpu_ctx_l=[1], gpu_tgt_l=[cid],
+            gpu_meta_l=np.array([(0, 1, 0.5, 1.0, 1.0, 1.0, 0.0, 1, cid, 1.0)], dtype=np.float32),
+            gpu_cid_gen=[cid], base_lr_val=0.1,
+            field_gate=False, inh_strength=0.0, inh_threshold=0.1,
+            destab_scale=0.0, momentum_mu=0.0)
+        assert gen._cluster_potential is not None

@@ -121,6 +121,10 @@ class CrystalGenerator:
         self._ema_steps = 0
         self._torch_dirty = False  # set True after fluctuate → trigger rebuild
         self._skip_gpu_sync = False  # B4: suppress GPU copy in hook after batched write
+        self._cluster_map = None  # (V,) int32: primary anchor index per CID
+        self._cluster_potential = None  # (n_anchors,) float32: minesweeper potential per cluster
+        self._cluster_update_counter = 0
+        self._cluster_update_every = 50  # recompute potential every N batches
         self._dirty_cids: set = set()  # G-72: CIDs modified on GPU, pending CPU sync
         self._total_freq_cache = None
         self._fused_buf = None  # G-49: pre-allocated fused buffer for scatter_add
@@ -324,6 +328,10 @@ class CrystalGenerator:
             init_rows = min(V, 4096)
             self._fused_buf = torch.zeros(init_rows, D + 1, device=dev, dtype=torch.float32)
 
+        # Minesweeper: build cluster map from field_bits
+        self._ensure_cluster_map(dev)
+        self._cluster_potential = None  # reset, will be updated periodically
+
         self._torch_dirty = False
         self.cs.fractal._fb_dirty = False
         if dev.type == 'cuda':
@@ -338,6 +346,7 @@ class CrystalGenerator:
         self._mom_t = None
         self._codes_t = None
         self._torch_dirty = True
+        self._cluster_potential = None  # stale after vector flush
 
     def _sync_after_fluctuate(self):
         """SN-54: Incremental GPU sync after fluctuate — no full O(V·D) rebuild.
@@ -438,6 +447,54 @@ class CrystalGenerator:
         if self._fb_t is None or self._fb_t.shape[0] != V or self._fb_t.device != dev:
             self._fb_t = torch.empty(V, fb_bytes, device=dev, dtype=torch.uint8)
         self._fb_t.copy_(torch.from_numpy(fb_arr), non_blocking=True)
+
+    def _ensure_cluster_map(self, dev=None):
+        """Lazy-build _cluster_map from field_bits — primary anchor per CID.
+        Cluster = index of first set bit in field_bits[cid]."""
+        if self._cluster_map is not None:
+            return
+        cs = self.cs
+        if dev is None:
+            dev = self._torch_device
+        if not hasattr(cs.fractal, 'field_bits') or not cs.fractal.field_bits:
+            return
+        V = cs.vocab_size
+        n_anchors = getattr(cs, 'n_anchors', 2048)
+        n_bytes = (n_anchors + 7) // 8
+        cluster_arr = np.zeros(V, dtype=np.int32)
+        for cid, fb in cs.fractal.field_bits.items():
+            fb_arr = np.asarray(fb, dtype=np.uint8).ravel()
+            if len(fb_arr) < n_bytes:
+                fb_arr = np.pad(fb_arr, (0, n_bytes - len(fb_arr)))
+            # Find first set bit
+            mask = fb_arr.view(np.uint64) if n_bytes >= 8 else fb_arr.view(np.uint32)
+            bits = int(mask[0]) if len(mask) > 0 else 0
+            if bits:
+                cluster_arr[cid] = (bits & -bits).bit_length() - 1  # ctz
+        self._cluster_map = torch.tensor(cluster_arr, device=dev, dtype=torch.long)
+
+    def _update_cluster_potential(self):
+        """Minesweeper: update potential per cluster based on _ce_t of members.
+        Called every N lines (not every batch). Potential decays toward 1.0,
+        boosted for clusters with low CE (stable concepts), reduced for high CE."""
+        if self._cluster_map is None or self._ce_t is None:
+            return
+        if self._cluster_potential is None:
+            cs = self.cs
+            n_anchors = getattr(cs, 'n_anchors', 2048)
+            self._cluster_potential = torch.ones(n_anchors, device=self._torch_device, dtype=torch.float32)
+        dev = self._torch_device
+        cm = self._cluster_map.to(dev)
+        ce = self._ce_t  # (V,) float32
+        # Mean CE per cluster via scatter_add
+        sum_ce = torch.zeros(len(self._cluster_potential), device=dev)
+        cnt = torch.zeros(len(self._cluster_potential), device=dev)
+        sum_ce.scatter_add_(0, cm, ce)
+        cnt.scatter_add_(0, cm, torch.ones_like(cm, dtype=torch.float32))
+        mean_ce = sum_ce / cnt.clamp(min=1)
+        # Update potential: low CE → boost (up to 1.2), high CE → reduce (down to 0.8)
+        target = 1.0 + (0.5 - mean_ce) * 0.4  # ce=0 → 1.2, ce=0.5 → 1.0, ce=1.0 → 0.8
+        self._cluster_potential = self._cluster_potential * 0.9 + target * 0.1
 
     # ── Temperature ────────────────────────────────────────────
 

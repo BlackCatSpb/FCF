@@ -146,6 +146,11 @@ class STDPTrainer:
         # (_build_torch_tensors iterates all 146K codes, O(V·D) CPU + 636MB PCIe xfer)
         # Only _invalidate_torch() (after fluctuate) should set it.
 
+        # Minesweeper: periodic cluster potential refresh
+        if gen._cluster_update_counter > 0 and gen._cluster_update_counter % gen._cluster_update_every == 0:
+            gen._update_cluster_potential()
+        gen._cluster_update_counter += 1
+
         return total_pairs
 
     # ═══════════════════════════════════════════════════
@@ -423,6 +428,9 @@ class STDPTrainer:
         if meta_t.shape[1] > _META_QWEN:
             lr *= meta_t[:, _META_QWEN]
         lr *= (0.5 + gen.hormones.acetylcholine * 0.5) * (0.5 + gen.hormones.dopamine * 0.5)
+        # Minesweeper: cluster-potential modulation per target CID
+        if gen._cluster_potential is not None and gen._cluster_map is not None:
+            lr *= gen._cluster_potential[gen._cluster_map[tgt_t]]
         dist_clamped = torch.clamp(dist, max=10.0)
         theta_fast = torch.exp(-dist_clamped.clamp(max=5.0) / max(gen.theta_tau, 1.0))
         theta_slow = torch.exp(-dist_clamped / max(gen.theta_tau * 3.0, 1.0))

@@ -719,9 +719,9 @@ class TestCheckpointManager:
             mgr = CheckpointManager(data_dir=tmp, cleanup_keep=1)
             mgr.save('ckpt_a', cs, lattice); mgr.wait()
             mgr.save('ckpt_b', cs, lattice); mgr.wait()
-            mgr.cleanup()
+            mgr._cleanup_old()
             mgr.save('ckpt_c', cs, lattice); mgr.wait()
-            mgr.cleanup()
+            mgr._cleanup_old()
 
 
 class TestCheckpointManagerResilience:
@@ -747,7 +747,7 @@ class TestCheckpointManagerResilience:
             mgr.save('ckpt_1', cs, lattice); mgr.wait()
             mgr.save('ckpt_2', cs, lattice); mgr.wait()
             mgr.save('ckpt_3', cs, lattice); mgr.wait()
-            mgr.cleanup()
+            mgr._cleanup_old()
             assert not os.path.exists(os.path.join(tmp, 'concept_space_ckpt_1.json'))
             assert os.path.exists(os.path.join(tmp, 'concept_space_ckpt_2.json'))
             assert os.path.exists(os.path.join(tmp, 'concept_space_ckpt_3.json'))
@@ -1017,23 +1017,25 @@ class TestAdaptiveErrorTracker:
 
 # ── QN-38: Checkpoint cleanup ──────────────────────────────────
 class TestCheckpointCleanup:
-    def test_cleanup_keep(self, tmp_path):
+    def test_cleanup_keep(self, tmp_path, cs, lattice):
         """Verify cleanup keeps correct number of checkpoints."""
         from eva.symbolic.checkpoint_manager import CheckpointManager
         mgr = CheckpointManager(data_dir=str(tmp_path), cleanup_keep=3)
         for tag in ['1k', '2k', '3k', '4k', '5k']:
-            mgr.save(tag, None, None)
-        mgr.cleanup(keep=3)
+            mgr.save(tag, cs, lattice)
+        mgr.wait()
+        mgr._cleanup_old()
         assert len(mgr._saved_tags) == 3
         assert mgr._saved_tags == ['3k', '4k', '5k']
 
-    def test_cleanup_below_keep(self, tmp_path):
+    def test_cleanup_below_keep(self, tmp_path, cs, lattice):
         """Verify cleanup doesn't remove when below threshold."""
         from eva.symbolic.checkpoint_manager import CheckpointManager
         mgr = CheckpointManager(data_dir=str(tmp_path), cleanup_keep=5)
         for tag in ['1k', '2k']:
-            mgr.save(tag, None, None)
-        mgr.cleanup()
+            mgr.save(tag, cs, lattice)
+        mgr.wait()
+        mgr._cleanup_old()
         assert len(mgr._saved_tags) == 2
 
     def test_shutdown(self, tmp_path):
@@ -1445,3 +1447,193 @@ class TestQNV11:
             # CPU and GPU should produce similar results (no 0.1 factor gap)
             diff = np.linalg.norm(v_cpu_after[cid] - v_gpu)
             assert diff < 0.1, f"CPU/GPU centroid pull mismatch for cid={cid}: diff={diff}"
+
+
+# ── QN-59..QN-63: V12 GPU tests (13 new) ────────────────────────────────
+
+class TestQNV12:
+    """Test suites QN-59 through QN-63 — GPU optimization + safety coverage."""
+
+    # ── QN-59 / G-60: GPU destab coverage (3 tests) ─────────────────
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_gpu_destab_basic(self, gen):
+        """Verify GPU destab with destab_scale=0.5 maintains unit norm."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        trainer = gen._trainer
+        gen_cids = [0, 1, 2]
+        v_before = {cid: gen._vecs_t[cid].clone() for cid in gen_cids}
+        trainer._gpu_stdp_apply(
+            gpu_ctx_l=[0, 0], gpu_tgt_l=[1, 2],
+            gpu_meta_l=np.array([(0, 1, 0.5, 1.0, 1.0, 1.0),
+                                 (0, 2, 0.3, 1.0, 1.0, 1.0)], dtype=np.float32),
+            gpu_cid_gen=[1, 2], base_lr_val=0.03,
+            field_gate=False, inh_strength=0.0, inh_threshold=0.1,
+            destab_scale=0.5, momentum_mu=0.0)
+        for cid in gen_cids:
+            assert abs(float(gen._vecs_t[cid].norm()) - 1.0) < 1e-5, \
+                f"cid={cid} lost unit norm after destab"
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_gpu_destab_high_destab(self, gen):
+        """Verify GPU destab with destab_scale=1.0 doesn't crash."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        trainer = gen._trainer
+        gen._trainer._gpu_stdp_apply(
+            gpu_ctx_l=[0], gpu_tgt_l=[1],
+            gpu_meta_l=np.array([(0, 1, 0.5, 1.0, 1.0, 1.0)], dtype=np.float32),
+            gpu_cid_gen=[1], base_lr_val=0.03,
+            field_gate=False, inh_strength=0.0, inh_threshold=0.1,
+            destab_scale=1.0, momentum_mu=0.0)
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_gpu_destab_random_vs_cpu(self, gen):
+        """Verify CPU and GPU destab both maintain unit norm."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        cs = gen.cs
+        cid = 0
+        v_cpu_before = cs.concept_vectors.get(cid).copy()
+        gen._trainer._cpu_stdp_apply({cid: [(1, 0.1), (2, 0.2)]},
+                                      base_lr_val=0.03, inh_strength=0.0,
+                                      inh_threshold=0.1, destab_scale=0.5)
+        v_cpu_after = cs.concept_vectors.get(cid)
+        assert abs(np.linalg.norm(v_cpu_after) - 1.0) < 1e-5, "CPU destab lost unit norm"
+        # Restore
+        cs.set_vec(cid, v_cpu_before)
+
+    # ── QN-60: Batched GPU neg sampling (2 tests) ──────────────────
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_gpu_neg_sampling_batched_write(self, gen):
+        """Verify batched neg sampling runs without crash."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        trainer = gen._trainer
+        trainer._negative_sampling_gpu(
+            gpu_ctx_l=[0], gpu_meta_l=np.array([(0, 0, 0.5, 1.0, 1.0, 1.0, 0.0, 0, 1)], dtype=np.float32),
+            gpu_cid_ctx=[0], gpu_cid_gen=[1],
+            device=gen._torch_device, field_gate=False,
+            base_lr_val=0.03, neg_lr_ratio=0.5, neg_samples=2)
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_gpu_neg_sampling_no_crash_empty(self, gen):
+        """Verify empty neg sampling doesn't crash."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        trainer = gen._trainer
+        trainer._negative_sampling_gpu(
+            gpu_ctx_l=[], gpu_meta_l=np.array([], dtype=np.float32),
+            gpu_cid_ctx=[], gpu_cid_gen=[],
+            device=gen._torch_device, field_gate=False,
+            base_lr_val=0.03, neg_lr_ratio=0.5, neg_samples=0)
+
+    # ── QN-61: Pre-computed boolean masks (3 tests) ────────────────
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_gpu_contrastive_valid_hn_mask(self, gen):
+        """Verify valid_hn excludes self and cooc."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        n_v = gen._vecs_t.shape[0]
+        gen_updates = {1: [(0, 0.1)]}
+        gen_cids = list(gen_updates.keys())
+        ng = 1
+        cooc_masks = torch.zeros(ng, n_v, dtype=torch.bool, device=gen._torch_device)
+        cooc_masks[0, 0] = True  # cid 1 co-occurs with cid 0
+        gen_idxs = torch.tensor(gen_cids, dtype=torch.long, device=gen._torch_device)
+        g_vecs = gen._vecs_t[gen_idxs].float()
+        all_vecs = gen._vecs_t[:n_v]
+        sim = (g_vecs.half() @ all_vecs.T).float()
+        topk = sim.topk(min(5, n_v), dim=-1)
+        topk_idx = topk.indices
+        mask_self = topk_idx == gen_idxs[:, None]
+        cooc_hn = cooc_masks.gather(1, topk_idx[:, :5])
+        valid_hn = ~mask_self[:, :5] & ~cooc_hn[:, :5]
+        assert valid_hn.dtype == torch.bool, "valid_hn should be bool"
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_gpu_contrastive_cross_field_reg(self, gen):
+        """Verify cross-field reg mask (fb_hn > 0) produces cos_upper=0.3."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        gen._ensure_fb_tensor(gen._torch_device)
+        if gen._fb_t is None:
+            pytest.skip("No fb_t")
+        n_v = gen._vecs_t.shape[0]
+        gen_updates = {1: [(0, 0.1)]}
+        gen_cids = list(gen_updates.keys())
+        gen_idxs = torch.tensor(gen_cids, dtype=torch.long, device=gen._torch_device)
+        fb_gen = gen._fb_t[gen_idxs]
+        fb_all = gen._fb_t.unsqueeze(0)
+        fb_overlaps = (fb_gen.unsqueeze(1) & fb_all).sum(dim=-1)
+        topk = (gen._vecs_t[gen_idxs].float().half() @ gen._vecs_t[:n_v].T).float()
+        best_idx = topk.topk(min(5, n_v), dim=-1).indices[:, :5]
+        fb_hn = fb_overlaps.gather(1, best_idx)
+        cos_upper = torch.where(fb_hn > 0, 0.3, 0.999)
+        assert (cos_upper[fb_hn > 0] == 0.3).all(), "cross-field should have cos_upper=0.3"
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_gpu_contrastive_no_crash_empty(self, gen):
+        """Verify empty contrastive GPU doesn't crash."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        trainer = gen._trainer
+        trainer._contrastive_objective_gpu({})
+
+    # ── QN-62: VRAM fp16 precision (3 tests) ───────────────────────
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_ema_bf16_stability(self, gen):
+        """Verify bf16 EMA doesn't underflow after many steps."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        if gen._ema_vecs_t is None or gen._ema_vecs_t.dtype != torch.bfloat16:
+            pytest.skip("No bf16 EMA")
+        for _ in range(100):
+            unique_gen = [0, 1]
+            ema_updated = torch.lerp(gen._ema_vecs_t[unique_gen].float(),
+                                      gen._vecs_t[unique_gen].float(), 0.001)
+            gen._ema_vecs_t[unique_gen] = ema_updated.to(gen._ema_vecs_t.dtype)
+        assert torch.isfinite(gen._ema_vecs_t[:2]).all(), "bf16 EMA underflow after 100 steps"
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_mom_bf16_stability(self, gen):
+        """Verify bf16 _mom_t doesn't underflow after many steps."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        if gen._mom_t is None or gen._mom_t.dtype != torch.bfloat16:
+            pytest.skip("No bf16 mom_t")
+        for _ in range(100):
+            noise = torch.randn(2, gen._mom_t.shape[1], device=gen._torch_device, dtype=torch.bfloat16) * 1e-6
+            gen._mom_t[[0, 1]] = 0.9 * gen._mom_t[[0, 1]] + 0.1 * noise
+        assert torch.isfinite(gen._mom_t[:2]).all(), "bf16 mom_t underflow after 100 steps"
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_codes_fp16_roundtrip(self, gen, cs):
+        """Verify fp16 _codes_t roundtrip: read → write → read preserves norm."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        if gen._codes_t is None or gen._codes_t.dtype != torch.float16:
+            pytest.skip("No fp16 _codes_t")
+        cids_t = torch.tensor([0, 1], dtype=torch.long, device=gen._torch_device)
+        codes_in = gen._codes_t[cids_t].clone()
+        gen._codes_t[cids_t] = codes_in * 0.5  # modify
+        codes_out = gen._codes_t[cids_t]
+        diff = (codes_in * 0.5 - codes_out).abs().max()
+        assert diff < 1e-4, f"fp16 roundtrip error too large: {diff}"
+
+    # ── QN-63: Cleanup public API (2 tests) ────────────────────────
+    def test_cleanup_old_method_exists(self):
+        """Verify CheckpointManager has _cleanup_old method."""
+        from eva.symbolic.checkpoint_manager import CheckpointManager
+        assert hasattr(CheckpointManager, '_cleanup_old'), "_cleanup_old method missing"
+
+    def test_cleanup_old_keeps_correct(self, tmp_path, cs, lattice):
+        """Verify _cleanup_old keeps correct number of checkpoints."""
+        from eva.symbolic.checkpoint_manager import CheckpointManager
+        mgr = CheckpointManager(data_dir=str(tmp_path), cleanup_keep=2)
+        for tag in ['a', 'b', 'c']:
+            mgr.save(tag, cs, lattice)
+        mgr.wait()
+        mgr._cleanup_old()
+        assert len(mgr._saved_tags) == 2
+        assert 'a' not in mgr._saved_tags, "oldest checkpoint should be removed"

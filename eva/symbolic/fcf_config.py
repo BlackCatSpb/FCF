@@ -359,6 +359,10 @@ class FCFConfig:
             AdaptRule('cos_flat >= 3', 'destab_decay_lines', 'shift', 2000),
             AdaptRule('full_stuck', 'destab_decay_lines', 'shift', -2000),
         ]),
+        ParamDef('field_gate_threshold', 0.0, 1.0, 1.0, 0.05, rules=[
+            AdaptRule('cos_flat >= 3', 'field_gate_threshold', 'shift', -0.05),
+            AdaptRule('mean_cos > 0.01', 'field_gate_threshold', 'shift', 0.05),
+        ]),
     ])
 
     # ── Метрические пары (заполняются из MorphVocab/корпуса) ──
@@ -374,7 +378,7 @@ class FCFConfig:
     lr_warmup_lines: int = 1000
     lr_cosine_T0: int = 5000
     lr_cosine_mult: float = 1.5
-    checkpoint_every: int = 500
+    checkpoint_every: int = 5000
     eval_every_fast: int = 1000
     eval_every_slow: int = 2000
     eval_fast_lines: int = 64      # TN-9: lines for fast eval (PPL only)

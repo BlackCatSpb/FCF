@@ -218,14 +218,16 @@ class SyntaxLattice:
                     self.ngrams[n][prefix] = Counter()
                 self.ngrams[n][prefix][next_c] += 1
                 self.concept_freq[next_c] = self.concept_freq.get(next_c, 0) * self.decay + 1.0
+                # Incremental prefix total (avoids O(all_ngrams) refresh on every line)
+                self._prefix_total[prefix] = self._prefix_total.get(prefix, 0) + 1
 
         for i in range(len(concept_sequence) - 1):
             self.add_connection(concept_sequence[i], concept_sequence[i + 1])
         for i in range(len(concept_sequence) - 2):
             self.skip2[concept_sequence[i]][concept_sequence[i + 2]] += 1
-
-        # Rebuild prefix totals
-        self._refresh_prefix_totals()
+            # Incremental skip2 total
+            cid = concept_sequence[i]
+            self._skip2_total[cid] = self._skip2_total.get(cid, 0) + 1
 
     def decay_all(self, min_freq=0.01, rare_concept_protect=False, rare_threshold=3):
         """Sweep all ngrams, concept frequencies, and connections with decay factor.

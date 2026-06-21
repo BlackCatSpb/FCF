@@ -459,17 +459,28 @@ class ConceptSpace:
             print(f"  Octree fields: {len(seen_cids)}/{len(self.fractal.codes)} concepts, "
                   f"sizes: min={a.min()} max={a.max()} mean={a.mean():.1f}")
 
-    def fluctuate_fractal(self, fluctuation_amp=0.003, decay=0.9995, repel_strength=0.0, generator=None):
+    def fluctuate_fractal(self, fluctuation_amp=0.003, decay=0.9995, repel_strength=0.0, generator=None, current_cos=None):
         """Autonomous drift + optional centroid repulsion.
 
         Args:
             generator: Optional CrystalGenerator instance whose GPU tensors
                        to invalidate after the drift.
+            current_cos: Optional float — mean cosine similarity. Used to
+                         modulate drift: high cos → reduce amp (prevent collapse),
+                         low cos (<0.05) → reduce amp (too sparse).
         """
+        if current_cos is not None and current_cos > 0:
+            if current_cos > 0.25:
+                cos_factor = 1.0 - (current_cos - 0.25) / 0.15
+                cos_factor = max(cos_factor, 0.2)
+                fluctuation_amp *= cos_factor
+            elif current_cos < 0.05:
+                cos_factor = current_cos / 0.05
+                fluctuation_amp *= max(cos_factor, 0.3)
         self.fractal.fluctuate(fluctuation_amp=fluctuation_amp, decay=decay)
         self._sync_from_fractal()
         if generator is not None:
-            generator._invalidate_torch()
+            generator._sync_after_fluctuate()
         if repel_strength > 0:
             self._repel_centroid(repel_strength)
 
@@ -623,6 +634,7 @@ class ConceptSpace:
 
         new_vecs_np = new_vecs.cpu().numpy()
         new_codes_np = new_codes.cpu().numpy()
+        gen._codes_t[cids_t] = new_codes.to(torch.float16)
         for i, cid in enumerate(cids):
             v_new = new_vecs_np[i]
             code_new = new_codes_np[i]
@@ -807,6 +819,18 @@ class ConceptSpace:
             if len(result) >= k:
                 break
         return result[:k]
+
+    def batch_dot(self, ctx_ids, target_id):
+        """Batch dot products of context vectors with target vector.
+
+        Args:
+            ctx_ids: list of concept IDs
+            target_id: target concept ID
+        Returns:
+            list of float dot products
+        """
+        tv = self.concept_vectors[target_id]
+        return [float(np.dot(self.concept_vectors[c], tv)) for c in ctx_ids]
 
     def save(self, path: str, use_pq: bool = False) -> None:
         """Save ConceptSpace to disk.

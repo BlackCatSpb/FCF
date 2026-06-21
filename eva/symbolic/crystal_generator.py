@@ -30,6 +30,8 @@ _META_DW = 3
 _META_FW = 4
 _META_FIELD_W = 5
 _META_SLOW = 6
+_META_PREV_CID = 7  # GPU-only: raw prev_cid for on-GPU PMI
+_META_NEXT_CID = 8  # GPU-only: raw next_cid for on-GPU PMI
 try:
     import torch
     _HAS_TORCH = True
@@ -60,11 +62,12 @@ class GenerationResult:
 class CrystalGenerator:
     """Generation as semantic navigation through BPE-token concept space."""
 
-    def __init__(self, cs, sp, lattice, config=None):
+    def __init__(self, cs, sp, lattice, config=None, qwen_knowledge=None):
         self.cs = cs
         self.sp = sp
         self.lattice = lattice
         self.config = config or {}
+        self.qwen_knowledge = qwen_knowledge
         cs._after_update_hook = self._on_vector_update
 
         self.max_words = self.config.get('max_words', 30)
@@ -116,26 +119,88 @@ class CrystalGenerator:
         self._ema_decay = 0.999
         self._ema_steps = 0
         self._torch_dirty = False  # set True after fluctuate → trigger rebuild
+        self._skip_gpu_sync = False  # B4: suppress GPU copy in hook after batched write
+        self._dirty_cids: set = set()  # G-72: CIDs modified on GPU, pending CPU sync
         self._total_freq_cache = None
         self._fused_buf = None  # G-49: pre-allocated fused buffer for scatter_add
 
-        # Hook lattice mutations to invalidate total_freq cache
+        # GPU frequency/ngram tensors for on-GPU PMI (lazy init, synced incrementally)
+        self._cf_t = None      # concept_freq [V] float32
+        self._pt2_t = None     # _prefix_total for 2-grams [V] float32
+        self._skip2_t = None   # _skip2_total [V] float32
+        self._total_freq_t = None  # scalar GPU tensor
+
+        # Hook lattice mutations to invalidate total_freq cache + sync GPU tensors
         _orig_update = self.lattice.update
         def _cached_update(concept_sequence):
             _orig_update(concept_sequence)
             self._total_freq_cache = None
+            if self._cf_t is not None:
+                self._sync_freq_tensors(concept_sequence)
         self.lattice.update = _cached_update
 
         _orig_decay = self.lattice.decay_all
         def _cached_decay(min_freq=0.01, **kwargs):
             _orig_decay(min_freq, **kwargs)
             self._total_freq_cache = None
+            if self._cf_t is not None:
+                self._rebuild_freq_tensors()
         self.lattice.decay_all = _cached_decay
 
     def _get_total_freq(self):
         if self._total_freq_cache is None:
             self._total_freq_cache = max(sum(self.lattice.concept_freq.values()), 1)
         return self._total_freq_cache
+
+    def _sync_freq_tensors(self, concept_sequence):
+        """Incremental CPU→GPU sync of frequency tensors after lattice.update()."""
+        device = self._cf_t.device
+        seen = list(set(concept_sequence))
+        cf_vals = [self.lattice.concept_freq.get(c, 0.0) for c in seen]
+        self._cf_t[seen] = torch.tensor(cf_vals, dtype=torch.float32, device=device)
+
+        # _prefix_total for 2-grams (single-CID prefixes)
+        changed_pt2 = set()
+        for i in range(len(concept_sequence) - 1):
+            prefix = (concept_sequence[i],)
+            if prefix in self.lattice._prefix_total:
+                changed_pt2.add(concept_sequence[i])
+        if changed_pt2:
+            pt2_l = list(changed_pt2)
+            pt2_v = [self.lattice._prefix_total.get((c,), 0) for c in pt2_l]
+            self._pt2_t[pt2_l] = torch.tensor(pt2_v, dtype=torch.float32, device=device)
+
+        # _skip2_total
+        changed_sk2 = set()
+        for i in range(len(concept_sequence) - 2):
+            cid = concept_sequence[i]
+            if cid in self.lattice._skip2_total:
+                changed_sk2.add(cid)
+        if changed_sk2:
+            sk2_l = list(changed_sk2)
+            sk2_v = [self.lattice._skip2_total.get(c, 0) for c in sk2_l]
+            self._skip2_t[sk2_l] = torch.tensor(sk2_v, dtype=torch.float32, device=device)
+
+        self._total_freq_t = torch.tensor(self._get_total_freq(), dtype=torch.float32, device=device)
+
+    def _rebuild_freq_tensors(self):
+        """Full rebuild of GPU frequency tensors from CPU dicts (after decay_all)."""
+        V = self._cf_t.shape[0]
+        device = self._cf_t.device
+        cf_arr = np.zeros(V, dtype=np.float32)
+        for cid, freq in self.lattice.concept_freq.items():
+            cf_arr[int(cid)] = freq
+        self._cf_t.copy_(torch.from_numpy(cf_arr).to(device, non_blocking=True))
+        pt2_arr = np.zeros(V, dtype=np.float32)
+        for prefix, total in self.lattice._prefix_total.items():
+            if len(prefix) == 1:
+                pt2_arr[prefix[0]] = total
+        self._pt2_t.copy_(torch.from_numpy(pt2_arr).to(device, non_blocking=True))
+        sk2_arr = np.zeros(V, dtype=np.float32)
+        for cid, total in self.lattice._skip2_total.items():
+            sk2_arr[int(cid)] = total
+        self._skip2_t.copy_(torch.from_numpy(sk2_arr).to(device, non_blocking=True))
+        self._total_freq_t = torch.tensor(self._get_total_freq(), dtype=torch.float32, device=device)
 
     def _destab_field_fallback(self, gen_cid, v_gen):
         """Field-based destab fallback: pick a random concept with overlapping field."""
@@ -157,7 +222,7 @@ class CrystalGenerator:
 
     def _on_vector_update(self, cid, v_new):
         """Hook called by ConceptSpace._apply_vector_update to keep _vecs_t in sync."""
-        if self._vecs_t is not None:
+        if self._vecs_t is not None and not self._skip_gpu_sync:
             self._vecs_t[cid].copy_(torch.from_numpy(v_new).to(device=self._vecs_t.device, dtype=self._vecs_t.dtype, non_blocking=True))
 
     def _ensure_torch(self, device=None):
@@ -225,7 +290,7 @@ class CrystalGenerator:
         for cid, code in cs.fractal.codes.items():
             codes_arr[cid] = code
         if self._codes_t is None or self._codes_t.shape[0] != V or self._codes_t.device != dev:
-            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float32)
+            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float16)
         self._codes_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
 
         # Concept error tensor for vectorized GPU negative sampling
@@ -236,15 +301,22 @@ class CrystalGenerator:
             self._ce_t = torch.empty(V, device=dev, dtype=torch.float32)
         self._ce_t.copy_(torch.from_numpy(ce_arr), non_blocking=True)
 
+        # Frequency/ngram tensors for on-GPU PMI
+        if self._cf_t is None or self._cf_t.shape[0] != V or self._cf_t.device != dev:
+            self._cf_t = torch.zeros(V, device=dev, dtype=torch.float32)
+            self._pt2_t = torch.zeros(V, device=dev, dtype=torch.float32)
+            self._skip2_t = torch.zeros(V, device=dev, dtype=torch.float32)
+        self._rebuild_freq_tensors()
+
         # Initialize EMA as a copy of vecs_t (fp16 to save 112MB)
         if self._ema_vecs_t is None or self._ema_vecs_t.shape[0] != V or self._ema_vecs_t.device != dev:
-            self._ema_vecs_t = self._vecs_t.clone()
+            self._ema_vecs_t = self._vecs_t.clone().to(torch.bfloat16)
         else:
-            self._ema_vecs_t.copy_(self._vecs_t)
+            self._ema_vecs_t.copy_(self._vecs_t.to(torch.bfloat16))
         self._ema_steps = 0
 
         if self._mom_t is None or self._mom_t.shape[0] != V or self._mom_t.device != dev:
-            self._mom_t = torch.zeros(V, D, device=dev, dtype=torch.float16)
+            self._mom_t = torch.zeros(V, D, device=dev, dtype=torch.bfloat16)
 
         # G-49: pre-allocate fused buffer for scatter_add (grows on demand, not full V)
         if self._fused_buf is None or self._fused_buf.shape[1] != D + 1 or self._fused_buf.device != dev:
@@ -266,6 +338,47 @@ class CrystalGenerator:
         self._codes_t = None
         self._torch_dirty = True
 
+    def _sync_after_fluctuate(self):
+        """SN-54: Incremental GPU sync after fluctuate — no full O(V·D) rebuild.
+
+        Reads CPU codes → copies to GPU _codes_t → recomputes _vecs_t via
+        batched matmul (_codes_t @ _basis_t), avoiding the per-concept
+        CPU loop + PCIe transfer of _build_torch_tensors.
+        """
+        cs = self.cs
+        if self._torch_device is None or self._vecs_t is None or not hasattr(cs.fractal, 'codes'):
+            self._invalidate_torch()
+            return
+        dev = self._torch_device
+        V = cs.vocab_size
+        latent_dim = cs.fractal.latent_dim
+
+        codes_arr = np.zeros((V, latent_dim), dtype=np.float32)
+        for cid, code in cs.fractal.codes.items():
+            codes_arr[cid] = code
+
+        if self._codes_t is None or self._codes_t.shape[0] != V:
+            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float16)
+        self._codes_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
+
+        basis_t = self._basis_t
+        # Recompute _vecs_t on GPU: (V, latent_dim) @ (latent_dim, D) → (V, D)
+        vecs_gpu = self._codes_t.float() @ basis_t.to(dev, non_blocking=True)
+        nv = vecs_gpu.norm(dim=1, keepdim=True).clamp(min=1e-10)
+        vecs_gpu /= nv
+        if self._vecs_t.shape[0] != V:
+            self._vecs_t = torch.empty(V, vecs_gpu.shape[1], device=dev, dtype=torch.float16)
+        self._vecs_t.copy_(vecs_gpu.to(torch.float16), non_blocking=True)
+
+        # Refresh basis_t (may have changed after fluctuate)
+        if cs.fractal.basis is not None:
+            self._basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(dev, non_blocking=True)
+
+        # Reset momentum (codes changed — old momentum is stale)
+        if self._mom_t is not None:
+            self._mom_t.zero_()
+        self._torch_dirty = False
+
     def _sync_ema(self):
         """SN-18: Copy EMA vectors → _vecs_t for stable eval/generation.
         Saves original _vecs_t backup internally. Call restore_vectors() after eval."""
@@ -279,6 +392,19 @@ class CrystalGenerator:
         if hasattr(self, '_eval_backup') and self._eval_backup is not None and self._vecs_t is not None:
             self._vecs_t.copy_(self._eval_backup.to(self._vecs_t.dtype))
             self._eval_backup = None
+
+    def _sync_dirty_cpu(self):
+        """G-72: Batch-sync dirty CIDs from GPU _vecs_t to CPU concept_vectors."""
+        if not self._dirty_cids or self._vecs_t is None or self._torch_device is None:
+            return
+        cids = list(self._dirty_cids)
+        cids_t = torch.tensor(cids, dtype=torch.long, device=self._torch_device)
+        vecs_cpu = self._vecs_t[cids_t].cpu().numpy()
+        for cid, v_new in zip(cids, vecs_cpu):
+            self.cs._apply_vector_update(cid, v_new)
+        self._dirty_cids.clear()
+        if hasattr(self.cs.fractal, '_matrix_dirty'):
+            self.cs.fractal._matrix_dirty = True
 
     def _ensure_fb_tensor(self, dev=None):
         """Lazy-build _fb_t field bit tensor (only if field_gate is needed)."""

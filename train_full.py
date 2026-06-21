@@ -36,6 +36,7 @@ from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 from eva.symbolic.parameter_optimizer import ParameterOptimizer
+from eva.symbolic.qwen_knowledge import QwenKnowledge
 from eva.symbolic.fcf_config import FCFConfig
 
 # ── Config ──────────────────────────────────────────────────────
@@ -130,14 +131,26 @@ if RESUME is not None:
             lat_path = CFG.lattice_path.replace('.json', f'_{resume_tag}.json')
             lat_ok = os.path.exists(lat_path) or os.path.exists(lat_path.replace('.json', '.lattice.npz'))
             if not os.path.exists(cs_path) or not lat_ok:
-                print(f"Checkpoint {resume_tag} not found: {cs_path} / {lat_path}")
-                cs_path = CFG.cs_path
-                lat_path = CFG.lattice_path
-                if not os.path.exists(cs_path) or not os.path.exists(lat_path.replace('.json', '.lattice.npz')):
-                    print(f"Base checkpoint also not found. Giving up.")
-                    sys.exit(1)
-                resume_tag = 'base'
-                print(f"  (fallback to base paths)")
+                # Try .tmp files (from interrupted async save) and rename them
+                tmp_cs = cs_path + '.tmp'
+                tmp_lat = lat_path + '.tmp'
+                tmp_lat_npz = lat_path.replace('.json', '.lattice.npz') + '.tmp'
+                if os.path.exists(tmp_cs) and (os.path.exists(tmp_lat) or os.path.exists(tmp_lat_npz)):
+                    print(f"  Found .tmp checkpoint — recovering {resume_tag}")
+                    os.replace(tmp_cs, cs_path) if os.path.exists(tmp_cs) else None
+                    if os.path.exists(tmp_lat):
+                        os.replace(tmp_lat, lat_path)
+                    if os.path.exists(tmp_lat_npz):
+                        os.replace(tmp_lat_npz, lat_path.replace('.json', '.lattice.npz'))
+                if not os.path.exists(cs_path) or not (os.path.exists(lat_path) or os.path.exists(lat_path.replace('.json', '.lattice.npz'))):
+                    print(f"Checkpoint {resume_tag} not found: {cs_path} / {lat_path}")
+                    cs_path = CFG.cs_path
+                    lat_path = CFG.lattice_path
+                    if not os.path.exists(cs_path) or not os.path.exists(lat_path.replace('.json', '.lattice.npz')):
+                        print(f"Base checkpoint also not found. Giving up.")
+                        sys.exit(1)
+                    resume_tag = 'base'
+                    print(f"  (fallback to base paths)")
     else:
         resume_tag = RESUME
         r = RESUME.lower().rstrip('k')
@@ -342,7 +355,7 @@ from eva.symbolic.checkpoint_manager import CheckpointManager
 
 class TrainingPipeline:
     """Encapsulates the main training loop with batch scheduling, checkpoints, and reporting."""
-    def __init__(self, gen, sp, cs, lattice, opt, cfg):
+    def __init__(self, gen, sp, cs, lattice, opt, cfg, start_line=0):
         self.gen = gen
         self.sp = sp
         self.cs = cs
@@ -372,7 +385,8 @@ class TrainingPipeline:
             cleanup_keep=ckpt_keep)
         # TN-32: preserve curriculum progress after rescore
         self._rescore_cp = None
-        self._rescore_line = None  # TN-41: preserve LR schedule position after rescore
+        # If resuming mid-epoch (start_line > 0), prevent rescore until next epoch
+        self._rescore_line = None if start_line == 0 else -1
 
     def _checkpoint(self, epoch, idx, elapsed, epoch_lines, destab_scale, t_start,
                     epoch_train=None, start_line=None, global_step=0):
@@ -388,17 +402,13 @@ class TrainingPipeline:
         print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} ngrams={ng_total}(+{ng_new})")
         ckpt_k = idx // 1000
         ckpt_name = f"{ckpt_k}k"
-        # AM-7: Async checkpoint save (non-blocking)
-        self.ckpt_mgr.save(ckpt_name, cs, lattice, opt)
-        self.ckpt_mgr.cleanup()
-        # TN-31: Save checkpoint_state.json at every checkpoint
-        try:
-            ckpt = {'line': idx, 'epoch': epoch, 'global_step': global_step, 'timestamp': time.time()}
-            with open(self.cfg.ckpt_state_path + '.tmp', 'w', encoding='utf-8') as _f:
-                json.dump(ckpt, _f)
-            os.replace(self.cfg.ckpt_state_path + '.tmp', self.cfg.ckpt_state_path)
-        except Exception as e:
-            print(f"[WARN] checkpoint_state save failed: {e}", file=sys.stderr)
+        # AM-7: Fully async checkpoint save (background thread + atomic state)
+        ckpt_state = {
+            '_path': self.cfg.ckpt_state_path,
+            'line': idx, 'epoch': epoch,
+            'global_step': global_step, 'timestamp': time.time(),
+        }
+        self.ckpt_mgr.save(ckpt_name, cs, lattice, opt, ckpt_state=ckpt_state)
         n_upd = cs._update_count
         avg_delta = (cs._total_shift / max(n_upd, 1)) * 1e3
         cs._total_shift = 0.0; cs._update_count = 0
@@ -445,14 +455,15 @@ class TrainingPipeline:
                     print(f"  vPPL={eval_vppl:.0f} (fast)")
         opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
                  vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
-        # T-B1: Self-paced learning rescore
-        if epoch_train is not None and start_line is not None:
+        # T-B1: Self-paced learning rescore (once per epoch)
+        if self._rescore_line is None and epoch_train is not None and start_line is not None:
             remaining = idx - start_line + 1
             if remaining > 0 and remaining < len(epoch_train):
                 self._rescore_cp = _curriculum_p(idx + 1)
                 self._rescore_line = idx  # TN-41: save LR schedule position
                 epoch_train = _rescore_lines(epoch_train[idx + 1:], gen)
-                idx = -1; start_line = 0
+                idx = 0; start_line = 0
+                self.last_fluct_lines = 0
         if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
             print(f"  Early stopping: patience={self.patience_counter}/{self.patience}, "
                   f"stuck={opt._full_stuck_counter}")
@@ -498,7 +509,9 @@ LIVE_REFRESH = 1.0  # seconds between live status updates
 COS_REFRESH = 5.0   # seconds between cos/pair recomputation
 
 print("STDP training...")
-gen = CrystalGenerator(cs, sp, lattice)
+qwen_knowledge_path = os.path.join(CFG.data_dir, 'qwen_knowledge.npz')
+qk = QwenKnowledge(qwen_knowledge_path)
+gen = CrystalGenerator(cs, sp, lattice, qwen_knowledge=qk)
 gen.train_lr = opt.p['full_lr'].current
 t_start = time.time()
 
@@ -624,7 +637,7 @@ if RESUME is not None:
 _ckpt_epoch = current_epoch
 idx = start_line
 # AM-15/T-B2: Activate TrainingPipeline
-pipeline = TrainingPipeline(gen, sp, cs, lattice, opt, CFG)
+pipeline = TrainingPipeline(gen, sp, cs, lattice, opt, CFG, start_line=start_line)
 pipeline.ngram_last_total = sum(len(v) for v in lattice.ngrams.values())
 try:
     for epoch in range(current_epoch, total_epochs + 1):
@@ -636,6 +649,7 @@ try:
             print(f"{'='*60}")
             # Reset start_line for new epoch
             start_line = 0
+            pipeline._rescore_line = None  # allow rescore once per epoch
             # Re-read corpus with fresh decay
             destab_pct = 0.0  # fresh destab for new epoch
 
@@ -645,6 +659,7 @@ try:
 
         bs_curve = lambda i: int(CFG.batch_size_start + (CFG.batch_size_end - CFG.batch_size_start) * _curriculum_p(i))
         BATCH_SIZE = bs_curve(idx)
+        _batch_mult = 1.0  # TN-46: plateau doubling multiplier (not overwritten by bs_curve)
         batch_buffer = []
         batch_lr = None
         batch_destab = 0.0
@@ -676,7 +691,7 @@ try:
             batch_buffer.append(line)
             batch_lr = gen.train_lr
             batch_destab = destab_scale
-            BATCH_SIZE = int(CFG.batch_size_start + (CFG.batch_size_end - CFG.batch_size_start) * _eff_cp)
+            BATCH_SIZE = int((CFG.batch_size_start + (CFG.batch_size_end - CFG.batch_size_start) * _eff_cp) * _batch_mult)
 
             if len(batch_buffer) < BATCH_SIZE and idx < start_line + len(epoch_train) - 1:
                 # Check if periodic tasks are due — if so, flush early
@@ -701,7 +716,7 @@ try:
                 context_window=cw_ramp,
                 inh_strength=opt.p['inh_strength'].current,
                 inh_threshold=opt.p['inh_threshold'].current,
-                neg_lr_ratio=CFG.neg_lr_ratio, field_gate=CFG.field_gate,
+                neg_lr_ratio=CFG.neg_lr_ratio, field_gate=opt.p['field_gate_threshold'].current,
                 use_torch=CFG.use_torch, destab_scale=batch_destab,
                 gradient_noise_scale=opt.p['gradient_noise_scale'].current,
                 momentum_mu=CFG.momentum_mu)
@@ -730,7 +745,8 @@ try:
                 cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
                                      decay=_decay_warmup,
                                      repel_strength=opt.p['repel_strength'].current,
-                                     generator=gen)
+                                     generator=gen,
+                                     current_cos=last_cos_sim[0] if last_cos_sim else None)
                 last_fluct_lines = idx
 
             if idx > 0 and total_pairs_since_last_decay >= CFG.decay_every_pairs:
@@ -779,13 +795,13 @@ try:
                     cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
                                          decay=_decay_warmup,
                                          repel_strength=opt.p['repel_strength'].current,
-                                         generator=gen)
+                                         generator=gen,
+                                         current_cos=last_cos_sim[0] if last_cos_sim else None)
                     last_fluct_lines = idx
-                # TN-13: plateau-adaptive batch size (double when stuck)
+                # TN-13/46: plateau-adaptive batch size via multiplier
                 if pipeline.opt._full_stuck_counter >= 3:
-                    BATCH_SIZE = min(BATCH_SIZE * 2, CFG.batch_size_end * 4)
-                    if pipeline.opt._full_stuck_counter >= 3 and pipeline.opt._full_stuck_counter < 5:
-                        print(f"  PLATEAU — doubling batch size to {BATCH_SIZE}")
+                    _batch_mult = min(_batch_mult * 2, 4.0)
+                    BATCH_SIZE = int(bs_curve(idx) * _batch_mult)
                 print()
             idx += 1
 

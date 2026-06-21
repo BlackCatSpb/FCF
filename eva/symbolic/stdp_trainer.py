@@ -20,6 +20,7 @@ _META_FIELD_W = 5
 _META_SLOW = 6
 _META_PREV_CID = 7
 _META_NEXT_CID = 8
+_META_QWEN = 9
 
 
 class STDPTrainer:
@@ -177,7 +178,7 @@ class STDPTrainer:
 
         # G-65/SN-48: Pre-compute field overlap matrix on GPU (one batch, no per-pair .item())
         _overlap_lookup = None
-        if use_torch and field_gate > 0.5 and gen._fb_t is not None:
+        if use_torch and field_gate > 0 and gen._fb_t is not None:
             ids_t = torch.tensor(ids, dtype=torch.long, device=gen._torch_device)
             fb_t = gen._fb_t[ids_t]
             overlap_mat = (fb_t.unsqueeze(1) & fb_t.unsqueeze(0)).sum(dim=-1).cpu().numpy()
@@ -236,14 +237,15 @@ class STDPTrainer:
                         continue
 
                 field_weight = 1.0
-                if field_gate > 0.5:
+                if field_gate > 0:
                     if _overlap_lookup is not None:
                         overlap = _overlap_lookup(i, j)
                     elif hasattr(cs.fractal, 'field_bits') and len(cs.fractal.field_bits) > 0:
                         overlap = cs.fractal.field_overlap(ids[i], ids[j])
                     else:
                         overlap = 0
-                    field_weight = min(1.0 + math.log(overlap + 1) * 2.0, 3.0) if overlap > 0 else 0.1
+                    fw = min(1.0 + math.log(overlap + 1) * 2.0, 3.0) if overlap > 0 else 0.1
+                    field_weight = 1.0 + (fw - 1.0) * field_gate
 
                 lr = base_lr * max(freq_weight, 0.05) * pmi_w * field_weight
                 # G-86: Qwen knowledge distillation — modulate lr by semantic proximity
@@ -266,7 +268,8 @@ class STDPTrainer:
                         continue
                     gpu_ctx_l.append(ci)
                     gpu_tgt_l.append(cj)
-                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 0.0, ids[i], ids[j]))
+                    qwen_factor = gen.qwen_knowledge.get_factor(ids[i], ids[j]) if gen.qwen_knowledge and gen.qwen_knowledge.is_loaded else 1.0
+                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 0.0, ids[i], ids[j], qwen_factor))
                     gpu_cid_ctx.append(ids[i])
                     gpu_cid_gen.append(ids[j])
                     # SN-25: Add slow STDP pair to GPU lists (matches CPU slow_lr > 1e-6 gate)
@@ -275,7 +278,7 @@ class STDPTrainer:
                     if slow_lr > 1e-6:
                         gpu_ctx_l.append(ci)
                         gpu_tgt_l.append(cj)
-                        gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 1.0, ids[i], ids[j]))
+                        gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 1.0, ids[i], ids[j], qwen_factor))
                         gpu_cid_ctx.append(ids[i])
                         gpu_cid_gen.append(ids[j])
 
@@ -417,6 +420,8 @@ class STDPTrainer:
         dw_t = torch.exp(-dist / 2.0)
 
         lr = torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w_t
+        if meta_t.shape[1] > _META_QWEN:
+            lr *= meta_t[:, _META_QWEN]
         lr *= (0.5 + gen.hormones.acetylcholine * 0.5) * (0.5 + gen.hormones.dopamine * 0.5)
         dist_clamped = torch.clamp(dist, max=10.0)
         theta_fast = torch.exp(-dist_clamped.clamp(max=5.0) / max(gen.theta_tau, 1.0))
@@ -454,10 +459,9 @@ class STDPTrainer:
         gen._gpu_elr_avg = elr_grouped / cnt.clamp(min=1)
         gen._gpu_unique_gen = unique_gen
 
-        if gen._cf_t is None:
-            avg_err_cpu = avg_err.cpu().numpy()
-            for gi, gen_cid in enumerate(unique_gen):
-                gen.concept_error.update(gen_cid, float(avg_err_cpu[gi]))
+        avg_err_cpu = avg_err.cpu().numpy()
+        for gi, gen_cid in enumerate(unique_gen):
+            gen.concept_error.update(gen_cid, float(avg_err_cpu[gi]))
 
         return acc, elr_grouped, cnt, D, ng
 
@@ -584,31 +588,35 @@ class STDPTrainer:
         gen = self.gen
         cs = gen.cs
         device = gen._torch_device
+        n = len(gen_cids)
+        if n == 0:
+            return
         idxs = torch.tensor(gen_cids, dtype=torch.long, device=device)
         gv = gen._vecs_t[idxs].float()
         sim = gv @ gv.T
-        n = len(gen_cids)
         mask_all = sim > inh_threshold * 2
         mask_all.fill_diagonal_(False)
-        _inh_updates = []
-        for gi in range(n):
-            gi_mask = mask_all[gi]
-            if not gi_mask.any():
-                continue
-            sv = sim[gi][gi_mask].unsqueeze(1)  # (k, 1)
-            inhibit_vec = (sv * gv[gi_mask] - (sv ** 2) * gv[gi]).sum(dim=0)
-            nv = inhibit_vec.norm()
-            if nv > 1e-10:
-                inhibit_vec /= nv
-                v_old_gpu = gen._vecs_t[gen_cids[gi]].float()
-                v_new = v_old_gpu + inhibit_vec * inh_strength * base_lr_val
-                nn = v_new.norm()
-                if nn > 1e-10:
-                    v_new /= nn
-                _inh_updates.append((gen_cids[gi], v_new))
-        if _inh_updates:
-            cids_batch = [d[0] for d in _inh_updates]
-            vecs_batch = torch.stack([d[1] for d in _inh_updates]).to(gen._vecs_t.dtype)
+        mask_sim = mask_all * sim
+        has_inh = mask_all.any(dim=1)  # (n,) — which gen_cids have inhibition targets
+        if not has_inh.any():
+            return
+        # AM-100: batched inhibition — all concepts in one matmul, no Python loop
+        sum_sim_gv = mask_sim @ gv  # (n, D): vectorized sum of sim_ij * gv_j
+        sum_sim2 = (mask_all * sim ** 2).sum(dim=1, keepdim=True)  # (n, 1): sum of sim_ij^2
+        inhibit_vec = sum_sim_gv - sum_sim2 * gv  # (n, D)
+        inh_norm = inhibit_vec.norm(dim=1, keepdim=True)
+        inh_ok = inh_norm.squeeze() > 1e-10
+        inhibit_vec[inh_ok] /= inh_norm[inh_ok]
+        v_old = gen._vecs_t[idxs].float()
+        v_new = v_old + inhibit_vec * inh_strength * base_lr_val
+        nn = v_new.norm(dim=1, keepdim=True)
+        nn_ok = nn.squeeze() > 1e-10
+        v_new[nn_ok] /= nn[nn_ok]
+        # Only update rows that had active inhibition
+        update_mask = has_inh & inh_ok & nn_ok
+        if update_mask.any():
+            cids_batch = [gen_cids[i] for i in range(n) if update_mask[i]]
+            vecs_batch = v_new[update_mask].to(gen._vecs_t.dtype)
             gen._vecs_t[cids_batch] = vecs_batch
             gen._dirty_cids.update(cids_batch)
 
@@ -628,10 +636,9 @@ class STDPTrainer:
                 continue
             avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
             neg_lr = avg_elr * neg_lr_ratio * 0.3
-            # SN-B2: concept_error reweighting (applied only when field_gate=True, matching original intent)
-            if field_gate > 0.5:
-                ce = gen.concept_error.get(gen_cid, 0.0)
-                neg_lr *= (1.0 + ce * 2.0)
+            # SN-57: concept_error reweighting with multiplicative field_gate strength
+            ce = gen.concept_error.get(gen_cid, 0.0)
+            neg_lr *= (1.0 + ce * 2.0 * field_gate)
             neg_candidates = gen.main_rng.choices(total_vocab, k=min(neg_samples, len(total_vocab)))
             for neg_cid in neg_candidates:
                 if neg_cid == gen_cid:
@@ -681,6 +688,8 @@ class STDPTrainer:
         else:
             device_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
             pair_elr = torch.clamp(device_t[:, _META_FW], min=0.05) * device_t[:, _META_DW] * device_t[:, _META_PMI] * device_t[:, _META_FIELD_W]
+            if device_t.shape[1] > _META_QWEN:
+                pair_elr *= device_t[:, _META_QWEN]
             elr_per_gen = torch.zeros(len(unique_gen), device=device)
             elr_per_gen.scatter_add_(0, inv_t, pair_elr)
             cnt_per_gen = torch.zeros(len(unique_gen), device=device)
@@ -688,30 +697,30 @@ class STDPTrainer:
             avg_elr_per_gen = elr_per_gen / cnt_per_gen.clamp(min=1)
 
         neg_lr = avg_elr_per_gen * neg_lr_ratio * 0.3
-        if field_gate > 0.5:
-            neg_lr *= (1.0 + gen._ce_t[unique_gen] * 2.0)
+        neg_lr *= (1.0 + gen._ce_t[unique_gen] * 2.0 * field_gate)
 
-        _neg_updates = []
-        for gi, gen_cid in enumerate(unique_gen):
-            neg_mask = mask[gi]
-            if not neg_mask.any() or neg_lr[gi] <= 0:
-                continue
-            valid_idx = noise[gi][neg_mask]
-            grad = (gen._vecs_t[valid_idx].float() - sim[gi][neg_mask][:, None] * gv[gi:gi+1]).sum(dim=0)
-            gn = grad.norm()
-            if gn > 1e-10:
-                grad = grad / gn * gn.clamp(max=1.0)
-                v_new = gv[gi] - grad * neg_lr[gi]
-                nn = v_new.norm()
-                if nn > 1e-10:
-                    v_new /= nn
-                _neg_updates.append((gen_cid, v_new))
-
-        if _neg_updates:
-            cids_batch = [d[0] for d in _neg_updates]
-            vecs_batch = torch.stack([d[1] for d in _neg_updates]).to(gen._vecs_t.dtype)
+        # AM-100: batched negative sampling — all concepts in one tensor op, no Python loop
+        noise_vecs = gen._vecs_t[noise].float()  # (ng, n_neg, D)
+        mask_3d = mask.unsqueeze(-1)  # (ng, n_neg, 1)
+        has_valid = mask.any(dim=1) & (neg_lr > 0)  # (ng,)
+        if not has_valid.any():
+            return
+        sum_noise = (noise_vecs * mask_3d).sum(dim=1)  # (ng, D) — zero for rows w/o valid
+        sum_sim = (sim * mask).sum(dim=1, keepdim=True)  # (ng, 1)
+        grad = sum_noise - sum_sim * gv  # (ng, D)
+        gn = grad.norm(dim=1, keepdim=True)
+        grad_ok = gn.squeeze() > 1e-10
+        grad[grad_ok] = grad[grad_ok] / gn[grad_ok] * gn[grad_ok].clamp(max=1.0)
+        v_new = gv - grad * neg_lr.unsqueeze(-1)  # (ng, D)
+        nn = v_new.norm(dim=1, keepdim=True)
+        nn_ok = nn.squeeze() > 1e-10
+        v_new[nn_ok] /= nn[nn_ok]
+        um = (has_valid & grad_ok & nn_ok).cpu()
+        if um.any():
+            cids_batch = unique_gen[um.cpu().numpy()]
+            vecs_batch = v_new[um].to(gen._vecs_t.dtype)
             gen._vecs_t[cids_batch] = vecs_batch
-            gen._dirty_cids.update(cids_batch)
+            gen._dirty_cids.update(cids_batch.tolist())
 
     # ═══════════════════════════════════════════════════
     # Contrastive objective
@@ -733,8 +742,7 @@ class STDPTrainer:
                 continue
             avg_elr = sum(elr for _, elr in updates) / max(len(updates), 1)
             contr_lr = avg_elr * 0.3
-            if field_gate > 0.5:
-                contr_lr *= (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0)
+            contr_lr *= (1.0 + gen.concept_error.get(gen_cid, 0.0) * 2.0 * field_gate)
 
             neighbours = cs.topk_similar_concepts(gen_cid, k=100, sample_size=2000)
             cooc_set = {ctx_cid for ctx_cid, _ in updates}
@@ -801,30 +809,37 @@ class STDPTrainer:
         gen_idxs_l = gen_cids[:]
 
         contr_lrs = avg_elrs * 0.3
-        if field_gate > 0.5:
-            contr_lrs *= (1.0 + gen._ce_t[gen_idxs] * 2.0)
+        contr_lrs *= (1.0 + gen._ce_t[gen_idxs] * 2.0 * field_gate)
 
         n_v = gen._vecs_t.shape[0]
         g_vecs = gen._vecs_t[gen_idxs].float()  # fp32 — used in gradient loop below
         all_vecs = gen._vecs_t[:n_v]            # fp16 — saves 224MB vs .float()
         sim = (g_vecs.half() @ all_vecs.T).float()  # fp16 matmul → fp32 result
 
-        # G-44: Pre-compute cooc masks as GPU boolean tensor
+        # AM-100: build cooc masks as sparse scatter (one batch scatter, no per-gen loop)
         cooc_masks = torch.zeros(ng, n_v, dtype=torch.bool, device=d)
+        ctx_scatter_gi = []
+        ctx_scatter_cid = []
         for i, gen_cid in enumerate(gen_idxs_l):
-            ctx_cids = [ctx for ctx, _ in gen_updates[gen_cid]]
-            if ctx_cids:
-                ctx_t = torch.tensor(ctx_cids, dtype=torch.long, device=d)
-                cooc_masks[i, ctx_t] = True
+            for ctx_cid, _ in gen_updates[gen_cid]:
+                ctx_scatter_gi.append(i)
+                ctx_scatter_cid.append(ctx_cid)
+        if ctx_scatter_gi:
+            ctx_gi_t = torch.tensor(ctx_scatter_gi, dtype=torch.long, device=d)
+            ctx_cid_t = torch.tensor(ctx_scatter_cid, dtype=torch.long, device=d)
+            cooc_masks[ctx_gi_t, ctx_cid_t] = True
 
-        # G-44: Pre-compute field overlaps (ng, n_v) when field bits exist
-        # Chunked per concept to avoid (ng, V, fb_bytes) = 299MB intermediate
+        # AM-100: batched field overlaps via chunked scatter (avoids O(ng*V*fb_bytes) RAM)
         if gen._fb_t is not None:
-            fb_gen_all = gen._fb_t[gen_idxs]
+            fb_gen_all = gen._fb_t[gen_idxs]  # (ng, fb_bytes)
             fb_overlaps = torch.zeros(ng, n_v, device=d, dtype=torch.int32)
-            fb_t_exp = gen._fb_t.unsqueeze(0)  # (1, V, fb_bytes)
-            for i in range(ng):
-                fb_overlaps[i] = (fb_gen_all[i:i+1].unsqueeze(1) & fb_t_exp).sum(dim=-1)
+            fb_chunk_size = 4096
+            for chunk_start in range(0, n_v, fb_chunk_size):
+                chunk_end = min(chunk_start + fb_chunk_size, n_v)
+                fb_chunk = gen._fb_t[chunk_start:chunk_end]  # (chunk, fb_bytes)
+                chunk_overlap = (fb_gen_all.unsqueeze(1) & fb_chunk.unsqueeze(0)).sum(dim=-1).to(torch.int32)
+                # chunk_overlap: (ng, chunk)
+                fb_overlaps[:, chunk_start:chunk_end] = chunk_overlap
         else:
             fb_overlaps = None
 
@@ -863,46 +878,48 @@ class STDPTrainer:
 
             valid_hn = ~self_hn & ~cooc_hn & (best_val > 0.05) & (best_val < cos_upper)
 
-            # SN-44: Pure tensor per-concept loop (no .item(), no .numpy())
-            _updates = []
-            for i in range(ng):
-                v_local = g_vecs[i].clone()
+            # AM-100: vectorized contrastive — all concepts in batched tensor ops
+            v_local = g_vecs.clone()  # (ng, D)
 
-                if fb_overlaps is not None:
-                    rmask = valid_reg[i]
-                    if rmask.any():
-                        rcid = reg_idx[i][rmask]
-                        rcos = reg_val[i][rmask]
-                        v_repel = gen._vecs_t[rcid].float()
-                        rep_grad = (rcos[:, None] * v_repel - v_local).sum(dim=0)
-                        rn = rep_grad.norm()
-                        if rn > gen.max_grad_norm > 0:
-                            rep_grad = rep_grad / rn * gen.max_grad_norm
-                        v_local = v_local + rep_grad * contr_lrs[i] * 0.05
+            if fb_overlaps is not None:
+                reg_mask = valid_reg.unsqueeze(-1)  # (ng, reg_n, 1)
+                v_reg_all = gen._vecs_t[reg_idx].float()  # (ng, reg_n, D)
+                cos_reg_all = reg_val.unsqueeze(-1)  # (ng, reg_n, 1)
+                sum_reg = (cos_reg_all * v_reg_all * reg_mask).sum(dim=1)  # (ng, D)
+                count_reg = valid_reg.sum(dim=1, keepdim=True).clamp(min=1)
+                rep_grad = sum_reg / count_reg - v_local  # (ng, D)
+                rep_gn = rep_grad.norm(dim=1, keepdim=True)
+                if gen.max_grad_norm > 0:
+                    rep_grad = rep_grad / rep_gn.clamp(min=1e-10) * rep_gn.clamp(max=gen.max_grad_norm)
+                v_local = v_local + rep_grad * contr_lrs.unsqueeze(-1) * 0.05
 
-                vmask = valid_hn[i]
-                if vmask.any():
-                    hn = best_idx[i][vmask]
-                    cos_v = best_val[i][vmask]
-                    v_neg = gen._vecs_t[hn].float()
-                    grad = (cos_v[:, None] * v_neg).mean(dim=0) - v_local
-                    gn = grad.norm()
-                    if gn > gen.max_grad_norm > 0:
-                        grad = grad / gn * gen.max_grad_norm
-                    v_new = v_local + grad * contr_lrs[i]
-                    nv = v_new.norm()
-                    if nv > 1e-10:
-                        v_new /= nv
-                    _updates.append((gen_idxs_l[i], v_new))
-                elif (v_local != g_vecs[i]).any():
-                    nv = v_local.norm()
-                    if nv > 1e-10:
-                        v_local /= nv
-                    _updates.append((gen_idxs_l[i], v_local))
+            hn_mask = valid_hn.unsqueeze(-1)  # (ng, max_hard, 1)
+            v_neg_all = gen._vecs_t[best_idx].float()  # (ng, max_hard, D)
+            cos_neg_all = best_val.unsqueeze(-1)  # (ng, max_hard, 1)
+            sum_weighted = (cos_neg_all * v_neg_all * hn_mask).sum(dim=1)  # (ng, D)
+            count_hn = valid_hn.sum(dim=1, keepdim=True).clamp(min=1)
+            has_hn = valid_hn.any(dim=1)
+            grad_hn = sum_weighted / count_hn - v_local  # (ng, D)
+            gn_hn = grad_hn.norm(dim=1, keepdim=True)
+            if gen.max_grad_norm > 0:
+                grad_hn = grad_hn / gn_hn.clamp(min=1e-10) * gn_hn.clamp(max=gen.max_grad_norm)
+            v_new_hn = v_local + grad_hn * contr_lrs.unsqueeze(-1)
+            nv_hn = v_new_hn.norm(dim=1, keepdim=True)
+            nv_ok_hn = nv_hn.squeeze() > 1e-10
+            v_new_hn[nv_ok_hn] /= nv_hn[nv_ok_hn]
 
-            if _updates:
-                cids_batch = [d[0] for d in _updates]
-                vecs_batch = torch.stack([d[1] for d in _updates]).to(gen._vecs_t.dtype)
+            v_local_changed = (v_local != g_vecs).any(dim=1)  # was modified by rep grad
+            update_hn = has_hn & nv_ok_hn
+            update_rep = ~has_hn & v_local_changed
+            update_mask = update_hn | update_rep
+            um_cpu = update_mask.cpu()
+            if um_cpu.any():
+                v_new = torch.where(update_hn.unsqueeze(-1), v_new_hn, v_local)
+                nv_all = v_new.norm(dim=1, keepdim=True)
+                nv_ok_all = nv_all.squeeze() > 1e-10
+                v_new[nv_ok_all] /= nv_all[nv_ok_all]
+                cids_batch = [gen_idxs_l[i] for i in range(ng) if um_cpu[i]]
+                vecs_batch = v_new[um_cpu].to(gen._vecs_t.dtype)
                 gen._vecs_t[cids_batch] = vecs_batch
                 gen._dirty_cids.update(cids_batch)
 

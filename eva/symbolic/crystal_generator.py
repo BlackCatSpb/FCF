@@ -32,6 +32,7 @@ _META_FIELD_W = 5
 _META_SLOW = 6
 _META_PREV_CID = 7  # GPU-only: raw prev_cid for on-GPU PMI
 _META_NEXT_CID = 8  # GPU-only: raw next_cid for on-GPU PMI
+_META_QWEN = 9
 try:
     import torch
     _HAS_TORCH = True
@@ -377,6 +378,9 @@ class CrystalGenerator:
         # Reset momentum (codes changed — old momentum is stale)
         if self._mom_t is not None:
             self._mom_t.zero_()
+        # SN-58: refresh EMA from new vectors after fluctuate
+        if self._ema_vecs_t is not None and self._vecs_t is not None:
+            self._ema_vecs_t.copy_(self._vecs_t.to(torch.bfloat16))
         self._torch_dirty = False
 
     def _sync_ema(self):
@@ -400,8 +404,10 @@ class CrystalGenerator:
         cids = list(self._dirty_cids)
         cids_t = torch.tensor(cids, dtype=torch.long, device=self._torch_device)
         vecs_cpu = self._vecs_t[cids_t].cpu().numpy()
+        self._skip_gpu_sync = True
         for cid, v_new in zip(cids, vecs_cpu):
             self.cs._apply_vector_update(cid, v_new)
+        self._skip_gpu_sync = False
         self._dirty_cids.clear()
         if hasattr(self.cs.fractal, '_matrix_dirty'):
             self.cs.fractal._matrix_dirty = True

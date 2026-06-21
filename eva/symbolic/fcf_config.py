@@ -363,6 +363,10 @@ class FCFConfig:
             AdaptRule('cos_flat >= 3', 'field_gate_threshold', 'shift', -0.05),
             AdaptRule('mean_cos > 0.01', 'field_gate_threshold', 'shift', 0.05),
         ]),
+        ParamDef('momentum_mu', 0.0, 0.95, 0.9, 0.05, rules=[
+            AdaptRule('mean_cos > 0.01', 'momentum_mu', 'shift', 0.02),
+            AdaptRule('full_stuck', 'momentum_mu', 'shift', -0.05),
+        ]),
     ])
 
     # ── Метрические пары (заполняются из MorphVocab/корпуса) ──
@@ -426,7 +430,6 @@ class FCFConfig:
 
     # ── Engine ────────────────────────────────
     use_torch: bool = True
-    field_gate: bool = True
     momentum_mu: float = 0.9
 
     # ── Seeds для генерации на чекпоинтах ─────

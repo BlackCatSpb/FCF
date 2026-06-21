@@ -1637,3 +1637,99 @@ class TestQNV12:
         mgr._cleanup_old()
         assert len(mgr._saved_tags) == 2
         assert 'a' not in mgr._saved_tags, "oldest checkpoint should be removed"
+
+
+class TestQNV14:
+    """QN-64..66: G-72 dirty_cids, SN-54 sync_after_fluctuate, B4 skip_gpu_sync."""
+
+    # ── QN-64 / G-72: dirty_cids lazy sync (2 tests) ─────────────────
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_dirty_cids_accumulates(self, gen):
+        """Verify _dirty_cids accumulates after GPU vecs_t update."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        gen._dirty_cids.clear()
+        gen._vecs_t[[0, 1]] = gen._vecs_t[[0, 1]] * 0.5
+        gen._dirty_cids.update([0, 1])
+        assert 0 in gen._dirty_cids and 1 in gen._dirty_cids
+        gen._sync_dirty_cpu()
+        assert len(gen._dirty_cids) == 0, "dirty_cids should clear after sync"
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_dirty_cids_syncs_cpu(self, gen, cs):
+        """Verify _sync_dirty_cpu propagates GPU vec to CPU (clamped by max_shift)."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        cid = 0
+        v0 = cs.concept_vector(cid).copy()
+        # Apply a small perturbation (within max_shift=0.5)
+        delta = np.random.randn(cs.dim).astype(np.float32) * 0.01
+        v_new_np = v0 + delta
+        v_new_np /= np.linalg.norm(v_new_np)
+        gen._vecs_t[cid] = torch.from_numpy(v_new_np).to(gen._torch_device)
+        gen._dirty_cids.add(cid)
+        gen._sync_dirty_cpu()
+        v_cpu = cs.concept_vector(cid)
+        max_diff = abs(v_cpu - v_new_np).max()
+        assert max_diff < 1e-4, f"CPU vec not matching GPU after _sync_dirty_cpu: max_diff={max_diff}"
+
+    # ── QN-65 / SN-54: sync_after_fluctuate GPU matmul (2 tests) ────
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_sync_after_fluctuate_produces_unit_norm(self, gen, cs):
+        """Verify _sync_after_fluctuate produces unit-norm vectors."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        if gen._codes_t is None:
+            pytest.skip("No _codes_t")
+        cs.fluctuate_fractal(fluctuation_amp=0.003, decay=0.9995, generator=gen)
+        gen._sync_after_fluctuate()
+        norms = gen._vecs_t[:min(10, gen._vecs_t.shape[0])].norm(dim=1)
+        assert (norms - 1.0).abs().max() < 1e-4, \
+            f"vectors not unit norm after _sync_after_fluctuate: max diff={float((norms - 1.0).abs().max())}"
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_sync_after_fluctuate_refreshes_ema(self, gen, cs):
+        """Verify _sync_after_fluctuate refreshes _ema_vecs_t (SN-58)."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        if gen._codes_t is None or gen._ema_vecs_t is None:
+            pytest.skip("No _codes_t or _ema_vecs_t")
+        ema_before = gen._ema_vecs_t[0].clone()
+        cs.fluctuate_fractal(fluctuation_amp=0.003, decay=0.9995, generator=gen)
+        gen._sync_after_fluctuate()
+        ema_after = gen._ema_vecs_t[0]
+        diff = (ema_before - ema_after).abs().max()
+        assert diff > 0, "EMA not refreshed after _sync_after_fluctuate"
+
+    # ── QN-66 / B4: skip_gpu_sync (2 tests) ─────────────────────────
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_skip_gpu_sync_suppresses_copy(self, gen, cs):
+        """Verify _skip_gpu_sync=True suppresses GPU copy in _apply_vector_update."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        cid = 0
+        v_new = np.random.randn(cs.dim).astype(np.float32)
+        v_new /= np.linalg.norm(v_new)
+        v_gpu_before = gen._vecs_t[cid].clone()
+        gen._skip_gpu_sync = True
+        cs._apply_vector_update(cid, v_new)
+        v_gpu_after = gen._vecs_t[cid]
+        assert (v_gpu_before == v_gpu_after).all(), "GPU vecs_t should NOT change when _skip_gpu_sync=True"
+        gen._skip_gpu_sync = False
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+    def test_skip_gpu_sync_partial_update(self, gen, cs):
+        """Verify only dirty synced CIDs are skipped, others remain dirty."""
+        gen._torch_device = torch.device('cpu')
+        gen._ensure_torch(device='cpu')
+        gen._dirty_cids.clear()
+        gen._dirty_cids.update([0])
+        gen._vecs_t[0] = torch.randn(gen._vecs_t.shape[1], device=gen._torch_device)
+        gen._vecs_t[0] /= gen._vecs_t[0].norm()
+        cpu_vec_0_before = cs.concept_vector(0).copy()
+        gen._skip_gpu_sync = True
+        gen._sync_dirty_cpu()
+        gen._skip_gpu_sync = False
+        cpu_vec_0_after = cs.concept_vector(0)
+        diff = np.linalg.norm(cpu_vec_0_before - cpu_vec_0_after)
+        assert diff > 1e-6, "CPU vec should update even with skip_gpu_sync"

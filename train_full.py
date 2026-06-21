@@ -464,6 +464,7 @@ class TrainingPipeline:
                 epoch_train = _rescore_lines(epoch_train[idx + 1:], gen)
                 idx = 0; start_line = 0
                 self.last_fluct_lines = 0
+                last_fluct_lines = 0  # TN-42: sync global rescore
         if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
             print(f"  Early stopping: patience={self.patience_counter}/{self.patience}, "
                   f"stuck={opt._full_stuck_counter}")
@@ -608,7 +609,7 @@ def _final_save(cs, lattice, opt, epoch, total_lines, global_step=0):
             print(f"[WARN] {_op_name} failed: {e}", file=sys.stderr)
     try:
         state = opt.save_state()
-        with open(CFG.cs_path.replace('.json', '.opt.json'), 'w', encoding='utf-8') as _of:
+        with open(os.path.join(CFG.data_dir, 'concept_space_final.opt.json'), 'w', encoding='utf-8') as _of:
             json.dump(state, _of)
     except Exception as e:
         print(f"[WARN] opt.save_state failed: {e}", file=sys.stderr)
@@ -719,7 +720,7 @@ try:
                 neg_lr_ratio=CFG.neg_lr_ratio, field_gate=opt.p['field_gate_threshold'].current,
                 use_torch=CFG.use_torch, destab_scale=batch_destab,
                 gradient_noise_scale=opt.p['gradient_noise_scale'].current,
-                momentum_mu=CFG.momentum_mu)
+                momentum_mu=opt.p['momentum_mu'].current)
             total_pairs_since_last_decay += n_pairs
             _batch_ms = (time.time() - _bt) * 1000
             _n = len(batch_buffer)
@@ -736,8 +737,8 @@ try:
             elapsed = now - t_start
 
             # ---- Periodic tasks (line-based) ----
-            # TN-15: decay warmup ramp from 0.998 to target over decay_warmup_lines
-            _decay_pct = min(idx / max(CFG.decay_warmup_lines, 1), 1.0)
+            # TN-49: decay warmup ramp from 0.998 to target over decay_warmup_lines (with rescore offset)
+            _decay_pct = min((idx + _lr_offset) / max(CFG.decay_warmup_lines, 1), 1.0)
             _decay_target = opt.p['decay_rate'].current
             _decay_warmup = 0.998 + (_decay_target - 0.998) * _decay_pct
 

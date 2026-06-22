@@ -285,6 +285,10 @@ class FCFConfig:
     def ckpt_state_path(self) -> str:
         return self.paths.ckpt_state_path
 
+    @property
+    def qwen_knowledge_path(self) -> str:
+        return self.paths.qwen_knowledge_path
+
     # ── Архитектура ─────────────────────────
     dim: int = 384
     latent_dim: int = 512

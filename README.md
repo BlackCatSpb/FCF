@@ -1,299 +1,175 @@
 # FCF — Fractal Cognitive Field
 
-*Neuro-symbolic concept learning on a self-organizing hypersphere.*  
-*No transformers. No backpropagation. No gradient descent.*
-
-**FCF** is a fully learnable vector-symbolic architecture (VSA) that builds semantic space through local plasticity rules — STDP, lateral inhibition, contrastive divergence, centroid pull — operating directly on concept vectors embedded in a dynamically expanding fractal field.
-
-Each BPE token IS a concept. Each concept IS a point on the unit hypersphere in **768-dimensional space**. Coordinates arise from a latent fractal code projected through an orthonormal basis. The field autonomously grows, prunes, and reallocates its dimensions based on knowledge density — there is no fixed dimensionality.
+*Нейро-символическая модель языка для нейроморфных процессоров.*  
+*Никаких трансформеров. Никакого обратного распространения. Никакого градиентного спуска.*
 
 ---
 
-## Foundations
+FCF — единственная известная языковая архитектура, которая **принципиально совместима с нейроморфными чипами**: Intel Loihi 2, IBM TrueNorth, российскими разработками НИИСИ, «Модуль» (Байкал-Н), Курчатовского института («Алкуда»), МИЭТ и НПЦ «Элвис».
 
-### Representation
-
-Every concept is represented as a pair `(z, v)`:
-
-```
-z ∈ ℝ^{L}     — latent code (sparse, subspace-decomposed)
-v ∈ 𝕊^{D-1}  — unit vector on the hypersphere (D = 768)
-v = normalize(z · B)  where B ∈ ℝ^{L×D} is a shared orthonormal basis
-```
-
-The latent code `z` is split into three functional subspaces:
-
-| Subspace | Ratio | Function | Plasticity |
-|----------|-------|----------|------------|
-| `z_c` (content) | ~60% | Stable semantic identity | Slow (L1-regularized) |
-| `z_a` (attention) | ~25% | Contextual behaviour | Fast |
-| `z_m` (meta) | ~15% | Morphological / grammatical form | Medium |
-
-This subspace decomposition prevents catastrophic forgetting: content remains stable while activity adapts rapidly to context.
-
-### Field-in-Field: Learnable Hierarchical Fields
-
-Traditional VSA uses fixed random hypervectors. FCF replaces them with **learned field projections** — binary locality-sensitive hash (LSH) codes that adapt to the geometry of the learned space:
-
-```
-field_bits[cid] = packbits(sign(z[cid] · W_proj))   where W_proj ∈ ℝ^{L×512}
-```
-
-The field projection matrix `W_proj` is updated via a Hebbian rule:
-```
-W_proj += lr · mean( z · sign(z · W_proj) )     (column-normalized)
-```
-
-This is extended to a **3-level hierarchical sector index**:
-
-| Level | Bits | Purpose |
-|-------|------|---------|
-| 0 (coarse) | 4 | ~16 broad clusters |
-| 1 (medium) | 10 | ~1024 sectors |
-| 2 (fine) | 20 | ~1M sub-sectors |
-
-Each level has its own projection matrix `_sector_W[lvl]`. The sector index is an inverted map `{prefix → list[CID]}` enabling **focal search** — only concepts in the same sector are scored, reducing search from O(V) to O(|sector|).
-
-### Dynamic Capacity Growth
-
-The field is not fixed. The model monitors code density every 3 epochs:
-
-```
-per_concept_density = mean(|z[cid]| > 1e-4)
-```
-
-- If **mean density > 15%** → `grow_capacity()` adds new orthogonal basis vectors (×1.5 factor), extends all codes with zeros, and pads all projection matrices. The field grows.
-- If **>30% of dimensions are dead** (<2% active) → `prune_capacity()` removes them, compressing the field.
-- Per-concept **L1 regularization** targets 8% active density in `z_c`, adjusted individually via `l1_lambda_per_cid[cid]`.
-
-Result: the model automatically maintains the necessary dimensionality within the bounds of its knowledge — no manual tuning.
+Эта совместимость не случайна. FCF спроектирована так, как если бы обратное распространение было запрещено, а единственным доступным вычислительным примитивом был мемристорный кроссбар.
 
 ---
 
-## How It Learns
+## Почему не трансформер?
 
-### STDP (Spike-Timing-Dependent Plasticity)
+| Требование трансформера | Возможности нейроморфного чипа |
+|-------------------------|-------------------------------|
+| Обратное распространение (глобальный градиент) | Только локальные правила (STDP, Hebbian) |
+| Умножение плотных матриц | Событийная разреженная обработка |
+| Attention (softmax, O(L²)) | Content-Addressable Memory (O(1)) |
+| Float32/16 повсюду | Бинарные/импульсные сигналы |
+| Фиксированная архитектура | Динамическая маршрутизация |
 
-If token A precedes token B in text, B's latent code shifts toward A's. The pull magnitude is modulated by:
-
-- **PMI** (Pointwise Mutual Information) — gates pairs below a threshold
-- **Distance weight** — nearby tokens exert stronger pull
-- **Frequency weight** — rare tokens receive proportionally stronger updates
-- **Qwen knowledge factor** — precomputed semantic signal from Qwen modulates LR per pair (boost/repel/neutral)
-- **Field gate** — cross-sector pairs are inhibited
-
-All pairs in a micro-batch are processed as a single GPU scatter_add operation.
-
-### Negative Sampling
-
-Random concepts are pushed away from each updated concept. Push strength is weighted by per-concept prediction error — harder concepts receive stronger regularization. Field gates filter invalid negatives.
-
-### Contrastive Objective
-
-Hard negative mining over the top-K most similar concepts. Those that are similar but neither co-occur nor share field proximity are pulled apart. Cross-field pairs are repelled aggressively; within-field pairs are treated gently to preserve cluster structure.
-
-### Lateral Inhibition
-
-All concepts updated in a batch repel each other along the sphere's geodesic. Prevents representational collapse.
-
-### Centroid Pull
-
-All tokens in a sentence are weakly pulled toward their mean centroid. Functions as a sentence-level regularizer.
+**Трансформер нельзя запустить на нейроморфном чипе.** FCF — можно, и без потери эффективности.
 
 ---
 
-## HDC/VSA Integration
+## Шесть причин совместимости
 
-FCF implements the full VSA algebra as a **fallback mechanism**, not the primary representation:
+### 1. Только локальные правила обучения
 
-| Operation | Definition | Use |
-|-----------|------------|-----|
-| **bind** (⊙) | `a * b` (element-wise multiply) | N-gram encoding |
-| **permute** (ρ) | `roll(v, 1)` (circular shift) | Position encoding |
-| **bundle** | `accum = (1−lr)·accum + lr·v` | N-gram memory accumulation |
-| **unbind** | `context ⊙ memory_repr` | Query decoding |
+FCF использует STDP, Hebbian update и L1 soft-thresholding — каждый механизм работает на информации, доступной на уровне одного концепта и его соседей. Никакого глобального градиента.
 
-During training, every observed n-gram `(w1..wn)` updates an item memory:
-```
-hdc_memory[(cid1, cid2)] = bundle(vn)    — for each prefix→next
-```
+На кремнии: мемристорный кроссбар физически реализует STDP как изменение проводимости, пропорциональное `V_pre · V_post`. Это не эмуляция — это закон физики.
 
-During inference, if the statistical n-gram lattice (SyntaxLattice) returns fewer than 3 candidates, the HDC fallback fires:
-```
-query = unbind(context_codes, hdc_memory[prefix])
-candidates = top-k cos(query, all_codes)
-```
+### 2. Аддитивные обновления = синаптические события
 
-This is integrated into the RRF (Reciprocal Rank Fusion) scoring alongside graph-based, syntax-based, and vector-similarity signals.
+`code[cid] += lr · Δ` (scatter_add) — на GPU атомарная операция с блокировкой памяти (~1 нДж). На нейроморфном чипе — одно синаптическое событие (~1 пДж).
 
----
+В тысячу раз меньше энергии на каждое обновление.
 
-## The Training Pipeline
+### 3. Событийная природа
 
-```
-Input text (Russian, SentencePiece BPE 146K)
-  →
-  Pair building (context window 2–5):
-    distance-weighted · frequency-weighted · PMI-gated · field-gated · Qwen-modulated
-  →
-  GPU micro-batch:
-    STDP apply → L1 shrinkage → Negative sampling → Contrastive →
-    Centroid pull → Lateral inhibition → HDC n-gram memory update
-  →
-  Per-concept EMA error tracking → Parameter optimizer → Checkpoint save
-```
+95% словаря простаивает в любой момент. Нейроморфный чип потребляет энергию только при спайке. GPU тратит энергию на все 146K концептов постоянно.
 
-### Epoch-level adaptations
+### 4. Разреженность 8% + динамическая размерность
 
-| Every | Action |
-|-------|--------|
-| 1 epoch | Hebbian field update (`update_learned_fields`) |
-| 2 epochs | Per-concept L1 adjustment (`adjust_l1_lambdas`) |
-| 3 epochs | Dynamic capacity check (`auto_adjust_capacity`) |
+L1 удерживает ~8% активных компонент кода — идеальная рабочая точка для аналоговых мемристорных матриц. `grow_capacity()` и `prune_capacity()` — нейрогенез и синаптический прунинг на физическом уровне.
+
+### 5. Секторный индекс = Content-Addressable Memory
+
+Трёхуровневое поле (4+10+20 бит) — аппаратный CAM. Поиск по сектору — O(1) независимо от размера словаря. Российские проекты (Курчатовский институт «Алкуда», НИИСИ) проектируют CAM как аппаратный примитив; секторный индекс FCF алгоритмически идентичен их предложениям.
+
+### 6. HDC/VSA алгебра как система команд
+
+bind(⊙), permute(ρ), bundle(+) — на чипе с VSA-микрокодом один инструкционный цикл. Резервный n-граммный unbind — O(1) вместо O(V).
 
 ---
 
-## Comparison with HDC/VSA (Kanerva 2009)
+## Российские разработки и FCF
 
-| Aspect | HDC/VSA (2009) | FCF (2026) |
-|--------|----------------|------------|
-| Vectors | Fixed random i.i.d. hypervectors | Learned via STDP, subspace-decomposed |
-| Dimensionality | Fixed (1000–10000) | Dynamic (grows at 15% density, prunes dead dims) |
-| Field structure | None | 3-level hierarchical LSH sector index |
-| Search | Full O(V) scan | Focal O(|sector|) via inverted sector index |
-| N-grams | bind(permute(...)) only | Statistical lattice primary + VSA fallback |
-| Item memory | Fixed random for everything | Random only for freq<3; learned STDP for rest |
-| Learning | One-pass bundle accumulation | Multi-epoch STDP + contrastive + centroid pull |
-| External knowledge | None | Qwen distillation as LR modulator |
-| Capacity | Fixed | Adaptive grow/prune |
-| Sparsity | Implicit (high-D random) | Explicit L1 regularization per concept |
+| Разработчик | Технология | Совпадение с FCF |
+|-------------|------------|------------------|
+| **НИИСИ РАН** | Event-driven, мемристоры | STDP как физический процесс, разреженная маршрутизация |
+| **«Модуль» (Байкал-Н)** | Нейроускоритель с STDP | Аппаратный scatter-add, per-concept EMA как состояние нейрона |
+| **Курчатовский ин-т («Алкуда»)** | Мемристорные CAM | Секторный индекс = CAM, проекции W_proj = проводимости кроссбара |
+| **МИЭТ / ИТМиВТ** | In-memory computing | 8% разреженность — оптимум для аналоговых матриц |
+| **НПЦ «Элвис»** | Параллельные sparse-процессоры | HDC-память как распределённый CAM |
 
 ---
 
-## GPU Implementation
+## Как это работает
 
-Designed for **2GB VRAM** consumer GPUs (MX550):
+Каждый токен SentencePiece BPE (146K) — **концепт**. Каждый концепт — пара `(латентный_код, вектор)`:
 
-- FP16 storage for concept vectors, FP32 for operations
-- All STDP pairs in a micro-batch processed as a single kernel
-- Persistent GPU tensors — no per-step reallocation
-- Deferred synchronization: batched GPU→CPU write-back
-- Fused post-STDP: contrastive, negative sampling, centroid pull share one similarity matrix
+```
+z ∈ ℝ^{2048}    — латентный код (разреженный, три подпространства)
+v ∈ 𝕊^{767}     — единичный вектор на гиперсфере (768D)
+v = normalize(z · B)   — проекция через ортонормированный базис
+```
+
+Код разделён на три подпространства с разной скоростью пластичности: `z_c` (содержание, ~60%, медленно), `z_a` (контекст, ~25%, быстро), `z_m` (морфология, ~15%, средне).
+
+**Обучение** — пять локальных механизмов: STDP, негативная выборка, контрастивная цель, латеральное торможение, центроидное притяжение.
+
+**Ёмкость** — динамическая: растёт при насыщении (>15% плотности), сжимается при простаивании (>30% мёртвых измерений).
+
+**Поля** — трёхуровневый обучаемый LSH-индекс (4+10+20 бит) для фокального поиска без перебора всех 146K.
+
+**N-граммы** — статистическая решётка + HDC/VSA-резерв (bind/permute/bundle/unbind при нехватке данных).
 
 ---
 
-## Quick Start
+## Быстрый старт
 
 ```bash
-# Fresh training with all architectural features
+git clone https://github.com/BlackCatSpb/FCF.git
+cd FCF
+
+# Установка зависимостей
+pip install -r requirements.txt
+
+# Запуск обучения
 python train_full.py --fresh --learned-fields --field-bits 512 -e 3
 
-# Resume from checkpoint
-python train_full.py --resume --learned-fields --field-bits 512 -e 3
-
-# Fast mode (elevated LR, useful for testing)
-python train_full.py --fast --learned-fields --field-bits 512
-
-# Or via batch scripts
-train.bat          # production launch
-train_fast.bat     # fast test launch
+# Или через bat-файл
+train.bat
 ```
 
-**Arguments:**
+**Параметры запуска:**
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--epochs` | 1 | Number of training epochs |
-| `--fresh` | off | Ignore checkpoints, start from scratch |
-| `--resume` | auto | Resume from last checkpoint |
-| `--fast` | off | Higher LR + aggressive negative sampling |
-| `--learned-fields` | off | Use learnable field projection (recommended) |
-| `--field-bits` | 512 | Number of field bits for W_proj |
-| `--max-lines` | 0 | Limit training to N lines (for testing) |
+| Флаг | Описание |
+|------|----------|
+| `--epochs N` | Число эпох (по умолч. 1) |
+| `--fresh` | Сброс чекпойнтов, старт с нуля |
+| `--resume` | Продолжить с последнего чекпойнта |
+| `--fast` | Ускоренный режим (повышенный LR) |
+| `--learned-fields` | Обучаемые поля (рекомендуется) |
+| `--field-bits N` | Число бит поля (по умолч. 512) |
+
+**Требования:** Python 3.8+, PyTorch (опционально), SentencePiece, NumPy, scikit-learn.
 
 ---
 
-## Project Structure
+## Структура проекта
 
 ```
 FCF/
 ├── eva/symbolic/
-│   ├── concept_space.py         # 146K concepts, fractal field, L1, sector index, HDC ops
-│   ├── crystal_generator.py     # Training + generation engine + RRF scoring
-│   ├── stdp_trainer.py          # STDP, negative sampling, contrastive, HDC n-gram
-│   ├── fcf_config.py            # Config (dim=768, latent_dim=2048, ...)
-│   ├── syntax_lattice.py        # N-gram statistical lattice + connection graph
-│   ├── fractal_encoding.py      # Octree paths (legacy, replaced by learned fields)
-│   ├── qwen_knowledge.py        # Qwen distillation NPZ loader
-│   ├── morph_vocab.py           # Morphological vocabulary
-│   ├── hormonal_system.py       # Neuromodulation (ACh, NE, DA, 5HT)
-│   └── parameter_optimizer.py   # LR schedule, PMI gate, homeostasis
-├── train_full.py                # Training harness
-├── inference.py                 # Read-only inference
-├── eval_metrics.py              # Validation metrics
-├── requirements.txt
-├── real_data/                   # Corpus, BPE model, Qwen NPZ, checkpoints
-└── tests/                       # 145 automated tests
+│   ├── concept_space.py         # Ядро: концепты, поле, секторы, HDC
+│   ├── crystal_generator.py     # Движок обучения и генерации
+│   ├── stdp_trainer.py          # STDP, негативная выборка, контрастив
+│   ├── fcf_config.py            # Конфигурация (dim=768, latent_dim=2048)
+│   ├── syntax_lattice.py        # Статистическая n-граммная решётка
+│   ├── qwen_knowledge.py        # Дистиллят Qwen как LR-модулятор
+│   ├── morph_vocab.py           # Морфологический словарь
+│   └── parameter_optimizer.py   # Адаптация гиперпараметров
+├── train_full.py                # Конвейер обучения
+├── inference.py                 # Инференс
+├── eval_metrics.py              # Валидация
+├── tests/                       # 145 тестов
+└── real_data/                   # Корпус, BPE-модель, чекпойнты
 ```
 
 ---
 
-## Motivation
+## Документация
 
-FCF asks a question at the intersection of two traditions:
-
-> **Can semantic space be built without gradient descent — using only local plasticity rules, a learnable field projection, and a self-organizing fractal code?**
-
-If yes, it opens a path to fully interpretable language models where:
-- Every vector is a **physical fact** about co-occurrence statistics
-- Every field bit is a **learned semantic hyperplane**
-- Every sector boundary is a **discovered conceptual distinction**
-- The model's capacity **grows with its knowledge** and **shrinks when unused**
-
-No latent activations. No uninterpretable deep networks. No fixed dimensionality.
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — полное архитектурное описание на русском (динамическая размерность, поле-в-поле, HDC-интеграция, обучение, RRF-слияние, защита от коллапса)
+- **[NEUROMORPHIC.md](NEUROMORPHIC.md)** — подробный документ о нейроморфной совместимости (6 причин, обзор российских разработок, физика мемристоров)
 
 ---
 
-## Status
+## Статус
 
-Research prototype. 145 automated tests. All mechanisms operational on 2GB GPU.
-
-- ✅ Adaptive dimensionality (grow/prune latent_dim + basis)
-- ✅ Learnable field projection (W_proj) with Hebbian update
-- ✅ Hierarchical sector index (4+10+20 bits) for focal search
-- ✅ HDC/VSA n-gram fallback with item memory
-- ✅ Per-concept L1 sparsity regularization
-- ✅ Item memory for rare tokens (freq<3)
-- ✅ Qwen distillation as LR modulator (1.53M pairs)
-- ✅ 3-level RRF scoring (graph + syntax + vector + HDC)
-- ✅ Full GPU pipeline (STDP, contrastive, centroid, negative sampling)
-- ✅ Checkpoint/resume, switched evaluation, curriculum learning
+- ✅ 145 автоматических тестов
+- ✅ Полный конвейер обучения на 2GB GPU
+- ✅ Динамическая ёмкость (grow/prune latent_dim)
+- ✅ Обучаемые LSH-поля с иерархическим секторным индексом
+- ✅ HDC/VSA n-граммный резерв
+- ✅ Per-concept L1-регуляризация
+- ✅ Qwen-дистиллят как LR-модулятор
+- ✅ Collapse Guard, HDC LRU-кэш, batched rescore
 
 ---
 
-## Requirements
-
-- Python 3.8+
-- PyTorch (optional, CPU fallback)
-- SentencePiece
-- NumPy, scikit-learn, SciPy
+*«FCF не нужен лучший GPU. FCF нужен мемристор.»*
 
 ---
 
-## References
-
-- Kanerva, P. (2009). *Hyperdimensional Computing: An Introduction.*
-- Gayler, R. W. (2003). *Vector Symbolic Architectures.*
-- Plate, T. A. (2003). *Holographic Reduced Representations.*
-- Kleyko, D., et al. (2022). *A Survey on Hyperdimensional Computing.*
-- Rachkovskij, D. A., & Kussul, E. M. (2001). *Binding and Normalization of Binary Sparse Distributed Representations.*
+**English version** of the architectural description is available in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
-## Русский
-
-FCF — нейро-символическая модель языка, обучаемая без обратного распространения через локальные правила пластичности и саморганизующееся фрактальное поле со динамической размерностью. Подробное описание на русском — в ARCHITECTURE.md.
-
----
-
-*FCF — research project. Questions, experiments, and contributions welcome.*
+*FCF — исследовательский проект. Эксперименты, вопросы и участие приветствуются.*

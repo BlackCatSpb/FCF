@@ -121,9 +121,11 @@ class FractalField:
         self.field_bits: Dict[int, np.ndarray] = {}
         self._fb_dirty = False
 
-        # HDC n-gram memory: prefix_cids_tuple → bundled latent repr
+        # HDC n-gram memory: prefix_cids_tuple → bundled latent repr (LRU-capped)
         self.hdc_memory: Dict[tuple, np.ndarray] = {}
         self.hdc_memory_counts: Dict[tuple, int] = {}
+        self.hdc_memory_max = 50000  # evict oldest when exceeding
+        self._hdc_access_order: List[tuple] = []  # simple FIFO eviction queue
 
         # Per-concept adaptive L1 lambda (dynamic dimensionality)
         self.l1_lambda_per_cid: Dict[int, float] = {}
@@ -646,11 +648,18 @@ class FractalField:
         """Update HDC memory for {prefix_cids → next_token_code}.
 
         Bundles next_code into hdc_memory[prefix_cids] (running average).
+        Evicts oldest entries when over hdc_memory_max.
         """
         key = tuple(prefix_cids)
         if key not in self.hdc_memory:
+            if len(self.hdc_memory) >= self.hdc_memory_max and self._hdc_access_order:
+                # FIFO eviction
+                evict_key = self._hdc_access_order.pop(0)
+                self.hdc_memory.pop(evict_key, None)
+                self.hdc_memory_counts.pop(evict_key, None)
             self.hdc_memory[key] = next_code.copy()
             self.hdc_memory_counts[key] = 1
+            self._hdc_access_order.append(key)
         else:
             count = self.hdc_memory_counts[key]
             lr = 1.0 / max(count + 1, 1.0)
@@ -671,6 +680,10 @@ class FractalField:
         """
         key = tuple(context_cids)
         if key in self.hdc_memory:
+            # Mark as recently accessed (move to end of FIFO queue)
+            if key in self._hdc_access_order:
+                self._hdc_access_order.remove(key)
+                self._hdc_access_order.append(key)
             mem_repr = self.hdc_memory[key]
         elif len(key) >= 2:
             # No stored repr — use the context itself as a probe

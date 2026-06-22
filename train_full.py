@@ -355,20 +355,28 @@ train_lens = [p[0] for p in train_pairs]
 train_lines = [p[1] for p in train_pairs]
 
 # Self-paced learning: re-rank by concept_error at each checkpoint
-def _rescore_lines(lines, gen):
+def _rescore_lines(lines, gen, batch_size=256):
+    """Score lines by mean concept error (batched for GPU efficiency)."""
     if not hasattr(gen, 'concept_error') or not gen.concept_error:
         return lines
     scores = []
-    for line in lines:
-        ids = gen._encode_input(line)
-        if not ids:
-            scores.append(0.0)
-        else:
-            mean_err = sum(gen.concept_error.get(cid, 0.5) for cid in ids) / len(ids)
-            scores.append(mean_err)
+    for i in range(0, len(lines), batch_size):
+        batch = lines[i:i + batch_size]
+        batch_scores = []
+        for line in batch:
+            ids = gen._encode_input(line)
+            if not ids:
+                batch_scores.append(0.0)
+            else:
+                mean_err = sum(gen.concept_error.get(cid, 0.5) for cid in ids) / len(ids)
+                batch_scores.append(mean_err)
+        scores.extend(batch_scores)
+        if len(lines) > 1000 and (i + batch_size) % 5000 == 0:
+            print(f"  Rescore: {i + batch_size}/{len(lines)} ({100*(i+batch_size)//len(lines)}%)")
     return [l for _, l in sorted(zip(scores, lines))]
 
 
+from collections import OrderedDict
 from eva.symbolic.checkpoint_manager import CheckpointManager
 
 class TrainingPipeline:
@@ -394,6 +402,9 @@ class TrainingPipeline:
         self.best_ckpt_name = None
         self.patience_counter = 0
         self.patience = 5
+        # Collapse-aware inhibition: base strength, scales up with cos_mean
+        self._base_inh_strength = 0.05
+        self._current_inh_strength = 0.05
         # TN-12: Switched Evaluation cycle counter
         self._eval_count = 0
         # AM-7: Async Checkpoint Manager
@@ -418,6 +429,14 @@ class TrainingPipeline:
         ng_new = ng_total - self.ngram_last_total
         self.ngram_last_total = ng_total
         print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} ngrams={ng_total}(+{ng_new})")
+        # Collapse-aware inhibition: scale inh_strength when cos_mean rises
+        if mean_sim > 0.08:
+            scale = 1.0 + (mean_sim - 0.08) * 50  # 1.0 at 0.08, 1.5 at 0.09, etc.
+            opt.p['inh_strength'].current = min(opt.p['inh_strength'].max,
+                opt.p['inh_strength'].default * scale)
+            print(f"  COLLAPSE_GUARD cos={mean_sim:.4f} > 0.08 → inh_strength={opt.p['inh_strength'].current:.3f}")
+        elif mean_sim < 0.04:
+            opt.p['inh_strength'].current = opt.p['inh_strength'].default
         ckpt_k = idx // 1000
         ckpt_name = f"{ckpt_k}k"
         # AM-7: Fully async checkpoint save (background thread + atomic state)

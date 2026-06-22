@@ -1434,6 +1434,7 @@ class ConceptSpace:
         obj.concept_vectors = ConceptVectorStore(obj.vocab_size, obj.dim)
 
         obj.rng = np.random.RandomState(42)
+        obj._item_rng = np.random.RandomState(42)
         rng_state = data.get('inhibit_rng_state')
         if rng_state is not None:
             obj._inhibit_rng = np.random.RandomState()

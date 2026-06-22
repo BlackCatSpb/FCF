@@ -50,28 +50,41 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 
 ## Current State
 - Training (epoch 1 resumed at ~21138L, Qwen knowledge active)
-- Vector space fixes active: centroid pull LR 0.3, theta-gate cap 5, contrastive push-pull
-- Qwen knowledge distillation active: 15.96M pairs modulating STDP LR via qwen_factor
+- Qwen knowledge: 1.53M high-confidence pairs (deduplicated from 15.96M, pruned from 20.6M raw)
+- Qwen factor distribution: boosted/reduced/neutral tracked in eval outputs
 
-### [2026-06-22] Qwen knowledge distillation + training enhancements
-- **QwenKnowledge integrated:** `real_data/qwen_knowledge.npz` (15.96M unique FCF CID pairs,
-  cosine similarities from RuadaptQwen3-4B over Russian corpus), loaded via `FCFConfig.qwen_knowledge_path`
-  in `train_full.py:513`, modulates STDP learning rate per pair: `lr *= 1.0 + cos_sim * 0.3`
+### [2026-06-22] Qwen distillation, NPZ pruning, eval logging
+
+- **QwenKnowledge integrated:** `real_data/qwen_knowledge.npz` (1.53M deduplicated,
+  count≥3, 10 MB), loaded via `FCFConfig.qwen_knowledge_path` in `train_full.py:513`,
+  modulates STDP learning rate per pair
+- **NPZ pruned & deduplicated** (`prune_qwen_knowledge.py`): 20.6M raw → 15.96M unique →
+  **1.53M high-confidence** (count≥3), 92 MB → **10 MB**
+- **Low-sim repulsion** (`qwen_knowledge.py:get_factor`): three regimes —
+  cos < 0.15 → neutral (1.0), 0.15 ≤ cos < 0.20 → linear repel (0.85→1.0),
+  cos ≥ 0.20 → boost (1.0+cos*0.3, capped at 1.5)
+- **Eval logging** (`eval_metrics.py`): qwen_factor distribution now reported:
+  `qwen_boosted/qwen_reduced/qwen_neutral` percentages + `qwen_factor_mean`/`std`
 - **Minesweeper inverted** (`crystal_generator.py:_update_cluster_potential`): high CE → boost (up to 1.2),
-  low CE → reduce (down to 0.8). Rare/struggling concepts now get MORE learning signal.
+  low CE → reduce (down to 0.8). Rare/struggling concepts get MORE learning signal.
 - **Antonym repel** (`stdp_trainer.py:_build_pairs` + `_gpu_stdp_core`): Russian antonym dictionary
   (22 pairs from eva_ai/contradiction_miner), decoded via `sp.IdToPiece`, flagged in GPU meta channel.
-  Antonym pairs receive inverted pair_delta × 2.0 (active repel). Coverage: ~37% of 146K voc.
+  Antonym pairs receive inverted pair_delta × 2.0 (active repel).
 - **Cluster centroid pull** (`stdp_trainer.py:_cluster_centroid_pull`): pulls concept vectors toward
-  their octree cluster centroid (via `_cluster_map` anchor), pull_strength=0.05, called every batch.
+  octree cluster centroid (via `_cluster_map` anchor), pull_strength=0.05, called every batch.
 
 ## Priority Queue
-- ✅ Qwen knowledge npz integrated
+- ✅ Qwen knowledge npz integrated + deduplicated + pruned (1.53M pairs, 10 MB)
 - ✅ Minesweeper inversion
 - ✅ Antonym repel
 - ✅ Cluster centroid pull
+- ✅ Low-sim repulsion (cos 0.15–0.20 → repel)
+- ✅ Eval logging (qwen_factor distribution)
 
 ## Key Decisions
+- **NPZ pruning:** count≥3 filter after deduplication (92.7% of raw entries were noise/count<3)
+- **Low-sim repulsion:** linear repulse band [0.15, 0.20) to counteract STDP over-similarity
+- **Qwen factor regimes:** three-way (neutral/repel/boost) instead of binary (unknown+threshold→boost)
 - **Centroid pull LR 0.3** — boost clustering speed (from 0.1)
 - **Theta-gate cap 5** — only first 5 tokens decay, rest get full LR
 - **Contrastive:** PPMI-filtered 80-cand sampling (O(80·cos) vs O(146K·cos))
@@ -89,6 +102,8 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - `eva/symbolic/qwen_knowledge.py`
 - `eva/symbolic/fcf_config.py`
 - `train_full.py`
+- `eval_metrics.py`
+- `prune_qwen_knowledge.py`
 - `real_data/qwen_knowledge.npz`
 - `real_data/checkpoint_state.json`
 - `PLAN.md`

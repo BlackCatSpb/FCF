@@ -23,21 +23,24 @@ class QwenKnowledge:
     """
 
     def __init__(self, path: str = None, factor_strength: float = 0.3,
-                 min_threshold: float = 0.15, max_factor: float = 1.5,
-                 min_factor: float = 0.85):
+                 min_threshold: float = 0.15, repulse_threshold: float = 0.2,
+                 max_factor: float = 1.5, min_factor: float = 0.85):
         """
         Args:
             path: Path to qwen_knowledge.npz. None = skip (all factors = 1.0).
-            factor_strength: How strongly cos_sim modulates lr.
-                lr *= 1.0 + cos_sim * factor_strength
-            min_threshold: Skip pairs with |cos_sim| < threshold
+            factor_strength: How strongly cos_sim modulates lr for boost.
+                lr *= 1.0 + cos_sim * factor_strength  (for cos >= repulse_threshold)
+            min_threshold: Pairs with cos < this are treated as unknown (factor=1.0).
+            repulse_threshold: Pairs with cos in [min_threshold, repulse_threshold)
+                get repulsion: linear from min_factor at min_threshold to 1.0 at repulse_threshold.
             max_factor: Cap for boost
-            min_factor: Floor for reduction
+            min_factor: Floor for repulsion
         """
         self._map: Dict[int, float] = {}
         self._total_counts = 0
         self.factor_strength = factor_strength
         self.min_threshold = min_threshold
+        self.repulse_threshold = repulse_threshold
         self.max_factor = max_factor
         self.min_factor = min_factor
 
@@ -77,14 +80,23 @@ class QwenKnowledge:
         """
         Get LR modulation factor for STDP pair (cid_a, cid_b).
         1.0 = no change, >1 = boost, <1 = reduce.
+
+        Three regimes:
+          cos < min_threshold      → 1.0 (unknown, neutral)
+          min_threshold ≤ cos < repulse_threshold → linear repel (min_factor → 1.0)
+          cos ≥ repulse_threshold  → 1.0 + cos * factor_strength (boost)
         """
         cos = self.get_raw(cid_a, cid_b)
         if cos is None:
             return 1.0
-        if abs(cos) < self.min_threshold:
+        if cos < self.min_threshold:
             return 1.0
+        if cos < self.repulse_threshold:
+            # Linear repulsion: min_factor at threshold → 1.0 at repulse_threshold
+            t = (cos - self.min_threshold) / (self.repulse_threshold - self.min_threshold)
+            return float(self.min_factor + (1.0 - self.min_factor) * t)
         factor = 1.0 + cos * self.factor_strength
-        return float(np.clip(factor, self.min_factor, self.max_factor))
+        return float(np.clip(factor, 1.0, self.max_factor))
 
     def __len__(self) -> int:
         return len(self._map)

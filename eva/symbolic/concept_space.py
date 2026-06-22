@@ -94,15 +94,15 @@ class FractalField:
     v = normalize(code @ basis) — unchanged.
     """
 
-    def __init__(self, dim=384, latent_dim=512, l_c=None, l_a=None, l_m=None):
+    def __init__(self, dim=768, latent_dim=2048, l_c=None, l_a=None, l_m=None):
         self.dim = dim
         self.latent_dim = latent_dim
         if l_c is not None and l_a is not None and l_m is not None:
             self.l_c, self.l_a, self.l_m = l_c, l_a, l_m
         else:
-            self.l_c = latent_dim // 2      # 256 — identity
-            self.l_a = latent_dim // 4      # 128 — attention
-            self.l_m = latent_dim - self.l_c - self.l_a  # 128 — meta
+            self.l_c = latent_dim * 3 // 5      # ~60% — identity
+            self.l_a = latent_dim // 4          # 25%  — attention
+            self.l_m = latent_dim - self.l_c - self.l_a  # ~15% — meta
 
         # Fractal basis: (latent_dim, dim) with orthonormal columns
         rng = np.random.RandomState(42)
@@ -156,8 +156,8 @@ class FractalField:
 
         z = np.zeros(self.latent_dim, dtype=np.float32)
 
-        # z_c: sparse identity
-        n_active = max(self.l_c // 8, 16)
+        # z_c: sparse identity (~3% active, room to grow via STDP)
+        n_active = max(int(self.l_c * 0.03), 8)
         idxs = rng.choice(self.l_c, n_active, replace=False)
         vals = rng.randn(n_active).astype(np.float32)
         z[:self.l_c][idxs] = vals
@@ -321,12 +321,12 @@ class ConceptSpace:
       - STDP-learned transitions to other tokens
     """
 
-    def __init__(self, vocab_size=None, dim=384):
+    def __init__(self, vocab_size=None, dim=768, latent_dim=2048):
         self.vocab_size = vocab_size or 0
         self.dim = dim
 
         # Fractal field: latent codes → full vectors via shared basis
-        self.fractal = FractalField(dim=self.dim, latent_dim=512)
+        self.fractal = FractalField(dim=self.dim, latent_dim=latent_dim)
 
         # Concept vectors: dense ndarray[V, dim] with dict-like convenience
         self.concept_vectors = ConceptVectorStore(self.vocab_size, self.dim)
@@ -896,7 +896,7 @@ class ConceptSpace:
                 if v is not None:
                     obj.concept_vectors[cid] = v
         else:
-            obj.fractal = FractalField(dim=obj.dim, latent_dim=512)
+            obj.fractal = FractalField(dim=obj.dim, latent_dim=obj.fractal.latent_dim if hasattr(obj, 'fractal') and hasattr(obj.fractal, 'latent_dim') else obj.dim * 2)
             valid_idxs = np.flatnonzero(obj.concept_vectors._valid)
             for idx in valid_idxs:
                 v = obj.concept_vectors._data[idx]
@@ -925,7 +925,7 @@ if __name__ == '__main__':
     sp = spm.SentencePieceProcessor(        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_146k.model'))
 
     print("Initializing ConceptSpace with BPE vocabulary...")
-    cs = ConceptSpace(vocab_size=sp.vocab_size(), dim=384)
+    cs = ConceptSpace(vocab_size=sp.vocab_size())
     cs.init_concepts()
     cs.init_homeostasis()
 

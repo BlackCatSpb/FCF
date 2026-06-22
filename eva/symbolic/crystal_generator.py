@@ -1009,7 +1009,7 @@ if __name__ == '__main__':
         model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_146k.model'))
 
     print("Initializing ConceptSpace (146K)...")
-    cs = ConceptSpace(vocab_size=sp.vocab_size(), dim=384)
+    cs = ConceptSpace(vocab_size=sp.vocab_size())
     cs.init_concepts()
     cs.init_homeostasis()
 

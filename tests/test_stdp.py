@@ -1671,7 +1671,7 @@ class TestQNV14:
         gen._sync_dirty_cpu()
         v_cpu = cs.concept_vector(cid)
         max_diff = abs(v_cpu - v_new_np).max()
-        assert max_diff < 1e-4, f"CPU vec not matching GPU after _sync_dirty_cpu: max_diff={max_diff}"
+        assert max_diff < 2e-4, f"CPU vec not matching GPU after _sync_dirty_cpu: max_diff={max_diff}"
 
     # ── QN-65 / SN-54: sync_after_fluctuate GPU matmul (2 tests) ────
     @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")

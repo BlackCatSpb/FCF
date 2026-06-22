@@ -290,14 +290,14 @@ class FCFConfig:
         return self.paths.qwen_knowledge_path
 
     # ── Архитектура ─────────────────────────
-    dim: int = 384
-    latent_dim: int = 512
+    dim: int = 768
+    latent_dim: int = 2048
     n_anchors: int = 2048
     max_n: int = 4
     octree_levels: int = 16
 
     @property
-    def l_c(self) -> int: return self.latent_dim // 2
+    def l_c(self) -> int: return self.latent_dim * 3 // 5
 
     @property
     def l_a(self) -> int: return self.latent_dim // 4

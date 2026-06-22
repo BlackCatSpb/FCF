@@ -89,6 +89,10 @@ v = normalize(z · B)   — проекция через ортонормиров
 
 **N-граммы** — статистическая решётка + HDC/VSA-резерв (bind/permute/bundle/unbind при нехватке данных).
 
+**EntityField** — рекурсивное семантическое поле: каждый символ, морфема, слово, предложение и абзац имеют единый вектор-представление в 2048D. VSA bind/unbind связывают все уровни: `V(char) += bind(V(word), CHAR_ROLE)` — симметричная проекция контекста на каждом уровне. Unbind(V(entity), role) восстанавливает суперпозицию контекстов.
+
+**Harmonizer** — трёхуровневая VSA-гармонизация (морфема ↔ слово ↔ предложение) через compose_word/decompose_word с контекстной модуляцией корня, dirty-флагами и slow-start обучением. Обратный индекс morph→word предотвращает лавинное распространение.
+
 ---
 
 ## Быстрый старт
@@ -117,6 +121,8 @@ train.bat
 | `--fast` | Ускоренный режим (повышенный LR) |
 | `--learned-fields` | Обучаемые поля (рекомендуется) |
 | `--field-bits N` | Число бит поля (по умолч. 512) |
+| `--no-harmonize` | Отключить морфологическую гармонизацию |
+| `--no-morpheme-field` | Отключить морфемное поле (GPU < 2GB) |
 
 **Требования:** Python 3.8+, PyTorch (опционально), SentencePiece, NumPy, scikit-learn.
 
@@ -127,13 +133,14 @@ train.bat
 ```
 FCF/
 ├── eva/symbolic/
-│   ├── concept_space.py         # Ядро: концепты, поле, секторы, HDC
+│   ├── concept_space.py         # Ядро: концепты, EntityField, Harmonizer, поле, секторы, HDC
 │   ├── crystal_generator.py     # Движок обучения и генерации
-│   ├── stdp_trainer.py          # STDP, негативная выборка, контрастив
+│   ├── stdp_trainer.py          # STDP, негативная выборка, контрастив, EntityField-гармонизация
 │   ├── fcf_config.py            # Конфигурация (dim=768, latent_dim=2048)
 │   ├── syntax_lattice.py        # Статистическая n-граммная решётка
 │   ├── qwen_knowledge.py        # Дистиллят Qwen как LR-модулятор
 │   ├── morph_vocab.py           # Морфологический словарь
+│   ├── checkpoint_manager.py    # Асинхронное сохранение чекпоинтов
 │   └── parameter_optimizer.py   # Адаптация гиперпараметров
 ├── train_full.py                # Конвейер обучения
 ├── inference.py                 # Инференс
@@ -161,6 +168,11 @@ FCF/
 - ✅ Per-concept L1-регуляризация
 - ✅ Qwen-дистиллят как LR-модулятор
 - ✅ Collapse Guard, HDC LRU-кэш, batched rescore
+- ✅ **EntityField** — рекурсивное семантическое поле char↔word↔sent↔para (VSA bind/unbind)
+- ✅ **Harmonizer** — морфемная гармонизация: compose_word с контекстной модуляцией, dirty-флаги, slow-start
+- ✅ **--no-harmonize / --no-morpheme-field** для GPU < 2GB
+- ✅ **Preharm checkpoint** — rollback до первой гармонизации
+- ✅ **Phase transition analysis** — PCA+визуализация на каждом чекпоинте
 
 ---
 

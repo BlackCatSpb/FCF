@@ -514,7 +514,7 @@ class CrystalGenerator:
 
     def _token_text(self, cid):
         try:
-            return self.sp.IdToPiece(cid)
+            return self.sp.IdToPiece(int(cid))
         except IndexError:
             return f'[CID{cid}]'
 

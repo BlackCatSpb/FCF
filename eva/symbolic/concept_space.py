@@ -697,7 +697,7 @@ class FractalField:
             sims = []
             for cid, code in all_codes.items():
                 score = float(ctx_repr @ code) / (np.linalg.norm(ctx_repr) * np.linalg.norm(code) + 1e-10)
-                sims.append((cid, score))
+                sims.append((int(cid), score))
             sims.sort(key=lambda x: -x[1])
             return sims[:k]
         else:
@@ -719,7 +719,7 @@ class FractalField:
         sims = []
         for cid, code in all_codes.items():
             score = float(query @ code / (np.linalg.norm(code) + 1e-10))
-            sims.append((cid, score))
+            sims.append((int(cid), score))
         sims.sort(key=lambda x: -x[1])
         return sims[:k]
 
@@ -833,6 +833,520 @@ class FractalField:
         return field
 
 
+# ═══════════════════════════════════════════════════════════
+# Harmonizer — multi-level field agreement via VSA
+# ═══════════════════════════════════════════════════════════
+
+class EntityField:
+    """Recursive semantic field — every entity (char, word, sent, para) has one
+    vector that encodes VSA bindings to its contexts at all levels.
+
+    Roles (cross-level):
+      CHAR  — char↔word
+      MORPH — morph↔word
+      WORD  — word↔sent
+      SENT  — sent↔para
+
+    All entities share one dict. Word vectors are synced from ConceptSpace
+    (source of truth for STDP). Char/sent/para vectors are stored here.
+
+    V(entity) accumulates bind(V(context), role) * lr for every occurrence.
+    query(entity, role) = unbind(V(entity), role) → superposition of contexts.
+    """
+    LEVEL_ROLES = ['CHAR', 'MORPH', 'WORD', 'SENT', 'PARA']
+    ETYPE_TO_ROLE = {'c': 'CHAR', 'm': 'MORPH', 'w': 'WORD', 's': 'SENT', 'p': 'PARA'}
+
+    def __init__(self, dim=2048, word_store=None):
+        self.dim = dim
+        self.word_store = word_store  # optional reference to ConceptVectorStore
+
+        # All entities: key = (etype_char, id)  e.g. ('c', 97), ('w', 42), ('s', hash)
+        self.entities = {}
+
+        # Quasi-orthogonal level roles (Gram-Schmidt)
+        rng = np.random.RandomState(1)
+        n_roles = len(self.LEVEL_ROLES)
+        mat = rng.randn(n_roles, dim).astype(np.float32)
+        Q, _ = np.linalg.qr(mat.T, mode='reduced')
+        self.role_vecs = {role: Q[:, i].copy() for i, role in enumerate(self.LEVEL_ROLES)}
+
+    # ── Key helpers ──────────────────────────────────────────
+    @staticmethod
+    def key_char(cp):    return ('c', cp)
+    @staticmethod
+    def key_morph(mid):  return ('m', mid)
+    @staticmethod
+    def key_word(cid):   return ('w', cid)
+    @staticmethod
+    def key_sent(h):     return ('s', h)
+    @staticmethod
+    def key_para(h):     return ('p', h)
+
+    # ── VSA primitives ───────────────────────────────────────
+    def _bind(self, a, b):
+        return a * b
+    def _unbind(self, c, b):
+        return c * b
+
+    # ── Core: ensure, get, set, sync_word ────────────────────
+    def ensure(self, key):
+        if key not in self.entities:
+            seed = hash(key) % (2**31 - 1)
+            rng = np.random.RandomState(seed)
+            v = rng.randn(self.dim).astype(np.float32)
+            n = float(np.linalg.norm(v))
+            self.entities[key] = v / n if n > 1e-10 else v
+        return self.entities[key]
+
+    def get(self, key):
+        # Word entities: if not in dict, try syncing from word_store
+        if key not in self.entities and key[0] == 'w' and self.word_store is not None:
+            v = self.word_store.get(key[1])
+            if v is not None:
+                self.entities[key] = v.copy().astype(np.float32)
+        return self.entities.get(key)
+
+    def set(self, key, v):
+        self.entities[key] = v
+
+    def sync_word(self, cid, vec=None):
+        """Sync word vector from concept_vectors into entity field."""
+        if vec is None and self.word_store is not None:
+            vec = self.word_store.get(cid)
+        if vec is not None:
+            self.entities[('w', cid)] = vec.copy().astype(np.float32)
+
+    # ── Bind / Query ─────────────────────────────────────────
+    def bind(self, etype, eid, ctx_type, ctx_id, lr=0.1):
+        """V(entity) += bind(V(context), role) * lr → normalise.
+
+        etype/ctx_type are single-char: 'c' (char), 'm' (morph), 'w' (word),
+        's' (sent), 'p' (para). Mapped via ETYPE_TO_ROLE to role vectors.
+        """
+        key = (etype, eid)
+        ctx_key = (ctx_type, ctx_id)
+        role = self.ETYPE_TO_ROLE.get(etype)
+        if role is None:
+            return
+        v_ctx = self.get(ctx_key)
+        if v_ctx is None:
+            v_ctx = self.ensure(ctx_key)
+        v_e = self.get(key)
+        if v_e is None:
+            v_e = self.ensure(key)
+        rv = self.role_vecs.get(role)
+        if rv is None:
+            return
+        bound = self._bind(v_ctx, rv)
+        self.entities[key] = v_e + bound * lr
+        n = float(np.linalg.norm(self.entities[key]))
+        if n > 1e-10:
+            self.entities[key] /= n
+
+    def query(self, etype, eid):
+        """unbind(V(entity), role) → superposition of bound contexts."""
+        key = (etype, eid)
+        v = self.get(key)
+        if v is None:
+            return None
+        role = self.ETYPE_TO_ROLE.get(etype)
+        if role is None:
+            return None
+        rv = self.role_vecs.get(role)
+        if rv is None:
+            return None
+        return self._unbind(v, rv)
+
+    # ── Serialisation ────────────────────────────────────────
+    def to_dict(self):
+        keys = []
+        vecs = []
+        for k, v in self.entities.items():
+            keys.append(k)
+            vecs.append(v)
+        return {
+            'ef_keys': keys,
+            'ef_vecs': np.array(vecs, dtype=np.float32) if vecs else np.empty((0, self.dim), dtype=np.float32),
+            'ef_dim': self.dim,
+        }
+
+    @classmethod
+    def from_dict(cls, data, word_store=None):
+        ef = cls(dim=data.get('ef_dim', 2048), word_store=word_store)
+        keys = data.get('ef_keys', [])
+        vecs = data.get('ef_vecs', np.empty((0, ef.dim), dtype=np.float32))
+        for k, v in zip(keys, vecs):
+            k = tuple(k)
+            ef.entities[k] = v.astype(np.float32)
+        return ef
+
+    # ── Decay: fade old bindings → prevent saturation ────────
+    def decay(self, factor=0.999):
+        for key in self.entities:
+            self.entities[key] *= factor
+            n = float(np.linalg.norm(self.entities[key]))
+            if n > 1e-10:
+                self.entities[key] /= n
+
+
+class Harmonizer:
+    """Harmonises WordField, MorphemeField, and SupraField via VSA bind/unbind.
+
+    Architecture:
+      - Each word = ⊕ bind(morpheme_vec, ROLE) over its morphemes (root+affixes)
+      - Decompose = unbind(word_vec, ROLE) to recover individual morphemes
+      - Harmonize: pull word toward its composition, backprop error to morphemes
+      - Dirty-flag tracking prevents avalanche: dirty means 'harmonise on next focus'
+
+    Role vectors are fixed quasi-orthogonal references initialised once.
+    """
+
+    ROLES = ['ROOT', 'PREFIX', 'SUFFIX', 'ENDING', 'WORD_POS', 'WORD_ROLE']
+
+    def __init__(self, dim=2048, harm_lr=0.05, morph_lr=0.03, n_iter=5):
+        self.dim = dim
+        self.harm_lr = harm_lr
+        self.morph_lr = morph_lr
+        self.n_iter = n_iter
+        self.damping = 0.5
+
+        # Initialise quasi-orthogonal role vectors
+        rng = np.random.RandomState(0)
+        role_mat = rng.randn(len(self.ROLES), dim).astype(np.float32)
+        # Gram-Schmidt orthonormalisation
+        Q, _ = np.linalg.qr(role_mat.T, mode='reduced')
+        self.role_vecs = {role: Q[:, i].copy() for i, role in enumerate(self.ROLES)}
+
+        # Backward index: morph_id -> set of word_ids that use it
+        self.morph_to_words = defaultdict(set)
+        # Dirty flags
+        self.word_dirty = set()
+        self.morph_dirty = set()
+        # Morpheme storage: morph_id -> HD vector (2048,)
+        self.morphemes = {}
+        # Word -> list of (morph_id, role) mappings
+        self.word_morphs = defaultdict(list)
+
+    # ── VSA primitives ────────────────────────────────────────
+
+    def _bind(self, a, b):
+        """Element-wise circular convolution via Hadamard product (HRR-style)."""
+        return a * b  # Hadamard product = VSA bind in frequency domain
+
+    def _unbind(self, c, b):
+        """Unbind: a ≈ c * b (since b is unit and self-inverse under Hadamard)."""
+        return c * b
+
+    def _bundle(self, vecs):
+        """Bundle (superposition) with normalisation."""
+        if not vecs:
+            return None
+        result = sum(vecs)
+        n = np.linalg.norm(result)
+        return result / n if n > 1e-10 else result
+
+    # ── Compose / Decompose ──────────────────────────────────
+
+    def compose_word(self, morph_parts, ctx_vec=None):
+        """Build word vector from morpheme parts.
+
+        If ctx_vec (sentence vector) is provided, the ROOT morpheme is
+        contextually modulated: root_effective = root_vec + unbind(ctx_vec, ROLE_POS) * 0.3
+        This enables context-dependent disambiguation (e.g. homonyms).
+
+        Args:
+            morph_parts: dict of {role_str: vec_or_morph_id} or list of (role, vec)
+            ctx_vec: optional sentence-level HD vector for context modulation
+
+        Returns:
+            unit-norm HD vector
+        """
+        bound = []
+        if isinstance(morph_parts, dict):
+            items = morph_parts.items()
+        else:
+            items = morph_parts
+        for role, vec in items:
+            if isinstance(vec, int):
+                vec = self.morphemes.get(vec)
+            if vec is None:
+                continue
+            # Context modulation: bias root toward sentence context
+            if role == 'ROOT' and ctx_vec is not None:
+                ctx_bias = self._unbind(ctx_vec, self.role_vecs['WORD_POS'])
+                bn = float(np.linalg.norm(ctx_bias))
+                if bn > 1e-10:
+                    w = 0.3
+                    vec = vec + ctx_bias * w
+                    vn = float(np.linalg.norm(vec))
+                    if vn > 1e-10:
+                        vec /= vn
+            role_v = self.role_vecs.get(role)
+            if role_v is None:
+                continue
+            bound.append(self._bind(vec, role_v))
+        return self._bundle(bound) if bound else None
+
+    def decompose_word(self, word_vec, roles=None):
+        """Extract morpheme vectors from a word vector via unbind.
+
+        Args:
+            word_vec: unit-norm word HD vector
+            roles: list of role strings (default: all except WORD_POS/WORD_ROLE)
+
+        Returns:
+            dict of {role: reconstructed_vec}
+        """
+        if roles is None:
+            roles = ['ROOT', 'PREFIX', 'SUFFIX', 'ENDING']
+        result = {}
+        for role in roles:
+            if role in self.role_vecs:
+                result[role] = self._unbind(word_vec, self.role_vecs[role])
+        return result
+
+    # ── Register morphology ──────────────────────────────────
+
+    def register_word(self, word_id, morph_map):
+        """Register a word's morphological decomposition.
+
+        Args:
+            word_id: int CID
+            morph_map: dict of {role_str: morph_id} — e.g. {'ROOT': 42, 'ENDING': 7}
+        """
+        for role, morph_id in morph_map.items():
+            self.word_morphs[word_id].append((morph_id, role))
+            self.morph_to_words[morph_id].add(word_id)
+
+    def set_morpheme_vec(self, morph_id, vec):
+        """Set or update a morpheme's HD vector."""
+        self.morphemes[morph_id] = vec.copy() if isinstance(vec, np.ndarray) else vec
+
+    def get_morpheme_vec(self, morph_id):
+        return self.morphemes.get(morph_id)
+
+    # ── Dirty tracking ───────────────────────────────────────
+
+    def mark_word_dirty(self, word_id):
+        self.word_dirty.add(word_id)
+
+    def mark_morph_dirty(self, morph_id):
+        if morph_id not in self.morph_dirty:
+            self.morph_dirty.add(morph_id)
+            # Cascade: all words containing this morph become dirty
+            for wid in self.morph_to_words.get(morph_id, set()):
+                self.word_dirty.add(wid)
+
+    def clear_dirty(self):
+        self.word_dirty.clear()
+        self.morph_dirty.clear()
+
+    # ── Harmonize ─────────────────────────────────────────────
+
+    def harmonize(self, word_id, word_vec, sent_vec=None):
+        """Pull a word vector toward its composition, propagate error to morphemes.
+
+        Args:
+            word_id: int CID
+            word_vec: current word HD vector (will NOT be mutated here)
+            sent_vec: optional sentence-level vector for top-down bias
+
+        Returns:
+            (new_word_vec, delta_norm) or (None, 0) if not applicable
+        """
+        if word_id not in self.word_morphs:
+            return None, 0.0
+
+        actual = word_vec
+        prev_delta = float('inf')
+        total_delta = 0.0
+
+        for iteration in range(self.n_iter):
+            # Bottom-up prediction: recompose from morphemes
+            morph_parts = []
+            for morph_id, role in self.word_morphs[word_id]:
+                mv = self.morphemes.get(morph_id)
+                if mv is not None:
+                    morph_parts.append((role, mv))
+            if not morph_parts:
+                break
+
+            pred_up = self.compose_word(morph_parts, ctx_vec=sent_vec)
+            if pred_up is None:
+                break
+
+            # Top-down prediction from sentence context
+            pred_dn = None
+            if sent_vec is not None:
+                pred_dn = self._unbind(sent_vec, self.role_vecs['WORD_POS'])
+
+            # Error = weighted combination of bottom-up and top-down
+            error = (pred_up - actual) * 0.5
+            if pred_dn is not None:
+                error += (pred_dn - actual) * 0.3
+
+            delta = float(np.linalg.norm(error))
+            total_delta += delta
+
+            # Convergence check
+            if delta > prev_delta * 1.5:
+                break  # diverging — stop
+            if delta < 1e-6:
+                break  # converged
+            prev_delta = delta
+
+            # Update word vector (clamped)
+            update = error * self.harm_lr * self.damping
+            un = float(np.linalg.norm(update))
+            if un > 0.3:
+                update = update / un * 0.3
+            actual = actual + update
+            an = float(np.linalg.norm(actual))
+            if an > 1e-10:
+                actual /= an
+
+            # Backpropagate error to morphemes via unbind
+            for morph_id, role in self.word_morphs[word_id]:
+                mv = self.morphemes.get(morph_id)
+                if mv is None:
+                    continue
+                # Error projection: what would the morpheme need to be to fix the error?
+                morph_grad = self._unbind(error, self.role_vecs[role])
+                mg_norm = float(np.linalg.norm(morph_grad))
+                if mg_norm > 0.3:
+                    morph_grad = morph_grad / mg_norm * 0.3
+                new_mv = mv + morph_grad * self.morph_lr
+                nmv = float(np.linalg.norm(new_mv))
+                if nmv > 1e-10:
+                    new_mv /= nmv
+                self.morphemes[morph_id] = new_mv
+                # Mark connected words as dirty (cascade)
+                for wid in self.morph_to_words.get(morph_id, set()):
+                    if wid != word_id:
+                        self.word_dirty.add(wid)
+
+        # Clear own dirty flag
+        self.word_dirty.discard(word_id)
+        if total_delta > 1e-6:
+            return actual, total_delta
+        return None, 0.0
+
+    def harmonize_with_envelope(self, word_id, word_vec, char_indices, envelope):
+        """Refine word vector using character-level context from envelope.
+
+        For each character in the word, unbind the envelope vector with ROLE_WORD
+        to get a character-predicted word vector, then average and use as top-down
+        bias.
+
+        Args:
+            word_id: int CID
+            word_vec: current word HD vector
+            char_indices: list of unicode codepoints (ints) for the word's characters
+            envelope: dict of {codepoint: ndarray} from ConceptSpace.char_envelope
+
+        Returns:
+            (new_word_vec, delta_norm) or (None, 0)
+        """
+        if word_id not in self.word_morphs:
+            return None, 0.0
+
+        role_w = self.role_vecs.get('WORD_ROLE')
+        if role_w is None or not char_indices:
+            return None, 0.0
+
+        actual = word_vec.copy()
+        char_preds = []
+        for cp in char_indices:
+            env_v = envelope.get(cp)
+            if env_v is not None:
+                pred = self._unbind(env_v, role_w)
+                pn = float(np.linalg.norm(pred))
+                if pn > 1e-10:
+                    pred /= pn
+                    char_preds.append(pred)
+
+        if not char_preds:
+            return None, 0.0
+
+        pred_from_chars = sum(char_preds) / len(char_preds)
+        pn = float(np.linalg.norm(pred_from_chars))
+        if pn > 1e-10:
+            pred_from_chars /= pn
+
+        # Weak top-down signal from characters
+        error = pred_from_chars - actual
+        den = float(np.linalg.norm(error))
+        if den < 1e-6:
+            return None, 0.0
+
+        update = error * self.harm_lr * 0.1  # weaker than morpheme harmonise
+        un = float(np.linalg.norm(update))
+        if un > 0.3:
+            update = update / un * 0.3
+        actual += update
+        an = float(np.linalg.norm(actual))
+        if an > 1e-10:
+            actual /= an
+
+        return actual, den
+
+    def to_dict(self):
+        """Serialize harmonizer state for npz/json persistence."""
+        morpheme_ids = np.array(list(self.morphemes.keys()), dtype=np.int64)
+        morpheme_vecs = np.array([self.morphemes[m] for m in morpheme_ids], dtype=np.float32)
+        words = np.array(list(self.word_morphs.keys()), dtype=np.int64)
+        roles_flat = []
+        mids_flat = []
+        word_lens = []
+        for w in words:
+            parts = self.word_morphs[w]
+            word_lens.append(len(parts))
+            for mid, role in parts:
+                mids_flat.append(mid)
+                roles_flat.append(role)
+        return {
+            'harm_morph_ids': morpheme_ids,
+            'harm_morph_vecs': morpheme_vecs,
+            'harm_words': words,
+            'harm_mids_flat': np.array(mids_flat, dtype=np.int64),
+            'harm_roles_flat': roles_flat,
+            'harm_word_lens': np.array(word_lens, dtype=np.int32),
+            'harm_dim': self.dim,
+            'harm_lr': self.harm_lr,
+            'morph_lr': self.morph_lr,
+            'n_iter': self.n_iter,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """Restore harmonizer from serialized dict."""
+        harm = cls(
+            dim=data.get('harm_dim', 2048),
+            harm_lr=data.get('harm_lr', 0.05),
+            morph_lr=data.get('morph_lr', 0.03),
+            n_iter=data.get('n_iter', 5),
+        )
+        morph_ids = data.get('harm_morph_ids', np.array([], dtype=np.int64))
+        morph_vecs = data.get('harm_morph_vecs', np.empty((0, harm.dim), dtype=np.float32))
+        for mid, vec in zip(morph_ids, morph_vecs):
+            harm.morphemes[int(mid)] = vec.astype(np.float32)
+        words = data.get('harm_words', np.array([], dtype=np.int64))
+        mids_flat = data.get('harm_mids_flat', np.array([], dtype=np.int64))
+        roles_flat = data.get('harm_roles_flat', [])
+        word_lens = data.get('harm_word_lens', np.array([], dtype=np.int32))
+        idx = 0
+        for w, n_parts in zip(words, word_lens):
+            w = int(w)
+            for j in range(n_parts):
+                if idx < len(mids_flat) and idx < len(roles_flat):
+                    mid = int(mids_flat[idx])
+                    role = roles_flat[idx]
+                    harm.word_morphs[w].append((mid, role))
+                    harm.morph_to_words[mid].add(w)
+                    idx += 1
+        return harm
+
+
 class ConceptSpace:
     """Vector space for BPE-token concepts.
 
@@ -862,6 +1376,16 @@ class ConceptSpace:
         self._total_shift = 0.0
         self._update_count = 0
         self._after_update_hook = None
+
+        # ── Morphological harmonizer (levels 1-2: morpheme ↔ word) ──
+        self.harmonizer = Harmonizer(dim=latent_dim)
+        self._morph_conf_threshold = 0.8
+        self._morph_vocab = None  # loaded on demand
+        self._harm_n_checkpoints = 0
+        self._harm_slow_start_epochs = 5
+
+        # ── EntityField: recursive semantic field (char↔word↔sent↔para) ──
+        self.entity_field = EntityField(dim=latent_dim, word_store=self.concept_vectors)
 
         # ---- Initialization ----
 
@@ -998,13 +1522,196 @@ class ConceptSpace:
             print(f"  Octree fields: {len(seen_cids)}/{len(self.fractal.codes)} concepts, "
                   f"sizes: min={a.min()} max={a.max()} mean={a.mean():.1f}")
 
-    def build_learned_fields(self, n_field_bits=512):
+    def build_learned_fields(self, n_field_bits=512, sp=None):
         """Build field_bits from learned projection instead of octree.
 
         Initializes W_proj as random hyperplanes, computes field_bits
         from latent codes. Call periodically during training to adapt.
+
+        Also builds morpheme field and initialises word vectors from
+        morphological composition if sp is provided.
         """
         self.fractal.init_learned_fields(field_bits=n_field_bits)
+        if sp is not None:
+            self._build_morphemes(sp=sp)
+            # Reinitialise word vectors from morpheme composition
+            n_reinit = 0
+            rng = np.random.RandomState(42)
+            for cid, word_morphs in list(self.harmonizer.word_morphs.items()):
+                morph_parts = [(r, self.harmonizer.get_morpheme_vec(m))
+                               for m, r in word_morphs]
+                composed = self.harmonizer.compose_word([(r, v) for r, v in morph_parts if v is not None])
+                if composed is not None:
+                    # Mix composed vector with existing fractal code (if any)
+                    existing = self.fractal.codes.get(cid)
+                    if existing is not None:
+                        mix = composed * 0.7 + existing * 0.3
+                        mix /= max(np.linalg.norm(mix), 1e-10)
+                        self.fractal.codes[cid] = mix
+                    else:
+                        self.fractal.codes[cid] = composed
+                    v = self.fractal.compute_vector(cid)
+                    if v is not None:
+                        self.concept_vectors[cid] = v
+                    n_reinit += 1
+            if n_reinit:
+                print(f"  [harmonizer] {n_reinit} words initialised from morphology")
+
+
+    def _load_morph_vocab(self):
+        """Load or import MorphVocab for morpheme decomposition."""
+        if self._morph_vocab is not None:
+            return self._morph_vocab
+        try:
+            base = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))
+            path = os.path.join(base, 'real_data', 'morph_vocab.json')
+            if os.path.exists(path):
+                from eva.symbolic.morph_vocab import MorphVocab
+                self._morph_vocab = MorphVocab.load(path)
+        except Exception as e:
+            print(f"  [harmonizer] MorphVocab load failed: {e}")
+        return self._morph_vocab
+
+    def _decompose_word(self, word):
+        """Rule-based Russian morpheme decomposition: prefix+stem+ending.
+
+        Returns dict of {role: string} or None if confidence < threshold.
+        """
+        word = word.lower().strip()
+        if len(word) < 3:
+            return None
+
+        # Known Russian prefixes (most common)
+        prefixes = ['вз', 'воз', 'вос', 'вы', 'до', 'за', 'из', 'ис',
+                    'на', 'над', 'наи', 'не', 'недо', 'низ', 'нис',
+                    'о', 'об', 'обез', 'обес', 'пере', 'по', 'под',
+                    'подо', 'пра', 'пред', 'пре', 'при', 'про',
+                    'раз', 'рас', 'со', 'с', 'у', 'без', 'бес',
+                    'вне', 'внутри', 'меж', 'между',
+                    'после', 'сверх', 'через',
+                    'анти', 'архи', 'гипер', 'де', 'дис', 'ин',
+                    'контр', 'суб', 'супер', 'ультра', 'экс']
+
+        # Known Russian endings (approximate)
+        endings = ['а', 'ы', 'е', 'у', 'ой', 'ую', 'ою',
+                   'ей', 'ий', 'ие', 'ия', 'ию', 'ием', 'иях',
+                   'ами', 'ях', 'ах', 'ов', 'ев', 'ём', 'ем',
+                   'ам', 'ом', 'ею', 'о', 'ых', 'им', 'ими',
+                   'ешь', 'ет', 'ем', 'ете', 'ут', 'ют', 'ат', 'ят',
+                   'ал', 'ла', 'ло', 'ли', 'ть', 'ти', 'чь',
+                   'л', 'на', 'ся', 'сь', 'ого', 'его', 'ому', 'ему',
+                   'ым', 'им', 'ыми', 'ими', 'ых', 'их']
+
+        result = {}
+        rest = word
+
+        # 1. Split prefix
+        pfx = ''
+        for p in sorted(prefixes, key=len, reverse=True):
+            if rest.startswith(p) and len(rest) > len(p) + 2:
+                nxt = rest[len(p)]
+                if nxt in 'аеёиоуыэюя':
+                    continue
+                pfx = p
+                rest = rest[len(p):]
+                result['PREFIX'] = pfx
+                break
+
+        # 2. Split ending
+        ending = ''
+        for e in sorted(endings, key=len, reverse=True):
+            if len(rest) > len(e) + 1 and rest.endswith(e):
+                # Check the char before ending is a consonant
+                pre = rest[-(len(e) + 1)]
+                if pre in 'бвгджзйклмнпрстфхцчшщ':
+                    ending = e
+                    rest = rest[:-len(e)]
+                    result['ENDING'] = ending
+                    break
+
+        # 3. The remainder is the stem (root + suffix)
+        if rest:
+            result['ROOT'] = rest
+
+        # Confidence: > 1 morpheme found and rest ≥ 2 chars
+        confidence = len(result) / 3.0
+        if len(rest) < 2:
+            confidence *= 0.5
+
+        if confidence < self._morph_conf_threshold:
+            return None
+
+        # Try to also get lemma from natasha via morph_vocab if available
+        mv = self._load_morph_vocab()
+        if mv and word in mv.word_cache:
+            # morph_vocab has lemma info stored at build time
+            pass  # we could use lemma as canonical root
+
+        return result
+
+    def _build_morphemes(self, sp=None):
+        """Build morpheme field from MorphVocab: decompose known words and
+        initialise morpheme vectors as quasi-orthogonal HD vectors.
+
+        Populates self.harmonizer with morph→word mappings and morpheme vectors.
+
+        Args:
+            sp: optional SentencePieceProcessor for CID→text lookup
+        """
+        rng = np.random.RandomState(42)
+        morph_set = set()
+        n_words = 0
+        n_skipped = 0
+
+        # Collect all decompositions
+        if sp is not None:
+            for cid in range(min(self.vocab_size, sp.vocab_size())):
+                try:
+                    text = sp.IdToPiece(cid).replace('\u2581', '').strip()
+                except Exception:
+                    continue
+                if not text or len(text) < 3:
+                    continue
+                # Skip pure punctuation/numbers
+                if all(c in '.,!?;:()[]{}«»—–-…\'\"1234567890' for c in text):
+                    continue
+                decomp = self._decompose_word(text)
+                if decomp is None:
+                    n_skipped += 1
+                    continue
+                # Assign integer IDs to each unique morpheme
+                morph_ids = {}
+                for role, morph_str in decomp.items():
+                    # Normalise ending/prefix by role to reduce vocabulary
+                    key = (role, morph_str)
+                    if key not in morph_set:
+                        # Convert set to list to track insertion order
+                        pass
+                    # Use hash as stable ID
+                    morph_id = abs(hash(key)) % (2**31 - 1)
+                    morph_set.add(key)
+                    morph_ids[role] = morph_id
+                self.harmonizer.register_word(cid, morph_ids)
+                n_words += 1
+
+        # Initialise morpheme vectors: quasi-orthogonal
+        morph_list = list(morph_set)
+        ids_done = set()
+        n_morph = 0
+        for key in morph_list:
+            morph_id = abs(hash(key)) % (2**31 - 1)
+            if morph_id in ids_done:
+                continue
+            ids_done.add(morph_id)
+            v = rng.randn(self.fractal.latent_dim).astype(np.float32)
+            v /= max(np.linalg.norm(v), 1e-10)
+            self.harmonizer.set_morpheme_vec(morph_id, v)
+            n_morph += 1
+
+        print(f"  [harmonizer] {n_morph} unique morphemes, "
+              f"{n_words} words decomposed ({n_skipped} skipped)")
+        return n_morph
 
     def update_learned_fields(self, batches_seen=0):
         """Periodic update of learned fields (Hebbian W_proj adaptation)."""
@@ -1413,6 +2120,48 @@ class ConceptSpace:
         data['update_count'] = self._update_count
         data['usage_decay_steps'] = getattr(self, '_usage_decay_steps', 0)
 
+        harmonizer_state = getattr(self, 'harmonizer', None)
+        if harmonizer_state is not None and harmonizer_state.morphemes:
+            harm_data = harmonizer_state.to_dict()
+            data['harm_dim'] = harm_data['harm_dim']
+            data['harm_lr'] = harm_data['harm_lr']
+            data['morph_lr'] = harm_data['morph_lr']
+            data['harm_n_iter'] = harm_data['n_iter']
+            data['harm_words'] = harm_data['harm_words'].tolist()
+            data['harm_mids_flat'] = harm_data['harm_mids_flat'].tolist()
+            data['harm_roles_flat'] = harm_data['harm_roles_flat']
+            data['harm_word_lens'] = harm_data['harm_word_lens'].tolist()
+            # Morpheme vectors go into npz, not json
+            npz_harm = {
+                'harm_morph_ids': harm_data['harm_morph_ids'],
+                'harm_morph_vecs': harm_data['harm_morph_vecs'],
+            }
+            npz_path = clean.replace('.json', '.codes.npz')
+            if os.path.exists(npz_path):
+                # Merge into existing npz
+                existing = dict(np.load(npz_path, allow_pickle=True))
+                existing.update(npz_harm)
+                np.savez_compressed(npz_path, **existing)
+            else:
+                np.savez_compressed(npz_path, **npz_harm)
+
+        # EntityField save → npz
+        ef = getattr(self, 'entity_field', None)
+        if ef is not None and len(ef.entities) > 0:
+            ef_data = ef.to_dict()
+            npz_ef = {
+                'ef_keys': np.array(ef_data['ef_keys'], dtype=object),
+                'ef_vecs': ef_data['ef_vecs'],
+                'ef_dim': ef_data['ef_dim'],
+            }
+            npz_path = clean.replace('.json', '.codes.npz')
+            if os.path.exists(npz_path):
+                existing = dict(np.load(npz_path, allow_pickle=True))
+                existing.update(npz_ef)
+                np.savez_compressed(npz_path, **existing)
+            else:
+                np.savez_compressed(npz_path, **npz_ef)
+
         with open(path + '.tmp', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
         os.replace(path + '.tmp', path)
@@ -1474,6 +2223,55 @@ class ConceptSpace:
         for cid in range(obj.vocab_size):
             if cid not in obj.concept_usage:
                 obj.concept_usage[cid] = 0
+
+        # ── Restore Harmonizer ──────────────────────────────────
+        if 'harm_dim' in data:
+            harm_data = {
+                'harm_dim': data['harm_dim'],
+                'harm_lr': data.get('harm_lr', 0.05),
+                'morph_lr': data.get('morph_lr', 0.03),
+                'n_iter': data.get('harm_n_iter', 5),
+                'harm_words': np.array(data.get('harm_words', []), dtype=np.int64),
+                'harm_mids_flat': np.array(data.get('harm_mids_flat', []), dtype=np.int64),
+                'harm_roles_flat': data.get('harm_roles_flat', []),
+                'harm_word_lens': np.array(data.get('harm_word_lens', []), dtype=np.int32),
+            }
+            # Load morpheme vectors from npz
+            binary_path = path.replace('.json', '.codes.npz')
+            if os.path.exists(binary_path):
+                npz = np.load(binary_path, allow_pickle=True)
+                harm_data['harm_morph_ids'] = npz.get('harm_morph_ids', np.array([], dtype=np.int64))
+                harm_data['harm_morph_vecs'] = npz.get('harm_morph_vecs', np.empty((0, data['harm_dim']), dtype=np.float32))
+                npz.close()
+            else:
+                harm_data['harm_morph_ids'] = np.array([], dtype=np.int64)
+                harm_data['harm_morph_vecs'] = np.empty((0, data['harm_dim']), dtype=np.float32)
+            obj.harmonizer = Harmonizer.from_dict(harm_data)
+            print(f"  Restored Harmonizer: {len(obj.harmonizer.morphemes)} morphemes, {len(obj.harmonizer.word_morphs)} words")
+        else:
+            obj.harmonizer = Harmonizer(dim=obj.fractal.latent_dim)
+
+        # ── Restore EntityField ────────────────────────────────
+        binary_path = path.replace('.json', '.codes.npz')
+        if os.path.exists(binary_path):
+            npz = np.load(binary_path, allow_pickle=True)
+            ef_keys = npz.get('ef_keys', None)
+            ef_vecs = npz.get('ef_vecs', None)
+            ef_dim = npz.get('ef_dim', None)
+            if ef_keys is not None and ef_vecs is not None:
+                ef_data = {
+                    'ef_keys': list(ef_keys),
+                    'ef_vecs': np.array(ef_vecs, dtype=np.float32),
+                    'ef_dim': int(ef_dim) if ef_dim is not None else obj.fractal.latent_dim,
+                }
+                obj.entity_field = EntityField.from_dict(ef_data, word_store=obj.concept_vectors)
+                print(f"  Restored EntityField: {len(obj.entity_field.entities)} entities")
+            else:
+                obj.entity_field = EntityField(dim=obj.fractal.latent_dim, word_store=obj.concept_vectors)
+            npz.close()
+        else:
+            obj.entity_field = EntityField(dim=obj.fractal.latent_dim, word_store=obj.concept_vectors)
+
         print(f"  Loaded ConceptSpace: {len(obj.concept_vectors)} concepts @ {obj.dim}D")
         return obj
 

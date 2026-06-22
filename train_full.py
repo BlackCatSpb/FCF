@@ -98,13 +98,17 @@ parser.add_argument('--fresh', action='store_true', help='force fresh start even
 parser.add_argument('--max-lines', type=int, default=0, help='limit training to N lines (for testing)')
 parser.add_argument('--learned-fields', action='store_true', help='use learnable fields (HDC projection) instead of octree')
 parser.add_argument('--field-bits', type=int, default=512, help='number of learned field bits (default: 512)')
-args = parser.parse_args()
+parser.add_argument('--no-harmonize', action='store_true', help='disable morphological harmonizer (fallback to STDP-only)')
+parser.add_argument('--no-morpheme-field', action='store_true', help='disable morpheme field (GPU < 2GB fallback)')
+
 RESUME = args.resume
 FAST = args.fast
 FRESH = args.fresh or FAST
 MAX_LINES = args.max_lines
 USE_LEARNED_FIELDS = args.learned_fields
 N_FIELD_BITS = args.field_bits
+NO_HARMONIZE = args.no_harmonize
+NO_MORPHEME_FIELD = args.no_morpheme_field
 
 print(f"vocab_size = {V}")
 
@@ -128,7 +132,7 @@ if RESUME is not None:
             resume_line = rl
             resume_epoch = r_epoch
             resume_global_step = r_global_step
-            ckpt_k = resume_line // 1000
+            ckpt_k = (resume_line // 5000) * 5
             resume_tag = f"{ckpt_k}k"
             print(f"\nAuto-resuming from line {resume_line} (checkpoint_state.json) — loading {resume_tag}")
             cs_path = CFG.cs_path.replace('.json', f'_{resume_tag}.json')
@@ -182,6 +186,10 @@ if RESUME is not None:
         sys.exit(1)
     ng_info = f" ({[len(v) for v in lattice.ngrams.values()]} prefixes)" if load_ng else " (ngrams skipped)"
     print(f"  Loaded {len(cs.concept_vectors)} vectors, {len(lattice.concept_freq)} concepts{ng_info}")
+    if NO_MORPHEME_FIELD and hasattr(cs, 'harmonizer'):
+        cs.harmonizer.word_morphs.clear()
+        cs.harmonizer.morphemes.clear()
+        print("  Morpheme field disabled (--no-morpheme-field)")
 
     if not any(lattice.ngrams.values()):
         print("  Rebuilding lattice n-grams from corpus...")
@@ -198,7 +206,8 @@ if RESUME is not None:
         print(f"  Rebuilding {fields_label} fields from loaded lattice...")
         try:
             if USE_LEARNED_FIELDS:
-                cs.build_learned_fields(n_field_bits=N_FIELD_BITS)
+                use_harm = sp if not (NO_HARMONIZE or NO_MORPHEME_FIELD) else None
+                cs.build_learned_fields(n_field_bits=N_FIELD_BITS, sp=use_harm)
             else:
                 cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
                                        gamma=CFG.octree_gamma, path_overrides=path_overrides)
@@ -234,7 +243,8 @@ else:
     print(f"Building {fields_label} fields...")
     try:
         if USE_LEARNED_FIELDS:
-            cs.build_learned_fields(n_field_bits=N_FIELD_BITS)
+            use_harm = sp if not (NO_HARMONIZE or NO_MORPHEME_FIELD) else None
+            cs.build_learned_fields(n_field_bits=N_FIELD_BITS, sp=use_harm)
         else:
             cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
                                    gamma=CFG.octree_gamma, path_overrides=path_overrides)
@@ -283,6 +293,14 @@ def check_consistency(cs, sample=500):
         if v_stored is not None and v_code is not None and abs(float(np.dot(v_stored, v_code)) - 1.0) < 1e-6:
             ok += 1
     return ok, len(cids)
+
+# ── Harmonizer config wiring (Phase 6.2) ─────────────────────────
+if hasattr(cs, 'harmonizer') and cs.harmonizer.word_morphs:
+    cs.harmonizer.harm_lr = CFG.harm_lr
+    cs.harmonizer.morph_lr = CFG.morph_lr
+    cs.harmonizer.n_iter = CFG.n_harm_iterations
+    cs._morph_conf_threshold = CFG.morph_confidence_threshold
+    cs._harm_slow_start_epochs = CFG.harm_slow_start_epochs
 
 # ── Baseline ────────────────────────────────────────────────────
 
@@ -453,6 +471,78 @@ class TrainingPipeline:
         vec_ok, vec_total, vec_max_dev = cs.validate_vector_norms()
         if n_code_out > 0 or vec_max_dev > self.cfg.vec_dev_warn:
             print(f"  CODE_DRIFT n_out={n_code_out} max|code|={max_code_abs:.1f} vec_dev={vec_max_dev:.6f}")
+        # Semantic bootstrap: use lattice PPMI connections to pull related tokens together
+        boot_n = self._semantic_bootstrap(cs, lattice, base_lr=self.cfg.bootstrap_lr)
+        if boot_n > 0:
+            print(f"  Semantic bootstrap: {boot_n} tokens updated")
+
+        # ── Phase 3.2/3.3: Harmonizer full pass + slow-start ──
+        if hasattr(cs, 'harmonizer') and cs.harmonizer.word_morphs:
+            harm = cs.harmonizer
+            # Slow-start: scale harm_lr for first N checkpoints
+            harm_n_ckpt = getattr(cs, '_harm_n_checkpoints', 0)
+            effective_harm_lr = harm.harm_lr
+            slow_start_epochs = getattr(cs, '_harm_slow_start_epochs', 5)
+            if harm_n_ckpt < slow_start_epochs:
+                scale = 0.1 + 0.9 * (harm_n_ckpt / slow_start_epochs)
+                effective_harm_lr = harm.harm_lr * scale
+                harm.harm_lr = effective_harm_lr
+            cs._harm_n_checkpoints = harm_n_ckpt + 1
+
+            # Phase 5.5: Save preharm checkpoint before first harmonize pass
+            if harm_n_ckpt == 0:
+                data_dir = os.path.dirname(self.cfg.cs_path)
+                preharm_path = os.path.join(data_dir, f'concept_space_{ckpt_name}_preharm.json')
+                cs.save(preharm_path)
+                print(f"  Preharm checkpoint saved: {preharm_path}")
+
+            # Full pass: harmonize all dirty words
+            dirty_words = list(harm.word_dirty)
+            if dirty_words:
+                n_ok = 0
+                n_delta = 0.0
+                for cid in dirty_words:
+                    v = cs.concept_vectors.get(cid)
+                    if v is not None:
+                        new_v, delta = harm.harmonize(cid, v)
+                        if new_v is not None:
+                            cs._apply_vector_update(cid, new_v)
+                            n_ok += 1
+                            n_delta += delta
+                harm.clear_dirty()
+                avg_d = n_delta / max(n_ok, 1)
+                print(f"  Harmonizer: {n_ok}/{len(dirty_words)} words harmonized "
+                      f"(avg δ={avg_d:.5f}, lr={effective_harm_lr:.4f})")
+                # Phase 6.3: harmonisation convergence metric
+                cs._harm_convergence = n_ok / max(1, len(harm.word_morphs))
+
+            # Phase 6.3: EntityField + morph_drift
+            if hasattr(cs, 'entity_field'):
+                n_ef = len(cs.entity_field.entities)
+                char_count = sum(1 for k in cs.entity_field.entities if k[0] == 'c')
+                sent_count = sum(1 for k in cs.entity_field.entities if k[0] == 's')
+                print(f"  EntityField: {n_ef} entities ({char_count} chars, {sent_count} sents)")
+
+            if harm_n_ckpt > 0:
+                # morph_drift: sample words, compare composed vs actual
+                drift_cids = list(harm.word_morphs.keys())[:200]
+                drifts = []
+                for cid in drift_cids:
+                    v = cs.concept_vectors.get(cid)
+                    if v is None:
+                        continue
+                    parts = []
+                    for mid, role in harm.word_morphs[cid]:
+                        mv = harm.morphemes.get(mid)
+                        if mv is not None:
+                            parts.append((role, mv))
+                    if parts:
+                        composed = harm.compose_word(parts)
+                        if composed is not None:
+                            drifts.append(float(1.0 - abs(np.dot(composed, v))))
+                if drifts:
+                    morph_drift = sum(drifts) / len(drifts)
+                    print(f"  Morph drift: {morph_drift:.4f} (mean 1-|cos|) over {len(drifts)} words")
         seed = self.cfg.test_seeds[zlib.crc32(str(idx).encode()) % len(self.cfg.test_seeds)]
         if gen.sp is not None:
             result = gen.generate(seed_word=seed, max_words=self.cfg.gen_max_words)

@@ -79,6 +79,7 @@ class STDPTrainer:
         # G-45: Persistent CUDA events (created once, reused across batches)
         pass  # profiling stubs removed (G-55)
 
+
     # ═══════════════════════════════════════════════════
     # Public API
     # ═══════════════════════════════════════════════════
@@ -196,12 +197,132 @@ class STDPTrainer:
         # (_build_torch_tensors iterates all 146K codes, O(V·D) CPU + 636MB PCIe xfer)
         # Only _invalidate_torch() (after fluctuate) should set it.
 
+        # ── Morphological harmonization (Phase 3) ──
+        self._harmonize_batch(gen, cs, all_ids)
+
         # Minesweeper (inverted): periodic cluster potential refresh
         if gen._cluster_update_counter > 0 and gen._cluster_update_counter % gen._cluster_update_every == 0:
             gen._update_cluster_potential()
         gen._cluster_update_counter += 1
 
         return total_pairs
+
+    def _harmonize_batch(self, gen, cs, all_ids):
+        """Recursive cross-level harmonization via EntityField.
+
+        For each batch sentence:
+          1. Sync word vectors from GPU→CPU into entity_field
+          2. char ↔ word: for each word, bind each character context
+          3. word → sent: compute sent_vec, bind each word to its sentence
+          4. sent → para: bind sentence to paragraph (if para boundaries exist)
+          5. Morpheme harmonization on dirty words (existing)
+          6. Sync back to GPU
+        """
+        if not hasattr(cs, 'harmonizer') or not cs.harmonizer.word_morphs:
+            return
+        harm = cs.harmonizer
+        ef = getattr(cs, 'entity_field', None)
+        if ef is None:
+            return
+
+        # Collect focus CIDs
+        focus_cids = set()
+        for ids in all_ids:
+            focus_cids.update(ids)
+        if gen._dirty_cids:
+            focus_cids.update(gen._dirty_cids)
+
+        morph_cids = [c for c in focus_cids if c in harm.word_morphs]
+        if not morph_cids and not focus_cids:
+            return
+
+        # ── 1. Sync GPU→CPU + sync word vectors into entity_field ──
+        all_cids = list(focus_cids | set(morph_cids))
+        if gen._use_torch and gen._vecs_t is not None:
+            cids_t = torch.tensor(all_cids, dtype=torch.long, device=gen._torch_device)
+            vecs_cpu = gen._vecs_t[cids_t].cpu().numpy()
+            gen._skip_gpu_sync = True
+            for cid, v_new in zip(all_cids, vecs_cpu):
+                cs._apply_vector_update(cid, v_new)
+                ef.sync_word(cid, v_new)
+            gen._skip_gpu_sync = False
+        else:
+            for cid in all_cids:
+                v = cs.concept_vectors.get(cid)
+                if v is not None:
+                    ef.sync_word(cid, v)
+
+        # Mark morph-words dirty
+        for cid in morph_cids:
+            harm.mark_word_dirty(cid)
+
+        # ── 2. Cross-level bindings: char↔word, word↔sent, sent↔para ──
+        for ids in all_ids:
+            if not ids:
+                continue
+
+            # ---- 2a. char ↔ word ----
+            for cid in ids:
+                wkey = ef.key_word(cid)
+                word_text = None
+                if hasattr(gen, 'sp') and gen.sp is not None:
+                    try:
+                        word_text = gen.sp.IdToPiece(int(cid)).replace('\u2581', ' ').strip()
+                    except Exception:
+                        pass
+                if word_text and len(word_text) >= 1:
+                    for ch in word_text:
+                        cp = ord(ch)
+                        # Char binds Word, Word binds Char
+                        ef.bind('c', cp, 'w', cid, lr=0.05)
+                        ef.bind('w', cid, 'c', cp, lr=0.05)
+
+            # ---- 2b. word → sent ----
+            sent_key = hash(tuple(ids))
+            # Build sent_vec from entity_field (or init if new)
+            skey = ef.key_sent(sent_key)
+            sv = ef.get(skey)
+            if sv is None:
+                # Compute from word vectors in entity field
+                codes = []
+                for cid in ids:
+                    wv = ef.get(ef.key_word(cid))
+                    if wv is not None:
+                        codes.append(wv)
+                if len(codes) >= 2:
+                    sv = cs.fractal.hdc_ngram_repr(codes)
+                    if sv is not None:
+                        ef.set(skey, sv)
+                else:
+                    sv = ef.ensure(skey)
+
+            if sv is not None:
+                for cid in ids:
+                    ef.bind('w', cid, 's', sent_key, lr=0.03)
+                # Sentence also binds its words
+                ef.bind('s', sent_key, 'w', ids[0], lr=0.01)
+
+        # ── 3. Morpheme harmonisation ──
+        dirty_words = list(harm.word_dirty)
+        for cid in dirty_words:
+            v = cs.concept_vectors.get(cid)
+            if v is not None:
+                # Top-down: use sent_vec from entity_field if available
+                sv = None
+                for ids in all_ids:
+                    if cid in ids:
+                        sk = ef.key_sent(hash(tuple(ids)))
+                        sv = ef.get(sk)
+                        break
+                new_v, delta = harm.harmonize(cid, v, sent_vec=sv)
+                if new_v is not None:
+                    cs._apply_vector_update(cid, new_v)
+                    ef.sync_word(cid, new_v)
+
+        # ── 4. Cleanup ──
+        if gen._dirty_cids:
+            gen._dirty_cids.difference_update(harm.word_dirty)
+        harm.clear_dirty()
 
     # ═══════════════════════════════════════════════════
     # Pair building
@@ -366,6 +487,84 @@ class STDPTrainer:
                         gpu_cid_gen.append(ids[j])
 
         return n_pairs
+
+    # ═══════════════════════════════════════════════════
+    # Lattice-based semantic bootstrap
+    # ═══════════════════════════════════════════════════
+    def _semantic_bootstrap(self, cs, lattice, base_lr=0.05, k_pos=5, k_neg=10):
+        """Use lattice PMI connections to bootstrap semantic vector space.
+
+        For each seen token:
+          - Pull toward top-PPMI neighbors (distributional similarity)
+          - Push away from random unconnected tokens
+
+        Returns number of updated tokens.
+        """
+        gen = self.gen
+        rng = np.random.RandomState(42 + getattr(self, '_bootstrap_seed', 0))
+        self._bootstrap_seed = getattr(self, '_bootstrap_seed', 0) + 1
+
+        seen_cids = [int(c) for c, u in cs.concept_usage.items() if u > 0]
+        if len(seen_cids) < 10:
+            return 0
+
+        rng.shuffle(seen_cids)
+        updated = 0
+        for cid in seen_cids[:max(200, len(seen_cids) // 2)]:
+            v_anc = cs.concept_vectors.get(cid)
+            if v_anc is None:
+                continue
+
+            # Positive: top PPMI neighbors from lattice connections
+            conns = lattice.connections_of(cid, top_k=k_pos * 2, use_ppmi=True)
+            conns = [(c, info) for c, info in conns if cs.concept_vectors.get(c) is not None]
+            if not conns:
+                continue
+
+            pos_vecs = [cs.concept_vectors.get(c) for c, _ in conns[:k_pos]]
+            pos_vecs = [v for v in pos_vecs if v is not None]
+            if not pos_vecs:
+                continue
+            pos_mean = np.mean(pos_vecs, axis=0)
+            pn = np.linalg.norm(pos_mean)
+            if pn > 1e-10:
+                pos_mean /= pn
+
+            # Negative: random seen tokens not in connections
+            conn_set = {c for c, _ in conns}
+            neg_pool = [c for c in seen_cids if c not in conn_set and c != cid]
+            if len(neg_pool) < k_neg:
+                continue
+            neg_sel = rng.choice(neg_pool, k_neg, replace=False).tolist()
+            neg_vecs = [cs.concept_vectors.get(c) for c in neg_sel]
+            neg_vecs = [v for v in neg_vecs if v is not None]
+            if not neg_vecs:
+                continue
+            neg_mean = np.mean(neg_vecs, axis=0)
+            nn = np.linalg.norm(neg_mean)
+            if nn > 1e-10:
+                neg_mean /= nn
+
+            # Contrastive gradient (Riemannian tangent)
+            cos_pos = float(v_anc @ pos_mean)
+            cos_neg = max(float(v_anc @ neg_mean), -1.0)
+
+            # Pull toward positives, push from negatives
+            pull = pos_mean - cos_pos * v_anc        # tangent toward pos
+            push = (v_anc - neg_mean * cos_neg) * 0.5  # tangent away from neg
+            grad = pull * base_lr + push * base_lr
+            gn = float(np.linalg.norm(grad))
+            if gn > 0.3:
+                grad = grad / gn * 0.3
+
+            v_new = v_anc + grad
+            nv = np.linalg.norm(v_new)
+            if nv > 1e-10:
+                v_new /= nv
+            cs._apply_vector_update(cid, v_new, max_shift=0.3)
+            updated += 1
+
+        return updated
 
     # ═══════════════════════════════════════════════════
     # CPU STDP (AM-25: legacy, GPU preferred)

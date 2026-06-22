@@ -436,6 +436,18 @@ class FCFConfig:
     max_grad_norm: float = 1.0  # clip gradient norm to prevent explosive updates
     neg_lr_ratio: float = 0.5
 
+    # ── Semantic Bootstrap ───────────────────
+    # Learning rate for lattice-derived contrastive pulls
+    bootstrap_lr: float = 0.05
+
+    # ── Morphological Harmonizer (Phases 1-5) ──
+    harm_lr: float = 0.05
+    morph_lr: float = 0.03
+    n_harm_iterations: int = 5
+    morph_confidence_threshold: float = 0.8
+    envelope_decay: float = 0.95
+    harm_slow_start_epochs: int = 5
+
     # ── Engine ────────────────────────────────
     use_torch: bool = True
     momentum_mu: float = 0.9

@@ -96,11 +96,15 @@ parser.add_argument('--resume', '-r', nargs='?', const='', default='',
 parser.add_argument('--fast', '-f', action='store_true', help='fast mode: higher lr + negative sampling, always fresh')
 parser.add_argument('--fresh', action='store_true', help='force fresh start even if checkpoint exists')
 parser.add_argument('--max-lines', type=int, default=0, help='limit training to N lines (for testing)')
+parser.add_argument('--learned-fields', action='store_true', help='use learnable fields (HDC projection) instead of octree')
+parser.add_argument('--field-bits', type=int, default=512, help='number of learned field bits (default: 512)')
 args = parser.parse_args()
 RESUME = args.resume
 FAST = args.fast
 FRESH = args.fresh or FAST
 MAX_LINES = args.max_lines
+USE_LEARNED_FIELDS = args.learned_fields
+N_FIELD_BITS = args.field_bits
 
 print(f"vocab_size = {V}")
 
@@ -190,12 +194,19 @@ if RESUME is not None:
     mv = _load_morph(CFG.morph_vocab_path, CFG.bpe_model_path)
     path_overrides = mv.get_path_overrides()
     if not hasattr(cs, 'H') or cs.H is None:
-        print("  Rebuilding H matrix + octree fields from loaded lattice...")
+        fields_label = "learned" if USE_LEARNED_FIELDS else "octree"
+        print(f"  Rebuilding {fields_label} fields from loaded lattice...")
         try:
-            cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
-                                   gamma=CFG.octree_gamma, path_overrides=path_overrides)
+            if USE_LEARNED_FIELDS:
+                cs.build_learned_fields(n_field_bits=N_FIELD_BITS)
+            else:
+                cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
+                                       gamma=CFG.octree_gamma, path_overrides=path_overrides)
+            n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3)
+            if n_rare:
+                print(f"  Item-memory: {n_rare} rare concepts re-initialized as random unit vectors")
         except Exception as e:
-            print(f"FATAL: build_octree_fields failed: {e}", file=sys.stderr)
+            print(f"FATAL: build_{fields_label}_fields failed: {e}", file=sys.stderr)
             sys.exit(1)
 
 else:
@@ -219,12 +230,19 @@ else:
         print(f"FATAL: lattice.build failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print("Octree H + fields...")
+    fields_label = "learned" if USE_LEARNED_FIELDS else "octree"
+    print(f"Building {fields_label} fields...")
     try:
-        cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
-                               gamma=CFG.octree_gamma, path_overrides=path_overrides)
+        if USE_LEARNED_FIELDS:
+            cs.build_learned_fields(n_field_bits=N_FIELD_BITS)
+        else:
+            cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
+                                   gamma=CFG.octree_gamma, path_overrides=path_overrides)
+        n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3)
+        if n_rare:
+            print(f"  Item-memory: {n_rare} rare concepts re-initialized as random unit vectors")
     except Exception as e:
-        print(f"FATAL: build_octree_fields failed: {e}", file=sys.stderr)
+        print(f"FATAL: build_{fields_label}_fields failed: {e}", file=sys.stderr)
         sys.exit(1)
 
     # ── Diagnostics ────────────────────────────────────────────────
@@ -653,6 +671,15 @@ try:
             pipeline._rescore_line = None  # allow rescore once per epoch
             # Re-read corpus with fresh decay
             destab_pct = 0.0  # fresh destab for new epoch
+            # Update learned fields (Hebbian adaptation of W_proj)
+            if hasattr(cs, 'fractal') and cs.fractal.W_proj is not None:
+                cs.update_learned_fields(batches_seen=global_step)
+            # Adaptive per-concept L1 (maintain target density)
+            if hasattr(cs.fractal, 'adjust_l1_lambdas') and epoch % 2 == 0:
+                cs.fractal.adjust_l1_lambdas()
+            # Dynamic capacity: grow if codes are dense, prune if sparse
+            if hasattr(cs.fractal, 'auto_adjust_capacity') and epoch % 3 == 0:
+                cs.fractal.auto_adjust_capacity()
 
         # Continuous curriculum: max_len ramps from CURICULUM_MIN_LEN → unlimited
         epoch_train = train_lines

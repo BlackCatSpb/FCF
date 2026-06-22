@@ -780,14 +780,30 @@ class CrystalGenerator:
         syn_ranked = {cid: i + 1 for i, (cid, _) in enumerate(syn_preds[:80])
                       if self._is_semantic_token(cid)}
 
-        # 3. All candidates from learned signals
-        all_cids = set(graph_candidates.keys()) | set(syn_ranked.keys())
+        # 2b. HDC n-gram fallback (when lattice has < 3 candidates)
+        hdc_candidates = {}
+        if len(syn_preds) < 3 and len(cids) >= 2:
+            ctx_cids = list(reversed(cids[-2:]))
+            if hasattr(self.cs.fractal, 'hdc_memory'):
+                hdc_preds = self.cs.fractal.hdc_predict(
+                    ctx_cids, self.cs.fractal.codes, k=30)
+                for hcid, hscore in hdc_preds:
+                    if self._is_semantic_token(hcid) and hscore > 0.05:
+                        hdc_candidates[hcid] = hscore
 
-        # 4. Vector similarity fallback
+        # 3. All candidates from learned signals
+        all_cids = set(graph_candidates.keys()) | set(syn_ranked.keys()) | set(hdc_candidates.keys())
+
+        # 4. Vector similarity fallback (sector search if available, else full)
         v_prev = self.cs.concept_vector(prev_cid)
         vector_sim = {}
         if v_prev is not None:
-            sim_candidates = self.cs.topk_similar_concepts(prev_cid, k=20, sample_size=500)
+            if hasattr(self.cs.fractal, '_sector_index') and self.cs.fractal._sector_index:
+                sim_candidates = self.cs.fractal.search_in_sector(prev_cid, depth=1, k=40)
+                if len(sim_candidates) < 5:
+                    sim_candidates = self.cs.fractal.focal_refine(prev_cid, start_depth=0, target_k=20)
+            else:
+                sim_candidates = self.cs.topk_similar_concepts(prev_cid, k=20, sample_size=500)
             for cid, sim in sim_candidates:
                 if cid not in all_cids and sim > 0.05:
                     all_cids.add(cid)
@@ -804,6 +820,8 @@ class CrystalGenerator:
                 rrf += 0.7 * graph_candidates[cid]
             if cid in syn_ranked:
                 rrf += 0.15 / (K + syn_ranked[cid])
+            if cid in hdc_candidates:
+                rrf += 0.10 * hdc_candidates[cid] / (K + 1)
             if cid in vector_sim:
                 rrf += 0.15 * vector_sim[cid] / (K + 1)
             freq = self.lattice.concept_freq.get(cid, 0)

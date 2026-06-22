@@ -13,7 +13,7 @@ on the corpus. No external knowledge bases (ConceptNet) needed.
 import numpy as np
 from collections import defaultdict, Counter
 import math, json, os, random
-from typing import Dict
+from typing import Dict, List, Optional
 try:
     import torch
     _HAS_TORCH = True
@@ -94,9 +94,11 @@ class FractalField:
     v = normalize(code @ basis) — unchanged.
     """
 
-    def __init__(self, dim=768, latent_dim=2048, l_c=None, l_a=None, l_m=None):
+    def __init__(self, dim=768, latent_dim=2048, l_c=None, l_a=None, l_m=None, l1_lambda=0.001,
+                 n_field_bits=512, field_lr=0.01):
         self.dim = dim
         self.latent_dim = latent_dim
+        self.l1_lambda = l1_lambda
         if l_c is not None and l_a is not None and l_m is not None:
             self.l_c, self.l_a, self.l_m = l_c, l_a, l_m
         else:
@@ -112,14 +114,74 @@ class FractalField:
         # Latent codes: cid → (latent_dim,) array
         self.codes = {}
 
-        # Field bits (lazy init via init_fields())
+        # Learnable field projection: code @ W_proj → binarized field bits
+        self.n_field_bits = n_field_bits
+        self.field_lr = field_lr
+        self.W_proj: Optional[np.ndarray] = None  # [latent_dim, n_field_bits]
         self.field_bits: Dict[int, np.ndarray] = {}
         self._fb_dirty = False
+
+        # HDC n-gram memory: prefix_cids_tuple → bundled latent repr
+        self.hdc_memory: Dict[tuple, np.ndarray] = {}
+        self.hdc_memory_counts: Dict[tuple, int] = {}
+
+        # Per-concept adaptive L1 lambda (dynamic dimensionality)
+        self.l1_lambda_per_cid: Dict[int, float] = {}
+        self.l1_target_density = 0.08  # target 8% active in z_c
+        self.l1_density_window: Dict[int, list] = {}
 
         # Cache
         self._vector_matrix = None
         self._cid_order = []
         self._matrix_dirty = True
+
+        # Dynamic capacity growth tracking
+        self._capacity_growths = 0
+        self._density_threshold_grow = 0.15   # grow if mean density exceeds 15%
+        self._density_threshold_prune = 0.01  # prune if dimension sparse across all codes
+        self._growth_factor = 1.5  # multiply latent_dim by this when growing
+
+        # Sector index for focal search (field-in-field)
+        self._sector_W: List[np.ndarray] = []  # per-level W_proj
+        self._sector_index: Dict[int, Dict[tuple, list]] = {}  # depth → {prefix → [cids]}
+        self._sector_depths: list = [4, 10, 20]  # bits at each depth level
+
+    def _apply_l1(self, code: np.ndarray, ce: float = 0.0, cid: Optional[int] = None) -> np.ndarray:
+        """Soft-threshold z_c subspace: high CE → weak L1 (allows densification).
+
+        Uses per-concept L1 lambda when available (adaptive dimensionality).
+        """
+        if self.l1_lambda <= 0:
+            return code
+        if cid is not None and cid in self.l1_lambda_per_cid:
+            lmbda = self.l1_lambda_per_cid[cid]
+        else:
+            lmbda = self.l1_lambda
+        strength = lmbda * max(0.0, 1.0 - ce * 2.0)
+        z_c = code[:self.l_c]
+        active_before = int(np.sum(np.abs(z_c) > 1e-6))
+        z_c = np.sign(z_c) * np.maximum(0.0, np.abs(z_c) - strength)
+        code[:self.l_c] = z_c
+        # Track density for adaptive adjustment
+        if cid is not None:
+            active_after = int(np.sum(np.abs(z_c) > 1e-6))
+            density = active_after / max(self.l_c, 1)
+            if cid not in self.l1_density_window:
+                self.l1_density_window[cid] = []
+            self.l1_density_window[cid].append(density)
+            # Keep last 100 measurements
+            if len(self.l1_density_window[cid]) > 100:
+                self.l1_density_window[cid].pop(0)
+        return code
+
+    def _apply_l1_batch(self, codes: np.ndarray, ce_list: list, cid_list: Optional[list] = None) -> np.ndarray:
+        """Batched L1 for GPU path."""
+        if self.l1_lambda <= 0 or len(codes) == 0:
+            return codes
+        for i in range(len(codes)):
+            cid = cid_list[i] if cid_list is not None and i < len(cid_list) else None
+            self._apply_l1(codes[i], ce_list[i] if i < len(ce_list) else 0.0, cid=cid)
+        return codes
 
     def check_basis_health(self):
         """Verify orthogonality, re-orthogonalize if drifted. Returns True if changed."""
@@ -183,12 +245,352 @@ class FractalField:
         """Initialize binary field bit arrays for all concepts.
 
         field_bits[cid] = np.uint8 array of n_anchors/8 bytes.
+        Used by octree encoding path (build_octree_fields).
         """
         self.field_bits = {}
         n_bytes = (n_anchors + 7) // 8
         for cid in self.codes:
             self.field_bits[cid] = np.zeros(n_bytes, dtype=np.uint8)
         self._fb_dirty = True
+
+    def init_learned_fields(self, field_bits=512):
+        """Initialize W_proj and compute field_bits from latent codes.
+
+        W_proj: random hyperplane projection matrix [latent_dim, field_bits].
+        Each field bit = sign(code @ W_proj[:, i]) → LSH-preserving similarity.
+        field_bits[cid] packed as np.uint8 array (bitmask).
+        """
+        rng = np.random.RandomState(42)
+        scale = 1.0 / np.sqrt(self.latent_dim)
+        self.W_proj = rng.randn(self.latent_dim, field_bits).astype(np.float32) * scale
+        self.n_field_bits = field_bits
+        self._init_sector_fields()
+        self._rebuild_field_bits()
+        print(f"  Learnable fields: {len(self.field_bits)}/{len(self.codes)} "
+              f"concepts, {field_bits} bits ({len(self._sector_depths)} levels)")
+        depths_str = ', '.join(str(d) for d in self._sector_depths)
+        print(f"  Sector depth bits: [{depths_str}]")
+
+    def _rebuild_field_bits(self):
+        """Recompute field_bits from current codes using W_proj."""
+        if self.W_proj is None:
+            return
+        n_bytes = (self.n_field_bits + 7) // 8
+        self.field_bits = {}
+        for cid, code in self.codes.items():
+            raw = code @ self.W_proj  # [n_field_bits]
+            bits = (raw > 0).astype(np.uint8)
+            packed = np.packbits(bits)[:n_bytes]
+            self.field_bits[cid] = packed
+        self._rebuild_sector_index()
+        self._fb_dirty = True
+
+    def update_learned_fields(self, batches_seen=0, lr_scale=1.0):
+        """Periodic field update with Hebbian W_proj adaptation.
+
+        W_proj update: outer product of code with sign(code @ W_proj).
+        Strengthens hyperplanes aligned with concept distribution.
+        """
+        if self.W_proj is None or len(self.codes) < 2:
+            return
+
+        codes = np.array(list(self.codes.values()), dtype=np.float32)
+        n = len(codes)
+        raw = codes @ self.W_proj  # [n, n_field_bits]
+        signs = np.sign(raw)  # ±1
+
+        # Hebbian: W += lr * mean(code * sign) over batch
+        lr = self.field_lr * lr_scale
+        delta = (codes.T @ signs) / max(n, 1)  # [latent_dim, n_field_bits]
+        self.W_proj += lr * delta
+
+        # Re-normalize columns to unit length (prevent drift)
+        norms = np.linalg.norm(self.W_proj, axis=0, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        self.W_proj /= norms
+
+        self._rebuild_field_bits()
+
+    def adjust_l1_lambdas(self, lr_scale=1.0):
+        """Adjust per-concept L1 lambdas to maintain target density.
+
+        Each concept tracks its active-fraction in z_c over time.
+        If density > target: increase L1 (more sparsity pressure).
+        If density < target*0.5: decrease L1 (allow densification).
+        """
+        if not self.l1_density_window:
+            return
+        n_adjusted = 0
+        for cid, densities in self.l1_density_window.items():
+            if len(densities) < 10:
+                continue
+            mean_density = np.mean(densities[-50:])  # trailing window
+            current_lambda = self.l1_lambda_per_cid.get(cid, self.l1_lambda)
+            if mean_density > self.l1_target_density * 1.5:
+                # Too dense — increase sparsity pressure
+                new_lambda = current_lambda * (1.0 + 0.1 * lr_scale)
+                self.l1_lambda_per_cid[cid] = min(new_lambda, 0.1)  # cap
+                n_adjusted += 1
+            elif mean_density < self.l1_target_density * 0.3 and current_lambda > 1e-6:
+                # Too sparse — relax sparsity pressure
+                new_lambda = current_lambda * (1.0 - 0.1 * lr_scale)
+                self.l1_lambda_per_cid[cid] = max(new_lambda, 1e-6)
+                n_adjusted += 1
+        if n_adjusted:
+            n_total = len([v for v in self.l1_density_window.values() if len(v) >= 10])
+            print(f"  Adaptive L1: adjusted {n_adjusted}/{n_total} concepts")
+
+    # ── Dynamic capacity ─────────────────────────────────────
+
+    def grow_capacity(self, new_latent_dim=None):
+        """Grow latent_dim by adding orthogonal basis vectors.
+
+        Preserves existing subspace structure. Extends all codes with zeros
+        in new dimensions (STDP will populate them).
+        """
+        old_dim = self.latent_dim
+        if new_latent_dim is None:
+            new_latent_dim = int(old_dim * self._growth_factor)
+        new_latent_dim = max(new_latent_dim, old_dim + 8)  # at least 8 new dims
+        # Ensure new dim respects subspace alignment
+        new_latent_dim = ((new_latent_dim + 7) // 8) * 8
+
+        # Generate new orthogonal basis vectors
+        rng = np.random.RandomState(42 + self._capacity_growths)
+        n_new = new_latent_dim - old_dim
+        mat = rng.randn(n_new, self.dim).astype(np.float32)
+        # Orthogonalise against existing basis
+        residual = mat - mat @ self.basis.T @ self.basis
+        Q_new, _ = np.linalg.qr(residual, mode='reduced')
+        self.basis = np.vstack([self.basis, Q_new.astype(np.float32)])
+
+        # Extend all codes with zeros
+        for cid in self.codes:
+            self.codes[cid] = np.append(self.codes[cid], np.zeros(n_new, dtype=np.float32))
+
+        # Update subspace ratios
+        old_l_c, old_l_a, old_l_m = self.l_c, self.l_a, self.l_m
+        self.latent_dim = new_latent_dim
+        self.l_c = new_latent_dim * 3 // 5
+        self.l_a = new_latent_dim // 4
+        self.l_m = new_latent_dim - self.l_c - self.l_a
+        # Shift existing code entries to new subspace positions
+        for cid in self.codes:
+            old_code = self.codes[cid]
+            new_code = np.zeros(new_latent_dim, dtype=np.float32)
+            # z_c: identity — kept in same relative position, extended
+            new_code[:old_l_c] = old_code[:old_l_c]
+            # z_a: attention — same
+            new_code[old_l_c:old_l_c + old_l_a] = old_code[old_l_c:old_l_c + old_l_a]
+            # z_m: meta — same
+            new_code[old_l_c + old_l_a:old_l_c + old_l_a + old_l_m] = old_code[old_l_c + old_l_a:]
+            self.codes[cid] = new_code
+
+        # Grow field projection matrices
+        if self.W_proj is not None:
+            pad = np.zeros((n_new, self.n_field_bits), dtype=np.float32)
+            self.W_proj = np.vstack([self.W_proj, pad])
+        for lvl in range(len(self._sector_W)):
+            pad = np.zeros((n_new, self._sector_W[lvl].shape[1]), dtype=np.float32)
+            self._sector_W[lvl] = np.vstack([self._sector_W[lvl], pad])
+
+        # Grow L1 lambda dict entries (inherit global)
+        if self.l1_lambda_per_cid:
+            self.l1_lambda_per_cid = {
+                cid: lmbda for cid, lmbda in self.l1_lambda_per_cid.items()
+                if cid in self.codes
+            }
+
+        self._matrix_dirty = True
+        self._capacity_growths += 1
+        self._fb_dirty = True
+        print(f"  Grown capacity: {old_dim} -> {new_latent_dim} "
+              f"(l_c={self.l_c} l_a={self.l_a} l_m={self.l_m})")
+        return new_latent_dim
+
+    def prune_capacity(self, sparsity_threshold=0.98):
+        """Prune near-zero latent dimensions across all codes.
+
+        A dimension is pruned if > 98% of codes have |val| < 1e-4.
+        Returns number of pruned dimensions.
+        """
+        if len(self.codes) < 10:
+            return 0
+        codes_arr = np.array(list(self.codes.values()), dtype=np.float32)
+        active_frac = np.mean(np.abs(codes_arr) > 1e-4, axis=0)
+        dead = np.where(active_frac < (1.0 - sparsity_threshold))[0]
+        if len(dead) == 0:
+            return 0
+
+        # Keep only live dimensions
+        live = np.where(active_frac >= (1.0 - sparsity_threshold))[0]
+        live_set = set(live)
+        old_dim = self.latent_dim
+
+        # Remap: live dims form new code, basis, W_proj
+        new_basis_rows = self.basis[live]
+        # Re-orthogonalise to maintain orthonormal basis
+        Q, _ = np.linalg.qr(new_basis_rows.T, mode='reduced')
+        self.basis = Q.T.astype(np.float32)
+        new_latent_dim = len(live)
+
+        for cid in self.codes:
+            self.codes[cid] = self.codes[cid][live]
+
+        self.latent_dim = new_latent_dim
+        self.l_c = new_latent_dim * 3 // 5
+        self.l_a = new_latent_dim // 4
+        self.l_m = new_latent_dim - self.l_c - self.l_a
+
+        if self.W_proj is not None:
+            self.W_proj = self.W_proj[live]
+
+        for lvl in range(len(self._sector_W)):
+            self._sector_W[lvl] = self._sector_W[lvl][live]
+
+        self._matrix_dirty = True
+        self._fb_dirty = True
+        print(f"  Pruned capacity: {old_dim}→{new_latent_dim} "
+              f"(removed {len(dead)} dead dimensions)")
+        return len(dead)
+
+    def auto_adjust_capacity(self):
+        """Automatically grow or shrink capacity based on code density.
+
+        If mean density across concepts exceeds threshold → grow.
+        If many dimensions are dead → prune.
+        Called periodically during training.
+        """
+        if len(self.codes) < 5:
+            return
+        codes_arr = np.array(list(self.codes.values()), dtype=np.float32)
+        # Fraction of dimensions with |val| > 1e-4 per concept
+        per_concept_density = np.mean(np.abs(codes_arr) > 1e-4, axis=1)
+        mean_density = float(np.mean(per_concept_density))
+        max_density = float(np.max(per_concept_density))
+
+        if mean_density > self._density_threshold_grow:
+            self.grow_capacity()
+        elif mean_density < self._density_threshold_prune * 2:
+            n_pruned = self.prune_capacity()
+            if n_pruned > 0:
+                return
+
+        # Per-dimension prunning
+        active_frac = np.mean(np.abs(codes_arr) > 1e-4, axis=0)
+        dead_pct = float(np.mean(active_frac < 0.02))
+        if dead_pct > 0.3:
+            self.prune_capacity()
+
+    # ── Sector index (focal search / field-in-field) ──────
+
+    def _init_sector_fields(self, depths=None):
+        """Initialise hierarchical sector projections (field-in-field).
+
+        Each level has its own W_proj[lvl] of [latent_dim, n_bits_lvl].
+        Level 0 = coarsest (few bits, large buckets).
+        Level N = finest (many bits, small buckets).
+        """
+        if depths is None:
+            depths = self._sector_depths
+        self._sector_depths = depths
+        rng = np.random.RandomState(42)
+        scale = 1.0 / np.sqrt(self.latent_dim)
+        self._sector_W = []
+        for n_bits in depths:
+            W = rng.randn(self.latent_dim, n_bits).astype(np.float32) * scale
+            self._sector_W.append(W)
+        self._rebuild_sector_index()
+
+    def _rebuild_sector_index(self):
+        """Rebuild inverted sector index from current codes.
+
+        sector_index[depth][prefix_tuple] = [cid, ...]
+        """
+        if not hasattr(self, '_sector_W') or not self._sector_W:
+            return
+        self._sector_index = {}
+        for depth in range(len(self._sector_W)):
+            self._sector_index[depth] = {}
+            cumulative_bits = sum(self._sector_depths[:depth + 1])
+            prefix_bytes = (cumulative_bits + 7) // 8
+            for cid, code in self.codes.items():
+                # Build prefix bits across all levels up to this depth
+                raw = code @ np.hstack(self._sector_W[:depth + 1])
+                bits = (raw > 0).astype(np.uint8)
+                packed = np.packbits(bits)[:prefix_bytes]
+                key = tuple(packed)
+                if key not in self._sector_index[depth]:
+                    self._sector_index[depth][key] = []
+                self._sector_index[depth][key].append(cid)
+        self._fb_dirty = True
+
+    def sector_key(self, cid, depth=0):
+        """Get sector key for a concept at given depth.
+
+        Returns hashable tuple of packed uint8 bytes for the first
+        sum(depths[:depth+1]) bits of the sector projection.
+        """
+        if not hasattr(self, '_sector_W') or depth >= len(self._sector_W):
+            return None
+        code = self.codes.get(cid)
+        if code is None:
+            return None
+        cumulative_bits = sum(self._sector_depths[:depth + 1])
+        raw = code @ np.hstack(self._sector_W[:depth + 1])
+        bits = (raw > 0).astype(np.uint8)
+        packed = np.packbits(bits)[:(cumulative_bits + 7) // 8]
+        return tuple(packed)
+
+    def search_in_sector(self, query_cid, depth=0, k=10, all_codes=None):
+        """Focal search: only score concepts sharing the same sector prefix.
+
+        Searches at given depth (0=coarse, N=fine).
+        Falls back to full search if sector is empty or query has no match.
+        """
+        key = self.sector_key(query_cid, depth)
+        if key is None or depth not in self._sector_index:
+            return []
+        candidates = self._sector_index[depth].get(key, [])
+        if len(candidates) < 2:
+            return []
+
+        if all_codes is None:
+            all_codes = self.codes
+
+        q_code = all_codes.get(query_cid)
+        if q_code is None:
+            return []
+        q_norm = np.linalg.norm(q_code)
+        if q_norm < 1e-10:
+            return []
+        q_code /= q_norm
+
+        sims = []
+        for cid in candidates:
+            if cid == query_cid:
+                continue
+            code = all_codes.get(cid)
+            if code is None:
+                continue
+            sim = float(q_code @ code / (np.linalg.norm(code) + 1e-10))
+            sims.append((cid, sim))
+        sims.sort(key=lambda x: -x[1])
+        return sims[:k]
+
+    def focal_refine(self, query_cid, start_depth=0, target_k=5, max_depth=None):
+        """Progressive sector refinement: start coarse, narrow to fine.
+
+        At each depth, if enough candidates found, stop.
+        Otherwise go one level deeper.
+        """
+        if max_depth is None:
+            max_depth = len(self._sector_depths) - 1 if hasattr(self, '_sector_depths') else 0
+        for depth in range(start_depth, max_depth + 1):
+            results = self.search_in_sector(query_cid, depth=depth, k=target_k * 3)
+            if len(results) >= target_k:
+                return results[:target_k]
+        return results
 
     def get_field_bits(self, cid):
         """Get binary field vector for a concept."""
@@ -201,6 +603,112 @@ class FractalField:
         if ba is None or bb is None or len(ba) != len(bb):
             return 0
         return int(np.unpackbits(np.bitwise_and(ba, bb)).sum())
+
+    # ── HDC/VSA n-gram fallback ────────────────────────────
+
+    def hdc_bind(self, a, b):
+        """Element-wise multiply (real-valued VSA binding)."""
+        return a * b
+
+    def hdc_permute(self, v, n=1):
+        """Circular shift by n positions."""
+        return np.roll(v, n)
+
+    def hdc_bundle(self, v, accum, lr=0.1):
+        """Bundle v into accumulator (adaptive running average)."""
+        return accum * (1.0 - lr) + v * lr
+
+    def hdc_ngram_repr(self, codes):
+        """Build HDC representation for an n-gram sequence of codes.
+
+        For (w1, w2, ..., wn): ρ^{n-1}(w1) ⊙ ρ^{n-2}(w2) ⊙ ... ⊙ wn
+        """
+        n = len(codes)
+        if n == 0:
+            return None
+        result = codes[-1].copy()
+        for i in range(n - 1):
+            result = self.hdc_bind(self.hdc_permute(codes[i], n - 1 - i), result)
+        return result
+
+    def hdc_unbind(self, context_codes, memory_repr):
+        """Given context (prefix) and n-gram memory, unbind to find next token.
+
+        query = hdc_ngram_repr(context) ⊙ memory_repr ≈ next_token_code
+        Context = all but last token of the n-gram.
+        """
+        ctx_repr = self.hdc_ngram_repr(context_codes)
+        if ctx_repr is None:
+            return None
+        return self.hdc_bind(ctx_repr, memory_repr)
+
+    def hdc_update_ngram(self, prefix_cids, next_code):
+        """Update HDC memory for {prefix_cids → next_token_code}.
+
+        Bundles next_code into hdc_memory[prefix_cids] (running average).
+        """
+        key = tuple(prefix_cids)
+        if key not in self.hdc_memory:
+            self.hdc_memory[key] = next_code.copy()
+            self.hdc_memory_counts[key] = 1
+        else:
+            count = self.hdc_memory_counts[key]
+            lr = 1.0 / max(count + 1, 1.0)
+            self.hdc_memory[key] = self.hdc_bundle(
+                next_code, self.hdc_memory[key], lr)
+            self.hdc_memory_counts[key] = count + 1
+
+    def hdc_predict(self, context_cids, all_codes, k=20):
+        """HDC fallback prediction from prefix context (CID-based key).
+
+        Args:
+            context_cids: list of concept IDs for the context (prefix)
+            all_codes: dict of {cid: code} for all candidates
+            k: number of candidates to return
+
+        Returns:
+            [(cid, score), ...] scored by cosine similarity
+        """
+        key = tuple(context_cids)
+        if key in self.hdc_memory:
+            mem_repr = self.hdc_memory[key]
+        elif len(key) >= 2:
+            # No stored repr — use the context itself as a probe
+            ctx_codes = [self.codes.get(cid) for cid in key]
+            ctx_codes = [c for c in ctx_codes if c is not None]
+            if len(ctx_codes) < 2:
+                return []
+            ctx_repr = self.hdc_ngram_repr(ctx_codes)
+            if ctx_repr is None:
+                return []
+            sims = []
+            for cid, code in all_codes.items():
+                score = float(ctx_repr @ code) / (np.linalg.norm(ctx_repr) * np.linalg.norm(code) + 1e-10)
+                sims.append((cid, score))
+            sims.sort(key=lambda x: -x[1])
+            return sims[:k]
+        else:
+            return []
+
+        # Query: unbind memory repr with context codes to find next token
+        ctx_codes = [self.codes.get(cid) for cid in key]
+        ctx_codes = [c for c in ctx_codes if c is not None]
+        if len(ctx_codes) < 1:
+            return []
+        query = self.hdc_unbind(ctx_codes, mem_repr)
+        if query is None:
+            return []
+        qnorm = np.linalg.norm(query)
+        if qnorm < 1e-10:
+            return []
+        query /= qnorm
+
+        sims = []
+        for cid, code in all_codes.items():
+            score = float(query @ code / (np.linalg.norm(code) + 1e-10))
+            sims.append((cid, score))
+        sims.sort(key=lambda x: -x[1])
+        return sims[:k]
 
     # ── Vector computation ───────────────────────────────────
 
@@ -333,6 +841,7 @@ class ConceptSpace:
 
         # Random state
         self.rng = np.random.RandomState(42)
+        self._item_rng = np.random.RandomState(42)
         self._inhibition_step = 0
         self._inhibit_rng = np.random.RandomState(42)
 
@@ -370,6 +879,23 @@ class ConceptSpace:
         self.concept_vectors[cid] = v
 
     # ── Octree encoding ──────────────────────────────────────
+
+    def reinit_rare(self, freq_map, threshold=3):
+        """Replace rare concept vectors with random unit vectors (item memory).
+        Concepts with freq < threshold get random vectors, naturally orthogonal.
+        """
+        reinit_count = 0
+        for cid in range(self.vocab_size):
+            freq = freq_map.get(cid, 0)
+            if 0 < freq < threshold:
+                v = self._item_rng.randn(self.dim).astype(np.float32)
+                v /= max(np.linalg.norm(v), 1e-10)
+                self.set_vec(cid, v)
+                self.fractal.codes.pop(cid, None)
+                reinit_count += 1
+        if reinit_count:
+            self.fractal._matrix_dirty = True
+        return reinit_count
 
     def build_octree_fields(self, lattice, n_anchors=1024, min_lcp=1, gamma=0.5, path_overrides=None):
         """Build H matrix and field_bits from nested octree encoding.
@@ -459,6 +985,18 @@ class ConceptSpace:
             print(f"  Octree fields: {len(seen_cids)}/{len(self.fractal.codes)} concepts, "
                   f"sizes: min={a.min()} max={a.max()} mean={a.mean():.1f}")
 
+    def build_learned_fields(self, n_field_bits=512):
+        """Build field_bits from learned projection instead of octree.
+
+        Initializes W_proj as random hyperplanes, computes field_bits
+        from latent codes. Call periodically during training to adapt.
+        """
+        self.fractal.init_learned_fields(field_bits=n_field_bits)
+
+    def update_learned_fields(self, batches_seen=0):
+        """Periodic update of learned fields (Hebbian W_proj adaptation)."""
+        self.fractal.update_learned_fields(batches_seen=batches_seen)
+
     def fluctuate_fractal(self, fluctuation_amp=0.003, decay=0.9995, repel_strength=0.0, generator=None, current_cos=None):
         """Autonomous drift + optional centroid repulsion.
 
@@ -525,7 +1063,7 @@ class ConceptSpace:
 
     # ---- STDP: Spike-Timing-Dependent Plasticity on fractal codes ----
 
-    def _apply_vector_update(self, cid: int, v_new: np.ndarray, max_shift: float = 0.5) -> None:
+    def _apply_vector_update(self, cid: int, v_new: np.ndarray, max_shift: float = 0.5, ce: float = 0.0) -> None:
         """Set concept_vector[cid] directly, then sync fractal code.
 
         Vector is the canonical representation — fractal code is
@@ -563,6 +1101,7 @@ class ConceptSpace:
             nv_code = np.linalg.norm(new_code @ self.fractal.basis)
             if nv_code > 1e-10:
                 new_code /= nv_code
+            self.fractal._apply_l1(new_code, ce, cid=cid)
             self.fractal.codes[cid] = new_code
             self.fractal._matrix_dirty = True
 
@@ -594,6 +1133,7 @@ class ConceptSpace:
             self._total_shift += shift
             self._update_count += 1
         self.set_vec(cid, v_new)
+        self.fractal._apply_l1(code_new, self.concept_error.get(cid, 0.0) if hasattr(self, 'concept_error') else 0.0, cid=cid)
         self.fractal.codes[cid] = code_new
         self.fractal._matrix_dirty = True
         if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
@@ -634,6 +1174,10 @@ class ConceptSpace:
 
         new_vecs_np = new_vecs.cpu().numpy()
         new_codes_np = new_codes.cpu().numpy()
+        # Apply L1 to z_c subspace (batch)
+        if self.fractal.l1_lambda > 0 and hasattr(gen, '_ce_t'):
+            ce_vals = gen._ce_t[cids_t].cpu().numpy()
+            self.fractal._apply_l1_batch(new_codes_np, ce_vals.tolist(), cid_list=cids)
         gen._codes_t[cids_t] = new_codes.to(torch.float16)
         for i, cid in enumerate(cids):
             v_new = new_vecs_np[i]

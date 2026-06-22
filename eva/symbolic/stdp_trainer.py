@@ -50,6 +50,25 @@ _ANTONYM_MAP = {
 }
 
 
+def _update_hdc_ngrams(cs, ids, max_n=3):
+    """Update HDC n-gram memory from a tokenized sentence."""
+    codes = {}
+    for cid in ids:
+        code = cs.fractal.codes.get(cid)
+        if code is not None:
+            codes[cid] = code
+    if len(codes) < 2:
+        return
+    for n in range(2, max_n + 1):
+        for i in range(len(ids) - n + 1):
+            ngram = ids[i:i + n]
+            if not all(cid in codes for cid in ngram):
+                continue
+            prefix_cids = ngram[:-1]
+            next_code = codes[ngram[-1]]
+            cs.fractal.hdc_update_ngram(prefix_cids, next_code)
+
+
 class STDPTrainer:
     """STDP training logic for CrystalGenerator.
     Operates on gen.cs, gen.lattice, gen._vecs_t, gen.hormones, gen.concept_error.
@@ -169,6 +188,9 @@ class STDPTrainer:
         for ids in all_ids:
             gen.lattice.update(ids)
             gen._graph_cache.clear()
+            # HDC n-gram memory update
+            if hasattr(cs.fractal, 'hdc_memory') and cs.fractal.W_proj is not None:
+                _update_hdc_ngrams(cs, ids, max_n=3)
 
         # _torch_dirty is NOT set here — would force full tensor rebuild every batch
         # (_build_torch_tensors iterates all 146K codes, O(V·D) CPU + 636MB PCIe xfer)

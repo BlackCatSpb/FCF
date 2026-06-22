@@ -118,6 +118,10 @@ class PathConfig:
     def ckpt_state_path(self) -> str:
         return os.path.join(self.data_dir, 'checkpoint_state.json')
 
+    @property
+    def qwen_knowledge_path(self) -> str:
+        return os.path.join(self.data_dir, 'qwen_knowledge.npz')
+
 
 # ──────────────────────────────────────────────
 #  Построитель метрических пар

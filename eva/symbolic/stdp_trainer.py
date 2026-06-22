@@ -21,6 +21,33 @@ _META_SLOW = 6
 _META_PREV_CID = 7
 _META_NEXT_CID = 8
 _META_QWEN = 9
+_META_ANTONYM = 10
+
+
+# Russian antonym dictionary (copied from eva_ai contradiction_miner)
+_ANTONYM_MAP = {
+    'быстрый': ['медленный', 'медленнее', 'медленно'],
+    'медленный': ['быстрый', 'быстрее', 'быстро'],
+    'хороший': ['плохой', 'худший'],
+    'плохой': ['хороший', 'лучший'],
+    'высокий': ['низкий', 'ниже', 'низко'],
+    'низкий': ['высокий', 'выше', 'высоко'],
+    'большой': ['маленький', 'меньше', 'мало'],
+    'маленький': ['большой', 'больше', 'много'],
+    'да': ['нет', 'не', 'никогда'],
+    'нет': ['да', 'всегда'],
+    'всегда': ['никогда', 'редко'],
+    'никогда': ['всегда', 'часто'],
+    'правда': ['ложь', 'враньё', 'неправда'],
+    'ложь': ['правда', 'истина'],
+    'истина': ['ложь', 'враньё'],
+    'важно': ['неважно', 'второстепенно'],
+    'неважно': ['важно', 'главное'],
+    'нужно': ['нельзя', 'запрещено'],
+    'можно': ['нельзя', 'запрещено'],
+    'верно': ['неверно', 'ошибочно'],
+    'неверно': ['верно', 'правильно'],
+}
 
 
 class STDPTrainer:
@@ -138,6 +165,7 @@ class STDPTrainer:
 
         # ── Centroid pull + lattice update (reuses cached ids from first loop) ──
         self._centroid_pull_batch(all_ids, base_lr)
+        self._cluster_centroid_pull(all_ids, base_lr, pull_strength=0.05)
         for ids in all_ids:
             gen.lattice.update(ids)
             gen._graph_cache.clear()
@@ -146,7 +174,7 @@ class STDPTrainer:
         # (_build_torch_tensors iterates all 146K codes, O(V·D) CPU + 636MB PCIe xfer)
         # Only _invalidate_torch() (after fluctuate) should set it.
 
-        # Minesweeper: periodic cluster potential refresh
+        # Minesweeper (inverted): periodic cluster potential refresh
         if gen._cluster_update_counter > 0 and gen._cluster_update_counter % gen._cluster_update_every == 0:
             gen._update_cluster_potential()
         gen._cluster_update_counter += 1
@@ -273,8 +301,35 @@ class STDPTrainer:
                         continue
                     gpu_ctx_l.append(ci)
                     gpu_tgt_l.append(cj)
+
                     qwen_factor = gen.qwen_knowledge.get_factor(ids[i], ids[j]) if gen.qwen_knowledge and gen.qwen_knowledge.is_loaded else 1.0
-                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 0.0, ids[i], ids[j], qwen_factor))
+
+                    # Antonym check: decode BPE tokens, compare against ANTONYM_MAP
+                    antonym_flag = 0.0
+                    if hasattr(gen.sp, 'IdToPiece'):
+                        if not hasattr(self, '_cid_text_cache'):
+                            self._cid_text_cache = {}
+                        if ids[i] not in self._cid_text_cache:
+                            try:
+                                self._cid_text_cache[ids[i]] = gen.sp.IdToPiece(ids[i]).replace('\u2581', ' ').strip().lower()
+                            except Exception:
+                                self._cid_text_cache[ids[i]] = ''
+                        if ids[j] not in self._cid_text_cache:
+                            try:
+                                self._cid_text_cache[ids[j]] = gen.sp.IdToPiece(ids[j]).replace('\u2581', ' ').strip().lower()
+                            except Exception:
+                                self._cid_text_cache[ids[j]] = ''
+                        ti = self._cid_text_cache[ids[i]]
+                        tj = self._cid_text_cache[ids[j]]
+                        if ti and tj:
+                            if ti in _ANTONYM_MAP:
+                                if any(ant in tj for ant in _ANTONYM_MAP[ti]):
+                                    antonym_flag = 1.0
+                            elif tj in _ANTONYM_MAP:
+                                if any(ant in ti for ant in _ANTONYM_MAP[tj]):
+                                    antonym_flag = 1.0
+
+                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 0.0, ids[i], ids[j], qwen_factor, antonym_flag))
                     gpu_cid_ctx.append(ids[i])
                     gpu_cid_gen.append(ids[j])
                     # SN-25: Add slow STDP pair to GPU lists (matches CPU slow_lr > 1e-6 gate)
@@ -283,7 +338,8 @@ class STDPTrainer:
                     if slow_lr > 1e-6:
                         gpu_ctx_l.append(ci)
                         gpu_tgt_l.append(cj)
-                        gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 1.0, ids[i], ids[j], qwen_factor))
+                        # Slow STDP also inherits antonym flag
+                        gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 1.0, ids[i], ids[j], qwen_factor, antonym_flag))
                         gpu_cid_ctx.append(ids[i])
                         gpu_cid_gen.append(ids[j])
 
@@ -441,6 +497,15 @@ class STDPTrainer:
         vc = gen._vecs_t[ctx_t].float(); vg = gen._vecs_t[tgt_t].float()
         y = torch.clamp((vg * vc).sum(dim=1), min=0.05)
         pair_delta = vc * effective_lr[:, None] - vg * (y * effective_lr)[:, None]
+
+        # Antonym repel: если пара — антонимы, разворачиваем градиент (push apart)
+        if meta_t.shape[1] > _META_ANTONYM:
+            antonym_mask = meta_t[:, _META_ANTONYM] > 0.5  # (N,) bool
+            if antonym_mask.any():
+                # Удвоенная сила отталкивания: -2 * pair_delta
+                repel_factor = torch.where(antonym_mask, -2.0, 1.0)
+                pair_delta = pair_delta * repel_factor[:, None]
+
         fused_src = torch.cat([pair_delta, effective_lr[:, None]], dim=1)
 
         if gen._fused_buf.shape[0] < ng:
@@ -987,6 +1052,61 @@ class STDPTrainer:
         if _centroid_updates:
             cids_batch = [d[0] for d in _centroid_updates]
             vecs_batch = torch.stack([d[1] for d in _centroid_updates]).to(gen._vecs_t.dtype)
+            gen._vecs_t[cids_batch] = vecs_batch
+            gen._dirty_cids.update(cids_batch)
+
+    # ═══════════════════════════════════════════════════
+    # Cluster centroid pull (octree cluster, not sentence)
+    # ═══════════════════════════════════════════════════
+
+    def _cluster_centroid_pull(self, all_ids, base_lr_val, pull_strength=0.1):
+        """Pull concepts toward their octree cluster centroid.
+
+        Uses _cluster_map (anchor per CID) to group into clusters,
+        computes centroid per cluster, pulls members toward it.
+        Prevents embedding sparsity within semantic fields.
+        """
+        gen = self.gen
+        cs = gen.cs
+        if gen._cluster_map is None or gen._vecs_t is None:
+            return
+
+        device = gen._torch_device
+        # Collect unique CIDs from this batch
+        batch_cids = set()
+        for ids in all_ids:
+            batch_cids.update(ids)
+        if len(batch_cids) < 2:
+            return
+
+        cid_list = sorted(batch_cids)
+        cid_t = torch.tensor(cid_list, dtype=torch.long, device=device)
+        cluster_ids = gen._cluster_map[cid_t]  # (M,) anchor per CID
+
+        # Group by cluster
+        unique_clusters = torch.unique(cluster_ids)
+        vecs = gen._vecs_t[cid_t].float()  # (M, D)
+
+        updates = []
+        for cl in unique_clusters:
+            mask = cluster_ids == cl
+            members = cid_t[mask]
+            if len(members) < 2:
+                continue
+            member_vecs = vecs[mask]  # (K, D)
+            centroid = member_vecs.mean(dim=0)
+            cn = centroid / centroid.norm().clamp(min=1e-10)
+            sims = (member_vecs * cn).sum(dim=1)
+            pulls = (cn - sims[:, None] * member_vecs)
+            v_new = member_vecs + pulls * base_lr_val * pull_strength
+            nv = v_new.norm(dim=1, keepdim=True).clamp(min=1e-10)
+            v_new /= nv
+            for i, cid in enumerate(members.tolist()):
+                updates.append((cid, v_new[i]))
+
+        if updates:
+            cids_batch = [d[0] for d in updates]
+            vecs_batch = torch.stack([d[1] for d in updates]).to(gen._vecs_t.dtype)
             gen._vecs_t[cids_batch] = vecs_batch
             gen._dirty_cids.update(cids_batch)
 

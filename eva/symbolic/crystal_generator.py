@@ -492,8 +492,9 @@ class CrystalGenerator:
         sum_ce.scatter_add_(0, cm, ce)
         cnt.scatter_add_(0, cm, torch.ones_like(cm, dtype=torch.float32))
         mean_ce = sum_ce / cnt.clamp(min=1)
-        # Update potential: low CE → boost (up to 1.2), high CE → reduce (down to 0.8)
-        target = 1.0 + (0.5 - mean_ce) * 0.4  # ce=0 → 1.2, ce=0.5 → 1.0, ce=1.0 → 0.8
+        # Minesweeper inverted: high CE → boost (up to 1.2), low CE → reduce (down to 0.8)
+        # Rare/struggling concepts get MORE learning signal instead of less
+        target = 1.0 + (mean_ce - 0.5) * 0.4  # ce=0 → 0.8, ce=0.5 → 1.0, ce=1.0 → 1.2
         self._cluster_potential = self._cluster_potential * 0.9 + target * 0.1
 
     # ── Temperature ────────────────────────────────────────────

@@ -49,12 +49,27 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - Serve via `python serve_vis.py` → http://127.0.0.1:8080/viewer.html
 
 ## Current State
-- Training (epoch 2 at ~21000L)
+- Training (epoch 1 resumed at ~21138L, Qwen knowledge active)
 - Vector space fixes active: centroid pull LR 0.3, theta-gate cap 5, contrastive push-pull
-- Baseline eval at 21k shows cos=0.0124, vac@1=0 — need post-epoch-3 comparison
+- Qwen knowledge distillation active: 15.96M pairs modulating STDP LR via qwen_factor
+
+### [2026-06-22] Qwen knowledge distillation + training enhancements
+- **QwenKnowledge integrated:** `real_data/qwen_knowledge.npz` (15.96M unique FCF CID pairs,
+  cosine similarities from RuadaptQwen3-4B over Russian corpus), loaded via `FCFConfig.qwen_knowledge_path`
+  in `train_full.py:513`, modulates STDP learning rate per pair: `lr *= 1.0 + cos_sim * 0.3`
+- **Minesweeper inverted** (`crystal_generator.py:_update_cluster_potential`): high CE → boost (up to 1.2),
+  low CE → reduce (down to 0.8). Rare/struggling concepts now get MORE learning signal.
+- **Antonym repel** (`stdp_trainer.py:_build_pairs` + `_gpu_stdp_core`): Russian antonym dictionary
+  (22 pairs from eva_ai/contradiction_miner), decoded via `sp.IdToPiece`, flagged in GPU meta channel.
+  Antonym pairs receive inverted pair_delta × 2.0 (active repel). Coverage: ~37% of 146K voc.
+- **Cluster centroid pull** (`stdp_trainer.py:_cluster_centroid_pull`): pulls concept vectors toward
+  their octree cluster centroid (via `_cluster_map` anchor), pull_strength=0.05, called every batch.
 
 ## Priority Queue
-1. ✅ (all completed for this session)
+- ✅ Qwen knowledge npz integrated
+- ✅ Minesweeper inversion
+- ✅ Antonym repel
+- ✅ Cluster centroid pull
 
 ## Key Decisions
 - **Centroid pull LR 0.3** — boost clustering speed (from 0.1)
@@ -63,12 +78,17 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - **GPU:** use_torch=True but 0.67× CPU at current batch sizes; future: batched lateral inh
 - **Eval:** standalone script with temp copies to avoid file-lock conflicts
 - **Inference:** wrapper around CrystalGenerator, not a reimplementation
+- **Minesweeper inverted:** rare/high-error concepts boosted (was: punished)
+- **Antonym repel:** hardcoded 22-pair Ru dictionary, BPE-token-level detection, GPU path
+- **Cluster centroid pull:** octree cluster anchors via `_cluster_map`, not sentence centroids
+- **Qwen knowledge:** precomputed offline (Colab, RuadaptQwen3-4B), loaded as read-only LR modulator
 
 ## Relevant Files
 - `eva/symbolic/crystal_generator.py`
-- `eval_metrics.py`
-- `inference.py`
+- `eva/symbolic/stdp_trainer.py`
+- `eva/symbolic/qwen_knowledge.py`
+- `eva/symbolic/fcf_config.py`
 - `train_full.py`
-- `run_train.bat`
+- `real_data/qwen_knowledge.npz`
 - `real_data/checkpoint_state.json`
 - `PLAN.md`

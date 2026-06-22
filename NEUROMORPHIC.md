@@ -1,109 +1,221 @@
-# FCF & Neuromorphic Computing
+# FCF и нейроморфные вычисления
 
-*Why FCF is the ideal software model for next-generation neuromorphic processors.*
-
----
-
-## The Mismatch: Transformers vs. Neuromorphic Hardware
-
-Modern neuromorphic chips — Intel Loihi 2, IBM TrueNorth, and Russian developments (NIISI, Module, MIET) — are fundamentally incompatible with transformer-based language models:
-
-| Requirement | Transformer | Neuromorphic capability |
-|-------------|-------------|------------------------|
-| Global backpropagation | Essential | Not supported natively |
-| Dense matrix × matrix | Core operation | Inefficient (event-driven) |
-| Full-precision activations | Float32/16 | Binary/spike events |
-| Attention softmax | O(L²) | No analogue |
-| Static architecture | Fixed layers | Dynamic routing |
-
-FCF was designed from the ground up with **zero architectural overlap** with transformers, making it a natural fit for the neuromorphic paradigm.
+*Почему FCF — идеальная программная модель для нейроморфных процессоров следующего поколения.*
 
 ---
 
-## Six Reasons FCF Belongs on a Neuromorphic Chip
+## Для начинающих: что такое нейроморфный чип?
 
-### 1. Local learning rules only (no backprop)
+Обычные процессоры (CPU, GPU) работают по принципу Фон Неймана: есть память, есть вычислитель, данные постоянно перемещаются туда-сюда. Это эффективно для математики, но очень энергозатратно.
 
-FCF uses **STDP**, **Hebbian updates**, **lateral inhibition**, and **contrastive divergence** — every update is computed from locally available information (pre-synaptic and post-synaptic state). No global gradient computation. No automatic differentiation.
+**Нейроморфный чип** устроен иначе. Он пытается копировать работу головного мозга:
+- Вместо тактового генератора — **события** (спайки)
+- Вместо оперативной памяти — **синапсы** (физические соединения)
+- Вместо умножения матриц — **изменение проводимости** соединений
+- Вместо глобального обучения — **локальные правила** (как в биологических нейронах)
 
-On silicon: a memristor crossbar naturally implements STDP as conductance change proportional to `V_pre · V_post`. The entire training loop maps to physical device physics.
+Известные примеры: Intel Loihi 2, IBM TrueNorth. В России: разработки НИИСИ, «Модуль» (Байкал-Н), Курчатовский институт («Алкуда»), МИЭТ.
 
-### 2. Additive updates = native synaptic events
+**Почему это важно?** Нейроморфный чип потребляет в 1000 раз меньше энергии, чем GPU, при той же вычислительной мощности. Он может работать от батарейки, обучаться на лету и не требовать облака. Но есть проблема: **современные языковые модели (трансформеры) не могут на нём работать**.
 
-FCF's core training operation is `code[cid] += lr · Δ` — a **scatter-add** of sparse vectors. The GPU emulates this through atomic operations (expensive). On a neuromorphic chip:
+---
 
-- A pre-synaptic spike arrives at a synapse
-- The synapse's weight updates by a fixed increment (STDP)
-- The post-synaptic neuron accumulates charge
+## Почему трансформеры несовместимы с нейроморфными чипами
 
-This is a single physical event — picoseconds of energy, not nanoseconds.
+| Что требует трансформер | Что умеет нейроморфный чип | Проблема |
+|-------------------------|----------------------------|----------|
+| Обратное распространение (backprop) — глобальный проход градиента по всей сети | Только локальные правила (синапс видит только свои вход и выход) | **Несовместимо**. Градиент требует глобальной синхронизации |
+| Умножение плотных матриц (matmul) | Событийная обработка разреженных спайков | **Неэффективно**. Матричное умножение эмулируется, а не выполняется нативно |
+| Attention (softmax над L² парами) | Ассоциативная память (CAM) | **Нет аналога**. Attention требует квадратичной памяти |
+| Float32/16 повсюду | Бинарные/импульсные сигналы | **Потеря точности**. Float не конвертируется в спайки без потерь |
+| Фиксированная архитектура (число слоёв, голов) | Динамическая маршрутизация | **Жёсткость**. Чип спроектирован под адаптацию |
 
-### 3. Event-driven computation
+Вывод: **трансформер нельзя «просто запустить» на нейроморфном чипе**. Нужна архитектура, спроектированная с нуля под возможности этого «железа».
 
-FCF only updates concepts that participate in the current batch. 95% of the vocabulary is idle at any moment. Neuromorphic chips are **event-driven by design**: neurons only consume power when they spike. In idle periods, they draw near-zero current.
+---
 
-The power ratio for a sparse STDP update:
-- CPU: ~10⁻⁶ J per event
-- GPU: ~10⁻⁹ J per event  
-- Loihi 2: ~10⁻¹² J per synaptic event
+## Почему FCF совместима
 
-That's a **1000× improvement** over GPU at every plasticity step.
+FCF не имеет **ни одного** из перечисленных выше требований. Она спроектирована так, как будто обратное распространение было запрещено изначально.
 
-### 4. Sparse codes + dynamic dimensionality
+Ниже — шесть причин, почему FCF — единственная известная языковая модель, готовая к нейроморфному развёртыванию.
 
-L1 regularization keeps each concept's latent code at ~8% active components. This sparsity matches the operating point of analog neuromorphic arrays, where each crossbar row sees only a few simultaneous activations.
+---
 
-The `grow_capacity()` / `prune_capacity()` mechanism — adding or removing basis vectors based on code density — maps directly to **structural plasticity** (neurogenesis / synaptic pruning) in biology. On a neuromorphic chip, this corresponds to allocating or releasing physical synapse rows, without reprogramming the instruction stream.
+### 1. Только локальные правила обучения (никакого backprop)
 
-### 5. Hierarchical sector index = content-addressable memory
+FCF использует четыре механизма пластичности, каждый из которых работает на информации, доступной **локально** — на уровне одного концепта и его непосредственных соседей:
 
-FCF's 3-level sector field (4+10+20 bits) is an **LSH-based content-addressable memory**. On a neuromorphic chip:
+- **STDP** (Spike-Timing-Dependent Plasticity): если токен A предшествует токену B, вектор B сдвигается к A. Синапсу не нужно знать ничего, кроме того, что «до меня был спайк от A».
+- **Hebbian update**: полевая проекция W_proj обновляется как `W += lr · code · sign(code · W)`. Это классическое правило Хебба — «клетки, возбуждающиеся вместе, связываются».
+- **L1 soft-thresholding**: каждый концепт сам решает, какие компоненты своего кода оставить активными, а какие обнулить.
+- **Lateral inhibition**: концепты, обновлённые в одном батче, отталкиваются друг от друга. Это локальный механизм, работающий внутри группы.
 
-- Hyperdimensional computing natively implements CAM
-- A sector lookup is a single pass through associative memory
-- Focal search (`search_in_sector`) maps to **parallel prefix matching** in hardware
+**На кремнии**: мемристорный кроссбар (матрица резистивных элементов) реализует STDP физически. Проводимость мемристора меняется пропорционально произведению напряжений на его выводах: `ΔG = V_pre · V_post`. Это не эмуляция — это **физический закон**, выполняющийся на уровне материала.
 
-Russian neuromorphic architectures under development at **Kurchatov Institute (Alkuda)** and **NII Sistem** explicitly target associative memory as a first-class primitive. FCF's sector index is algorithmically identical to their hardware CAM proposals.
+Никакого автоматического дифференцирования. Никакого глобального градиента. Никакой синхронизации весов через всю сеть.
 
-### 6. HDC/VSA algebra as a hardware primitive
+---
 
-The VSA operations (`bind=⊙`, `permute=ρ`, `bundle=+`) that FCF uses as a fallback are the **native instruction set** of many neuromorphic designs. When the statistical n-gram lattice has insufficient data, FCF falls back to:
+### 2. Аддитивные обновления = синаптические события
+
+Основная операция обучения в FCF:
 
 ```
-query = unbind(context, hdc_memory[prefix])
+code[cid] += lr · Δ          — прибавить разностный вектор к коду концепта
 ```
 
-On a neuromorphic chip with VSA microcode, this is a **single instruction cycle** — the hypervectors circulate through the CAM and produce a result in O(1) time, regardless of vocabulary size.
+На GPU это делается через `scatter_add` — атомарную операцию, которая блокирует память при каждой записи. Это дорого (сотни наносекунд на операцию).
+
+На нейроморфном чипе та же операция выглядит так:
+
+1. Пре-синаптический нейрон A генерирует спайк (импульс напряжения)
+2. Спайк достигает синапса, соединяющего A с B
+3. Проводимость синапса изменяется на фиксированную величину (STDP)
+4. Пост-синаптический нейрон B накапливает заряд
+
+Это **одно физическое событие**. Время: ~1 пикоджоуль энергии. Сравните:
+- CPU: ~1 микроджоуль на событие (в миллион раз больше)
+- GPU: ~1 наноджоуль на событие (в тысячу раз больше)
+- Нейроморфный чип: ~1 пикоджоуль на событие
+
+Каждый STDP-шаг, каждая L1-коррекция, каждое хеббово обновление — это синаптическое событие. Тысячи событий в секунду вместо миллиардов инструкций.
 
 ---
 
-## Russian Neuromorphic Ecosystem
+### 3. Событийная природа вычислений
 
-| Organisation | Focus | FCF alignment |
-|-------------|-------|---------------|
-| **NIISI RAS** | Event-driven processors, non-volatile memory | STDP-on-chip, sparse event routing |
-| **Module (Baikal-N)** | Neuromorphic accelerator with STDP | Native scatter-add, per-concept EMAs |
-| **Kurchatov Institute (Alkuda)** | Memristor crossbars, associative memory | CAM sector lookup, VSA primitives |
-| **MIET / ITMiVT** | In-memory computing, analog neuromorphics | 8% sparse codes → low analog MUX ratio |
-| **Elvis (NPTS)** | Massively-parallel sparse vector processors | `hdc_memory` as distributed CAM |
+FCF обновляет **только те концепты, которые участвовали в текущем предложении**. 95% словаря (140K из 146K токенов) простаивают в любой момент времени.
 
----
+Нейроморфные чипы спроектированы именно для такой нагрузки:
+- Нейрон потребляет энергию **только когда спайкает**
+- В состоянии покоя — микроамперы утечки, практически ноль
+- Активность одного нейрона не требует синхронизации всех остальных
 
-## What This Means
-
-FCF is currently the **only language-capable model** that simultaneously satisfies all constraints of neuromorphic hardware:
-
-- **No backpropagation** required
-- **Only local learning rules**: STDP, Hebbian, L1
-- **Dynamic algebraic capacity**: grows/shrinks with knowledge
-- **Cellular decomposition**: each concept is an independent computational unit
-- **Sparse event-driven**: only active concepts consume energy
-- **Hardware-algebra compatible**: VSA primitives as native instructions
-
-This is not an accident. The architecture was designed by asking the question: *"How would a language model look if it could only use the operations that a neuromorphic chip natively supports?"*
-
-FCF is the answer. The transformer era runs on GPUs. The FCF era is waiting for the right chip.
+На GPU «простаивающие» концепты всё равно занимают память и шину PCIe. На нейроморфном чипе они literally отключены.
 
 ---
 
-*"FCF doesn't need a better GPU. FCF needs a memristor."*
+### 4. Разреженные коды + динамическая размерность
+
+L1-регуляризация удерживает плотность каждого латентного кода ~8%. Это означает, что из 2048 компонент `z` активны (отличны от нуля) лишь ~160.
+
+Нейроморфные аналоговые матрицы работают эффективно, когда на каждый ряд кроссбара приходится **несколько одновременных активаций**. Если активировать все 2048 — токи суммируются, точность падает, шум растёт. 8% — идеальная рабочая точка.
+
+**Динамическая ёмкость** (grow/prune capacity) — прямое соответствие биологическому нейрогенезу:
+
+- Когда коды становятся плотными (>15% активных) — поле **растёт**: добавляются новые ортогональные базис-векторы, коды расширяются. В мозге — рост дендритов.
+- Когда измерения умирают (<2% активности) — они **удаляются**, поле сжимается. В мозге — синаптический прунинг.
+
+На нейроморфном чипе это буквально выделение или освобождение физических рядов синапсов, без перекомпиляции программы.
+
+---
+
+### 5. Иерархический секторный индекс = ассоциативная память
+
+Трёхуровневое поле FCF (4+10+20 бит) — это Content-Addressable Memory (CAM). Каждый концепт имеет бинарный LSH-код (локально-чувствительный хеш). Поиск в секторе:
+
+```python
+key = sector_key(query_cid, depth=1)   # 10-битный хеш
+candidates = sector_index[depth][key]   # концепты с тем же хешем
+```
+
+На обычном CPU это хеш-таблица. На чипе с аппаратной CAM:
+
+- Битовая маска (10 бит) подаётся на шину адреса
+- Все ячейки памяти одновременно сравнивают свой тег с адресом
+- Совпавшие ячейки выдают свои данные за один такт
+
+Это **O(1)**, независимо от размера словаря. 146K или 146 млн — время поиска одинаково.
+
+Российские разработки (Курчатовский институт «Алкуда», НИИСИ) проектируют CAM как аппаратный примитив первого класса. Секторный индекс FCF алгоритмически идентичен их hardware CAM.
+
+---
+
+### 6. HDC/VSA алгебра как система команд
+
+Операции гипермерных вычислений (HDC/VSA), которые FCF использует как резервный n-граммный механизм:
+
+| Операция | FCF | Физический смысл |
+|----------|-----|------------------|
+| **bind (⊙)** | `a * b` (поэлементно) | XOR в бинарном пространстве |
+| **permute (ρ)** | `roll(v, 1)` | Циклический сдвиг |
+| **bundle** | `accum += lr · v` | Накопление в памяти |
+| **unbind** | `context ⊙ memory` | Декодирование запроса |
+
+На чипе с VSA-микрокодом это **один инструкционный цикл**. Гипервекторы циркулируют через CAM, unbind выполняется за O(1) — независимо от размера словаря.
+
+Когда статистическая n-граммная решётка (SyntaxLattice) даёт менее 3 кандидатов, FCF делает разовый unbind:
+
+```python
+query = unbind(context_codes, hdc_memory[prefix])
+candidates = top-k cos(query, all_codes)
+```
+
+На нейроморфном чипе это одна операция: подали контекстный гипервектор на вход, получили вектор-декодировку на выходе.
+
+---
+
+## Российские разработки: готовность к FCF
+
+Россия — одна из немногих стран, где нейроморфные процессоры разрабатываются на государственном уровне. Вот ключевые проекты и их совместимость с FCF:
+
+### НИИСИ РАН (Нижний Новгород)
+
+**Направление**: процессоры с событийным управлением (event-driven), энергонезависимая память.
+
+FCF-совместимость: STDP как физический процесс на мемристорах, разреженная событийная маршрутизация, 8% плотность кода → минимум одновременных событий.
+
+**Совпадение**: архитектура FCF (scatter-add, локальные обновления, событийность) — прямое отражение того, как НИИСИ проектирует свои чипы.
+
+### ООО «Модуль» (Москва) — Байкал-Н
+
+**Направление**: нейроморфный ускоритель с аппаратной поддержкой STDP.
+
+FCF-совместимость: аппаратный scatter-add для обновления кодов концептов, per-concept EMA ошибки предсказания может храниться как состояние нейрона, L1 soft-thresholding — как пороговое возбуждение.
+
+**Совпадение**: Байкал-Н заявлен как ускоритель для «когнитивных архитектур без backprop» — FCF единственная известная реализация такой архитектуры на уровне языка.
+
+### Курчатовский институт — «Алкуда»
+
+**Направление**: мемристорные кроссбары, ассоциативная память (CAM), бинарные нейросети.
+
+FCF-совместимость: секторный индекс = CAM (поиск за O(1)). Проекционные матрицы W_proj = проводимости кроссбара. Бинарные field bits = бинарные сигналы на шине.
+
+**Совпадение**: «Алкуда» проектирует CAM как аппаратный примитив, иерархическое поле FCF (4+10+20 бит) является идеальным алгоритмическим соответствием.
+
+### МИЭТ / ИТМиВТ (Зеленоград, Москва)
+
+**Направление**: in-memory computing (вычисления в памяти), аналоговые нейроморфные системы.
+
+FCF-совместимость: L1-разреживание до 8% снижает аналоговый MUX (коэффициент мультиплексирования), аналоговые мемристоры работают с максимальной точностью при низкой плотности активаций.
+
+**Совпадение**: 8% активных компонент — оптимальная точка для аналоговых матриц. Трансформеры с их плотными matmul не могут этим воспользоваться.
+
+### НПЦ «Элвис» (Зеленоград)
+
+**Направление**: массивно-параллельные процессоры для разреженных векторов.
+
+FCF-совместимость: `hdc_memory` может быть распределена как CAM, `hdc_predict` — как параллельный поиск по всем сохранённым n-граммам.
+
+**Совпадение**: FCF генерирует именно разреженные векторные операции, под которые заточены процессоры Элвис.
+
+---
+
+## Резюме
+
+| Аспект | Что это значит для проекта |
+|--------|---------------------------|
+| **Нет backprop** | FCF — единственная известная языковая архитектура, способная работать на нейроморфном чипе без эмуляции градиента |
+| **Аддитивные обновления** | Каждый STDP-шаг = одно синаптическое событие. GPU тратит на это наноджоули, нейроморфный чип — пикоджоули |
+| **Событийность** | 95% словаря простаивает → энергопотребление пропорционально активности, не размеру модели |
+| **Разреженность 8%** | Идеальная рабочая точка для аналоговых мемристорных кроссбаров |
+| **Секторный индекс (CAM)** | O(1) поиск независимо от словаря — на CPU это хеш, на чипе — физическое сравнение тегов |
+| **Динамическая ёмкость** | Рост/сжатие поля = нейрогенез/прунинг на физическом уровне |
+| **HDC/VSA алгебра** | Одна инструкция на unbind — не O(V) как на GPU |
+
+FCF спроектирована так, как если бы обратное распространение было запрещено, а единственным доступным вычислительным примитивом был мемристорный кроссбар. GPU для неё — временная платформа.
+
+---
+
+*«FCF не нужен лучший GPU. FCF нужен мемристор.»*

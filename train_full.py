@@ -99,6 +99,7 @@ parser.add_argument('--learned-fields', action='store_true', help='use learnable
 parser.add_argument('--field-bits', type=int, default=512, help='number of learned field bits (default: 512)')
 parser.add_argument('--no-harmonize', action='store_true', help='disable morphological harmonizer (fallback to STDP-only)')
 parser.add_argument('--no-morpheme-field', action='store_true', help='disable morpheme field (GPU < 2GB fallback)')
+args = parser.parse_args()
 
 RESUME = args.resume
 FAST = args.fast

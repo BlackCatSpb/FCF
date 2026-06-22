@@ -68,7 +68,6 @@ class CrystalGenerator:
         self.sp = sp
         self.lattice = lattice
         self.config = config or {}
-        self.qwen_knowledge = qwen_knowledge
         cs._after_update_hook = self._on_vector_update
 
         self.max_words = self.config.get('max_words', 30)

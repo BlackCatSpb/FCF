@@ -36,7 +36,6 @@ from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 from eva.symbolic.parameter_optimizer import ParameterOptimizer
-from eva.symbolic.qwen_knowledge import QwenKnowledge
 from eva.symbolic.fcf_config import FCFConfig
 
 # ── Config ──────────────────────────────────────────────────────
@@ -637,9 +636,7 @@ LIVE_REFRESH = 1.0  # seconds between live status updates
 COS_REFRESH = 5.0   # seconds between cos/pair recomputation
 
 print("STDP training...")
-qwen_knowledge_path = CFG.qwen_knowledge_path
-qk = QwenKnowledge(qwen_knowledge_path)
-gen = CrystalGenerator(cs, sp, lattice, qwen_knowledge=qk)
+gen = CrystalGenerator(cs, sp, lattice, qwen_knowledge=None)
 gen.train_lr = opt.p['full_lr'].current
 t_start = time.time()
 

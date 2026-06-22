@@ -17,7 +17,6 @@ from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 from eva.symbolic.fcf_config import FCFConfig
-from eva.symbolic.qwen_knowledge import QwenKnowledge
 
 CFG = FCFConfig()
 BASE = CFG.data_dir
@@ -114,34 +113,6 @@ def main():
              if cs.concept_vector(c) is not None and abs(np.linalg.norm(cs.concept_vector(c))-1.0) < 1e-4)
     results['vec_consistency'] = ok / 500
     print(f"  Consistency: {ok}/500 ({results['vec_consistency']*100:.1f}%)")
-
-    # ── Qwen factor distribution ────────────────────────────────
-    if os.path.exists(CFG.qwen_knowledge_path):
-        qk = QwenKnowledge(CFG.qwen_knowledge_path)
-        if qk and len(qk):
-            n_pairs = min(50000, len(qk))
-            qk_items = list(qk._map.items())
-            rng_qk = np.random.RandomState(42)
-            idxs = rng_qk.choice(len(qk_items), size=n_pairs, replace=False)
-            factors = []
-            for idx in idxs:
-                key, cos = qk_items[idx]
-                a = key >> 32
-                b = key & 0xFFFFFFFF
-                factors.append(qk.get_factor(a, b))
-            factors = np.array(factors, dtype=np.float32)
-            boosted = float((factors > 1.05).mean())
-            reduced = float((factors < 0.95).mean())
-            neutral = float((abs(factors - 1.0) <= 0.05).mean())
-            mean_f = float(factors.mean())
-            std_f = float(factors.std())
-            print(f"\n--- Qwen Knowledge ---")
-            print(f"  {len(qk)} pairs loaded")
-            print(f"  factors: mean={mean_f:.4f} std={std_f:.4f} "
-                  f"boosted={boosted*100:.1f}% reduced={reduced*100:.1f}% neutral={neutral*100:.1f}%")
-            results.update(qwen_pairs=len(qk),
-                           qwen_factor_mean=mean_f, qwen_factor_std=std_f,
-                           qwen_boosted=boosted, qwen_reduced=reduced, qwen_neutral=neutral)
 
     print("\n--- Generation ---")
     gen_samples = []

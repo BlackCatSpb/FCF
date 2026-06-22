@@ -424,9 +424,6 @@ class STDPTrainer:
                     field_weight = 1.0 + (fw - 1.0) * field_gate
 
                 lr = base_lr * max(freq_weight, 0.05) * pmi_w * field_weight
-                # G-86: Qwen knowledge distillation — modulate lr by semantic proximity
-                if gen.qwen_knowledge and gen.qwen_knowledge.is_loaded:
-                    lr *= gen.qwen_knowledge.get_factor(ids[i], ids[j])
                 lr *= (0.5 + gen.hormones.acetylcholine * 0.5) * (0.5 + gen.hormones.dopamine * 0.5)
                 theta_gate = math.exp(-min(abs(j-i), 5) / max(gen.theta_tau, 1.0))
                 gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
@@ -444,8 +441,6 @@ class STDPTrainer:
                         continue
                     gpu_ctx_l.append(ci)
                     gpu_tgt_l.append(cj)
-
-                    qwen_factor = gen.qwen_knowledge.get_factor(ids[i], ids[j]) if gen.qwen_knowledge and gen.qwen_knowledge.is_loaded else 1.0
 
                     # Antonym check: decode BPE tokens, compare against ANTONYM_MAP
                     antonym_flag = 0.0

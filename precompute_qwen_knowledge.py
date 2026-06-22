@@ -197,7 +197,7 @@ def _load_qwen_tokenizer(model_path):
     except Exception:
         return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-def _load_hf_backend(model_path, device=None):
+def _load_hf_backend(model_path, device=None, num_layers=None, layer_offset=0):
     """HF transformers backend — recommended for cloud GPU."""
     import torch
     from transformers import AutoModelForCausalLM
@@ -209,6 +209,11 @@ def _load_hf_backend(model_path, device=None):
         device_map="auto" if device == "cuda" else device,
         output_hidden_states=True, low_cpu_mem_usage=True,
     )
+    # Slice layers for early exit
+    if num_layers is not None:
+        total = len(model.model.layers)
+        model.model.layers = model.model.layers[layer_offset:layer_offset + num_layers]
+        print(f"  Truncated to layers {layer_offset}-{layer_offset + num_layers - 1}/{total}")
     model.eval()
     dev = next(model.parameters()).device
     def infer(qw_ids):
@@ -253,7 +258,7 @@ def _load_ov_backend(model_path):
 
 def precompute(corpus_path, fcf_bpe_path, qwen_model_path, output_path,
                backend="transformers", max_lines=0, checkpoint_every=1000,
-               context_window=8, device=None):
+               context_window=8, device=None, num_layers=None, layer_offset=0):
     import sentencepiece as spm
 
     # Load FCF BPE
@@ -267,7 +272,8 @@ def precompute(corpus_path, fcf_bpe_path, qwen_model_path, output_path,
     print(f"Loading Qwen ({backend})...")
     tokenizer = _load_qwen_tokenizer(qwen_model_path)
     if backend == "transformers":
-        infer_fn, _ = _load_hf_backend(qwen_model_path, device=device)
+        infer_fn, _ = _load_hf_backend(qwen_model_path, device=device,
+                                        num_layers=num_layers, layer_offset=layer_offset)
     else:
         infer_fn, _ = _load_ov_backend(qwen_model_path)
 
@@ -351,5 +357,9 @@ if __name__ == "__main__":
     p.add_argument("--max-lines", type=int, default=0)
     p.add_argument("--checkpoint-every", type=int, default=1000)
     p.add_argument("--context-window", type=int, default=8)
+    p.add_argument("--num-layers", type=int, default=None,
+                   help="Number of transformer layers to use (None=all)")
+    p.add_argument("--layer-offset", type=int, default=0,
+                   help="Start layer index for slicing")
     args = p.parse_args()
     precompute(**vars(args))

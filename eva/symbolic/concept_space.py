@@ -474,6 +474,8 @@ class FractalField:
         """Prune near-zero latent dimensions across all codes.
 
         A dimension is pruned if > 98% of codes have |val| < 1e-4.
+        Rare concept protection: prevents pruning dims that are significant
+        for concepts with few active dimensions.
         Returns number of pruned dimensions.
         """
         with self._capacity_lock:
@@ -485,14 +487,41 @@ class FractalField:
             if len(dead) == 0:
                 return 0
 
+            # V18: Rare concept protection — identify significant dims per concept
+            per_concept_significant = np.abs(codes_arr) > 0.1 * np.max(np.abs(codes_arr), axis=1, keepdims=True)
+            rare_mask = per_concept_significant.sum(axis=1) < max(1, self.latent_dim // 20)
+            # Candidate dead dims to remove
+            to_remove = list(dead)
+            if rare_mask.any():
+                # Re-check: would removing 'dead' leave any rare concept with < 5 significant dims?
+                keep_extra = set()
+                for i, is_rare in enumerate(rare_mask):
+                    if not is_rare:
+                        continue
+                    significant_now = np.where(per_concept_significant[i])[0]
+                    after_prune = np.array([d for d in significant_now if d not in to_remove])
+                    if len(after_prune) < max(5, self.latent_dim // 20):
+                        # Protect the most significant dims that were going to be pruned
+                        at_risk = [d for d in significant_now if d in to_remove]
+                        at_risk.sort(key=lambda d: -abs(codes_arr[i, d]))
+                        for d in at_risk[:3]:
+                            keep_extra.add(d)
+                if keep_extra:
+                    n_protected = len(keep_extra)
+                    to_remove = [d for d in to_remove if d not in keep_extra]
+                    print(f"  Rare concept protection: kept {n_protected} dims for {int(rare_mask.sum())} rare concepts")
+
+            if not to_remove:
+                return 0
+            dead = np.array(to_remove)
             # Keep only live dimensions
-            live = np.where(active_frac >= (1.0 - sparsity_threshold))[0]
-            live_set = set(live)
+            live_mask = np.ones(self.latent_dim, dtype=bool)
+            live_mask[dead] = False
+            live = np.where(live_mask)[0]
             old_dim = self.latent_dim
 
             # Remap: live dims form new code, basis, W_proj
             new_basis_rows = self.basis[live]
-            # Re-orthogonalise to maintain orthonormal basis
             Q, _ = np.linalg.qr(new_basis_rows.T, mode='reduced')
             self.basis = Q.T.astype(np.float32)
             new_latent_dim = len(live)
@@ -1092,6 +1121,49 @@ class EntityField:
             n = float(np.linalg.norm(self.entities[key]))
             if n > 1e-10:
                 self.entities[key] /= n
+
+
+class CharEnvelope:
+    """Char-level semantic envelope (P3.1 V18): Unicode codepoint → HD vector.
+
+    Позволяет модулировать word vector на основе char-level контекста.
+    LFU eviction при превышении max_chars.
+    """
+
+    def __init__(self, dim=768, max_chars=5000):
+        self.dim = dim
+        self.max_chars = max_chars
+        self._char_vecs = {}
+        self._access_count = {}
+
+    def ensure(self, codepoint):
+        if codepoint not in self._char_vecs:
+            if len(self._char_vecs) >= self.max_chars:
+                evict = min(self._access_count, key=self._access_count.get)
+                self._char_vecs.pop(evict, None)
+                self._access_count.pop(evict, None)
+            seed = hash(('char_env', codepoint)) % (2**31 - 1)
+            rng = np.random.RandomState(seed)
+            v = rng.randn(self.dim).astype(np.float32)
+            n = np.linalg.norm(v)
+            self._char_vecs[codepoint] = v / n if n > 1e-10 else v
+        self._access_count[codepoint] = self._access_count.get(codepoint, 0) + 1
+        return self._char_vecs[codepoint]
+
+    def word_envelope(self, word_text):
+        if not word_text:
+            return None
+        vecs = [self.ensure(ord(ch)) for ch in word_text]
+        result = sum(vecs) / len(vecs)
+        n = np.linalg.norm(result)
+        return result / n if n > 1e-10 else result
+
+    def modulate(self, word_vec, char_env, strength=0.05):
+        """Модулировать word vector char-level envelope через VSA binding."""
+        bound = _hybrid_bind(char_env, word_vec)
+        result = word_vec + bound * strength
+        n = np.linalg.norm(result)
+        return result / n if n > 1e-10 else result
 
 
 class Harmonizer:

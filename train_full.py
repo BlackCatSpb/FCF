@@ -35,7 +35,7 @@ def _load_morph(path, sp_path):
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
-from eva.symbolic.parameter_optimizer import ParameterOptimizer
+from eva.symbolic.parameter_optimizer import ParameterOptimizer, PlateauDetector
 from eva.symbolic.fcf_config import FCFConfig
 
 # ── Config ──────────────────────────────────────────────────────
@@ -445,6 +445,8 @@ class TrainingPipeline:
             cleanup_keep=ckpt_keep)
         # TN-32: preserve curriculum progress after rescore
         self._rescore_cp = None
+        # V18: Soft plateau detector (replaces hard _full_stuck_counter ×2 logic)
+        self._plateau_detector = PlateauDetector()
         # If resuming mid-epoch (start_line > 0), prevent rescore until next epoch
         self._rescore_line = None if start_line == 0 else -1
 
@@ -955,9 +957,16 @@ try:
                                          generator=gen,
                                          current_cos=last_cos_sim[0] if last_cos_sim else None)
                     pipeline.last_fluct_lines = idx
+                # V18: Soft plateau detector (supplements hard _full_stuck_counter)
+                plateau_loss = eval_vppl if eval_vppl is not None else mean_sim * 1000
+                plateau_df = pipeline._plateau_detector.update(plateau_loss, idx)
                 # TN-13/46: plateau-adaptive batch size via multiplier
                 if pipeline.opt._full_stuck_counter >= 3:
                     _batch_mult = min(_batch_mult * 2, 4.0)
+                    BATCH_SIZE = int(bs_curve(idx) * _batch_mult)
+                elif plateau_df < 0.6 and _batch_mult < 2.0:
+                    # Soft plateau: gentle increase
+                    _batch_mult = min(2.0, _batch_mult * 1.15)
                     BATCH_SIZE = int(bs_curve(idx) * _batch_mult)
                 elif _batch_mult > 1.0:
                     _batch_mult = max(1.0, _batch_mult * 0.95)  # decay back to 1x

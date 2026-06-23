@@ -5,6 +5,7 @@ Extracts STDP, negative sampling, contrastive, centroid pull, evaluate.
 import math
 import numpy as np
 import torch
+import json, os
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -23,30 +24,28 @@ _META_NEXT_CID = 8
 _META_ANTONYM = 9
 
 
-# Russian antonym dictionary (copied from eva_ai contradiction_miner)
-_ANTONYM_MAP = {
-    'быстрый': ['медленный', 'медленнее', 'медленно'],
-    'медленный': ['быстрый', 'быстрее', 'быстро'],
-    'хороший': ['плохой', 'худший'],
-    'плохой': ['хороший', 'лучший'],
-    'высокий': ['низкий', 'ниже', 'низко'],
-    'низкий': ['высокий', 'выше', 'высоко'],
-    'большой': ['маленький', 'меньше', 'мало'],
-    'маленький': ['большой', 'больше', 'много'],
-    'да': ['нет', 'не', 'никогда'],
-    'нет': ['да', 'всегда'],
-    'всегда': ['никогда', 'редко'],
-    'никогда': ['всегда', 'часто'],
-    'правда': ['ложь', 'враньё', 'неправда'],
-    'ложь': ['правда', 'истина'],
-    'истина': ['ложь', 'враньё'],
-    'важно': ['неважно', 'второстепенно'],
-    'неважно': ['важно', 'главное'],
-    'нужно': ['нельзя', 'запрещено'],
-    'можно': ['нельзя', 'запрещено'],
-    'верно': ['неверно', 'ошибочно'],
-    'неверно': ['верно', 'правильно'],
-}
+# P1.8: Антоним-словарь из JSON с fallback на хардкод
+_ANTONYM_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'antonyms.json')
+
+def _load_antonym_map(path=_ANTONYM_PATH):
+    """Загрузить антоним-словарь из JSON. При отсутствии — минимальный fallback."""
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {k.lower(): [v.lower() for v in vals] for k, vals in data.items()}
+        except Exception:
+            pass
+    return {
+        'быстрый': ['медленный'], 'медленный': ['быстрый'],
+        'хороший': ['плохой'], 'плохой': ['хороший'],
+        'высокий': ['низкий'], 'низкий': ['высокий'],
+        'большой': ['маленький'], 'маленький': ['большой'],
+        'да': ['нет'], 'нет': ['да'],
+    }
+
+_ANTONYM_MAP = _load_antonym_map()
 
 
 def _update_hdc_ngrams(cs, ids, max_n=3):

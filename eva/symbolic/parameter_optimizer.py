@@ -359,3 +359,61 @@ class ParameterOptimizer:
 
     def summary(self):
         return ' | '.join(f"{p.name}={p.current:.4g}" for p in self.p.values())
+
+
+class PlateauDetector:
+    """Мягкий детектор плато с EMA loss + std threshold (§4 Training Dynamics V18).
+
+    Заменяет жёсткий `_full_stuck_counter >= 3 → ×0.95` на:
+    - EMA loss с окном 100 шагов
+    - Адаптивный порог (std loss / mean loss)
+    - Плавный линейный decay (-1%/шаг после patience)
+    - Автоматическое восстановление при выходе из плато
+    """
+
+    def __init__(self, window=100, patience=20, threshold_std=0.5, min_decay=0.1, recovery_factor=0.05):
+        self.window = window
+        self.patience = patience
+        self.threshold_std = threshold_std
+        self.min_decay = min_decay
+        self.recovery_factor = recovery_factor
+        self.losses = []
+        self.ema_loss = None
+        self.ema_alpha = 0.05
+        self._plateau_steps = 0
+        self._decay_factor = 1.0
+        self._last_reduction_step = 0
+
+    def update(self, loss: float, step: int) -> float:
+        self.losses.append(loss)
+        if len(self.losses) > self.window * 2:
+            self.losses.pop(0)
+        if self.ema_loss is None:
+            self.ema_loss = loss
+        else:
+            self.ema_loss = self.ema_alpha * loss + (1 - self.ema_alpha) * self.ema_loss
+        if len(self.losses) >= self.window:
+            recent = self.losses[-self.window:]
+            mean = float(np.mean(recent))
+            std = float(np.std(recent))
+            if std < self.threshold_std * abs(mean) and std > 0:
+                self._plateau_steps += 1
+            else:
+                if self._plateau_steps > 0:
+                    self._plateau_steps = max(0, self._plateau_steps - 1)
+        if self._plateau_steps >= self.patience:
+            steps_in_plateau = self._plateau_steps - self.patience
+            decay = 1.0 - (steps_in_plateau * 0.01)
+            self._decay_factor = max(self.min_decay, decay)
+            self._last_reduction_step = step
+        else:
+            if self._decay_factor < 1.0:
+                recovery = self.recovery_factor * (1.0 - self._decay_factor)
+                self._decay_factor = min(1.0, self._decay_factor + recovery)
+        return self._decay_factor
+
+    def is_plateau(self) -> bool:
+        return self._plateau_steps >= self.patience
+
+    def get_metrics(self) -> dict:
+        return {'decay_factor': self._decay_factor, 'plateau_steps': self._plateau_steps, 'ema_loss': self.ema_loss}

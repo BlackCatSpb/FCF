@@ -778,9 +778,9 @@ class CrystalGenerator:
         syn_ranked = {cid: i + 1 for i, (cid, _) in enumerate(syn_preds[:80])
                       if self._is_semantic_token(cid)}
 
-        # 2b. HDC n-gram fallback (when lattice has < 3 candidates)
+        # 2b. HDC n-gram fallback (always participates in RRF for stability)
         hdc_candidates = {}
-        if len(syn_preds) < 3 and len(cids) >= 2:
+        if len(cids) >= 2:
             ctx_cids = list(reversed(cids[-2:]))
             if hasattr(self.cs.fractal, 'hdc_memory'):
                 hdc_preds = self.cs.fractal.hdc_predict(

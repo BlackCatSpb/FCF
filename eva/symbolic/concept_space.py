@@ -13,6 +13,7 @@ on the corpus. No external knowledge bases (ConceptNet) needed.
 import numpy as np
 from collections import defaultdict, Counter
 import math, json, os, random
+import threading
 from typing import Dict, List, Optional
 
 # ── FFT-HRR VSA primitives ─────────────────────────────────────
@@ -32,6 +33,27 @@ def _hrr_unbind(c, b):
     fc = np.fft.rfft(c)
     fb_conj = np.conj(np.fft.rfft(b))
     return np.fft.irfft(fc * fb_conj, n=len(c)).astype(c.dtype) / len(c)
+
+# ── Hybrid bind/unbind (HRR + element-wise, §5 Training Dynamics V18) ──
+def _hybrid_bind(a, b, alpha=0.7, eps=1e-8):
+    """Гибрид HRR ⊛ и element-wise: alpha*hrr + (1-alpha)*ew."""
+    A = np.fft.rfft(a)
+    B = np.fft.rfft(b)
+    hrr = np.fft.irfft(A * B, n=len(a))
+    ew = a * b
+    combined = alpha * hrr + (1 - alpha) * ew
+    nrm = np.linalg.norm(combined)
+    return combined / (nrm + eps) if nrm > 0 else combined
+
+def _hybrid_unbind(c, b, alpha=0.7, eps=1e-8):
+    """Гибрид HRR correlation и element-wise unbind."""
+    fc = np.fft.rfft(c)
+    fb_conj = np.conj(np.fft.rfft(b))
+    hrr = np.fft.irfft(fc * fb_conj, n=len(c))
+    ew = c * b
+    combined = alpha * hrr + (1 - alpha) * ew
+    nrm = np.linalg.norm(combined)
+    return combined / (nrm + eps) if nrm > 0 else combined
 try:
     import torch
     _HAS_TORCH = True
@@ -143,8 +165,9 @@ class FractalField:
         # HDC n-gram memory: prefix_cids_tuple → bundled latent repr (LRU-capped)
         self.hdc_memory: Dict[tuple, np.ndarray] = {}
         self.hdc_memory_counts: Dict[tuple, int] = {}
-        self.hdc_memory_max = 50000  # evict oldest when exceeding
-        self._hdc_access_order: List[tuple] = []  # simple FIFO eviction queue
+        self.hdc_memory_max = 2000  # 2000×2048×4=16MB вместо 400MB
+        self._hdc_access_order: List[tuple] = []  # (unused after P3.6 LFU, kept for compat)
+        self._capacity_lock = threading.Lock()
 
         # Per-concept adaptive L1 lambda (dynamic dimensionality)
         self.l1_lambda_per_cid: Dict[int, float] = {}
@@ -330,6 +353,24 @@ class FractalField:
         norms = np.maximum(norms, 1e-10)
         self.W_proj /= norms
 
+        # P1.3a: QR orthogonalization of W_proj columns — prevents Hebbian collapse
+        Q_w, _ = np.linalg.qr(self.W_proj, mode='reduced')
+        self.W_proj = Q_w.astype(np.float32) * np.sqrt(float(self.latent_dim))
+
+        # P1.3b: collapse detection — reset degenerate hyperplanes
+        if self.field_bits and len(self.field_bits) >= 10:
+            try:
+                all_bits = np.array([np.unpackbits(self.field_bits[cid])[:self.n_field_bits]
+                                     for cid in self.field_bits])
+                bit_ratio = all_bits.mean(axis=0)
+                collapsed = np.where((bit_ratio > 0.85) | (bit_ratio < 0.15))[0]
+                if len(collapsed) > 0:
+                    rng = np.random.RandomState(42 + self._capacity_growths)
+                    self.W_proj[:, collapsed] = rng.randn(self.latent_dim, len(collapsed)).astype(np.float32)
+                    print(f"  Collapse guard: reset {len(collapsed)}/{self.n_field_bits} degenerate hyperplanes")
+            except Exception:
+                pass  # non-critical — skip collapse detection on error
+
         self._rebuild_field_bits()
 
     def adjust_l1_lambdas(self, lr_scale=1.0):
@@ -364,69 +405,70 @@ class FractalField:
     # ── Dynamic capacity ─────────────────────────────────────
 
     def grow_capacity(self, new_latent_dim=None):
-        old_dim = self.latent_dim
-        if old_dim >= self.max_latent_dim:
-            return old_dim
-        if new_latent_dim is None:
-            new_latent_dim = int(old_dim * self._growth_factor)
-        new_latent_dim = min(new_latent_dim, self.max_latent_dim)
-        new_latent_dim = max(new_latent_dim, old_dim + 8)
-        # Ensure new dim respects subspace alignment
-        new_latent_dim = ((new_latent_dim + 7) // 8) * 8
+        with self._capacity_lock:
+            old_dim = self.latent_dim
+            if old_dim >= self.max_latent_dim:
+                return old_dim
+            if new_latent_dim is None:
+                new_latent_dim = int(old_dim * self._growth_factor)
+            new_latent_dim = min(new_latent_dim, self.max_latent_dim)
+            new_latent_dim = max(new_latent_dim, old_dim + 8)
+            # Ensure new dim respects subspace alignment
+            new_latent_dim = ((new_latent_dim + 7) // 8) * 8
 
-        # Generate new orthogonal basis vectors
-        rng = np.random.RandomState(42 + self._capacity_growths)
-        n_new = new_latent_dim - old_dim
-        mat = rng.randn(n_new, self.dim).astype(np.float32)
-        # Orthogonalise against existing basis
-        residual = mat - mat @ self.basis.T @ self.basis
-        Q_new, _ = np.linalg.qr(residual, mode='reduced')
-        self.basis = np.vstack([self.basis, Q_new.astype(np.float32)])
+            # Generate new orthogonal basis vectors
+            rng = np.random.RandomState(42 + self._capacity_growths)
+            n_new = new_latent_dim - old_dim
+            mat = rng.randn(n_new, self.dim).astype(np.float32)
+            # Orthogonalise against existing basis
+            residual = mat - mat @ self.basis.T @ self.basis
+            Q_new, _ = np.linalg.qr(residual, mode='reduced')
+            self.basis = np.vstack([self.basis, Q_new.astype(np.float32)])
 
-        # Extend all codes with zeros
-        for cid in self.codes:
-            self.codes[cid] = np.append(self.codes[cid], np.zeros(n_new, dtype=np.float32))
+            # Extend all codes with zeros
+            for cid in self.codes:
+                self.codes[cid] = np.append(self.codes[cid], np.zeros(n_new, dtype=np.float32))
 
-        # Update subspace ratios
-        old_l_c, old_l_a, old_l_m = self.l_c, self.l_a, self.l_m
-        self.latent_dim = new_latent_dim
-        self.l_c = new_latent_dim * 3 // 5
-        self.l_a = new_latent_dim // 4
-        self.l_m = new_latent_dim - self.l_c - self.l_a
-        # Shift existing code entries to new subspace positions
-        for cid in self.codes:
-            old_code = self.codes[cid]
-            new_code = np.zeros(new_latent_dim, dtype=np.float32)
-            # z_c: identity — kept in same relative position, extended
-            new_code[:old_l_c] = old_code[:old_l_c]
-            # z_a: attention — same
-            new_code[old_l_c:old_l_c + old_l_a] = old_code[old_l_c:old_l_c + old_l_a]
-            # z_m: meta — same
-            new_code[old_l_c + old_l_a:old_l_c + old_l_a + old_l_m] = old_code[old_l_c + old_l_a:]
-            self.codes[cid] = new_code
+            # Update subspace ratios
+            old_l_c, old_l_a, old_l_m = self.l_c, self.l_a, self.l_m
+            self.latent_dim = new_latent_dim
+            self.l_c = new_latent_dim * 3 // 5
+            self.l_a = new_latent_dim // 4
+            self.l_m = new_latent_dim - self.l_c - self.l_a
+            # Shift existing code entries to new subspace positions
+            for cid in self.codes:
+                old_code = self.codes[cid]
+                new_code = np.zeros(new_latent_dim, dtype=np.float32)
+                # z_c: identity — kept in same relative position, extended
+                new_code[:old_l_c] = old_code[:old_l_c]
+                # z_a: attention — same
+                new_code[old_l_c:old_l_c + old_l_a] = old_code[old_l_c:old_l_c + old_l_a]
+                # z_m: meta — same
+                new_code[old_l_c + old_l_a:old_l_c + old_l_a + old_l_m] = old_code[old_l_c + old_l_a:]
+                self.codes[cid] = new_code
 
-        # Grow field projection matrices
-        if self.W_proj is not None:
-            pad = np.zeros((n_new, self.n_field_bits), dtype=np.float32)
-            self.W_proj = np.vstack([self.W_proj, pad])
-        for lvl in range(len(self._sector_W)):
-            pad = np.zeros((n_new, self._sector_W[lvl].shape[1]), dtype=np.float32)
-            self._sector_W[lvl] = np.vstack([self._sector_W[lvl], pad])
+            # Grow field projection matrices
+            if self.W_proj is not None:
+                pad = np.zeros((n_new, self.n_field_bits), dtype=np.float32)
+                self.W_proj = np.vstack([self.W_proj, pad])
+            for lvl in range(len(self._sector_W)):
+                pad = np.zeros((n_new, self._sector_W[lvl].shape[1]), dtype=np.float32)
+                self._sector_W[lvl] = np.vstack([self._sector_W[lvl], pad])
 
-        # Grow L1 lambda dict entries (inherit global)
-        if self.l1_lambda_per_cid:
-            self.l1_lambda_per_cid = {
-                cid: lmbda for cid, lmbda in self.l1_lambda_per_cid.items()
-                if cid in self.codes
-            }
+            # Grow L1 lambda dict entries (inherit global)
+            if self.l1_lambda_per_cid:
+                self.l1_lambda_per_cid = {
+                    cid: lmbda for cid, lmbda in self.l1_lambda_per_cid.items()
+                    if cid in self.codes
+                }
 
-        self._matrix_dirty = True
-        self._capacity_growths += 1
-        self._fb_dirty = True
-        self._rebuild_sector_index()
-        print(f"  Grown capacity: {old_dim} -> {new_latent_dim} "
-              f"(l_c={self.l_c} l_a={self.l_a} l_m={self.l_m})")
-        return new_latent_dim
+            self._matrix_dirty = True
+            self._capacity_growths += 1
+            self._fb_dirty = True
+            self._rebuild_sector_index()
+            print(f"  Grown capacity: {old_dim} -> {new_latent_dim} "
+                  f"(l_c={self.l_c} l_a={self.l_a} l_m={self.l_m})")
+            return new_latent_dim
 
     def prune_capacity(self, sparsity_threshold=0.98):
         """Prune near-zero latent dimensions across all codes.
@@ -434,46 +476,47 @@ class FractalField:
         A dimension is pruned if > 98% of codes have |val| < 1e-4.
         Returns number of pruned dimensions.
         """
-        if len(self.codes) < 10:
-            return 0
-        codes_arr = np.array(list(self.codes.values()), dtype=np.float32)
-        active_frac = np.mean(np.abs(codes_arr) > 1e-4, axis=0)
-        dead = np.where(active_frac < (1.0 - sparsity_threshold))[0]
-        if len(dead) == 0:
-            return 0
+        with self._capacity_lock:
+            if len(self.codes) < 10:
+                return 0
+            codes_arr = np.array(list(self.codes.values()), dtype=np.float32)
+            active_frac = np.mean(np.abs(codes_arr) > 1e-4, axis=0)
+            dead = np.where(active_frac < (1.0 - sparsity_threshold))[0]
+            if len(dead) == 0:
+                return 0
 
-        # Keep only live dimensions
-        live = np.where(active_frac >= (1.0 - sparsity_threshold))[0]
-        live_set = set(live)
-        old_dim = self.latent_dim
+            # Keep only live dimensions
+            live = np.where(active_frac >= (1.0 - sparsity_threshold))[0]
+            live_set = set(live)
+            old_dim = self.latent_dim
 
-        # Remap: live dims form new code, basis, W_proj
-        new_basis_rows = self.basis[live]
-        # Re-orthogonalise to maintain orthonormal basis
-        Q, _ = np.linalg.qr(new_basis_rows.T, mode='reduced')
-        self.basis = Q.T.astype(np.float32)
-        new_latent_dim = len(live)
+            # Remap: live dims form new code, basis, W_proj
+            new_basis_rows = self.basis[live]
+            # Re-orthogonalise to maintain orthonormal basis
+            Q, _ = np.linalg.qr(new_basis_rows.T, mode='reduced')
+            self.basis = Q.T.astype(np.float32)
+            new_latent_dim = len(live)
 
-        for cid in self.codes:
-            self.codes[cid] = self.codes[cid][live]
+            for cid in self.codes:
+                self.codes[cid] = self.codes[cid][live]
 
-        self.latent_dim = new_latent_dim
-        self.l_c = new_latent_dim * 3 // 5
-        self.l_a = new_latent_dim // 4
-        self.l_m = new_latent_dim - self.l_c - self.l_a
+            self.latent_dim = new_latent_dim
+            self.l_c = new_latent_dim * 3 // 5
+            self.l_a = new_latent_dim // 4
+            self.l_m = new_latent_dim - self.l_c - self.l_a
 
-        if self.W_proj is not None:
-            self.W_proj = self.W_proj[live]
+            if self.W_proj is not None:
+                self.W_proj = self.W_proj[live]
 
-        for lvl in range(len(self._sector_W)):
-            self._sector_W[lvl] = self._sector_W[lvl][live]
+            for lvl in range(len(self._sector_W)):
+                self._sector_W[lvl] = self._sector_W[lvl][live]
 
-        self._matrix_dirty = True
-        self._fb_dirty = True
-        self._rebuild_sector_index()
-        print(f"  Pruned capacity: {old_dim}→{new_latent_dim} "
-              f"(removed {len(dead)} dead dimensions)")
-        return len(dead)
+            self._matrix_dirty = True
+            self._fb_dirty = True
+            self._rebuild_sector_index()
+            print(f"  Pruned capacity: {old_dim}→{new_latent_dim} "
+                  f"(removed {len(dead)} dead dimensions)")
+            return len(dead)
 
     def auto_adjust_capacity(self):
         """Automatically grow or shrink capacity based on code density.
@@ -628,12 +671,12 @@ class FractalField:
     # ── HDC/VSA n-gram fallback ────────────────────────────
 
     def hdc_bind(self, a, b):
-        """FFT-HRR bind = circular convolution a ⊛ b."""
-        return _hrr_bind(a, b)
+        """Hybrid bind: HRR ⊛ + element-wise (α=0.7 for STDP compatibility)."""
+        return _hybrid_bind(a, b)
 
     def hdc_unbind(self, c, b):
-        """FFT-HRR unbind = circular correlation c ⋆ b (approximate inverse)."""
-        return _hrr_unbind(c, b)
+        """Hybrid unbind: HRR correlation + element-wise."""
+        return _hybrid_unbind(c, b)
 
     def hdc_permute(self, v, n=1):
         """Circular shift by n positions."""
@@ -661,18 +704,19 @@ class FractalField:
         """Update HDC memory for {prefix_cids → next_token_code}.
 
         Bundles next_code into hdc_memory[prefix_cids] (running average).
-        Evicts oldest entries when over hdc_memory_max.
+        Evicts LFU (least-frequently-used) entries when over hdc_memory_max.
         """
         key = tuple(prefix_cids)
         if key not in self.hdc_memory:
-            if len(self.hdc_memory) >= self.hdc_memory_max and self._hdc_access_order:
-                # FIFO eviction
-                evict_key = self._hdc_access_order.pop(0)
+            if len(self.hdc_memory) >= self.hdc_memory_max:
+                # P3.6: LFU eviction — remove entry with lowest access count
+                min_count = min(self.hdc_memory_counts.values()) if self.hdc_memory_counts else 0
+                evict_candidates = [k for k, v in self.hdc_memory_counts.items() if v == min_count]
+                evict_key = evict_candidates[0]
                 self.hdc_memory.pop(evict_key, None)
                 self.hdc_memory_counts.pop(evict_key, None)
             self.hdc_memory[key] = next_code.copy()
             self.hdc_memory_counts[key] = 1
-            self._hdc_access_order.append(key)
         else:
             count = self.hdc_memory_counts[key]
             lr = 1.0 / max(count + 1, 1.0)
@@ -693,10 +737,6 @@ class FractalField:
         """
         key = tuple(context_cids)
         if key in self.hdc_memory:
-            # Mark as recently accessed (move to end of FIFO queue)
-            if key in self._hdc_access_order:
-                self._hdc_access_order.remove(key)
-                self._hdc_access_order.append(key)
             mem_repr = self.hdc_memory[key]
         elif len(key) >= 2:
             # No stored repr — use the context itself as a probe
@@ -766,37 +806,38 @@ class FractalField:
         Args:
             binary_path: if set, save codes+basis as .npz and return lightweight dict.
         """
-        if binary_path:
-            tmp_path = binary_path.replace('.npz', '.tmp.npz')
-            cids = np.array(list(self.codes.keys()), dtype=np.int32)
-            codes_arr = np.array([self.codes[cid] for cid in cids], dtype=np.float32)
-            kw = dict(codes=codes_arr, cids=cids, basis=self.basis)
-            # Save field bits if present
-            if hasattr(self, 'field_bits') and self.field_bits:
-                fb_cids = np.array(list(self.field_bits.keys()), dtype=np.int32)
-                fb_arr = np.array([self.field_bits[cid] for cid in fb_cids], dtype=np.uint8)
-                kw['fb_cids'] = fb_cids
-                kw['fb_arr'] = fb_arr
-            np.savez_compressed(tmp_path, **kw)
-            os.replace(tmp_path, binary_path)
+        with self._capacity_lock:
+            if binary_path:
+                tmp_path = binary_path.replace('.npz', '.tmp.npz')
+                cids = np.array(list(self.codes.keys()), dtype=np.int32)
+                codes_arr = np.array([self.codes[cid] for cid in cids], dtype=np.float32)
+                kw = dict(codes=codes_arr, cids=cids, basis=self.basis)
+                # Save field bits if present
+                if hasattr(self, 'field_bits') and self.field_bits:
+                    fb_cids = np.array(list(self.field_bits.keys()), dtype=np.int32)
+                    fb_arr = np.array([self.field_bits[cid] for cid in fb_cids], dtype=np.uint8)
+                    kw['fb_cids'] = fb_cids
+                    kw['fb_arr'] = fb_arr
+                np.savez_compressed(tmp_path, **kw)
+                os.replace(tmp_path, binary_path)
+                result = {
+                    'dim': self.dim,
+                    'latent_dim': self.latent_dim,
+                    'binary_codes': os.path.basename(binary_path),
+                    'n_codes': len(cids),
+                }
+                if self.l1_lambda_per_cid:
+                    result['l1_lambda_per_cid'] = {str(cid): float(v) for cid, v in self.l1_lambda_per_cid.items()}
+                return result
             result = {
                 'dim': self.dim,
                 'latent_dim': self.latent_dim,
-                'binary_codes': os.path.basename(binary_path),
-                'n_codes': len(cids),
+                'basis': self.basis.tolist(),
+                'codes': {str(cid): c.tolist() for cid, c in self.codes.items()},
             }
             if self.l1_lambda_per_cid:
                 result['l1_lambda_per_cid'] = {str(cid): float(v) for cid, v in self.l1_lambda_per_cid.items()}
             return result
-        result = {
-            'dim': self.dim,
-            'latent_dim': self.latent_dim,
-            'basis': self.basis.tolist(),
-            'codes': {str(cid): c.tolist() for cid, c in self.codes.items()},
-        }
-        if self.l1_lambda_per_cid:
-            result['l1_lambda_per_cid'] = {str(cid): float(v) for cid, v in self.l1_lambda_per_cid.items()}
-        return result
 
     @classmethod
     def from_dict(cls, data, base_dir=None):
@@ -845,6 +886,7 @@ class FractalField:
         raw_l1 = data.get('l1_lambda_per_cid')
         if raw_l1:
             field.l1_lambda_per_cid = {int(cid): float(v) for cid, v in raw_l1.items()}
+        field._capacity_lock = threading.Lock()
         field._matrix_dirty = True
         return field
 
@@ -893,6 +935,11 @@ class EntityField:
         self._char_word_cache = {}
         self._char_word_cache_evict = []
 
+        # P1.7: EntityField cleanup — TTL + size cap
+        self._entity_access_time: Dict[tuple, float] = {}
+        self._entity_batch_counter = 0
+        self._max_entities = 50000  # 50K × 2048 × fp32 ≈ 400MB cap
+
     # ── Key helpers ──────────────────────────────────────────
     @staticmethod
     def key_char(cp):    return ('c', cp)
@@ -916,11 +963,11 @@ class EntityField:
             self._proj = rng_p.randn(self.dim, len(v)).astype(np.float32) * scale
         return self._proj @ v
 
-    # ── VSA primitives (FFT-HRR) ────────────────────────────
+    # ── VSA primitives (hybrid HRR+element-wise) ─────────────
     def _bind(self, a, b):
-        return _hrr_bind(a, b)
+        return _hybrid_bind(a, b)
     def _unbind(self, c, b):
-        return _hrr_unbind(c, b)
+        return _hybrid_unbind(c, b)
 
     # ── Core: ensure, get, set, sync_word ────────────────────
     def ensure(self, key):
@@ -938,6 +985,9 @@ class EntityField:
             v = self.word_store.get(key[1])
             if v is not None:
                 self.entities[key] = self._to_dim(v.copy().astype(np.float32))
+        # P1.7: track access time for cleanup
+        if key in self.entities:
+            self._entity_access_time[key] = self._entity_batch_counter
         return self.entities.get(key)
 
     def set(self, key, v):
@@ -999,6 +1049,17 @@ class EntityField:
             return None
         return self._unbind(v, rv)
 
+    # ── Cleanup: remove stale entities ────────────────────────
+    def cleanup(self):
+        """Удалить entity, превышающие лимит (по access time)."""
+        if len(self.entities) <= self._max_entities:
+            return
+        sorted_keys = sorted(self._entity_access_time.items(), key=lambda x: x[1])
+        to_remove = len(self.entities) - self._max_entities
+        for key, _ in sorted_keys[:to_remove]:
+            self.entities.pop(key, None)
+            self._entity_access_time.pop(key, None)
+
     # ── Serialisation ────────────────────────────────────────
     def to_dict(self):
         keys = []
@@ -1010,6 +1071,7 @@ class EntityField:
             'ef_keys': keys,
             'ef_vecs': np.array(vecs, dtype=np.float32) if vecs else np.empty((0, self.dim), dtype=np.float32),
             'ef_dim': self.dim,
+            'ef_batch_counter': self._entity_batch_counter,
         }
 
     @classmethod
@@ -1020,6 +1082,7 @@ class EntityField:
         for k, v in zip(keys, vecs):
             k = tuple(k)
             ef.entities[k] = v.astype(np.float32)
+        ef._entity_batch_counter = data.get('ef_batch_counter', 0)
         return ef
 
     # ── Decay: fade old bindings → prevent saturation ────────
@@ -1072,12 +1135,12 @@ class Harmonizer:
     # ── VSA primitives ────────────────────────────────────────
 
     def _bind(self, a, b):
-        """FFT-HRR bind = circular convolution a ⊛ b."""
-        return _hrr_bind(a, b)
+        """Hybrid bind: HRR ⊛ + element-wise (α=0.7 for STDP compatibility)."""
+        return _hybrid_bind(a, b)
 
     def _unbind(self, c, b):
-        """FFT-HRR unbind = circular correlation c ⋆ b."""
-        return _hrr_unbind(c, b)
+        """Hybrid unbind: HRR correlation + element-wise."""
+        return _hybrid_unbind(c, b)
 
     def _bundle(self, vecs):
         """Bundle (superposition) with normalisation."""

@@ -227,6 +227,10 @@ class STDPTrainer:
         if not morph_cids and not focus_cids:
             return
         ef.clear_bind_cache()
+        # P1.7: periodic entity field cleanup
+        ef._entity_batch_counter += 1
+        if ef._entity_batch_counter % 100 == 0 and len(ef.entities) > ef._max_entities:
+            ef.cleanup()
 
         # ── 1. Sync GPU→CPU + sync word vectors into entity_field ──
         all_cids = list(focus_cids | set(morph_cids))
@@ -330,6 +334,28 @@ class STDPTrainer:
                     cs._apply_vector_update(cid, new_v)
                     ef.sync_word(cid, new_v)
                     updated_cids.append(cid)
+
+        # ── 3b. P1.2: EntityField → STDP feedback ──
+        if morph_cids:
+            for cid in morph_cids:
+                wkey = ef.key_word(cid)
+                v_word = ef.get(wkey)
+                if v_word is not None:
+                    char_query = ef.query('w', cid)
+                    if char_query is not None:
+                        cq_norm = np.linalg.norm(char_query)
+                        if cq_norm > 1e-10:
+                            char_query /= cq_norm
+                            v_cs = cs.concept_vectors.get(cid)
+                            if v_cs is not None:
+                                sim = float(v_cs @ char_query)
+                                pull = (char_query - sim * v_cs) * 0.005
+                                v_new = v_cs + pull
+                                nv = np.linalg.norm(v_new)
+                                if nv > 1e-10:
+                                    v_new /= nv
+                                cs._apply_vector_update(cid, v_new)
+                                updated_cids.append(cid)
 
         # ── 4. Batched GPU sync for harmonize updates (P1.13) ──
         if gen._use_torch and gen._vecs_t is not None and updated_cids:

@@ -14,6 +14,24 @@ import numpy as np
 from collections import defaultdict, Counter
 import math, json, os, random
 from typing import Dict, List, Optional
+
+# ── FFT-HRR VSA primitives ─────────────────────────────────────
+# Circular convolution (bind) and circular correlation (unbind)
+# via FFT for real-valued unit-norm vectors.
+# Unlike Hadamard product a*b, FFT-HRR is (approximately) invertible:
+#   unbind(bind(a, b), b) ≈ a   with SNR ~ sqrt(D).
+
+def _hrr_bind(a, b):
+    """FFT-HRR bind = circular convolution a ⊛ b."""
+    fa = np.fft.rfft(a)
+    fb = np.fft.rfft(b)
+    return np.fft.irfft(fa * fb, n=len(a)).astype(a.dtype) / len(a)
+
+def _hrr_unbind(c, b):
+    """FFT-HRR unbind = circular correlation c ⋆ b."""
+    fc = np.fft.rfft(c)
+    fb_conj = np.conj(np.fft.rfft(b))
+    return np.fft.irfft(fc * fb_conj, n=len(c)).astype(c.dtype) / len(c)
 try:
     import torch
     _HAS_TORCH = True
@@ -610,8 +628,12 @@ class FractalField:
     # ── HDC/VSA n-gram fallback ────────────────────────────
 
     def hdc_bind(self, a, b):
-        """Element-wise multiply (real-valued VSA binding)."""
-        return a * b
+        """FFT-HRR bind = circular convolution a ⊛ b."""
+        return _hrr_bind(a, b)
+
+    def hdc_unbind(self, c, b):
+        """FFT-HRR unbind = circular correlation c ⋆ b (approximate inverse)."""
+        return _hrr_unbind(c, b)
 
     def hdc_permute(self, v, n=1):
         """Circular shift by n positions."""
@@ -624,7 +646,8 @@ class FractalField:
     def hdc_ngram_repr(self, codes):
         """Build HDC representation for an n-gram sequence of codes.
 
-        For (w1, w2, ..., wn): ρ^{n-1}(w1) ⊙ ρ^{n-2}(w2) ⊙ ... ⊙ wn
+        For (w1, w2, ..., wn): ρ^{n-1}(w1) ⊛ ρ^{n-2}(w2) ⊛ ... ⊛ wn
+        where ⊛ is circular convolution and ρ is circular shift.
         """
         n = len(codes)
         if n == 0:
@@ -633,17 +656,6 @@ class FractalField:
         for i in range(n - 1):
             result = self.hdc_bind(self.hdc_permute(codes[i], n - 1 - i), result)
         return result
-
-    def hdc_unbind(self, context_codes, memory_repr):
-        """Given context (prefix) and n-gram memory, unbind to find next token.
-
-        query = hdc_ngram_repr(context) ⊙ memory_repr ≈ next_token_code
-        Context = all but last token of the n-gram.
-        """
-        ctx_repr = self.hdc_ngram_repr(context_codes)
-        if ctx_repr is None:
-            return None
-        return self.hdc_bind(ctx_repr, memory_repr)
 
     def hdc_update_ngram(self, prefix_cids, next_code):
         """Update HDC memory for {prefix_cids → next_token_code}.
@@ -704,18 +716,12 @@ class FractalField:
         else:
             return []
 
-        # Query: unbind memory repr with context codes to find next token
-        ctx_codes = [self.codes.get(cid) for cid in key]
-        ctx_codes = [c for c in ctx_codes if c is not None]
-        if len(ctx_codes) < 1:
-            return []
-        query = self.hdc_unbind(ctx_codes, mem_repr)
-        if query is None:
-            return []
-        qnorm = np.linalg.norm(query)
+        # Query: mem_repr stores next_code directly (bundled average),
+        # so use it directly as the query probe.
+        qnorm = np.linalg.norm(mem_repr)
         if qnorm < 1e-10:
             return []
-        query /= qnorm
+        query = mem_repr / qnorm
 
         sims = []
         for cid, code in all_codes.items():
@@ -910,11 +916,11 @@ class EntityField:
             self._proj = rng_p.randn(self.dim, len(v)).astype(np.float32) * scale
         return self._proj @ v
 
-    # ── VSA primitives ───────────────────────────────────────
+    # ── VSA primitives (FFT-HRR) ────────────────────────────
     def _bind(self, a, b):
-        return a * b
+        return _hrr_bind(a, b)
     def _unbind(self, c, b):
-        return c * b
+        return _hrr_unbind(c, b)
 
     # ── Core: ensure, get, set, sync_word ────────────────────
     def ensure(self, key):
@@ -1066,12 +1072,12 @@ class Harmonizer:
     # ── VSA primitives ────────────────────────────────────────
 
     def _bind(self, a, b):
-        """Element-wise circular convolution via Hadamard product (HRR-style)."""
-        return a * b  # Hadamard product = VSA bind in frequency domain
+        """FFT-HRR bind = circular convolution a ⊛ b."""
+        return _hrr_bind(a, b)
 
     def _unbind(self, c, b):
-        """Unbind: a ≈ c * b (since b is unit and self-inverse under Hadamard)."""
-        return c * b
+        """FFT-HRR unbind = circular correlation c ⋆ b."""
+        return _hrr_unbind(c, b)
 
     def _bundle(self, vecs):
         """Bundle (superposition) with normalisation."""

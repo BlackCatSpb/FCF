@@ -51,6 +51,9 @@ _ANTONYM_MAP = {
 
 def _update_hdc_ngrams(cs, ids, max_n=3):
     """Update HDC n-gram memory from a tokenized sentence."""
+    # P2.8: skip if no training uses HDC prediction
+    if not hasattr(cs.fractal, 'hdc_memory') or not cs.fractal.hdc_memory_max:
+        return
     codes = {}
     for cid in ids:
         code = cs.fractal.codes.get(cid)
@@ -207,16 +210,6 @@ class STDPTrainer:
         return total_pairs
 
     def _harmonize_batch(self, gen, cs, all_ids):
-        """Recursive cross-level harmonization via EntityField.
-
-        For each batch sentence:
-          1. Sync word vectors from GPU→CPU into entity_field
-          2. char ↔ word: for each word, bind each character context
-          3. word → sent: compute sent_vec, bind each word to its sentence
-          4. sent → para: bind sentence to paragraph (if para boundaries exist)
-          5. Morpheme harmonization on dirty words (existing)
-          6. Sync back to GPU
-        """
         if not hasattr(cs, 'harmonizer') or not cs.harmonizer.word_morphs:
             return
         harm = cs.harmonizer
@@ -224,7 +217,6 @@ class STDPTrainer:
         if ef is None:
             return
 
-        # Collect focus CIDs
         focus_cids = set()
         for ids in all_ids:
             focus_cids.update(ids)
@@ -234,9 +226,11 @@ class STDPTrainer:
         morph_cids = [c for c in focus_cids if c in harm.word_morphs]
         if not morph_cids and not focus_cids:
             return
+        ef.clear_bind_cache()
 
         # ── 1. Sync GPU→CPU + sync word vectors into entity_field ──
         all_cids = list(focus_cids | set(morph_cids))
+        updated_cids = []
         if gen._use_torch and gen._vecs_t is not None:
             cids_t = torch.tensor(all_cids, dtype=torch.long, device=gen._torch_device)
             vecs_cpu = gen._vecs_t[cids_t].cpu().numpy()
@@ -245,26 +239,32 @@ class STDPTrainer:
                 for cid, v_new in zip(all_cids, vecs_cpu):
                     cs._apply_vector_update(cid, v_new)
                     ef.sync_word(cid, v_new)
+                    updated_cids.append(cid)
             finally:
                 gen._skip_gpu_sync = False
+                # ══ P1.13: batched GPU write instead of individual _on_vector_update ══
+                if gen._vecs_t is not None and updated_cids:
+                    batch_v = np.stack([cs.concept_vectors[cid] for cid in updated_cids])
+                    batch_t = torch.from_numpy(batch_v).to(device=gen._vecs_t.device, dtype=gen._vecs_t.dtype, non_blocking=True)
+                    gen._vecs_t[torch.tensor(updated_cids, device=gen._vecs_t.device)] = batch_t
         else:
             for cid in all_cids:
                 v = cs.concept_vectors.get(cid)
                 if v is not None:
                     ef.sync_word(cid, v)
 
-        # Mark morph-words dirty
         for cid in morph_cids:
             harm.mark_word_dirty(cid)
 
         # ── 2. Cross-level bindings: char↔word, word↔sent, sent↔para ──
+        # P2.6: precompute per-sentence vectors for reuse in step 3
+        sent_vec_cache = {}
         for ids in all_ids:
             if not ids:
                 continue
 
             # ---- 2a. char ↔ word ----
             for cid in ids:
-                wkey = ef.key_word(cid)
                 word_text = None
                 if hasattr(gen, 'sp') and gen.sp is not None:
                     try:
@@ -274,17 +274,14 @@ class STDPTrainer:
                 if word_text and len(word_text) >= 1:
                     for ch in word_text:
                         cp = ord(ch)
-                        # Char binds Word, Word binds Char
                         ef.bind('c', cp, 'w', cid, lr=0.05)
                         ef.bind('w', cid, 'c', cp, lr=0.05)
 
             # ---- 2b. word → sent ----
             sent_key = hash(tuple(ids))
-            # Build sent_vec from entity_field (or init if new)
             skey = ef.key_sent(sent_key)
             sv = ef.get(skey)
             if sv is None:
-                # Compute from word vectors in entity field
                 codes = []
                 for cid in ids:
                     wv = ef.get(ef.key_word(cid))
@@ -300,11 +297,24 @@ class STDPTrainer:
             if sv is not None:
                 for cid in ids:
                     ef.bind('w', cid, 's', sent_key, lr=0.03)
-                # Sentence also binds its words
                 ef.bind('s', sent_key, 'w', ids[0], lr=0.01)
 
+            # ---- 2c. sent → para (P2.3) ----
+            para_key = getattr(gen, '_current_para_key', None)
+            if para_key is not None:
+                pkey = ef.key_para(para_key)
+                pv = ef.get(pkey)
+                if pv is None:
+                    pv = ef.ensure(pkey)
+                ef.bind('s', sent_key, 'p', para_key, lr=0.02)
+                ef.bind('p', para_key, 's', sent_key, lr=0.01)
+
+            # P2.6: cache sent_vec built from concept vectors (768D) for morpheme harmonisation
+            sv_768 = cs.fractal.hdc_ngram_repr([cs.concept_vectors.get(c) for c in ids if cs.concept_vectors.get(c) is not None])
+            if sv_768 is not None:
+                sent_vec_cache[sent_key] = sv_768
+
         # ── 3. Morpheme harmonisation ──
-        # Build a 768D sent_vec from concept vectors (Harmonizer operates in 768D space)
         dirty_words = list(harm.word_dirty)
         for cid in dirty_words:
             v = cs.concept_vectors.get(cid)
@@ -312,20 +322,24 @@ class STDPTrainer:
                 sv = None
                 for ids in all_ids:
                     if cid in ids:
-                        codes = []
-                        for c in ids:
-                            cv = cs.concept_vectors.get(c)
-                            if cv is not None:
-                                codes.append(cv)
-                        if len(codes) >= 2:
-                            sv = cs.fractal.hdc_ngram_repr(codes)
+                        sent_key = hash(tuple(ids))
+                        sv = sent_vec_cache.get(sent_key)
                         break
                 new_v, delta = harm.harmonize(cid, v, sent_vec=sv)
                 if new_v is not None:
                     cs._apply_vector_update(cid, new_v)
                     ef.sync_word(cid, new_v)
+                    updated_cids.append(cid)
 
-        # ── 4. Cleanup ──
+        # ── 4. Batched GPU sync for harmonize updates (P1.13) ──
+        if gen._use_torch and gen._vecs_t is not None and updated_cids:
+            harmonize_cids = [c for c in dirty_words if c in updated_cids]
+            if harmonize_cids:
+                batch_v = np.stack([cs.concept_vectors[cid] for cid in harmonize_cids])
+                batch_t = torch.from_numpy(batch_v).to(device=gen._vecs_t.device, dtype=gen._vecs_t.dtype, non_blocking=True)
+                gen._vecs_t[torch.tensor(harmonize_cids, device=gen._vecs_t.device)] = batch_t
+
+        # ── 5. Cleanup ──
         if gen._dirty_cids:
             gen._dirty_cids.difference_update(harm.word_dirty)
         harm.clear_dirty()

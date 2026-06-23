@@ -95,9 +95,10 @@ class FractalField:
     """
 
     def __init__(self, dim=768, latent_dim=2048, l_c=None, l_a=None, l_m=None, l1_lambda=0.001,
-                 n_field_bits=512, field_lr=0.01):
+                 n_field_bits=512, field_lr=0.01, max_latent_dim=None):
         self.dim = dim
         self.latent_dim = latent_dim
+        self.max_latent_dim = max_latent_dim or latent_dim * 4
         self.l1_lambda = l1_lambda
         if l_c is not None and l_a is not None and l_m is not None:
             self.l_c, self.l_a, self.l_m = l_c, l_a, l_m
@@ -345,15 +346,13 @@ class FractalField:
     # ── Dynamic capacity ─────────────────────────────────────
 
     def grow_capacity(self, new_latent_dim=None):
-        """Grow latent_dim by adding orthogonal basis vectors.
-
-        Preserves existing subspace structure. Extends all codes with zeros
-        in new dimensions (STDP will populate them).
-        """
         old_dim = self.latent_dim
+        if old_dim >= self.max_latent_dim:
+            return old_dim
         if new_latent_dim is None:
             new_latent_dim = int(old_dim * self._growth_factor)
-        new_latent_dim = max(new_latent_dim, old_dim + 8)  # at least 8 new dims
+        new_latent_dim = min(new_latent_dim, self.max_latent_dim)
+        new_latent_dim = max(new_latent_dim, old_dim + 8)
         # Ensure new dim respects subspace alignment
         new_latent_dim = ((new_latent_dim + 7) // 8) * 8
 
@@ -774,18 +773,24 @@ class FractalField:
                 kw['fb_arr'] = fb_arr
             np.savez_compressed(tmp_path, **kw)
             os.replace(tmp_path, binary_path)
-            return {
+            result = {
                 'dim': self.dim,
                 'latent_dim': self.latent_dim,
                 'binary_codes': os.path.basename(binary_path),
                 'n_codes': len(cids),
             }
-        return {
+            if self.l1_lambda_per_cid:
+                result['l1_lambda_per_cid'] = {str(cid): float(v) for cid, v in self.l1_lambda_per_cid.items()}
+            return result
+        result = {
             'dim': self.dim,
             'latent_dim': self.latent_dim,
             'basis': self.basis.tolist(),
             'codes': {str(cid): c.tolist() for cid, c in self.codes.items()},
         }
+        if self.l1_lambda_per_cid:
+            result['l1_lambda_per_cid'] = {str(cid): float(v) for cid, v in self.l1_lambda_per_cid.items()}
+        return result
 
     @classmethod
     def from_dict(cls, data, base_dir=None):
@@ -831,6 +836,9 @@ class FractalField:
                 field.codes[cid] = new_codes[i]
             field.basis = Q.astype(np.float32)
 
+        raw_l1 = data.get('l1_lambda_per_cid')
+        if raw_l1:
+            field.l1_lambda_per_cid = {int(cid): float(v) for cid, v in raw_l1.items()}
         field._matrix_dirty = True
         return field
 
@@ -874,6 +882,10 @@ class EntityField:
 
         # Random projection: 768D → dim, for syncing word_store vectors
         self._proj = None  # lazy init
+
+        # LRU cache for char↔word bindings — prevents O(corpus_bytes) on repeated chars
+        self._char_word_cache = {}
+        self._char_word_cache_evict = []
 
     # ── Key helpers ──────────────────────────────────────────
     @staticmethod
@@ -925,6 +937,10 @@ class EntityField:
     def set(self, key, v):
         self.entities[key] = v
 
+    def clear_bind_cache(self):
+        self._char_word_cache.clear()
+        self._char_word_cache_evict.clear()
+
     def sync_word(self, cid, vec=None):
         """Sync word vector from concept_vectors into entity field."""
         if vec is None and self.word_store is not None:
@@ -934,16 +950,20 @@ class EntityField:
 
     # ── Bind / Query ─────────────────────────────────────────
     def bind(self, etype, eid, ctx_type, ctx_id, lr=0.1):
-        """V(entity) += bind(V(context), role) * lr → normalise.
-
-        etype/ctx_type are single-char: 'c' (char), 'm' (morph), 'w' (word),
-        's' (sent), 'p' (para). Mapped via ETYPE_TO_ROLE to role vectors.
-        """
         key = (etype, eid)
         ctx_key = (ctx_type, ctx_id)
         role = self.ETYPE_TO_ROLE.get(etype)
         if role is None:
             return
+        # LRU skip: if this exact (entity, context) pair was bound recently, skip
+        cache_tag = (key, ctx_key)
+        if cache_tag in self._char_word_cache:
+            return
+        if len(self._char_word_cache) > 50000:
+            evict = self._char_word_cache_evict.pop(0) if self._char_word_cache_evict else next(iter(self._char_word_cache))
+            self._char_word_cache.pop(evict, None)
+        self._char_word_cache[cache_tag] = True
+        self._char_word_cache_evict.append(cache_tag)
         v_ctx = self.get(ctx_key)
         if v_ctx is None:
             v_ctx = self.ensure(ctx_key)
@@ -1685,15 +1705,6 @@ class ConceptSpace:
         self.fractal.update_learned_fields(batches_seen=batches_seen)
 
     def fluctuate_fractal(self, fluctuation_amp=0.003, decay=0.9995, repel_strength=0.0, generator=None, current_cos=None):
-        """Autonomous drift + optional centroid repulsion.
-
-        Args:
-            generator: Optional CrystalGenerator instance whose GPU tensors
-                       to invalidate after the drift.
-            current_cos: Optional float — mean cosine similarity. Used to
-                         modulate drift: high cos → reduce amp (prevent collapse),
-                         low cos (<0.05) → reduce amp (too sparse).
-        """
         if current_cos is not None and current_cos > 0:
             if current_cos > 0.25:
                 cos_factor = 1.0 - (current_cos - 0.25) / 0.15
@@ -1703,6 +1714,8 @@ class ConceptSpace:
                 cos_factor = current_cos / 0.05
                 fluctuation_amp *= max(cos_factor, 0.3)
         self.fractal.fluctuate(fluctuation_amp=fluctuation_amp, decay=decay)
+        self.fractal.hdc_memory.clear()
+        self.fractal.hdc_memory_counts.clear()
         self._sync_from_fractal()
         if generator is not None:
             generator._sync_after_fluctuate()

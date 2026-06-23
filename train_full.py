@@ -75,10 +75,14 @@ V = sp.vocab_size()
 # ── Helpers ─────────────────────────────────────────────────────
 
 def load_checkpoint_state():
+    global RESUME_CLUSTER_POTENTIAL
     if os.path.exists(CFG.ckpt_state_path):
         try:
             with open(CFG.ckpt_state_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            cp = data.get('cluster_potential')
+            if cp is not None:
+                RESUME_CLUSTER_POTENTIAL = cp
             return data.get('line'), data.get('epoch', 1), data.get('global_step', 0)
         except (json.JSONDecodeError, Exception) as e:
             print(f"[WARN] Corrupted checkpoint state ({e}), starting fresh",
@@ -99,6 +103,7 @@ parser.add_argument('--learned-fields', action='store_true', help='use learnable
 parser.add_argument('--field-bits', type=int, default=512, help='number of learned field bits (default: 512)')
 parser.add_argument('--no-harmonize', action='store_true', help='disable morphological harmonizer (fallback to STDP-only)')
 parser.add_argument('--no-morpheme-field', action='store_true', help='disable morpheme field (GPU < 2GB fallback)')
+parser.add_argument('--no-hebbian-field', action='store_true', help='disable Hebbian entity field (VSA field bindings off)')
 args = parser.parse_args()
 
 RESUME = args.resume
@@ -109,6 +114,8 @@ USE_LEARNED_FIELDS = args.learned_fields
 N_FIELD_BITS = args.field_bits
 NO_HARMONIZE = args.no_harmonize
 NO_MORPHEME_FIELD = args.no_morpheme_field
+NO_HEBBIAN_FIELD = args.no_hebbian_field
+RESUME_CLUSTER_POTENTIAL = None
 
 print(f"vocab_size = {V}")
 
@@ -190,6 +197,9 @@ if RESUME is not None:
         cs.harmonizer.word_morphs.clear()
         cs.harmonizer.morphemes.clear()
         print("  Morpheme field disabled (--no-morpheme-field)")
+    if NO_HEBBIAN_FIELD and hasattr(cs, 'entity_field'):
+        del cs.entity_field
+        print("  Hebbian field disabled (--no-hebbian-field)")
 
     if not any(lattice.ngrams.values()):
         print("  Rebuilding lattice n-grams from corpus...")
@@ -227,6 +237,9 @@ else:
         print(f"FATAL: init_concepts failed: {e}", file=sys.stderr)
         sys.exit(1)
     cs.init_homeostasis()
+    if NO_HEBBIAN_FIELD and hasattr(cs, 'entity_field'):
+        del cs.entity_field
+        print("  Hebbian field disabled (--no-hebbian-field)")
 
     mv = _load_morph(CFG.morph_vocab_path, CFG.bpe_model_path)
     path_overrides = mv.get_path_overrides()
@@ -463,6 +476,9 @@ class TrainingPipeline:
             'line': idx, 'epoch': epoch,
             'global_step': global_step, 'timestamp': time.time(),
         }
+        # P2.2: persist cluster potential for minesweeper
+        if hasattr(gen, '_cluster_potential') and gen._cluster_potential is not None:
+            ckpt_state['cluster_potential'] = gen._cluster_potential.tolist()
         self.ckpt_mgr.save(ckpt_name, cs, lattice, opt, ckpt_state=ckpt_state)
         n_upd = cs._update_count
         avg_delta = (cs._total_shift / max(n_upd, 1)) * 1e3
@@ -520,9 +536,12 @@ class TrainingPipeline:
 
             # Phase 6.3: EntityField + morph_drift
             if hasattr(cs, 'entity_field'):
-                n_ef = len(cs.entity_field.entities)
-                char_count = sum(1 for k in cs.entity_field.entities if k[0] == 'c')
-                sent_count = sum(1 for k in cs.entity_field.entities if k[0] == 's')
+                ef = cs.entity_field
+                # P2.4: decay entity vectors to prevent unbounded growth
+                ef.decay(factor=0.999)
+                n_ef = len(ef.entities)
+                char_count = sum(1 for k in ef.entities if k[0] == 'c')
+                sent_count = sum(1 for k in ef.entities if k[0] == 's')
                 print(f"  EntityField: {n_ef} entities ({char_count} chars, {sent_count} sents)")
 
             if harm_n_ckpt > 0:
@@ -640,6 +659,10 @@ COS_REFRESH = 5.0   # seconds between cos/pair recomputation
 print("STDP training...")
 gen = CrystalGenerator(cs, sp, lattice, qwen_knowledge=None)
 gen.train_lr = opt.p['full_lr'].current
+if RESUME_CLUSTER_POTENTIAL is not None:
+    import torch
+    dev = gen._torch_device if gen._torch_device is not None else torch.device('cpu')
+    gen._cluster_potential = torch.tensor(RESUME_CLUSTER_POTENTIAL, device=dev, dtype=torch.float32)
 t_start = time.time()
 
 total_lines = len(train_lines)

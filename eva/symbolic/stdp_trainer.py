@@ -336,19 +336,22 @@ class STDPTrainer:
 
         # ── 3b. P1.2: EntityField → STDP feedback ──
         if morph_cids:
+            proj = getattr(ef, '_proj', None)
             for cid in morph_cids:
                 wkey = ef.key_word(cid)
                 v_word = ef.get(wkey)
                 if v_word is not None:
                     char_query = ef.query('w', cid)
-                    if char_query is not None:
-                        cq_norm = np.linalg.norm(char_query)
-                        if cq_norm > 1e-10:
-                            char_query /= cq_norm
+                    if char_query is not None and proj is not None:
+                        # Project 2048D query → 768D concept space
+                        char_query_768 = proj.T @ char_query
+                        cqn = np.linalg.norm(char_query_768)
+                        if cqn > 1e-10:
+                            char_query_768 /= cqn
                             v_cs = cs.concept_vectors.get(cid)
                             if v_cs is not None:
-                                sim = float(v_cs @ char_query)
-                                pull = (char_query - sim * v_cs) * 0.005
+                                sim = float(v_cs @ char_query_768)
+                                pull = (char_query_768 - sim * v_cs) * 0.005
                                 v_new = v_cs + pull
                                 nv = np.linalg.norm(v_new)
                                 if nv > 1e-10:

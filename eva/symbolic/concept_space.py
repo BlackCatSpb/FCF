@@ -1685,8 +1685,9 @@ class ConceptSpace:
 
     def _load_morph_vocab(self):
         """Load or import MorphVocab for morpheme decomposition."""
-        if self._morph_vocab is not None:
-            return self._morph_vocab
+        cached = getattr(self, '_morph_vocab', None)
+        if cached is not None:
+            return cached
         try:
             base = os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__))))
@@ -1764,7 +1765,7 @@ class ConceptSpace:
         if len(rest) < 2:
             confidence *= 0.5
 
-        threshold = self._morph_conf_threshold
+        threshold = getattr(self, '_morph_conf_threshold', 0.8)
         if len(word) <= 4:
             threshold = 0.4  # lower bar for short words
         if confidence < threshold:

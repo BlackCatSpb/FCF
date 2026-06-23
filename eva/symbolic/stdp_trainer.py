@@ -302,16 +302,21 @@ class STDPTrainer:
                 ef.bind('s', sent_key, 'w', ids[0], lr=0.01)
 
         # ── 3. Morpheme harmonisation ──
+        # Build a 768D sent_vec from concept vectors (Harmonizer operates in 768D space)
         dirty_words = list(harm.word_dirty)
         for cid in dirty_words:
             v = cs.concept_vectors.get(cid)
             if v is not None:
-                # Top-down: use sent_vec from entity_field if available
                 sv = None
                 for ids in all_ids:
                     if cid in ids:
-                        sk = ef.key_sent(hash(tuple(ids)))
-                        sv = ef.get(sk)
+                        codes = []
+                        for c in ids:
+                            cv = cs.concept_vectors.get(c)
+                            if cv is not None:
+                                codes.append(cv)
+                        if len(codes) >= 2:
+                            sv = cs.fractal.hdc_ngram_repr(codes)
                         break
                 new_v, delta = harm.harmonize(cid, v, sent_vec=sv)
                 if new_v is not None:

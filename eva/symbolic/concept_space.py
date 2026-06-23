@@ -870,6 +870,9 @@ class EntityField:
         Q, _ = np.linalg.qr(mat.T, mode='reduced')
         self.role_vecs = {role: Q[:, i].copy() for i, role in enumerate(self.LEVEL_ROLES)}
 
+        # Random projection: 768D → dim, for syncing word_store vectors
+        self._proj = None  # lazy init
+
     # ── Key helpers ──────────────────────────────────────────
     @staticmethod
     def key_char(cp):    return ('c', cp)
@@ -881,6 +884,17 @@ class EntityField:
     def key_sent(h):     return ('s', h)
     @staticmethod
     def key_para(h):     return ('p', h)
+
+    # ── Dimension bridge ─────────────────────────────────────
+    def _to_dim(self, v):
+        """Project vector v to self.dim if needed (Johnson-Lindenstrauss style)."""
+        if len(v) == self.dim:
+            return v
+        if self._proj is None or self._proj.shape[1] != len(v):
+            rng_p = np.random.RandomState(7)
+            scale = 1.0 / np.sqrt(len(v))
+            self._proj = rng_p.randn(self.dim, len(v)).astype(np.float32) * scale
+        return self._proj @ v
 
     # ── VSA primitives ───────────────────────────────────────
     def _bind(self, a, b):
@@ -903,7 +917,7 @@ class EntityField:
         if key not in self.entities and key[0] == 'w' and self.word_store is not None:
             v = self.word_store.get(key[1])
             if v is not None:
-                self.entities[key] = v.copy().astype(np.float32)
+                self.entities[key] = self._to_dim(v.copy().astype(np.float32))
         return self.entities.get(key)
 
     def set(self, key, v):
@@ -914,7 +928,7 @@ class EntityField:
         if vec is None and self.word_store is not None:
             vec = self.word_store.get(cid)
         if vec is not None:
-            self.entities[('w', cid)] = vec.copy().astype(np.float32)
+            self.entities[('w', cid)] = self._to_dim(vec.copy().astype(np.float32))
 
     # ── Bind / Query ─────────────────────────────────────────
     def bind(self, etype, eid, ctx_type, ctx_id, lr=0.1):
@@ -1378,7 +1392,7 @@ class ConceptSpace:
         self._after_update_hook = None
 
         # ── Morphological harmonizer (levels 1-2: morpheme ↔ word) ──
-        self.harmonizer = Harmonizer(dim=latent_dim)
+        self.harmonizer = Harmonizer(dim=dim)
         self._morph_conf_threshold = 0.8
         self._morph_vocab = None  # loaded on demand
         self._harm_n_checkpoints = 0
@@ -1704,7 +1718,7 @@ class ConceptSpace:
             if morph_id in ids_done:
                 continue
             ids_done.add(morph_id)
-            v = rng.randn(self.fractal.latent_dim).astype(np.float32)
+            v = rng.randn(self.dim).astype(np.float32)
             v /= max(np.linalg.norm(v), 1e-10)
             self.harmonizer.set_morpheme_vec(morph_id, v)
             n_morph += 1
@@ -2249,7 +2263,7 @@ class ConceptSpace:
             obj.harmonizer = Harmonizer.from_dict(harm_data)
             print(f"  Restored Harmonizer: {len(obj.harmonizer.morphemes)} morphemes, {len(obj.harmonizer.word_morphs)} words")
         else:
-            obj.harmonizer = Harmonizer(dim=obj.fractal.latent_dim)
+            obj.harmonizer = Harmonizer(dim=obj.dim)
 
         # ── Restore EntityField ────────────────────────────────
         binary_path = path.replace('.json', '.codes.npz')

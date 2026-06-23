@@ -54,6 +54,31 @@ def _hybrid_unbind(c, b, alpha=0.7, eps=1e-8):
     combined = alpha * hrr + (1 - alpha) * ew
     nrm = np.linalg.norm(combined)
     return combined / (nrm + eps) if nrm > 0 else combined
+
+def _bind_weighted_zeckendorf(vec, weight, max_val=7):
+    """Структурированное взвешивание через Zeckendorf-разложение веса.
+    Вес w ∈ [0, max_val] раскладывается на сумму непоследовательных чисел
+    Фибоначчи, каждое применяется как bind(vec, scale(sub_vec)) и bundle.
+    """
+    from eva.symbolic.fibonacci_utils import FibonacciUtils
+    w_clamped = max(0, min(max_val, int(round(weight))))
+    tree = FibonacciUtils.zeckendorf(w_clamped)
+    if sum(tree) != w_clamped:
+        tree.append(w_clamped - sum(tree))
+    result = None
+    for part in tree:
+        scale = part / tree[0] if tree else 1.0
+        sub = vec * scale
+        sn = np.linalg.norm(sub)
+        if sn > 1e-10:
+            sub /= sn
+        bound = _hybrid_bind(vec, sub)
+        result = bound if result is None else result + bound
+    if result is None:
+        return vec.copy()
+    rn = np.linalg.norm(result)
+    return result / (rn + 1e-10) if rn > 0 else result
+
 try:
     import torch
     _HAS_TORCH = True
@@ -710,6 +735,13 @@ class FractalField:
     def hdc_permute(self, v, n=1):
         """Circular shift by n positions."""
         return np.roll(v, n)
+
+    def hdc_fib_permute(self, v, t, dim=None):
+        """Circular shift by Fibonacci(t) positions (позиционное кодирование Фибоначчи)."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        d = dim or len(v)
+        shift = FibonacciUtils.fib_position_shift(t, d)
+        return np.roll(v, shift)
 
     def hdc_bundle(self, v, accum, lr=0.1):
         """Bundle v into accumulator (adaptive running average)."""
@@ -1408,7 +1440,9 @@ class Harmonizer:
             return actual, total_delta
         return None, 0.0
 
-
+    def balance_subspaces(self, z_c, z_a, z_m):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        return FibonacciUtils.balance_subspaces(z_c, z_a, z_m)
 
     def to_dict(self):
         """Serialize harmonizer state for npz/json persistence."""

@@ -472,7 +472,7 @@ class TrainingPipeline:
         if n_code_out > 0 or vec_max_dev > self.cfg.vec_dev_warn:
             print(f"  CODE_DRIFT n_out={n_code_out} max|code|={max_code_abs:.1f} vec_dev={vec_max_dev:.6f}")
         # Semantic bootstrap: use lattice PPMI connections to pull related tokens together
-        boot_n = self._semantic_bootstrap(cs, lattice, base_lr=self.cfg.bootstrap_lr)
+        boot_n = self.gen._trainer._semantic_bootstrap(cs, lattice, base_lr=self.cfg.bootstrap_lr)
         if boot_n > 0:
             print(f"  Semantic bootstrap: {boot_n} tokens updated")
 

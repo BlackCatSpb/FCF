@@ -92,13 +92,46 @@ def _hybrid_bind_masked(a, b, mask, threshold=0.5, alpha=0.7, eps=1e-8):
     return result / (nrm + eps) if nrm > 0 else result
 
 
-def _fractal_convolution(vec, kernel_sizes=(3, 5, 7), mode='reflect'):
-    """Multi-scale smoothing via 1D convolution, bundle результатов."""
+def _make_kernel(ksize, kernel_type='uniform', sigma=1.0, freq=0.1):
+    """Создать 1D свёрточное ядро на ℤ_{ksize}.
+
+    Types:
+      uniform    — box filter (все веса равны)
+      gaussian   — exp(-0.5*(x/sigma)²)
+      laplacian  — вторая производная гауссиана (zero-crossing)
+      gabor      — gaussian × cos(2π·freq·x)
+      dog        — Difference of Gaussians (σ₁ < σ₂)
+    """
+    x = np.arange(ksize) - ksize // 2
+    if kernel_type == 'uniform':
+        k = np.ones(ksize)
+    elif kernel_type == 'gaussian':
+        k = np.exp(-0.5 * (x / sigma) ** 2)
+    elif kernel_type == 'laplacian':
+        g = np.exp(-0.5 * (x / sigma) ** 2)
+        lap = (x ** 2 / sigma ** 4 - 1 / sigma ** 2) * g
+        k = lap - lap.mean()
+    elif kernel_type == 'gabor':
+        gauss = np.exp(-0.5 * (x / sigma) ** 2)
+        k = gauss * np.cos(2 * np.pi * freq * x)
+    elif kernel_type == 'dog':
+        g1 = np.exp(-0.5 * (x / (sigma * 0.6)) ** 2)
+        g2 = np.exp(-0.5 * (x / (sigma * 1.6)) ** 2)
+        k = g1 - g2
+    else:
+        raise ValueError(f"Unknown kernel_type: {kernel_type}")
+    kn = np.linalg.norm(k)
+    return k / (kn + 1e-10) if kn > 0 else k
+
+
+def _fractal_convolution(vec, kernel_sizes=(3, 5, 7), mode='reflect',
+                         kernel_type='uniform', sigma=1.0):
+    """Multi-scale convolution с выбором типа ядра, bundle результатов."""
     from scipy.ndimage import convolve1d
     result = None
     for ksize in kernel_sizes:
-        kernel = np.ones(ksize) / ksize
-        smoothed = convolve1d(vec, kernel, mode=mode)
+        kernel = _make_kernel(ksize, kernel_type=kernel_type, sigma=sigma)
+        smoothed = convolve1d(vec, kernel.astype(vec.dtype), mode=mode)
         if result is None:
             result = smoothed.copy()
         else:
@@ -177,6 +210,147 @@ class ResidueEncoder:
 
     def mul(self, a, b):
         return _hybrid_bind(a, b)
+
+
+# ── VSAGrid: Z_8^d grid mapping + FFT ──────────────────────
+
+class VSAGrid:
+    """Mapping between flat ℝ^D and mixed-radix grid.
+
+    Факторизует D в произведение малых целых (radix≤8),
+    каждая ось — циклическая группа ℤ_{s_i}.
+    Позволяет делать FFT по каждой оси независимо.
+    """
+
+    @staticmethod
+    def _factorize(dim, max_radix=8):
+        """Разложить dim на множители ≤ max_radix."""
+        n = dim
+        factors = []
+        for r in range(max_radix, 1, -1):
+            while n % r == 0:
+                factors.append(r)
+                n //= r
+        if n > 1:
+            factors.append(n)
+        return tuple(sorted(factors, reverse=True)) if factors else (dim,)
+
+    def __init__(self, dim):
+        self.dim = dim
+        self.shape = self._factorize(dim)
+        self.ndim = len(self.shape)
+        self.strides = [1]
+        for s in self.shape[:-1]:
+            self.strides.append(self.strides[-1] * s)
+
+    def flat_to_grid(self, idx):
+        result = []
+        for s, st in zip(self.shape, self.strides):
+            result.append((idx // st) % s)
+        return tuple(result)
+
+    def grid_to_flat(self, coord):
+        idx = 0
+        for c, st in zip(coord, self.strides):
+            idx += c * st
+        return idx
+
+    def fft_along_axis(self, vec, axis=0):
+        """1D FFT вдоль одной оси через reshape."""
+        grid = vec.astype(np.complex128).reshape(self.shape)
+        return np.fft.fft(grid, axis=axis).ravel()
+
+    def ifft_along_axis(self, vec, axis=0):
+        """1D IFFT вдоль одной оси через reshape."""
+        grid = vec.astype(np.complex128).reshape(self.shape)
+        return np.fft.ifft(grid, axis=axis).ravel().real.astype(np.float64)
+
+    def fft_nd(self, vec):
+        """Полное многомерное FFT."""
+        grid = vec.astype(np.complex128).reshape(self.shape)
+        return np.fft.fftn(grid).ravel()
+
+    def ifft_nd(self, vec):
+        """Обратное многомерное FFT."""
+        grid = vec.astype(np.complex128).reshape(self.shape)
+        return np.fft.ifftn(grid).ravel().real.astype(np.float64)
+
+    def conv_nd(self, vec, kernel):
+        """Свёртка vec * kernel через FFT (O(N log N))."""
+        V = self.fft_nd(vec)
+        K = self.fft_nd(kernel)
+        conv = self.ifft_nd(V * K)
+        return conv.real.astype(np.float64)
+
+
+# ── VSA-CNN: иерархические свёрточные слои ─────────────────
+
+class VSAConvLayer:
+    """Один слой VSA-CNN: multi-scale convolution → bundle → nonlin.
+
+    kx_weights: list of (kernel_size, kernel_type, sigma) for parallel scales.
+    """
+
+    def __init__(self, kx_weights=None, grid=None, mode='reflect'):
+        if kx_weights is None:
+            kx_weights = [(3, 'gaussian', 1.0), (5, 'gaussian', 1.5), (7, 'gaussian', 2.0)]
+        self.kx_weights = kx_weights
+        self.grid = grid or VSAGrid(768)
+        self.mode = mode
+
+    def forward(self, vec):
+        """Multi-scale convolution → bundle."""
+        results = []
+        for ksize, ktype, sigma in self.kx_weights:
+            kernel = _make_kernel(ksize, kernel_type=ktype, sigma=sigma)
+            if self.grid.ndim == 1:
+                from scipy.ndimage import convolve1d
+                conv = convolve1d(vec, kernel.astype(vec.dtype), mode=self.mode)
+            else:
+                conv = self.grid.conv_nd(vec, np.resize(kernel, self.grid.dim))
+            results.append(conv)
+        result = results[0].copy()
+        for r in results[1:]:
+            result = result + r
+        nrm = np.linalg.norm(result)
+        return result / (nrm + 1e-10) if nrm > 0 else result
+
+
+class VSACNN:
+    """Hierarchical VSA-CNN: стек VSAConvLayer.
+
+    Каждый слой увеличивает масштаб: kernel_sizes растут.
+    """
+
+    def __init__(self, dim=768, n_layers=3):
+        self.dim = dim
+        self.grid = VSAGrid(dim)
+        self.layers = []
+        for i in range(n_layers):
+            base_ksize = 3 + 2 * i
+            kx = [
+                (base_ksize, 'gaussian', 0.5 + i * 0.5),
+                (base_ksize + 2, 'gaussian', 1.0 + i * 0.5),
+                (base_ksize + 4, 'laplacian', 1.0 + i * 0.5),
+            ]
+            self.layers.append(VSAConvLayer(kx, grid=self.grid))
+
+    def forward(self, vec):
+        """Пропустить вектор через все слои."""
+        h = vec.copy()
+        for layer in self.layers:
+            h = layer.forward(h)
+        return h
+
+    def forward_pyramid(self, vec):
+        """Вернуть пирамиду: [input, layer1_out, layer2_out, ...]."""
+        pyramid = [vec.copy()]
+        h = vec.copy()
+        for layer in self.layers:
+            h = layer.forward(h)
+            pyramid.append(h.copy())
+        return pyramid
+
 
 try:
     import torch

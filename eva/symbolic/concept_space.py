@@ -79,6 +79,105 @@ def _bind_weighted_zeckendorf(vec, weight, max_val=7):
     rn = np.linalg.norm(result)
     return result / (rn + 1e-10) if rn > 0 else result
 
+
+# ── VSA utility functions (from Фибоначчи.txt analysis) ──
+
+def _hybrid_bind_masked(a, b, mask, threshold=0.5, alpha=0.7, eps=1e-8):
+    """Селективный hybrid bind: только измерения где mask > threshold."""
+    mask_bin = (np.asarray(mask, dtype=np.float64) > threshold).astype(np.float64)
+    bound = _hybrid_bind(a, b, alpha=alpha, eps=eps)
+    result = a.copy()
+    result[mask_bin > 0] = bound[mask_bin > 0]
+    nrm = np.linalg.norm(result)
+    return result / (nrm + eps) if nrm > 0 else result
+
+
+def _fractal_convolution(vec, kernel_sizes=(3, 5, 7), mode='reflect'):
+    """Multi-scale smoothing via 1D convolution, bundle результатов."""
+    from scipy.ndimage import convolve1d
+    result = None
+    for ksize in kernel_sizes:
+        kernel = np.ones(ksize) / ksize
+        smoothed = convolve1d(vec, kernel, mode=mode)
+        if result is None:
+            result = smoothed.copy()
+        else:
+            result = result + smoothed
+    nrm = np.linalg.norm(result)
+    return result / (nrm + 1e-10) if nrm > 0 else result
+
+
+def _compute_dim_importance(vectors, labels):
+    """Взаимная информация维度→label. Возвращает importance[dim]."""
+    from sklearn.feature_selection import mutual_info_classif
+    vecs = np.asarray(vectors, dtype=np.float64)
+    labs = np.asarray(labels, dtype=np.int64)
+    if vecs.ndim != 2 or len(vecs) < 2:
+        return np.ones(vecs.shape[-1] if vecs.ndim == 2 else 768)
+    return mutual_info_classif(vecs, labs, random_state=42)
+
+
+def _analogy(a, b, c, eps=1e-8):
+    """a:b :: c:d = bundle(b ⊘ a, c). Где ⊘ = element-wise division (unbind)."""
+    ratio = b / (np.asarray(a, dtype=np.float64) + eps)
+    rn = np.linalg.norm(ratio)
+    if rn > 1e-10:
+        ratio /= rn
+    d = _hybrid_bind(ratio, np.asarray(c, dtype=np.float64))
+    dn = np.linalg.norm(d)
+    return d / (dn + eps) if dn > 0 else d
+
+
+def _quantize_adaptive(sim, mean, std, z_score=2.0, max_val=7):
+    """z-score quantization: cosine[-1,1] → integer[0, max_val]."""
+    z = (sim - mean) / (std + 1e-8)
+    z = np.clip(z, -z_score, z_score)
+    scaled = (z + z_score) / (2 * z_score) * max_val
+    return int(round(np.clip(scaled, 0, max_val)))
+
+
+def _random_masks(dim, n_heads=3, rng=None):
+    """Случайные маски для multi-head VSA attention."""
+    if rng is None:
+        rng = np.random.RandomState(42)
+    masks = []
+    for _ in range(n_heads):
+        m = rng.randn(dim).astype(np.float64) * 0.3 + 0.5
+        masks.append(m)
+    return masks
+
+
+class ResidueEncoder:
+    """RNS-кодирование чисел через систему остаточных классов.
+    value → [value % m1, value % m2, ...] → bind(базовые_векторы).
+    """
+
+    def __init__(self, moduli, dim=768, rng=None):
+        self.moduli = list(moduli)
+        self.dim = dim
+        if rng is None:
+            rng = np.random.RandomState(42)
+        self.bases = {}
+        for m in self.moduli:
+            self.bases[m] = [rng.randn(dim).astype(np.float64) for _ in range(m)]
+            for bv in self.bases[m]:
+                bn = np.linalg.norm(bv)
+                if bn > 1e-10:
+                    bv /= bn
+
+    def encode(self, value):
+        residues = [int(value) % m for m in self.moduli]
+        result = self.bases[self.moduli[0]][residues[0]].copy()
+        for m, r in zip(self.moduli[1:], residues[1:]):
+            result = _hybrid_bind(result, self.bases[m][r])
+        return result
+
+    def add(self, a, b):
+        return a + b
+
+    def mul(self, a, b):
+        return _hybrid_bind(a, b)
+
 try:
     import torch
     _HAS_TORCH = True

@@ -79,13 +79,31 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - **--learned-fields flag** — retains octree path for backward compat
 - **Old checkpoints incompatible** (384D, 512 latent) — requires full re-training
 
+### [2026-06-23] Вечерняя сессия: групповая алгебра ℤ₈^d + VSA-CNN + Fibonacci (4 коммита)
+- **Архитектурный сдвиг:** VSA формализована как групповая алгебра ℝ[G] (G = ℤ₈^d)
+- **VSAGrid** — mixed-radix отображение flat→ℤ₈^d, FFT по каждой оси через reshape+fftn
+- **VSAConvLayer / VSACNN** — иерархия multi-scale group convolution без learned weights
+- **`_make_kernel`** — 5 типов ядер: uniform, gaussian, laplacian, gabor, dog
+- **FibonacciUtils** — числа Фибоначчи, Zeckendorf-разложение, золотое сечение
+- **`_bind_weighted_zeckendorf`** — structured weight decomposition через Fib
+- **`_hybrid_bind_masked`** — bind только где mask > threshold (selective attention)
+- **`_analogy`** — a:b :: c:d через VSA
+- **`_quantize_adaptive`** — z-score quantization в [0,7]
+- **`_compute_dim_importance`** — mutual information per dimension
+- **`ResidueEncoder`** — RNS-кодирование чисел
+- **Фикс:** P1.2 feedback — проекция EntityField query 2048→768 через `proj.T`
+- 145/145 тестов
+
 ## Relevant Files
-- `eva/symbolic/concept_space.py` — FractalField (L1, field projection, HDC ops), ConceptSpace
-- `eva/symbolic/crystal_generator.py` — _branch() with HDC fallback
-- `eva/symbolic/stdc_trainer.py` — _update_hdc_ngrams, L1 wiring
+- `eva/symbolic/concept_space.py` — FractalField, EntityField, Harmonizer, VSAGrid, VSACNN, VSA-утилиты (3200+ строк)
+- `eva/symbolic/crystal_generator.py` — _branch() with HDC fallback + RRF
+- `eva/symbolic/stdp_trainer.py` — STDP, _harmonize_batch, _ANTONYM_MAP
 - `eva/symbolic/fcf_config.py` — dim=768, latent_dim=2048
+- `eva/symbolic/fibonacci_utils.py` — FibonacciUtils (Zeckendorf, golden ratio, fib_position_shift)
+- `eva/symbolic/parameter_optimizer.py` — ParameterOptimizer + PlateauDetector
 - `eva/symbolic/qwen_knowledge.py` — three-regime get_factor
-- `train_full.py` — --learned-fields, --field-bits, epoch-level L1/field adaptation
+- `train_full.py` — --learned-fields, --field-bits, soft plateau protocol
+- `data/antonyms.json` — 22-парный антоним-словарь для P1.8
 - `eval_metrics.py` — qwen-factor distribution logging
 - `precompute_qwen_knowledge.ipynb` — LAYER_OFFSET=12 for layers 12–24
 - `real_data/qwen_knowledge.npz` — 1.53M pruned pairs (10 MB)

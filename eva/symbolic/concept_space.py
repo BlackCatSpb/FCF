@@ -1,13 +1,21 @@
-"""ConceptSpace — vector space for BPE-token concepts.
+"""ConceptSpace — vector space for BPE-token concepts (FCF).
 
-Architecture:
-  - Each BPE token is a concept with a vector on the unit sphere
-  - Vectors are computed from a fractal field: v = code @ basis
-  - Concept transitions learned via STDP from corpus (token_i → token_j)
-  - Generation = concept navigation -> token sequence -> SentencePiece decode
+VSA-операции формализованы как групповая алгебра ℝ[G] на ℤ₈^d:
+  - bind = convolution on group (FFT-HRR), hybrid α=0.7
+  - permute = сдвиг на элемент группы (циклический)
+  - bundle = суперпозиция функций на G
+  - conv_nd = многомерное FFT на mixed-radix решётке (768=8×8×6×2)
 
-The concept vocabulary is defined by a SentencePiece model trained
-on the corpus. No external knowledge bases (ConceptNet) needed.
+Ключевые компоненты:
+  - ConceptSpace — 146K BPE-концептов на 768D гиперсфере
+  - EntityField — рекурсивное семантическое поле char↔morph↔word↔sent↔para
+  - Harmonizer — морфемная гармонизация через VSA compose/decompose
+  - VSAGrid — flat ↔ ℤ₈^d отображение + FFT по каждой оси
+  - VSACNN — иерархическая VSA-свёртка (5 типов ядер)
+  - FractalField — латентные коды z ∈ ℝ^{2048} → вектор на сфере
+
+Обучение: STDP + негативная выборка + контрастивная цель + L1.
+Никаких трансформеров. Никакого обратного распространения.
 """
 
 import numpy as np

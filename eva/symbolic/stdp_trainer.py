@@ -20,8 +20,7 @@ _META_FIELD_W = 5
 _META_SLOW = 6
 _META_PREV_CID = 7
 _META_NEXT_CID = 8
-_META_QWEN = 9
-_META_ANTONYM = 10
+_META_ANTONYM = 9
 
 
 # Russian antonym dictionary (copied from eva_ai contradiction_miner)
@@ -467,7 +466,7 @@ class STDPTrainer:
                                 if any(ant in ti for ant in _ANTONYM_MAP[tj]):
                                     antonym_flag = 1.0
 
-                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 0.0, ids[i], ids[j], qwen_factor, antonym_flag))
+                    gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 0.0, ids[i], ids[j], antonym_flag))
                     gpu_cid_ctx.append(ids[i])
                     gpu_cid_gen.append(ids[j])
                     # SN-25: Add slow STDP pair to GPU lists (matches CPU slow_lr > 1e-6 gate)
@@ -477,7 +476,7 @@ class STDPTrainer:
                         gpu_ctx_l.append(ci)
                         gpu_tgt_l.append(cj)
                         # Slow STDP also inherits antonym flag
-                        gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 1.0, ids[i], ids[j], qwen_factor, antonym_flag))
+                        gpu_meta_l.append((i, j, pmi_w, dist_weight, freq_weight, field_weight, 1.0, ids[i], ids[j], antonym_flag))
                         gpu_cid_ctx.append(ids[i])
                         gpu_cid_gen.append(ids[j])
 
@@ -697,8 +696,6 @@ class STDPTrainer:
         dw_t = torch.exp(-dist / 2.0)
 
         lr = torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w_t
-        if meta_t.shape[1] > _META_QWEN:
-            lr *= meta_t[:, _META_QWEN]
         lr *= (0.5 + gen.hormones.acetylcholine * 0.5) * (0.5 + gen.hormones.dopamine * 0.5)
         # Minesweeper: cluster-potential modulation per target CID
         if gen._cluster_potential is not None and gen._cluster_map is not None:
@@ -977,8 +974,6 @@ class STDPTrainer:
         else:
             device_t = torch.tensor(gpu_meta_l, dtype=torch.float32, device=device)
             pair_elr = torch.clamp(device_t[:, _META_FW], min=0.05) * device_t[:, _META_DW] * device_t[:, _META_PMI] * device_t[:, _META_FIELD_W]
-            if device_t.shape[1] > _META_QWEN:
-                pair_elr *= device_t[:, _META_QWEN]
             elr_per_gen = torch.zeros(len(unique_gen), device=device)
             elr_per_gen.scatter_add_(0, inv_t, pair_elr)
             cnt_per_gen = torch.zeros(len(unique_gen), device=device)

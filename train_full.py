@@ -479,14 +479,15 @@ class TrainingPipeline:
         # ── Phase 3.2/3.3: Harmonizer full pass + slow-start ──
         if hasattr(cs, 'harmonizer') and cs.harmonizer.word_morphs:
             harm = cs.harmonizer
-            # Slow-start: scale harm_lr for first N checkpoints
             harm_n_ckpt = getattr(cs, '_harm_n_checkpoints', 0)
-            effective_harm_lr = harm.harm_lr
             slow_start_epochs = getattr(cs, '_harm_slow_start_epochs', 5)
             if harm_n_ckpt < slow_start_epochs:
-                scale = 0.1 + 0.9 * (harm_n_ckpt / slow_start_epochs)
-                effective_harm_lr = harm.harm_lr * scale
-                harm.harm_lr = effective_harm_lr
+                scale = 0.1 + 0.9 * (harm_n_ckpt / max(slow_start_epochs - 1, 1))
+            else:
+                scale = 1.0
+            effective_harm_lr = harm.harm_lr * scale
+            saved_lr = harm.harm_lr
+            harm.harm_lr = effective_harm_lr
             cs._harm_n_checkpoints = harm_n_ckpt + 1
 
             # Phase 5.5: Save preharm checkpoint before first harmonize pass
@@ -515,6 +516,7 @@ class TrainingPipeline:
                       f"(avg δ={avg_d:.5f}, lr={effective_harm_lr:.4f})")
                 # Phase 6.3: harmonisation convergence metric
                 cs._harm_convergence = n_ok / max(1, len(harm.word_morphs))
+            harm.harm_lr = saved_lr
 
             # Phase 6.3: EntityField + morph_drift
             if hasattr(cs, 'entity_field'):
@@ -591,7 +593,6 @@ class TrainingPipeline:
                 epoch_train = _rescore_lines(epoch_train[idx + 1:], gen)
                 idx = 0; start_line = 0
                 self.last_fluct_lines = 0
-                last_fluct_lines = 0  # TN-42: sync global rescore
         if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
             print(f"  Early stopping: patience={self.patience_counter}/{self.patience}, "
                   f"stuck={opt._full_stuck_counter}")
@@ -652,8 +653,6 @@ vppl_history = []
 last_stat_time = 0.0
 last_cos_time = 0.0
 last_cos_sim = (0.0, 0.0)
-last_fluct_lines = 0
-
 global_step = resume_global_step if RESUME is not None else 0
 last_decay_pairs = 0
 total_pairs_since_last_decay = 0
@@ -830,7 +829,7 @@ try:
 
             if len(batch_buffer) < BATCH_SIZE and idx < start_line + len(epoch_train) - 1:
                 # Check if periodic tasks are due — if so, flush early
-                is_fluct_due = (idx + 1 - last_fluct_lines) >= FLUCTUATE_EVERY
+                is_fluct_due = (idx + 1 - pipeline.last_fluct_lines) >= FLUCTUATE_EVERY
                 is_decay_due = total_pairs_since_last_decay >= CFG.decay_every_pairs
                 if not is_fluct_due and not is_decay_due:
                     continue
@@ -876,13 +875,13 @@ try:
             _decay_target = opt.p['decay_rate'].current
             _decay_warmup = 0.998 + (_decay_target - 0.998) * _decay_pct
 
-            if idx > 0 and idx - last_fluct_lines >= FLUCTUATE_EVERY:
+            if idx > 0 and idx - pipeline.last_fluct_lines >= FLUCTUATE_EVERY:
                 cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
                                      decay=_decay_warmup,
                                      repel_strength=opt.p['repel_strength'].current,
                                      generator=gen,
                                      current_cos=last_cos_sim[0] if last_cos_sim else None)
-                last_fluct_lines = idx
+                pipeline.last_fluct_lines = idx
 
             if idx > 0 and total_pairs_since_last_decay >= CFG.decay_every_pairs:
                 lattice.decay_all(rare_concept_protect=True, rare_threshold=3)
@@ -925,18 +924,20 @@ try:
                 if result is not None:
                     idx, start_line, epoch_train = result
                 gen.train_lr = pipeline.opt.p['full_lr'].current
-                if pipeline.opt._full_stuck_counter >= 5 and last_fluct_lines != idx:
+                if pipeline.opt._full_stuck_counter >= 5 and pipeline.last_fluct_lines != idx:
                     print(f"  FULL_STUCK — forcing fluctuate")
                     cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
                                          decay=_decay_warmup,
                                          repel_strength=opt.p['repel_strength'].current,
                                          generator=gen,
                                          current_cos=last_cos_sim[0] if last_cos_sim else None)
-                    last_fluct_lines = idx
+                    pipeline.last_fluct_lines = idx
                 # TN-13/46: plateau-adaptive batch size via multiplier
                 if pipeline.opt._full_stuck_counter >= 3:
                     _batch_mult = min(_batch_mult * 2, 4.0)
                     BATCH_SIZE = int(bs_curve(idx) * _batch_mult)
+                elif _batch_mult > 1.0:
+                    _batch_mult = max(1.0, _batch_mult * 0.95)  # decay back to 1x
                 print()
             idx += 1
 

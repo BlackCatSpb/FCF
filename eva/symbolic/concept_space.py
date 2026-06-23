@@ -333,7 +333,7 @@ class FractalField:
                 new_lambda = current_lambda * (1.0 + 0.1 * lr_scale)
                 self.l1_lambda_per_cid[cid] = min(new_lambda, 0.1)  # cap
                 n_adjusted += 1
-            elif mean_density < self.l1_target_density * 0.3 and current_lambda > 1e-6:
+            elif mean_density < self.l1_target_density * 0.5 and current_lambda > 1e-6:
                 # Too sparse — relax sparsity pressure
                 new_lambda = current_lambda * (1.0 - 0.1 * lr_scale)
                 self.l1_lambda_per_cid[cid] = max(new_lambda, 1e-6)
@@ -406,6 +406,7 @@ class FractalField:
         self._matrix_dirty = True
         self._capacity_growths += 1
         self._fb_dirty = True
+        self._rebuild_sector_index()
         print(f"  Grown capacity: {old_dim} -> {new_latent_dim} "
               f"(l_c={self.l_c} l_a={self.l_a} l_m={self.l_m})")
         return new_latent_dim
@@ -452,6 +453,7 @@ class FractalField:
 
         self._matrix_dirty = True
         self._fb_dirty = True
+        self._rebuild_sector_index()
         print(f"  Pruned capacity: {old_dim}→{new_latent_dim} "
               f"(removed {len(dead)} dead dimensions)")
         return len(dead)
@@ -1245,64 +1247,7 @@ class Harmonizer:
             return actual, total_delta
         return None, 0.0
 
-    def harmonize_with_envelope(self, word_id, word_vec, char_indices, envelope):
-        """Refine word vector using character-level context from envelope.
 
-        For each character in the word, unbind the envelope vector with ROLE_WORD
-        to get a character-predicted word vector, then average and use as top-down
-        bias.
-
-        Args:
-            word_id: int CID
-            word_vec: current word HD vector
-            char_indices: list of unicode codepoints (ints) for the word's characters
-            envelope: dict of {codepoint: ndarray} from ConceptSpace.char_envelope
-
-        Returns:
-            (new_word_vec, delta_norm) or (None, 0)
-        """
-        if word_id not in self.word_morphs:
-            return None, 0.0
-
-        role_w = self.role_vecs.get('WORD_ROLE')
-        if role_w is None or not char_indices:
-            return None, 0.0
-
-        actual = word_vec.copy()
-        char_preds = []
-        for cp in char_indices:
-            env_v = envelope.get(cp)
-            if env_v is not None:
-                pred = self._unbind(env_v, role_w)
-                pn = float(np.linalg.norm(pred))
-                if pn > 1e-10:
-                    pred /= pn
-                    char_preds.append(pred)
-
-        if not char_preds:
-            return None, 0.0
-
-        pred_from_chars = sum(char_preds) / len(char_preds)
-        pn = float(np.linalg.norm(pred_from_chars))
-        if pn > 1e-10:
-            pred_from_chars /= pn
-
-        # Weak top-down signal from characters
-        error = pred_from_chars - actual
-        den = float(np.linalg.norm(error))
-        if den < 1e-6:
-            return None, 0.0
-
-        update = error * self.harm_lr * 0.1  # weaker than morpheme harmonise
-        un = float(np.linalg.norm(update))
-        if un > 0.3:
-            update = update / un * 0.3
-        actual += update
-        an = float(np.linalg.norm(actual))
-        if an > 1e-10:
-            actual /= an
-
-        return actual, den
 
     def to_dict(self):
         """Serialize harmonizer state for npz/json persistence."""
@@ -1658,7 +1603,10 @@ class ConceptSpace:
         if len(rest) < 2:
             confidence *= 0.5
 
-        if confidence < self._morph_conf_threshold:
+        threshold = self._morph_conf_threshold
+        if len(word) <= 4:
+            threshold = 0.4  # lower bar for short words
+        if confidence < threshold:
             return None
 
         # Try to also get lemma from natasha via morph_vocab if available

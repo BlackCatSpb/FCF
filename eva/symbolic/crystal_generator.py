@@ -32,7 +32,6 @@ _META_FIELD_W = 5
 _META_SLOW = 6
 _META_PREV_CID = 7  # GPU-only: raw prev_cid for on-GPU PMI
 _META_NEXT_CID = 8  # GPU-only: raw next_cid for on-GPU PMI
-_META_QWEN = 9
 try:
     import torch
     _HAS_TORCH = True

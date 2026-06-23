@@ -241,10 +241,12 @@ class STDPTrainer:
             cids_t = torch.tensor(all_cids, dtype=torch.long, device=gen._torch_device)
             vecs_cpu = gen._vecs_t[cids_t].cpu().numpy()
             gen._skip_gpu_sync = True
-            for cid, v_new in zip(all_cids, vecs_cpu):
-                cs._apply_vector_update(cid, v_new)
-                ef.sync_word(cid, v_new)
-            gen._skip_gpu_sync = False
+            try:
+                for cid, v_new in zip(all_cids, vecs_cpu):
+                    cs._apply_vector_update(cid, v_new)
+                    ef.sync_word(cid, v_new)
+            finally:
+                gen._skip_gpu_sync = False
         else:
             for cid in all_cids:
                 v = cs.concept_vectors.get(cid)

@@ -1556,14 +1556,19 @@ class ConceptSpace:
                                for m, r in word_morphs]
                 composed = self.harmonizer.compose_word([(r, v) for r, v in morph_parts if v is not None])
                 if composed is not None:
-                    # Mix composed vector with existing fractal code (if any)
+                    # Encode 768D harmonizer output → 2048D latent code
+                    latent_code = composed @ self.fractal.basis.T
+                    ln = float(np.linalg.norm(latent_code))
+                    if ln > 1e-10:
+                        latent_code /= ln
+                    # Mix with existing fractal code (if any)
                     existing = self.fractal.codes.get(cid)
                     if existing is not None:
-                        mix = composed * 0.7 + existing * 0.3
+                        mix = latent_code * 0.7 + existing * 0.3
                         mix /= max(np.linalg.norm(mix), 1e-10)
                         self.fractal.codes[cid] = mix
                     else:
-                        self.fractal.codes[cid] = composed
+                        self.fractal.codes[cid] = latent_code
                     v = self.fractal.compute_vector(cid)
                     if v is not None:
                         self.concept_vectors[cid] = v

@@ -24,6 +24,7 @@ import math, json, os, random
 import threading
 from typing import Dict, List, Optional
 from eva.symbolic.dimension_coordinator import DimensionCoordinator
+from eva.symbolic.adaptive_controller import AdaptiveArchitectureController, SubspaceConfig
 
 # ── FFT-HRR VSA primitives ─────────────────────────────────────
 # Circular convolution (bind) and circular correlation (unbind)
@@ -56,14 +57,19 @@ def _set_alpha_curriculum(epoch, total_epochs, decay='exp'):
     _ALPHA_TOTAL = total_epochs
     _ALPHA_DECAY = decay
 
-def _alpha_from_curriculum(alpha_max=0.9, alpha_min=0.1, decay_rate=0.5):
+def _alpha_from_curriculum(alpha_max=None, alpha_min=None, decay_rate=None):
+    from eva.symbolic.fcf_config import FormulaCoefficients
+    _fc = FormulaCoefficients()
+    alpha_max = alpha_max if alpha_max is not None else _fc.hybrid_alpha_max
+    alpha_min = alpha_min if alpha_min is not None else _fc.hybrid_alpha_min
+    decay_rate = decay_rate if decay_rate is not None else _fc.hybrid_alpha_decay_rate
     if _ALPHA_TOTAL > 0 and _ALPHA_EPOCH > 0:
         t = _ALPHA_EPOCH / _ALPHA_TOTAL
         if _ALPHA_DECAY == 'exp':
             return alpha_min + (alpha_max - alpha_min) * math.exp(-decay_rate * t)
         else:
             return alpha_max * (1 - t) + alpha_min
-    return 0.7  # default fallback
+    return _fc.hybrid_bind_alpha  # default fallback
 
 def _hybrid_bind(a, b, alpha=None, eps=1e-8):
     """Гибрид HRR ⊛ и element-wise: alpha*hrr + (1-alpha)*ew."""
@@ -230,17 +236,23 @@ class FractalField:
     """
 
     def __init__(self, dim=768, latent_dim=2048, l_c=None, l_a=None, l_m=None, l1_lambda=0.001,
-                 n_field_bits=512, field_lr=0.01, max_latent_dim=None):
+                 n_field_bits=512, field_lr=0.01, max_latent_dim=None, arch_controller=None):
         self.dim = dim
         self.latent_dim = latent_dim
         self.max_latent_dim = max_latent_dim or latent_dim * 4
         self.l1_lambda = l1_lambda
+
+        # Adaptive architecture controller
+        self.arch = arch_controller or AdaptiveArchitectureController(
+            config=SubspaceConfig(growth_factor=self.max_latent_dim / latent_dim),
+            latent_dim=latent_dim)
         if l_c is not None and l_a is not None and l_m is not None:
-            self.l_c, self.l_a, self.l_m = l_c, l_a, l_m
-        else:
-            self.l_c = latent_dim * 3 // 5      # ~60% — identity
-            self.l_a = latent_dim // 4          # 25%  — attention
-            self.l_m = latent_dim - self.l_c - self.l_a  # ~15% — meta
+            self.arch.config.l_c_ratio = l_c / latent_dim
+            self.arch.config.l_a_ratio = l_a / latent_dim
+            self.arch.config.l_m_ratio = l_m / latent_dim
+        self.l_c = self.arch.l_c
+        self.l_a = self.arch.l_a
+        self.l_m = self.arch.l_m
 
         # Fractal basis: (latent_dim, dim) with orthonormal columns
         from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
@@ -266,7 +278,7 @@ class FractalField:
 
         # Per-concept adaptive L1 lambda (dynamic dimensionality)
         self.l1_lambda_per_cid: Dict[int, float] = {}
-        self.l1_target_density = 0.08  # target 8% active in z_c
+        self.l1_target_density = self.arch.config.l1_target_density
         self.l1_density_window: Dict[int, list] = {}
 
         # Cache
@@ -276,14 +288,11 @@ class FractalField:
 
         # Dynamic capacity growth tracking
         self._capacity_growths = 0
-        self._density_threshold_grow = 0.15   # grow if mean density exceeds 15%
-        self._density_threshold_prune = 0.01  # prune if dimension sparse across all codes
-        self._growth_factor = 1.5  # multiply latent_dim by this when growing
 
         # Sector index for focal search (field-in-field)
         self._sector_W: List[np.ndarray] = []  # per-level W_proj
         self._sector_index: Dict[int, Dict[tuple, list]] = {}  # depth → {prefix → [cids]}
-        self._sector_depths: list = [4, 10, 20]  # bits at each depth level
+        self._sector_depths: list = self.arch.config.sector_depths
 
     def _apply_l1(self, code: np.ndarray, ce: float = 0.0, cid: Optional[int] = None) -> np.ndarray:
         """Soft-threshold z_c subspace: high CE → weak L1 (allows densification).
@@ -505,7 +514,7 @@ class FractalField:
             if old_dim >= self.max_latent_dim:
                 return old_dim
             if new_latent_dim is None:
-                new_latent_dim = int(old_dim * self._growth_factor)
+                new_latent_dim = int(old_dim * self.arch.config.growth_factor)
             new_latent_dim = min(new_latent_dim, self.max_latent_dim)
             new_latent_dim = max(new_latent_dim, old_dim + 8)
             # Ensure new dim respects subspace alignment
@@ -657,9 +666,9 @@ class FractalField:
         mean_density = float(np.mean(per_concept_density))
         max_density = float(np.max(per_concept_density))
 
-        if mean_density > self._density_threshold_grow:
+        if mean_density > self.arch.density_threshold_grow:
             self.grow_capacity()
-        elif mean_density < self._density_threshold_prune * 2:
+        elif mean_density < self.arch.density_threshold_prune * 2:
             n_pruned = self.prune_capacity()
             if n_pruned > 0:
                 return

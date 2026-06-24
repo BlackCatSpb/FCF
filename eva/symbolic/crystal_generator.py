@@ -41,6 +41,7 @@ except ImportError:
 
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.hormonal_system import HormonalSystem
+from eva.symbolic.fcf_config import FormulaCoefficients
 
 
 _BOS_ID = 1
@@ -631,7 +632,8 @@ class CrystalGenerator:
 
                     self.cs.update_usage(cid)
 
-                    novelty = 1.0 - min(self.lattice.concept_freq.get(cid, 0) / 50, 1.0)
+                    _f = FormulaCoefficients()
+                    novelty = 1.0 - min(self.lattice.concept_freq.get(cid, 0) / _f.novelty_freq_cap, 1.0)
                     surprise = 0.1 if is_match else 0.5
                     self.hormones.update(confidence=conf, is_match=is_match,
                         novelty=novelty, surprise=surprise,
@@ -728,7 +730,8 @@ class CrystalGenerator:
                         continue
                     # Edge weight from PPMI: high PPMI = specific connection = low weight (short path)
                     ppmi = conn_info.get('ppmi', 0.0)
-                    w = max(0.20, 1.0 - min(ppmi / 8.0, 1.0) * 0.7)
+                    _f = FormulaCoefficients()
+                    w = max(_f.edge_weight_min, 1.0 - min(ppmi / _f.edge_ppmi_cap, 1.0) * _f.edge_weight_strength)
                     dv = d[u] + w
                     if dv >= B:
                         continue
@@ -817,26 +820,27 @@ class CrystalGenerator:
             return []
 
         # 5. RRF scoring
+        _fc = FormulaCoefficients()
         combined = {}
         for cid in all_cids:
             rrf = 0.0
             if cid in graph_candidates:
-                rrf += 0.7 * graph_candidates[cid]
+                rrf += _fc.rrf_graph * graph_candidates[cid]
             if cid in syn_ranked:
-                rrf += 0.15 / (K + syn_ranked[cid])
+                rrf += _fc.rrf_syntax / (K + syn_ranked[cid])
             if cid in hdc_candidates:
-                rrf += 0.10 * hdc_candidates[cid] / (K + 1)
+                rrf += _fc.rrf_hdc * hdc_candidates[cid] / (K + 1)
             if cid in vector_sim:
-                rrf += 0.15 * vector_sim[cid] / (K + 1)
+                rrf += _fc.rrf_vector * vector_sim[cid] / (K + 1)
             freq = self.lattice.concept_freq.get(cid, 0)
-            prior = 0.02 / (K + 1) * (1.0 - min(freq / 1000, 1.0))
+            prior = _fc.rrf_prior / (K + 1) * (1.0 - min(freq / _fc.rrf_prior_freq_cap, 1.0))
             rrf += prior
             combined[cid] = rrf
 
         # 5. Homeostatic boost
         for cid in list(combined.keys()):
             h_boost = self.cs.homeostatic_boost(cid)
-            combined[cid] *= (1.0 + h_boost * 0.3)
+            combined[cid] *= (1.0 + h_boost * _fc.homeostatic_rrf_mult)
 
         # 6. Intent centroid bonus: prefer candidates near the query centroid
         if centroid is not None and np.linalg.norm(centroid) > 1e-10:

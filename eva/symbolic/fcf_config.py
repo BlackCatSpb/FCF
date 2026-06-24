@@ -291,6 +291,146 @@ class MetricPairBuilder:
 
 
 # ──────────────────────────────────────────────
+#  Формульные коэффициенты
+# ──────────────────────────────────────────────
+
+@dataclass
+class FormulaCoefficients:
+    """Все числовые константы формул — здесь, а не в алгоритмическом коде.
+
+    Алгоритмы остаются в коде (crystal_generator, stdp_trainer, ...),
+    коэффициенты читаются из этого датакласса.
+    """
+    # RRF weights (crystal_generator.py)
+    rrf_graph: float = 0.7
+    rrf_syntax: float = 0.15
+    rrf_hdc: float = 0.10
+    rrf_vector: float = 0.15
+    rrf_prior: float = 0.02
+    rrf_prior_freq_cap: float = 1000.0
+
+    # θ-decay (crystal_generator.py, stdp_trainer.py)
+    theta_tau_default: float = 12.0
+    theta_tau_slow_mult: float = 3.0
+    theta_fast_clamp: float = 5.0
+    theta_slow_clamp: float = 10.0
+    theta_fast_min: float = 0.1
+    theta_slow_min: float = 0.02
+    theta_slow_scale: float = 0.3
+    theta_temp_floor: float = 0.15
+
+    # PMI mapping (crystal_generator.py, stdp_trainer.py)
+    pmi_slope: float = 0.5       # 1/2
+    pmi_intercept: float = 0.2
+    pmi_clamp_max: float = 2.0
+    pmi_strength_default: float = 1.0
+    pmi_gate_min_default: float = 0.20
+    pmi_ce_error_scale: float = 0.75
+    pmi_ce_error_floor: float = 0.25
+
+    # Anti-repetition (crystal_generator.py)
+    antirep_decay: float = 0.3   # exp(-0.3 * count)
+
+    # Edge weight from PPMI (crystal_generator.py)
+    edge_weight_min: float = 0.20
+    edge_ppmi_cap: float = 8.0
+    edge_weight_strength: float = 0.7
+
+    # Target boost (crystal_generator.py)
+    target_boost_scale: float = 5.0
+    target_boost_temp_scale: float = 0.5
+
+    # Novelty frequency cap (crystal_generator.py)
+    novelty_freq_cap: float = 50.0
+
+    # Hybrid bind alpha (concept_space.py)
+    hybrid_bind_alpha: float = 0.7
+    hybrid_alpha_max: float = 0.9
+    hybrid_alpha_min: float = 0.1
+    hybrid_alpha_decay_rate: float = 0.5
+
+    # Homeostatic boost (concept_space.py, crystal_generator.py)
+    homeostatic_boost_clip: float = 0.3
+    homeostatic_rrf_mult: float = 0.3
+
+    # Intent centroid (crystal_generator.py)
+    intent_bonus_scale: float = 0.3
+
+    # Confidence formula (crystal_generator.py)
+    confidence_freq_scale: float = 0.5
+
+    # STDP frequency weight (stdp_trainer.py)
+    freq_weight_log_scale: float = 0.15
+    freq_weight_min: float = 0.05
+
+    # STDP field weight (stdp_trainer.py)
+    field_weight_log_scale: float = 2.0
+    field_weight_cap: float = 3.0
+    field_weight_floor: float = 0.1
+
+    # STDP hormonal modulation (stdp_trainer.py)
+    hormonal_mod_baseline: float = 0.5
+    hormonal_mod_scale: float = 0.5
+
+    # Negative sampling LR (stdp_trainer.py)
+    neg_lr_multiplier: float = 0.3
+    neg_lr_ce_scale: float = 2.0
+
+    # Contrastive LR (stdp_trainer.py)
+    contr_lr_ce_scale: float = 2.0
+
+    # Code mixing ratio (concept_space.py)
+    code_mix_latent: float = 0.7
+    code_mix_existing: float = 0.3
+
+    # Concept usage EMA (concept_space.py)
+    concept_usage_ema_alpha: float = 0.1
+
+    # Cluster potential (crystal_generator.py)
+    cluster_potential_slope: float = 0.4
+    cluster_potential_center: float = 0.5
+    cluster_potential_ema_alpha: float = 0.1
+
+    # RRF boost for homeostasis (crystal_generator.py)
+    rrf_boost_homeostasis: float = 0.3
+
+    # Intonation-based factors (hormonal_system.py references)
+    da_baseline: float = 0.5
+    ht_baseline: float = 0.5
+    na_baseline: float = 0.3
+    ach_baseline: float = 0.5
+    tonic_decay: float = 0.95
+    phasic_decay: float = 0.7
+    da_coherence_strength: float = 0.05
+    da_curiosity_strength: float = 0.4
+    da_mastery_strength: float = 0.5
+    da_boredom_penalty: float = 0.1
+    da_phasic_to_tonic: float = 0.1
+    da_floor: float = 0.1
+    ach_surprise_strength: float = 0.6
+    ach_uncertainty_strength: float = 0.5
+    ach_match_strength: float = 0.15
+    ach_novelty_scale: float = 0.5
+    ach_drift_up: float = 0.15
+    ach_drift_down: float = 0.1
+    ach_phasic_integration: float = 0.1
+    ht_baseline_part: float = 0.3
+    ht_match_scale: float = 0.4
+    ht_adapt_rate: float = 0.1
+    na_baseline_part: float = 0.2
+    na_surprise_scale: float = 0.5
+    na_confidence_scale: float = 0.3
+    na_adapt_rate: float = 0.3
+    ach_novelty_baseline: float = 0.3
+    ach_novelty_scale_tonic: float = 0.5
+    ach_well_known_floor: float = 0.2
+    ach_tonic_drift: float = 0.15
+    da_temperature_min: float = 0.05
+    da_temperature_scale: float = 0.9
+    na_beam_scale: float = 0.5
+
+
+# ──────────────────────────────────────────────
 #  Главный конфиг
 # ──────────────────────────────────────────────
 
@@ -298,6 +438,9 @@ class MetricPairBuilder:
 class FCFConfig:
     # ── Пути ─────────────────────────────────
     paths: 'EnvironmentResolver' = field(default_factory=EnvironmentResolver)
+
+    # ── Формульные коэффициенты ────────────────
+    formula: FormulaCoefficients = field(default_factory=FormulaCoefficients)
 
     @property
     def data_dir(self) -> str:

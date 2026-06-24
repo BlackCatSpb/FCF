@@ -2,6 +2,7 @@ from collections import Counter, defaultdict
 import json, os, sys, time
 import numpy as np
 from eva.symbolic.fractal_encoding import path as oct_path, digits
+from eva.symbolic.fcf_config import EnvironmentResolver
 
 try:
     from natasha import Segmenter, NewsEmbedding, NewsMorphTagger, MorphVocab as NatMorph, Doc
@@ -9,7 +10,7 @@ except ImportError:
     Segmenter = NewsEmbedding = NewsMorphTagger = NatMorph = Doc = None
 
 
-_BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # morph_vocab.py -> eva/symbolic -> eva -> FCF/
+_ENV = EnvironmentResolver()
 
 
 class MorphVocab:
@@ -27,7 +28,7 @@ class MorphVocab:
 
     def __init__(self, sp_model_path=None, vocab_size=146000):
         if sp_model_path is None:
-            sp_model_path = os.path.join(_BASE, 'real_data', 'bpe_ru_146k.model')
+            sp_model_path = _ENV.bpe_model_path
         import sentencepiece as spm
         self._sp = spm.SentencePieceProcessor(model_file=sp_model_path)
         self.vocab_size = min(vocab_size, self._sp.vocab_size())
@@ -61,9 +62,9 @@ class MorphVocab:
               sp_model_path=None):
         """Build morphological vocabulary: parse corpus, assign custom paths."""
         if corpus_path is None:
-            corpus_path = os.path.join(_BASE, 'real_data', 'full_corpus_ru.txt')
+            corpus_path = _ENV.raw_corpus_path
         if sp_model_path is None:
-            sp_model_path = os.path.join(_BASE, 'real_data', 'bpe_ru_146k.model')
+            sp_model_path = _ENV.bpe_model_path
         self = cls(sp_model_path=sp_model_path)
 
         if Segmenter is None:
@@ -193,7 +194,9 @@ class MorphVocab:
         print(f"  Saved MorphVocab to {path}")
 
     @classmethod
-    def load(cls, path, sp_model_path='real_data/bpe_ru_146k.model'):
+    def load(cls, path, sp_model_path=None):
+        if sp_model_path is None:
+            sp_model_path = _ENV.bpe_model_path
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         self = cls(sp_model_path=sp_model_path)
@@ -217,10 +220,16 @@ class MorphVocab:
         return piece.lstrip('▁'), False
 
 
-def build_morph_vocab(corpus_path='real_data/full_corpus_ru.txt',
-                      sp_model='real_data/bpe_ru_146k.model',
-                      output='real_data/morph_vocab.json'):
-    mv = MorphVocab.build(corpus_path, sp_model_path=sp_model)
+def build_morph_vocab(corpus_path=None,
+                      sp_model_path=None,
+                      output=None):
+    if corpus_path is None:
+        corpus_path = _ENV.raw_corpus_path
+    if sp_model_path is None:
+        sp_model_path = _ENV.bpe_model_path
+    if output is None:
+        output = _ENV.morph_vocab_path
+    mv = MorphVocab.build(corpus_path, sp_model_path=sp_model_path)
     mv.save(output)
     return mv
 

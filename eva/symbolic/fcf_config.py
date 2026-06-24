@@ -66,25 +66,55 @@ class MetricPair:
 
 
 # ──────────────────────────────────────────────
-#  Пути к файлам
+#  Пути к файлам — EnvironmentResolver
 # ──────────────────────────────────────────────
 
+def _auto_detect_model(data_dir: str) -> str | None:
+    """Find first *.model file in data_dir."""
+    import glob
+    models = glob.glob(os.path.join(data_dir, '*.model'))
+    return os.path.basename(models[0]) if models else None
+
+
 @dataclass
-class PathConfig:
-    """All file/directory paths for the FCF project."""
+class EnvironmentResolver:
+    """Single source of truth for all FCF file paths.
+
+    Auto-detects model name from data_dir/*.model.
+    Supports env overrides: FCF_MODEL_NAME, FCF_DATA_DIR.
+    """
     base_dir: str = field(default_factory=_auto_base_dir)
+    model_name: str | None = None
+
+    def __post_init__(self):
+        self.base_dir = os.environ.get('FCF_BASE_DIR', self.base_dir)
+        self._data_dir_override = os.environ.get('FCF_DATA_DIR', None)
+        if self.model_name is None:
+            self.model_name = os.environ.get('FCF_MODEL_NAME', None)
 
     @property
     def data_dir(self) -> str:
+        if self._data_dir_override:
+            return self._data_dir_override
         return os.path.join(self.base_dir, 'real_data')
+
+    @property
+    def bpe_model_path(self) -> str:
+        if self.model_name:
+            return os.path.join(self.data_dir, self.model_name)
+        detected = _auto_detect_model(self.data_dir)
+        if detected:
+            self.model_name = detected
+            return os.path.join(self.data_dir, detected)
+        return os.path.join(self.data_dir, 'bpe_ru_146k.model')
 
     @property
     def corpus_path(self) -> str:
         return os.path.join(self.data_dir, 'full_corpus_ru_clean.txt')
 
     @property
-    def bpe_model_path(self) -> str:
-        return os.path.join(self.data_dir, 'bpe_ru_146k.model')
+    def raw_corpus_path(self) -> str:
+        return os.path.join(self.data_dir, 'full_corpus_ru.txt')
 
     @property
     def morph_vocab_path(self) -> str:
@@ -121,6 +151,34 @@ class PathConfig:
     @property
     def qwen_knowledge_path(self) -> str:
         return os.path.join(self.data_dir, 'qwen_knowledge.npz')
+
+    @property
+    def antonym_path(self) -> str:
+        return os.path.join(self.base_dir, 'data', 'antonyms.json')
+
+    def cs_tag_path(self, tag: str) -> str:
+        return os.path.join(self.data_dir, f'concept_space_{tag}.json')
+
+    def cs_tag_codes_path(self, tag: str) -> str:
+        return os.path.join(self.data_dir, f'concept_space_{tag}.codes.npz')
+
+    def lat_tag_path(self, tag: str) -> str:
+        return os.path.join(self.data_dir, f'syntax_lattice_{tag}.json')
+
+    def lat_tag_npz_path(self, tag: str) -> str:
+        return os.path.join(self.data_dir, f'syntax_lattice_{tag}.lattice.npz')
+
+    def lat_tag_meta_path(self, tag: str) -> str:
+        return os.path.join(self.data_dir, f'syntax_lattice_{tag}.meta.json')
+
+    def cs_opt_path(self, tag: str | None = None) -> str:
+        if tag:
+            return os.path.join(self.data_dir, f'concept_space_{tag}.opt.json')
+        return os.path.join(self.data_dir, 'concept_space.opt.json')
+
+
+# Backward-compat alias
+PathConfig = EnvironmentResolver
 
 
 # ──────────────────────────────────────────────
@@ -239,7 +297,7 @@ class MetricPairBuilder:
 @dataclass
 class FCFConfig:
     # ── Пути ─────────────────────────────────
-    paths: PathConfig = field(default_factory=PathConfig)
+    paths: 'EnvironmentResolver' = field(default_factory=EnvironmentResolver)
 
     @property
     def data_dir(self) -> str:
@@ -288,6 +346,10 @@ class FCFConfig:
     @property
     def qwen_knowledge_path(self) -> str:
         return self.paths.qwen_knowledge_path
+
+    @property
+    def antonym_path(self) -> str:
+        return self.paths.antonym_path
 
     # ── Архитектура ─────────────────────────
     dim: int = 768

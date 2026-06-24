@@ -114,6 +114,7 @@ class CrystalGenerator:
         self._mom_t = None
         self._basis_t = None
         self._codes_t = None
+        self._codes_master_t = None  # fp32 master for STDP gradient precision
         self._ema_vecs_t = None  # EMA copy for stable eval/generation (TN-2)
         self._ema_decay = 0.999
         self._ema_steps = 0
@@ -293,8 +294,10 @@ class CrystalGenerator:
         for cid, code in cs.fractal.codes.items():
             codes_arr[cid] = code
         if self._codes_t is None or self._codes_t.shape[0] != V or self._codes_t.device != dev:
-            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float16)
+            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.bfloat16)
+            self._codes_master_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float32)
         self._codes_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
+        self._codes_master_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
 
         # Concept error tensor for vectorized GPU negative sampling
         ce_arr = np.zeros(V, dtype=np.float32)
@@ -343,6 +346,7 @@ class CrystalGenerator:
         Call after fluctuate_fractal() or any code-level change."""
         self._mom_t = None
         self._codes_t = None
+        self._codes_master_t = None
         self._torch_dirty = True
         self._cluster_potential = None  # stale after vector flush
 
@@ -366,12 +370,14 @@ class CrystalGenerator:
             codes_arr[cid] = code
 
         if self._codes_t is None or self._codes_t.shape[0] != V:
-            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float16)
+            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.bfloat16)
+            self._codes_master_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float32)
         self._codes_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
+        self._codes_master_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
 
         basis_t = self._basis_t
         # Recompute _vecs_t on GPU: (V, latent_dim) @ (latent_dim, D) → (V, D)
-        vecs_gpu = self._codes_t.float() @ basis_t.to(dev, non_blocking=True)
+        vecs_gpu = self._codes_master_t @ basis_t.to(dev, non_blocking=True)
         nv = vecs_gpu.norm(dim=1, keepdim=True).clamp(min=1e-10)
         vecs_gpu /= nv
         if self._vecs_t.shape[0] != V:
@@ -1016,13 +1022,14 @@ class CrystalGenerator:
 
 
 if __name__ == '__main__':
+    from eva.symbolic.fcf_config import EnvironmentResolver
+    _env = EnvironmentResolver()
     import sys; sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
     import sentencepiece as spm
     from eva.symbolic.concept_space import ConceptSpace
     from eva.symbolic.syntax_lattice import SyntaxLattice
 
-    sp = spm.SentencePieceProcessor(
-        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_146k.model'))
+    sp = spm.SentencePieceProcessor(model_file=_env.bpe_model_path)
 
     print("Initializing ConceptSpace (146K)...")
     cs = ConceptSpace(vocab_size=sp.vocab_size())

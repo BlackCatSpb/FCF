@@ -23,6 +23,7 @@ from collections import defaultdict, Counter
 import math, json, os, random
 import threading
 from typing import Dict, List, Optional
+from eva.symbolic.dimension_coordinator import DimensionCoordinator
 
 # ── FFT-HRR VSA primitives ─────────────────────────────────────
 # Circular convolution (bind) and circular correlation (unbind)
@@ -34,17 +35,40 @@ def _hrr_bind(a, b):
     """FFT-HRR bind = circular convolution a ⊛ b."""
     fa = np.fft.rfft(a)
     fb = np.fft.rfft(b)
-    return np.fft.irfft(fa * fb, n=len(a)).astype(a.dtype) / len(a)
+    return np.fft.irfft(fa * fb, n=len(a)).astype(a.dtype)
 
 def _hrr_unbind(c, b):
     """FFT-HRR unbind = circular correlation c ⋆ b."""
     fc = np.fft.rfft(c)
     fb_conj = np.conj(np.fft.rfft(b))
-    return np.fft.irfft(fc * fb_conj, n=len(c)).astype(c.dtype) / len(c)
+    return np.fft.irfft(fc * fb_conj, n=len(c)).astype(c.dtype)
 
 # ── Hybrid bind/unbind (HRR + element-wise, §5 Training Dynamics V18) ──
-def _hybrid_bind(a, b, alpha=0.7, eps=1e-8):
+
+# P1.2: α curriculum — starts HRR-heavy for invertibility, decays for expressivity
+_ALPHA_EPOCH = 0
+_ALPHA_TOTAL = 0
+_ALPHA_DECAY = 'exp'  # 'linear' or 'exp'
+
+def _set_alpha_curriculum(epoch, total_epochs, decay='exp'):
+    global _ALPHA_EPOCH, _ALPHA_TOTAL, _ALPHA_DECAY
+    _ALPHA_EPOCH = epoch
+    _ALPHA_TOTAL = total_epochs
+    _ALPHA_DECAY = decay
+
+def _alpha_from_curriculum(alpha_max=0.9, alpha_min=0.1, decay_rate=0.5):
+    if _ALPHA_TOTAL > 0 and _ALPHA_EPOCH > 0:
+        t = _ALPHA_EPOCH / _ALPHA_TOTAL
+        if _ALPHA_DECAY == 'exp':
+            return alpha_min + (alpha_max - alpha_min) * math.exp(-decay_rate * t)
+        else:
+            return alpha_max * (1 - t) + alpha_min
+    return 0.7  # default fallback
+
+def _hybrid_bind(a, b, alpha=None, eps=1e-8):
     """Гибрид HRR ⊛ и element-wise: alpha*hrr + (1-alpha)*ew."""
+    if alpha is None:
+        alpha = _alpha_from_curriculum()
     A = np.fft.rfft(a)
     B = np.fft.rfft(b)
     hrr = np.fft.irfft(A * B, n=len(a))
@@ -53,8 +77,10 @@ def _hybrid_bind(a, b, alpha=0.7, eps=1e-8):
     nrm = np.linalg.norm(combined)
     return combined / (nrm + eps) if nrm > 0 else combined
 
-def _hybrid_unbind(c, b, alpha=0.7, eps=1e-8):
+def _hybrid_unbind(c, b, alpha=None, eps=1e-8):
     """Гибрид HRR correlation и element-wise unbind."""
+    if alpha is None:
+        alpha = _alpha_from_curriculum()
     fc = np.fft.rfft(c)
     fb_conj = np.conj(np.fft.rfft(b))
     hrr = np.fft.irfft(fc * fb_conj, n=len(c))
@@ -100,264 +126,16 @@ def _hybrid_bind_masked(a, b, mask, threshold=0.5, alpha=0.7, eps=1e-8):
     return result / (nrm + eps) if nrm > 0 else result
 
 
-def _make_kernel(ksize, kernel_type='uniform', sigma=1.0, freq=0.1):
-    """Создать 1D свёрточное ядро на ℤ_{ksize}.
-
-    Types:
-      uniform    — box filter (все веса равны)
-      gaussian   — exp(-0.5*(x/sigma)²)
-      laplacian  — вторая производная гауссиана (zero-crossing)
-      gabor      — gaussian × cos(2π·freq·x)
-      dog        — Difference of Gaussians (σ₁ < σ₂)
-    """
-    x = np.arange(ksize) - ksize // 2
-    if kernel_type == 'uniform':
-        k = np.ones(ksize)
-    elif kernel_type == 'gaussian':
-        k = np.exp(-0.5 * (x / sigma) ** 2)
-    elif kernel_type == 'laplacian':
-        g = np.exp(-0.5 * (x / sigma) ** 2)
-        lap = (x ** 2 / sigma ** 4 - 1 / sigma ** 2) * g
-        k = lap - lap.mean()
-    elif kernel_type == 'gabor':
-        gauss = np.exp(-0.5 * (x / sigma) ** 2)
-        k = gauss * np.cos(2 * np.pi * freq * x)
-    elif kernel_type == 'dog':
-        g1 = np.exp(-0.5 * (x / (sigma * 0.6)) ** 2)
-        g2 = np.exp(-0.5 * (x / (sigma * 1.6)) ** 2)
-        k = g1 - g2
-    else:
-        raise ValueError(f"Unknown kernel_type: {kernel_type}")
-    kn = np.linalg.norm(k)
-    return k / (kn + 1e-10) if kn > 0 else k
-
-
-def _fractal_convolution(vec, kernel_sizes=(3, 5, 7), mode='reflect',
-                         kernel_type='uniform', sigma=1.0):
-    """Multi-scale convolution с выбором типа ядра, bundle результатов."""
-    from scipy.ndimage import convolve1d
-    result = None
-    for ksize in kernel_sizes:
-        kernel = _make_kernel(ksize, kernel_type=kernel_type, sigma=sigma)
-        smoothed = convolve1d(vec, kernel.astype(vec.dtype), mode=mode)
-        if result is None:
-            result = smoothed.copy()
-        else:
-            result = result + smoothed
-    nrm = np.linalg.norm(result)
-    return result / (nrm + 1e-10) if nrm > 0 else result
-
-
-def _compute_dim_importance(vectors, labels):
-    """Взаимная информация维度→label. Возвращает importance[dim]."""
-    from sklearn.feature_selection import mutual_info_classif
-    vecs = np.asarray(vectors, dtype=np.float64)
-    labs = np.asarray(labels, dtype=np.int64)
-    if vecs.ndim != 2 or len(vecs) < 2:
-        return np.ones(vecs.shape[-1] if vecs.ndim == 2 else 768)
-    return mutual_info_classif(vecs, labs, random_state=42)
-
-
-def _analogy(a, b, c, eps=1e-8):
-    """a:b :: c:d = bundle(b ⊘ a, c). Где ⊘ = element-wise division (unbind)."""
-    ratio = b / (np.asarray(a, dtype=np.float64) + eps)
-    rn = np.linalg.norm(ratio)
-    if rn > 1e-10:
-        ratio /= rn
-    d = _hybrid_bind(ratio, np.asarray(c, dtype=np.float64))
-    dn = np.linalg.norm(d)
-    return d / (dn + eps) if dn > 0 else d
-
-
-def _quantize_adaptive(sim, mean, std, z_score=2.0, max_val=7):
-    """z-score quantization: cosine[-1,1] → integer[0, max_val]."""
-    z = (sim - mean) / (std + 1e-8)
-    z = np.clip(z, -z_score, z_score)
-    scaled = (z + z_score) / (2 * z_score) * max_val
-    return int(round(np.clip(scaled, 0, max_val)))
-
-
-def _random_masks(dim, n_heads=3, rng=None):
-    """Случайные маски для multi-head VSA attention."""
-    if rng is None:
-        rng = np.random.RandomState(42)
-    masks = []
-    for _ in range(n_heads):
-        m = rng.randn(dim).astype(np.float64) * 0.3 + 0.5
-        masks.append(m)
-    return masks
-
-
-class ResidueEncoder:
-    """RNS-кодирование чисел через систему остаточных классов.
-    value → [value % m1, value % m2, ...] → bind(базовые_векторы).
-    """
-
-    def __init__(self, moduli, dim=768, rng=None):
-        self.moduli = list(moduli)
-        self.dim = dim
-        if rng is None:
-            rng = np.random.RandomState(42)
-        self.bases = {}
-        for m in self.moduli:
-            self.bases[m] = [rng.randn(dim).astype(np.float64) for _ in range(m)]
-            for bv in self.bases[m]:
-                bn = np.linalg.norm(bv)
-                if bn > 1e-10:
-                    bv /= bn
-
-    def encode(self, value):
-        residues = [int(value) % m for m in self.moduli]
-        result = self.bases[self.moduli[0]][residues[0]].copy()
-        for m, r in zip(self.moduli[1:], residues[1:]):
-            result = _hybrid_bind(result, self.bases[m][r])
-        return result
-
-    def add(self, a, b):
-        return a + b
-
-    def mul(self, a, b):
-        return _hybrid_bind(a, b)
-
-
-# ── VSAGrid: Z_8^d grid mapping + FFT ──────────────────────
-
-class VSAGrid:
-    """Mapping between flat ℝ^D and mixed-radix grid.
-
-    Факторизует D в произведение малых целых (radix≤8),
-    каждая ось — циклическая группа ℤ_{s_i}.
-    Позволяет делать FFT по каждой оси независимо.
-    """
-
-    @staticmethod
-    def _factorize(dim, max_radix=8):
-        """Разложить dim на множители ≤ max_radix."""
-        n = dim
-        factors = []
-        for r in range(max_radix, 1, -1):
-            while n % r == 0:
-                factors.append(r)
-                n //= r
-        if n > 1:
-            factors.append(n)
-        return tuple(sorted(factors, reverse=True)) if factors else (dim,)
-
-    def __init__(self, dim):
-        self.dim = dim
-        self.shape = self._factorize(dim)
-        self.ndim = len(self.shape)
-        self.strides = [1]
-        for s in self.shape[:-1]:
-            self.strides.append(self.strides[-1] * s)
-
-    def flat_to_grid(self, idx):
-        result = []
-        for s, st in zip(self.shape, self.strides):
-            result.append((idx // st) % s)
-        return tuple(result)
-
-    def grid_to_flat(self, coord):
-        idx = 0
-        for c, st in zip(coord, self.strides):
-            idx += c * st
-        return idx
-
-    def fft_along_axis(self, vec, axis=0):
-        """1D FFT вдоль одной оси через reshape."""
-        grid = vec.astype(np.complex128).reshape(self.shape)
-        return np.fft.fft(grid, axis=axis).ravel()
-
-    def ifft_along_axis(self, vec, axis=0):
-        """1D IFFT вдоль одной оси через reshape."""
-        grid = vec.astype(np.complex128).reshape(self.shape)
-        return np.fft.ifft(grid, axis=axis).ravel().real.astype(np.float64)
-
-    def fft_nd(self, vec):
-        """Полное многомерное FFT."""
-        grid = vec.astype(np.complex128).reshape(self.shape)
-        return np.fft.fftn(grid).ravel()
-
-    def ifft_nd(self, vec):
-        """Обратное многомерное FFT."""
-        grid = vec.astype(np.complex128).reshape(self.shape)
-        return np.fft.ifftn(grid).ravel().real.astype(np.float64)
-
-    def conv_nd(self, vec, kernel):
-        """Свёртка vec * kernel через FFT (O(N log N))."""
-        V = self.fft_nd(vec)
-        K = self.fft_nd(kernel)
-        conv = self.ifft_nd(V * K)
-        return conv.real.astype(np.float64)
-
-
-# ── VSA-CNN: иерархические свёрточные слои ─────────────────
-
-class VSAConvLayer:
-    """Один слой VSA-CNN: multi-scale convolution → bundle → nonlin.
-
-    kx_weights: list of (kernel_size, kernel_type, sigma) for parallel scales.
-    """
-
-    def __init__(self, kx_weights=None, grid=None, mode='reflect'):
-        if kx_weights is None:
-            kx_weights = [(3, 'gaussian', 1.0), (5, 'gaussian', 1.5), (7, 'gaussian', 2.0)]
-        self.kx_weights = kx_weights
-        self.grid = grid or VSAGrid(768)
-        self.mode = mode
-
-    def forward(self, vec):
-        """Multi-scale convolution → bundle."""
-        results = []
-        for ksize, ktype, sigma in self.kx_weights:
-            kernel = _make_kernel(ksize, kernel_type=ktype, sigma=sigma)
-            if self.grid.ndim == 1:
-                from scipy.ndimage import convolve1d
-                conv = convolve1d(vec, kernel.astype(vec.dtype), mode=self.mode)
-            else:
-                conv = self.grid.conv_nd(vec, np.resize(kernel, self.grid.dim))
-            results.append(conv)
-        result = results[0].copy()
-        for r in results[1:]:
-            result = result + r
-        nrm = np.linalg.norm(result)
-        return result / (nrm + 1e-10) if nrm > 0 else result
-
-
-class VSACNN:
-    """Hierarchical VSA-CNN: стек VSAConvLayer.
-
-    Каждый слой увеличивает масштаб: kernel_sizes растут.
-    """
-
-    def __init__(self, dim=768, n_layers=3):
-        self.dim = dim
-        self.grid = VSAGrid(dim)
-        self.layers = []
-        for i in range(n_layers):
-            base_ksize = 3 + 2 * i
-            kx = [
-                (base_ksize, 'gaussian', 0.5 + i * 0.5),
-                (base_ksize + 2, 'gaussian', 1.0 + i * 0.5),
-                (base_ksize + 4, 'laplacian', 1.0 + i * 0.5),
-            ]
-            self.layers.append(VSAConvLayer(kx, grid=self.grid))
-
-    def forward(self, vec):
-        """Пропустить вектор через все слои."""
-        h = vec.copy()
-        for layer in self.layers:
-            h = layer.forward(h)
-        return h
-
-    def forward_pyramid(self, vec):
-        """Вернуть пирамиду: [input, layer1_out, layer2_out, ...]."""
-        pyramid = [vec.copy()]
-        h = vec.copy()
-        for layer in self.layers:
-            h = layer.forward(h)
-            pyramid.append(h.copy())
-        return pyramid
+# ── Experimental VSA utilities (defined in eva/symbolic/experimental/) ──
+# Imported lazily to keep concept_space.py focused on core training pipeline.
+try:
+    from eva.symbolic.experimental import (  # noqa: F401
+        VSAGrid, VSAConvLayer, VSACNN, ResidueEncoder,
+        _make_kernel, _fractal_convolution, _compute_dim_importance,
+        _analogy, _quantize_adaptive, _random_masks,
+    )
+except ImportError:
+    pass
 
 
 try:
@@ -366,6 +144,17 @@ try:
 except ImportError:
     torch = None
     _HAS_TORCH = False
+
+
+def _hybrid_bind_torch(a, b, alpha=0.7, eps=1e-8):
+    """Batch GPU hybrid bind — 4.4× faster than np FFT per V20."""
+    A = torch.fft.rfft(a)
+    B = torch.fft.rfft(b)
+    hrr = torch.fft.irfft(A * B, n=a.shape[-1])
+    ew = a * b
+    combined = alpha * hrr + (1 - alpha) * ew
+    nrm = combined.norm(dim=-1, keepdim=True)
+    return combined / nrm.clamp(min=eps)
 
 
 class ConceptVectorStore:
@@ -454,8 +243,8 @@ class FractalField:
             self.l_m = latent_dim - self.l_c - self.l_a  # ~15% — meta
 
         # Fractal basis: (latent_dim, dim) with orthonormal columns
-        rng = np.random.RandomState(42)
-        mat = rng.randn(latent_dim, dim).astype(np.float32)
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+        mat = _R.rng('basis').randn(latent_dim, dim).astype(np.float32)
         Q, _ = np.linalg.qr(mat, mode='reduced')
         self.basis = Q.astype(np.float32)
         # Latent codes: cid → (latent_dim,) array
@@ -471,7 +260,7 @@ class FractalField:
         # HDC n-gram memory: prefix_cids_tuple → bundled latent repr (LRU-capped)
         self.hdc_memory: Dict[tuple, np.ndarray] = {}
         self.hdc_memory_counts: Dict[tuple, int] = {}
-        self.hdc_memory_max = 2000  # 2000×2048×4=16MB вместо 400MB
+        self.hdc_memory_max = 20000  # P1.5: 20K entries for better coverage
         self._hdc_access_order: List[tuple] = []  # (unused after P3.6 LFU, kept for compat)
         self._capacity_lock = threading.Lock()
 
@@ -610,9 +399,9 @@ class FractalField:
         Each field bit = sign(code @ W_proj[:, i]) → LSH-preserving similarity.
         field_bits[cid] packed as np.uint8 array (bitmask).
         """
-        rng = np.random.RandomState(42)
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
         scale = 1.0 / np.sqrt(self.latent_dim)
-        self.W_proj = rng.randn(self.latent_dim, field_bits).astype(np.float32) * scale
+        self.W_proj = _R.rng('field_bits').randn(self.latent_dim, field_bits).astype(np.float32) * scale
         self.n_field_bits = field_bits
         self._init_sector_fields()
         self._rebuild_field_bits()
@@ -893,11 +682,12 @@ class FractalField:
         if depths is None:
             depths = self._sector_depths
         self._sector_depths = depths
-        rng = np.random.RandomState(42)
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+        _R_sector = _R.rng('field_bits')  # same seed for sector W_proj
         scale = 1.0 / np.sqrt(self.latent_dim)
         self._sector_W = []
         for n_bits in depths:
-            W = rng.randn(self.latent_dim, n_bits).astype(np.float32) * scale
+            W = _R_sector.randn(self.latent_dim, n_bits).astype(np.float32) * scale
             self._sector_W.append(W)
         self._rebuild_sector_index()
 
@@ -1128,7 +918,8 @@ class FractalField:
     def fluctuate(self, fluctuation_amp=0.005, decay=0.999):
         """Apply autonomous drift to all latent codes."""
         if not hasattr(self, '_fluct_rng'):
-            self._fluct_rng = np.random.RandomState(42)
+            from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+            self._fluct_rng = _R.rng('fluctuate')
         for cid in list(self.codes.keys()):
             c = self.codes[cid]
             noise = self._fluct_rng.randn(self.latent_dim).astype(np.float32) * fluctuation_amp
@@ -1256,22 +1047,24 @@ class EntityField:
     LEVEL_ROLES = ['CHAR', 'MORPH', 'WORD', 'SENT', 'PARA']
     ETYPE_TO_ROLE = {'c': 'CHAR', 'm': 'MORPH', 'w': 'WORD', 's': 'SENT', 'p': 'PARA'}
 
-    def __init__(self, dim=2048, word_store=None):
-        self.dim = dim
+    def __init__(self, dim=None, word_store=None, dim_coord=None):
+        self.dim = dim or (dim_coord.latent_dim if dim_coord else 2048)
         self.word_store = word_store  # optional reference to ConceptVectorStore
+        self.dim_coord = dim_coord
 
         # All entities: key = (etype_char, id)  e.g. ('c', 97), ('w', 42), ('s', hash)
         self.entities = {}
 
         # Quasi-orthogonal level roles (Gram-Schmidt)
-        rng = np.random.RandomState(1)
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
         n_roles = len(self.LEVEL_ROLES)
-        mat = rng.randn(n_roles, dim).astype(np.float32)
+        mat = _R.rng('entity_roles').randn(n_roles, self.dim).astype(np.float32)
         Q, _ = np.linalg.qr(mat.T, mode='reduced')
         self.role_vecs = {role: Q[:, i].copy() for i, role in enumerate(self.LEVEL_ROLES)}
 
         # Random projection: 768D → dim, for syncing word_store vectors
         self._proj = None  # lazy init
+        self._proj_lock = threading.Lock()
 
         # LRU cache for char↔word bindings — prevents O(corpus_bytes) on repeated chars
         self._char_word_cache = {}
@@ -1299,10 +1092,11 @@ class EntityField:
         """Project vector v to self.dim if needed (Johnson-Lindenstrauss style)."""
         if len(v) == self.dim:
             return v
-        if self._proj is None or self._proj.shape[1] != len(v):
-            rng_p = np.random.RandomState(7)
-            scale = 1.0 / np.sqrt(len(v))
-            self._proj = rng_p.randn(self.dim, len(v)).astype(np.float32) * scale
+        with self._proj_lock:
+            if self._proj is None or self._proj.shape[1] != len(v):
+                from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+                scale = 1.0 / np.sqrt(len(v))
+                self._proj = _R.rng('entity_proj').randn(self.dim, len(v)).astype(np.float32) * scale
         return self._proj @ v
 
     # ── VSA primitives (hybrid HRR+element-wise) ─────────────
@@ -1318,8 +1112,9 @@ class EntityField:
             rng = np.random.RandomState(seed)
             v = rng.randn(self.dim).astype(np.float32)
             n = float(np.linalg.norm(v))
-            self.entities[key] = v / n if n > 1e-10 else v
-        return self.entities[key]
+            self.entities[key] = (v / n).astype(np.float16) if n > 1e-10 else v.astype(np.float16)
+        v = self.entities[key]
+        return v.astype(np.float32) if hasattr(v, 'astype') else v
 
     def get(self, key):
         # Word entities: if not in dict, try syncing from word_store
@@ -1330,10 +1125,11 @@ class EntityField:
         # P1.7: track access time for cleanup
         if key in self.entities:
             self._entity_access_time[key] = self._entity_batch_counter
-        return self.entities.get(key)
+        v = self.entities.get(key)
+        return v.astype(np.float32) if v is not None and hasattr(v, 'astype') else v
 
     def set(self, key, v):
-        self.entities[key] = v
+        self.entities[key] = v.astype(np.float16) if hasattr(v, 'astype') else v
 
     def clear_bind_cache(self):
         self._char_word_cache.clear()
@@ -1344,7 +1140,7 @@ class EntityField:
         if vec is None and self.word_store is not None:
             vec = self.word_store.get(cid)
         if vec is not None:
-            self.entities[('w', cid)] = self._to_dim(vec.copy().astype(np.float32))
+            self.entities[('w', cid)] = self._to_dim(vec.copy().astype(np.float32)).astype(np.float16)
 
     # ── Bind / Query ─────────────────────────────────────────
     def bind(self, etype, eid, ctx_type, ctx_id, lr=0.1):
@@ -1464,12 +1260,16 @@ class CharEnvelope:
         return self._char_vecs[codepoint]
 
     def word_envelope(self, word_text):
+        """Word = ρ⁰(c₁) ⊛ ρ¹(c₂) ⊛ ρ²(c₃) ⊛ ... — order-sensitive chain."""
         if not word_text:
             return None
-        vecs = [self.ensure(ord(ch)) for ch in word_text]
-        result = sum(vecs) / len(vecs)
-        n = np.linalg.norm(result)
-        return result / n if n > 1e-10 else result
+        result = None
+        for i, ch in enumerate(word_text):
+            cv = self.ensure(ord(ch))
+            shifted = np.roll(cv, i)
+            result = shifted if result is None else _hybrid_bind(result, shifted)
+        nrm = np.linalg.norm(result)
+        return result / nrm if nrm > 1e-10 else result
 
     def modulate(self, word_vec, char_env, strength=0.05):
         """Модулировать word vector char-level envelope через VSA binding."""
@@ -1493,16 +1293,16 @@ class Harmonizer:
 
     ROLES = ['ROOT', 'PREFIX', 'SUFFIX', 'ENDING', 'WORD_POS', 'WORD_ROLE']
 
-    def __init__(self, dim=2048, harm_lr=0.05, morph_lr=0.03, n_iter=5):
-        self.dim = dim
+    def __init__(self, dim=None, harm_lr=0.05, morph_lr=0.03, n_iter=5, dim_coord=None):
+        self.dim = dim or (dim_coord.latent_dim if dim_coord else 2048)
         self.harm_lr = harm_lr
         self.morph_lr = morph_lr
         self.n_iter = n_iter
         self.damping = 0.5
 
         # Initialise quasi-orthogonal role vectors
-        rng = np.random.RandomState(0)
-        role_mat = rng.randn(len(self.ROLES), dim).astype(np.float32)
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+        role_mat = _R.rng('harm_roles').randn(len(self.ROLES), self.dim).astype(np.float32)
         # Gram-Schmidt orthonormalisation
         Q, _ = np.linalg.qr(role_mat.T, mode='reduced')
         self.role_vecs = {role: Q[:, i].copy() for i, role in enumerate(self.ROLES)}
@@ -1795,17 +1595,21 @@ class ConceptSpace:
         self.vocab_size = vocab_size or 0
         self.dim = dim
 
+        # Dimension coordinator — validates all component dims at construction
+        self.dims = DimensionCoordinator(vec_dim=dim, latent_dim=latent_dim)
+
         # Fractal field: latent codes → full vectors via shared basis
-        self.fractal = FractalField(dim=self.dim, latent_dim=latent_dim)
+        self.fractal = FractalField(dim=self.dims.vec_dim, latent_dim=self.dims.latent_dim)
 
         # Concept vectors: dense ndarray[V, dim] with dict-like convenience
         self.concept_vectors = ConceptVectorStore(self.vocab_size, self.dim)
 
         # Random state
-        self.rng = np.random.RandomState(42)
-        self._item_rng = np.random.RandomState(42)
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+        self.rng = _R.rng('rng')
+        self._item_rng = _R.rng('item_rng')
         self._inhibition_step = 0
-        self._inhibit_rng = np.random.RandomState(42)
+        self._inhibit_rng = _R.rng('inhibit_rng')
 
         # Shift tracking
         self._total_shift = 0.0
@@ -1813,14 +1617,14 @@ class ConceptSpace:
         self._after_update_hook = None
 
         # ── Morphological harmonizer (levels 1-2: morpheme ↔ word) ──
-        self.harmonizer = Harmonizer(dim=dim)
+        self.harmonizer = Harmonizer(dim=self.dims.latent_dim)
         self._morph_conf_threshold = 0.8
         self._morph_vocab = None  # loaded on demand
         self._harm_n_checkpoints = 0
         self._harm_slow_start_epochs = 5
 
         # ── EntityField: recursive semantic field (char↔word↔sent↔para) ──
-        self.entity_field = EntityField(dim=latent_dim, word_store=self.concept_vectors)
+        self.entity_field = EntityField(dim=self.dims.latent_dim, word_store=self.concept_vectors, dim_coord=self.dims)
 
         # ---- Initialization ----
 
@@ -1971,7 +1775,6 @@ class ConceptSpace:
             self._build_morphemes(sp=sp)
             # Reinitialise word vectors from morpheme composition
             n_reinit = 0
-            rng = np.random.RandomState(42)
             for cid, word_morphs in list(self.harmonizer.word_morphs.items()):
                 morph_parts = [(r, self.harmonizer.get_morpheme_vec(m))
                                for m, r in word_morphs]
@@ -2004,9 +1807,8 @@ class ConceptSpace:
         if cached is not None:
             return cached
         try:
-            base = os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__))))
-            path = os.path.join(base, 'real_data', 'morph_vocab.json')
+            from eva.symbolic.fcf_config import EnvironmentResolver
+            path = EnvironmentResolver().morph_vocab_path
             if os.path.exists(path):
                 from eva.symbolic.morph_vocab import MorphVocab
                 self._morph_vocab = MorphVocab.load(path)
@@ -2103,7 +1905,8 @@ class ConceptSpace:
         Args:
             sp: optional SentencePieceProcessor for CID→text lookup
         """
-        rng = np.random.RandomState(42)
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+        rng = _R.rng('morph_init')
         morph_set = set()
         n_words = 0
         n_skipped = 0
@@ -2313,7 +2116,7 @@ class ConceptSpace:
 
         cids_t = torch.tensor(cids, dtype=torch.long, device=device)
         grads_t = torch.from_numpy(grads).to(device, dtype=torch.float32)
-        codes = gen._codes_t[cids_t]
+        codes = gen._codes_master_t[cids_t]
         basis_t = gen._basis_t
 
         code_grads = grads_t @ basis_t.T
@@ -2335,7 +2138,8 @@ class ConceptSpace:
         if self.fractal.l1_lambda > 0 and hasattr(gen, '_ce_t'):
             ce_vals = gen._ce_t[cids_t].cpu().numpy()
             self.fractal._apply_l1_batch(new_codes_np, ce_vals.tolist(), cid_list=cids)
-        gen._codes_t[cids_t] = new_codes.to(torch.float16)
+        gen._codes_master_t[cids_t] = new_codes.to(torch.float32)
+        gen._codes_t[cids_t] = new_codes.to(torch.bfloat16)
         for i, cid in enumerate(cids):
             v_new = new_vecs_np[i]
             code_new = new_codes_np[i]
@@ -2619,14 +2423,20 @@ class ConceptSpace:
 
         obj.concept_vectors = ConceptVectorStore(obj.vocab_size, obj.dim)
 
-        obj.rng = np.random.RandomState(42)
-        obj._item_rng = np.random.RandomState(42)
+        latent_from_data = data.get('fractal', {}).get('latent_dim', None)
+        obj.dims = DimensionCoordinator(vec_dim=obj.dim,
+                                        latent_dim=latent_from_data or obj.dim * 2)
+
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+        obj.rng = _R.rng('rng')
+        obj._item_rng = _R.rng('item_rng')
         rng_state = data.get('inhibit_rng_state')
         if rng_state is not None:
-            obj._inhibit_rng = np.random.RandomState()
+            from eva.symbolic.seed_registry import DEFAULT_REGISTRY as __R
+            obj._inhibit_rng = __R.rng('inhibit_rng')
             obj._inhibit_rng.set_state(tuple(rng_state))
         else:
-            obj._inhibit_rng = np.random.RandomState(42)
+            obj._inhibit_rng = _R.rng('inhibit_rng')
         obj._inhibition_step = data.get('inhibition_step', 0)
         obj._total_shift = data.get('total_shift', 0.0)
         obj._update_count = data.get('update_count', 0)
@@ -2686,7 +2496,9 @@ class ConceptSpace:
             obj.harmonizer = Harmonizer.from_dict(harm_data)
             print(f"  Restored Harmonizer: {len(obj.harmonizer.morphemes)} morphemes, {len(obj.harmonizer.word_morphs)} words")
         else:
-            obj.harmonizer = Harmonizer(dim=obj.dim)
+            harm_dim = getattr(obj, 'latent_dim', getattr(getattr(obj, 'fractal', None), 'latent_dim', None))
+            harm_dim = harm_dim or obj.dim
+            obj.harmonizer = Harmonizer(dim=harm_dim)
 
         # ── Restore EntityField ────────────────────────────────
         binary_path = path.replace('.json', '.codes.npz')
@@ -2704,18 +2516,21 @@ class ConceptSpace:
                 obj.entity_field = EntityField.from_dict(ef_data, word_store=obj.concept_vectors)
                 print(f"  Restored EntityField: {len(obj.entity_field.entities)} entities")
             else:
-                obj.entity_field = EntityField(dim=obj.fractal.latent_dim, word_store=obj.concept_vectors)
+                ef_dim = obj.dims.latent_dim
+                obj.entity_field = EntityField(dim=ef_dim, word_store=obj.concept_vectors)
             npz.close()
         else:
-            obj.entity_field = EntityField(dim=obj.fractal.latent_dim, word_store=obj.concept_vectors)
+            obj.entity_field = EntityField(dim=obj.dims.latent_dim, word_store=obj.concept_vectors)
 
         print(f"  Loaded ConceptSpace: {len(obj.concept_vectors)} concepts @ {obj.dim}D")
         return obj
 
 
 if __name__ == '__main__':
+    from eva.symbolic.fcf_config import EnvironmentResolver
+    _env = EnvironmentResolver()
     import sentencepiece as spm
-    sp = spm.SentencePieceProcessor(        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_146k.model'))
+    sp = spm.SentencePieceProcessor(model_file=_env.bpe_model_path)
 
     print("Initializing ConceptSpace with BPE vocabulary...")
     cs = ConceptSpace(vocab_size=sp.vocab_size())
@@ -2752,4 +2567,4 @@ if __name__ == '__main__':
         for c, s in top:
             print(f"  {sp.IdToPiece(c):20s} (CID {c:5d}) sim={s:.4f}")
 
-    cs.save(os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'concept_space.json'))
+    cs.save(_env.cs_path)

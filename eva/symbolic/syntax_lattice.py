@@ -631,23 +631,19 @@ class SyntaxLattice:
 
 
 if __name__ == '__main__':
+    from eva.symbolic.fcf_config import EnvironmentResolver
+    _env = EnvironmentResolver()
     import sys; sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
     import sentencepiece as spm
     from eva.symbolic.concept_space import ConceptSpace
 
-    sp = spm.SentencePieceProcessor(
-        model_file=os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'bpe_ru_146k.model'))
+    sp = spm.SentencePieceProcessor(model_file=_env.bpe_model_path)
 
-    cs = ConceptSpace.load(
-        os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'concept_space.json'))
+    cs = ConceptSpace.load(_env.cs_path)
 
     print("Building SyntaxLattice from full corpus via SentencePiece...")
     lattice = SyntaxLattice()
-    lattice.build(
-        os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'full_corpus_ru_clean.txt'),
-        sp,
-        max_n=4,
-    )
+    lattice.build(_env.corpus_path, sp, max_n=4)
 
-    lattice.save(os.path.join(os.path.dirname(__file__), '..', '..', 'real_data', 'syntax_lattice.json'))
+    lattice.save(_env.lattice_path)
     print("Done.")

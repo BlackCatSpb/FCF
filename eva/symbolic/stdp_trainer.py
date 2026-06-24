@@ -24,8 +24,10 @@ _META_NEXT_CID = 8
 _META_ANTONYM = 9
 
 
+from eva.symbolic.fcf_config import EnvironmentResolver
+
 # P1.8: Антоним-словарь из JSON с fallback на хардкод
-_ANTONYM_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'antonyms.json')
+_ANTONYM_PATH = EnvironmentResolver().antonym_path
 
 def _load_antonym_map(path=_ANTONYM_PATH):
     """Загрузить антоним-словарь из JSON. При отсутствии — минимальный fallback."""
@@ -46,11 +48,20 @@ def _load_antonym_map(path=_ANTONYM_PATH):
     }
 
 _ANTONYM_MAP = _load_antonym_map()
+_ANTONYM_RELOAD_COUNTER = 0
+_ANTONYM_RELOAD_EVERY = 100  # reload every 100 calls to _build_pairs
+
+def _reload_antonym_map():
+    """Periodically reload antonym map from JSON (P1.6)."""
+    global _ANTONYM_MAP
+    if os.path.exists(_ANTONYM_PATH):
+        fresh = _load_antonym_map()
+        if len(fresh) > len(_ANTONYM_MAP):
+            _ANTONYM_MAP = fresh
 
 
 def _update_hdc_ngrams(cs, ids, max_n=3):
-    """Update HDC n-gram memory from a tokenized sentence."""
-    # P2.8: skip if no training uses HDC prediction
+    """P1.5: Batch HDC deduplication — group by prefix, update only unique prefixes."""
     if not hasattr(cs.fractal, 'hdc_memory') or not cs.fractal.hdc_memory_max:
         return
     codes = {}
@@ -60,14 +71,28 @@ def _update_hdc_ngrams(cs, ids, max_n=3):
             codes[cid] = code
     if len(codes) < 2:
         return
+    # Deduplicate: collect all next_codes per prefix
+    updates = {}
     for n in range(2, max_n + 1):
         for i in range(len(ids) - n + 1):
             ngram = ids[i:i + n]
             if not all(cid in codes for cid in ngram):
                 continue
-            prefix_cids = ngram[:-1]
-            next_code = codes[ngram[-1]]
-            cs.fractal.hdc_update_ngram(prefix_cids, next_code)
+            prefix = tuple(ngram[:-1])
+            if prefix not in updates:
+                updates[prefix] = []
+            updates[prefix].append(codes[ngram[-1]])
+    # Update each prefix once with averaged next_code
+    memory_counts = cs.fractal.hdc_memory_counts if hasattr(cs.fractal, 'hdc_memory_counts') else {}
+    for prefix, next_codes in updates.items():
+        count = memory_counts.get(prefix, 0)
+        if count > 50:
+            continue  # skip well-learned prefixes
+        avg_code = np.mean(next_codes, axis=0)
+        avg_norm = np.linalg.norm(avg_code)
+        if avg_norm > 1e-10:
+            avg_code /= avg_norm
+        cs.fractal.hdc_update_ngram(list(prefix), avg_code)
 
 
 class STDPTrainer:
@@ -334,7 +359,7 @@ class STDPTrainer:
                     ef.sync_word(cid, new_v)
                     updated_cids.append(cid)
 
-        # ── 3b. P1.2: EntityField → STDP feedback ──
+        # ── 3b. P1.3: EntityField → STDP feedback (error_clip + momentum) ──
         if morph_cids:
             proj = getattr(ef, '_proj', None)
             for cid in morph_cids:
@@ -351,13 +376,19 @@ class STDPTrainer:
                             v_cs = cs.concept_vectors.get(cid)
                             if v_cs is not None:
                                 sim = float(v_cs @ char_query_768)
-                                pull = (char_query_768 - sim * v_cs) * 0.005
+                                error = char_query_768 - sim * v_cs
+                                error_clipped = np.clip(error, -0.1, 0.1)
+                                ce = gen.concept_error.get(cid, 0.0)
+                                pull_strength = 0.001 * max(0.1, 1.0 - ce * 2.0)
+                                pull = error_clipped * pull_strength
                                 v_new = v_cs + pull
                                 nv = np.linalg.norm(v_new)
                                 if nv > 1e-10:
                                     v_new /= nv
                                 cs._apply_vector_update(cid, v_new)
                                 updated_cids.append(cid)
+                                # Clear char cache after feedback
+                                ef._char_word_cache.clear()
 
         # ── 4. Batched GPU sync for harmonize updates (P1.13) ──
         if gen._use_torch and gen._vecs_t is not None and updated_cids:
@@ -381,6 +412,10 @@ class STDPTrainer:
                      gen_updates, gpu_ctx_l, gpu_tgt_l, gpu_meta_l,
                      gpu_cid_ctx, gpu_cid_gen):
         """Build STDP pairs for one sentence. Shared CPU/GPU pair generation."""
+        global _ANTONYM_RELOAD_COUNTER
+        _ANTONYM_RELOAD_COUNTER += 1
+        if _ANTONYM_RELOAD_COUNTER % _ANTONYM_RELOAD_EVERY == 0:
+            _reload_antonym_map()
         gen = self.gen
         cs = gen.cs
         T = len(ids)
@@ -544,8 +579,10 @@ class STDPTrainer:
         Returns number of updated tokens.
         """
         gen = self.gen
-        rng = np.random.RandomState(42 + getattr(self, '_bootstrap_seed', 0))
-        self._bootstrap_seed = getattr(self, '_bootstrap_seed', 0) + 1
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+        bs = getattr(self, '_bootstrap_seed', 0)
+        rng = _R.rng('semantic_bootstrap' + '_' + str(bs))
+        self._bootstrap_seed = bs + 1
 
         seen_cids = [int(c) for c, u in cs.concept_usage.items() if u > 0]
         if len(seen_cids) < 10:

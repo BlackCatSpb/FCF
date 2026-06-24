@@ -957,19 +957,14 @@ try:
                                          generator=gen,
                                          current_cos=last_cos_sim[0] if last_cos_sim else None)
                     pipeline.last_fluct_lines = idx
-                # V18: Soft plateau detector (supplements hard _full_stuck_counter)
+                # P1.4: EMA-based batch plateau (replaces hard ×2/×0.95)
                 plateau_loss = eval_vppl if eval_vppl is not None else mean_sim * 1000
                 plateau_df = pipeline._plateau_detector.update(plateau_loss, idx)
-                # TN-13/46: plateau-adaptive batch size via multiplier
-                if pipeline.opt._full_stuck_counter >= 3:
-                    _batch_mult = min(_batch_mult * 2, 4.0)
-                    BATCH_SIZE = int(bs_curve(idx) * _batch_mult)
-                elif plateau_df < 0.6 and _batch_mult < 2.0:
-                    # Soft plateau: gentle increase
-                    _batch_mult = min(2.0, _batch_mult * 1.15)
-                    BATCH_SIZE = int(bs_curve(idx) * _batch_mult)
-                elif _batch_mult > 1.0:
-                    _batch_mult = max(1.0, _batch_mult * 0.95)  # decay back to 1x
+                if pipeline.opt._full_stuck_counter >= 5:
+                    _batch_mult = max(1.0, min(4.0, _batch_mult * 0.85))
+                else:
+                    _batch_mult = max(1.0, min(4.0, _batch_mult * (0.95 + 0.1 * (1.0 - plateau_df))))
+                BATCH_SIZE = int(bs_curve(idx) * _batch_mult)
                 print()
             idx += 1
 

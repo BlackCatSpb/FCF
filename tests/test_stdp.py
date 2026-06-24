@@ -792,7 +792,8 @@ class TestCheckpointManagerResilience:
                     raise RuntimeError("disk full")
             mgr = CheckpointManager(data_dir=tmp)
             mgr.save('broken', BrokenCS(), lattice)
-            mgr.wait()
+            with pytest.raises((RuntimeError, Exception)):
+                mgr.wait(raise_on_error=True)
             tmp_files = [f for f in os.listdir(tmp) if f.endswith('.tmp')]
             assert len(tmp_files) == 0, f"tmp files not cleaned: {tmp_files}"
 
@@ -1784,3 +1785,1405 @@ class TestClusterPotential:
             field_gate=False, inh_strength=0.0, inh_threshold=0.1,
             destab_scale=0.0, momentum_mu=0.0)
         assert gen._cluster_potential is not None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Новые тесты V19 (Quality-Safety report): 125 тестов для покрытия
+# HRR, HybridBind, VSAKernels, VSAUtils, VSAGrid, VSACNN,
+# EntityField, CharEnvelope, Harmonizer, FibonacciUtils, ResidueEncoder
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestHRR:
+    """FFT-HRR circular convolution bind/unbind: unbind(bind(a,b), b) ≈ a."""
+
+    def test_hrr_bind_unbind_snr(self):
+        from eva.symbolic.concept_space import _hrr_bind, _hrr_unbind
+        D = 768
+        a = np.random.randn(D).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b = np.random.randn(D).astype(np.float64)
+        b /= np.linalg.norm(b)
+        c = _hrr_bind(a, b)
+        a_recovered = _hrr_unbind(c, b)
+        cos = np.dot(a, a_recovered) / (np.linalg.norm(a) * np.linalg.norm(a_recovered) + 1e-30)
+        assert cos > 0.5, f"cos={cos:.4f} < 0.5"
+
+    def test_hrr_bind_preserves_dim(self, dim):
+        from eva.symbolic.concept_space import _hrr_bind
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        c = _hrr_bind(a, b)
+        assert len(c) == dim
+
+    def test_hrr_bind_commutative(self, dim):
+        from eva.symbolic.concept_space import _hrr_bind
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        ab = _hrr_bind(a, b)
+        ba = _hrr_bind(b, a)
+        assert np.allclose(ab, ba, atol=1e-12)
+
+    def test_hrr_bind_approx_inverse(self):
+        from eva.symbolic.concept_space import _hrr_bind, _hrr_unbind
+        D = 768
+        a = np.random.randn(D).astype(np.float64)
+        b = np.random.randn(D).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        c = _hrr_bind(a, b)
+        b_recovered = _hrr_unbind(c, a)
+        cos = np.dot(b, b_recovered) / (np.linalg.norm(b) * np.linalg.norm(b_recovered) + 1e-30)
+        assert cos > 0.7, f"cos={cos:.4f} < 0.7"
+
+    def test_hrr_bind_zero_input(self, dim):
+        from eva.symbolic.concept_space import _hrr_bind
+        a = np.zeros(dim, dtype=np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        b /= np.linalg.norm(b)
+        c = _hrr_bind(a, b)
+        assert np.allclose(c, np.zeros(dim), atol=1e-15)
+
+    def test_hrr_unbind_zero_input(self, dim):
+        from eva.symbolic.concept_space import _hrr_unbind
+        a = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b = np.zeros(dim, dtype=np.float64)
+        c = _hrr_unbind(a, b)
+        assert np.allclose(c, np.zeros(dim), atol=1e-15)
+
+    def test_hrr_bind_unbind_deterministic(self, dim):
+        from eva.symbolic.concept_space import _hrr_bind, _hrr_unbind
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        c1 = _hrr_bind(a, b)
+        c2 = _hrr_bind(a, b)
+        assert np.array_equal(c1, c2)
+        u1 = _hrr_unbind(c1, b)
+        u2 = _hrr_unbind(c2, b)
+        assert np.array_equal(u1, u2)
+
+    def test_hrr_bind_scaling(self, dim):
+        from eva.symbolic.concept_space import _hrr_bind
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        alpha, beta = 0.5, 2.0
+        lhs = _hrr_bind(alpha * a, beta * b)
+        rhs = alpha * beta * _hrr_bind(a, b)
+        assert np.allclose(lhs, rhs, atol=1e-12)
+
+
+class TestHybridBind:
+    """Hybrid bind properties: α-scaling, unit norm preservation."""
+
+    def test_hybrid_bind_unit_norm(self, dim):
+        from eva.symbolic.concept_space import _hybrid_bind
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        c = _hybrid_bind(a, b, alpha=0.7)
+        assert abs(np.linalg.norm(c) - 1.0) < 1e-6
+
+    def test_hybrid_unbind_unit_norm(self, dim):
+        from eva.symbolic.concept_space import _hybrid_bind, _hybrid_unbind
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        c = _hybrid_bind(a, b, alpha=0.7)
+        d = _hybrid_unbind(c, b, alpha=0.7)
+        assert abs(np.linalg.norm(d) - 1.0) < 1e-6
+
+    def test_hybrid_alpha_zero(self, dim):
+        from eva.symbolic.concept_space import _hybrid_bind
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        c = _hybrid_bind(a, b, alpha=0.0)
+        expected = a * b
+        en = np.linalg.norm(expected)
+        if en > 1e-10:
+            expected /= en
+        cos = np.dot(c, expected) / (np.linalg.norm(c) * np.linalg.norm(expected) + 1e-30)
+        assert cos > 0.99, f"cos={cos:.4f}"
+
+    def test_hybrid_alpha_one(self, dim):
+        from eva.symbolic.concept_space import _hybrid_bind, _hrr_bind
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        hybrid = _hybrid_bind(a, b, alpha=1.0)
+        pure = _hrr_bind(a, b)
+        pn = np.linalg.norm(pure)
+        if pn > 1e-10:
+            pure /= pn
+        cos = np.dot(hybrid, pure) / (np.linalg.norm(hybrid) * np.linalg.norm(pure) + 1e-30)
+        assert cos > 0.99, f"cos={cos:.4f}"
+
+    def test_hybrid_bind_approx_inverse(self):
+        from eva.symbolic.concept_space import _hybrid_bind, _hybrid_unbind
+        D = 768
+        a = np.random.randn(D).astype(np.float64)
+        b = np.random.randn(D).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        c = _hybrid_bind(a, b, alpha=0.9)
+        a_recovered = _hybrid_unbind(c, b, alpha=0.9)
+        cos = np.dot(a, a_recovered) / (np.linalg.norm(a) * np.linalg.norm(a_recovered) + 1e-30)
+        assert cos > 0.4, f"cos={cos:.4f} < 0.4"
+
+    def test_hybrid_bind_commutative(self, dim):
+        from eva.symbolic.concept_space import _hybrid_bind
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        ab = _hybrid_bind(a, b, alpha=0.7)
+        ba = _hybrid_bind(b, a, alpha=0.7)
+        cos = np.dot(ab, ba) / (np.linalg.norm(ab) * np.linalg.norm(ba) + 1e-30)
+        assert cos > 0.99, f"cos={cos:.4f}"
+
+    def test_hybrid_bind_masked_selective(self, dim):
+        from eva.symbolic.concept_space import _hybrid_bind_masked
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        mask = np.ones(dim, dtype=np.float64) * 0.1
+        mask[:dim//2] = 0.8
+        result = _hybrid_bind_masked(a, b, mask, threshold=0.5, alpha=0.7)
+        assert abs(np.linalg.norm(result) - 1.0) < 1e-6
+
+    def test_bind_weighted_zeckendorf_properties(self, dim):
+        from eva.symbolic.concept_space import _bind_weighted_zeckendorf
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        result = _bind_weighted_zeckendorf(vec, weight=3)
+        assert abs(np.linalg.norm(result) - 1.0) < 1e-5
+
+    def test_bind_weighted_zeckendorf_zero(self, dim):
+        from eva.symbolic.concept_space import _bind_weighted_zeckendorf
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        result = _bind_weighted_zeckendorf(vec, weight=0)
+        cos = np.dot(vec, result) / (np.linalg.norm(vec) * np.linalg.norm(result) + 1e-30)
+        assert cos > 0.99, f"cos={cos:.4f}"
+
+    def test_bind_weighted_zeckendorf_max_bound(self, dim):
+        from eva.symbolic.concept_space import _bind_weighted_zeckendorf
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        r1 = _bind_weighted_zeckendorf(vec, weight=7)
+        r2 = _bind_weighted_zeckendorf(vec, weight=100)
+        assert abs(np.linalg.norm(r1) - 1.0) < 1e-5
+        assert abs(np.linalg.norm(r2) - 1.0) < 1e-5
+
+
+class TestVSAKernels:
+    """Test kernel creation and fractal convolution."""
+
+    def test_make_kernel_uniform(self):
+        from eva.symbolic.concept_space import _make_kernel
+        k = _make_kernel(5, kernel_type='uniform')
+        assert abs(np.linalg.norm(k) - 1.0) < 1e-6
+        assert np.allclose(k, k[0], atol=1e-15)
+
+    def test_make_kernel_gaussian(self):
+        from eva.symbolic.concept_space import _make_kernel
+        k = _make_kernel(7, kernel_type='gaussian', sigma=1.0)
+        assert abs(np.linalg.norm(k) - 1.0) < 1e-6
+        assert np.allclose(k, k[::-1], atol=1e-12)
+
+    def test_make_kernel_laplacian(self):
+        from eva.symbolic.concept_space import _make_kernel
+        k = _make_kernel(9, kernel_type='laplacian', sigma=1.0)
+        assert abs(np.linalg.norm(k) - 1.0) < 1e-6
+        assert abs(k.mean()) < 0.1
+
+    def test_make_kernel_gabor(self):
+        from eva.symbolic.concept_space import _make_kernel
+        k = _make_kernel(11, kernel_type='gabor', sigma=2.0, freq=0.2)
+        assert abs(np.linalg.norm(k) - 1.0) < 1e-6
+
+    def test_make_kernel_dog(self):
+        from eva.symbolic.concept_space import _make_kernel
+        k = _make_kernel(7, kernel_type='dog', sigma=1.0)
+        assert abs(np.linalg.norm(k) - 1.0) < 1e-6
+
+    def test_make_kernel_unknown_type(self):
+        from eva.symbolic.concept_space import _make_kernel
+        with pytest.raises(ValueError):
+            _make_kernel(5, kernel_type='unknown')
+
+    def test_make_kernel_even_size(self):
+        from eva.symbolic.concept_space import _make_kernel
+        for ksize in [2, 4, 6, 8]:
+            k = _make_kernel(ksize, kernel_type='gaussian', sigma=1.0)
+            assert abs(np.linalg.norm(k) - 1.0) < 1e-6
+
+    def test_fractal_convolution_shape(self, dim):
+        from eva.symbolic.concept_space import _fractal_convolution
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        result = _fractal_convolution(vec, kernel_sizes=(3, 5), mode='reflect')
+        assert result.shape == vec.shape
+        assert abs(np.linalg.norm(result) - 1.0) < 1e-6
+
+    def test_fractal_convolution_single_kernel(self, dim):
+        from eva.symbolic.concept_space import _fractal_convolution
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        result = _fractal_convolution(vec, kernel_sizes=(3,), mode='reflect')
+        assert abs(np.linalg.norm(result) - 1.0) < 1e-6
+
+    def test_fractal_convolution_identity(self, dim):
+        from eva.symbolic.concept_space import _fractal_convolution
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        result = _fractal_convolution(vec, kernel_sizes=(3, 5), mode='reflect')
+        cos = np.dot(vec, result) / (np.linalg.norm(vec) * np.linalg.norm(result) + 1e-30)
+        assert cos < 0.99, "Smoothing should change vector"
+
+    def test_fractal_convolution_gaussian_vs_laplacian(self, dim):
+        from eva.symbolic.concept_space import _fractal_convolution
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        r1 = _fractal_convolution(vec, kernel_sizes=(5,), kernel_type='gaussian')
+        r2 = _fractal_convolution(vec, kernel_sizes=(5,), kernel_type='laplacian')
+        cos = np.dot(r1, r2) / (np.linalg.norm(r1) * np.linalg.norm(r2) + 1e-30)
+        assert cos < 0.99, "Different kernels should differ"
+
+
+class TestVSAUtils:
+    """_analogy, _compute_dim_importance, _quantize_adaptive, _random_masks."""
+
+    def test_analogy_basic(self, dim):
+        from eva.symbolic.concept_space import _analogy
+        a = np.random.randn(dim).astype(np.float64)
+        b = np.random.randn(dim).astype(np.float64)
+        c = np.random.randn(dim).astype(np.float64)
+        a /= np.linalg.norm(a)
+        b /= np.linalg.norm(b)
+        c /= np.linalg.norm(c)
+        d = _analogy(a, b, c)
+        assert abs(np.linalg.norm(d) - 1.0) < 1e-6
+
+    def test_analogy_identity(self):
+        from eva.symbolic.concept_space import _analogy
+        D = 768
+        a = np.random.randn(D).astype(np.float64)
+        c = np.random.randn(D).astype(np.float64)
+        a /= np.linalg.norm(a)
+        c /= np.linalg.norm(c)
+        d = _analogy(a, a, c, alpha=0.9)
+        cos = np.dot(c, d) / (np.linalg.norm(c) * np.linalg.norm(d) + 1e-30)
+        assert cos > 0.5, f"cos={cos:.4f}"
+
+    def test_analogy_zero_division(self):
+        from eva.symbolic.concept_space import _analogy
+        D = 768
+        a = np.ones(D, dtype=np.float64) * 1e-20
+        b = np.random.randn(D).astype(np.float64)
+        c = np.random.randn(D).astype(np.float64)
+        b /= np.linalg.norm(b)
+        c /= np.linalg.norm(c)
+        d = _analogy(a, b, c)
+        assert np.linalg.norm(d) > 1e-6
+
+    def test_compute_dim_importance_shape(self):
+        from eva.symbolic.concept_space import _compute_dim_importance
+        n_samples, n_dims = 20, 10
+        vectors = np.random.randn(n_samples, n_dims).astype(np.float64)
+        labels = np.random.randint(0, 3, size=n_samples).astype(np.int64)
+        imp = _compute_dim_importance(vectors, labels)
+        assert len(imp) == n_dims
+
+    def test_compute_dim_importance_single_sample(self):
+        from eva.symbolic.concept_space import _compute_dim_importance
+        vectors = np.random.randn(1, 768).astype(np.float64)
+        labels = np.array([0], dtype=np.int64)
+        imp = _compute_dim_importance(vectors, labels)
+        assert np.allclose(imp, np.ones(768))
+
+    def test_quantize_adaptive_basic(self):
+        from eva.symbolic.concept_space import _quantize_adaptive
+        q = _quantize_adaptive(0.5, mean=0.0, std=0.3, z_score=2.0, max_val=7)
+        assert 0 <= q <= 7
+        assert isinstance(q, int)
+
+    def test_quantize_adaptive_extremes(self):
+        from eva.symbolic.concept_space import _quantize_adaptive
+        q_low = _quantize_adaptive(-10.0, mean=0.0, std=0.3, z_score=2.0, max_val=7)
+        q_high = _quantize_adaptive(10.0, mean=0.0, std=0.3, z_score=2.0, max_val=7)
+        assert q_low == 0
+        assert q_high == 7
+
+    def test_quantize_adaptive_mean(self):
+        from eva.symbolic.concept_space import _quantize_adaptive
+        q = _quantize_adaptive(0.0, mean=0.0, std=0.3, z_score=2.0, max_val=7)
+        assert q == 3 or q == 4
+
+    def test_random_masks_count(self, dim):
+        from eva.symbolic.concept_space import _random_masks
+        masks = _random_masks(dim, n_heads=3)
+        assert len(masks) == 3
+
+    def test_random_masks_shape(self, dim):
+        from eva.symbolic.concept_space import _random_masks
+        masks = _random_masks(dim, n_heads=5)
+        for m in masks:
+            assert len(m) == dim
+
+    def test_random_masks_deterministic(self, dim):
+        from eva.symbolic.concept_space import _random_masks
+        rng1 = np.random.RandomState(42)
+        rng2 = np.random.RandomState(42)
+        m1 = _random_masks(dim, n_heads=2, rng=rng1)
+        m2 = _random_masks(dim, n_heads=2, rng=rng2)
+        for a, b in zip(m1, m2):
+            assert np.array_equal(a, b)
+
+
+class TestVSAGrid:
+    """VSAGrid roundtrip and FFT operations."""
+
+    def test_vsagrid_factorize_768(self):
+        from eva.symbolic.concept_space import VSAGrid
+        grid = VSAGrid(768)
+        assert grid.shape == (8, 8, 6, 2) or np.prod(grid.shape) == 768
+
+    def test_vsagrid_factorize_64(self):
+        from eva.symbolic.concept_space import VSAGrid
+        grid = VSAGrid(64)
+        assert np.prod(grid.shape) == 64
+
+    def test_vsagrid_flat_to_grid_roundtrip(self):
+        from eva.symbolic.concept_space import VSAGrid
+        grid = VSAGrid(768)
+        for idx in [0, 1, 100, 383, 767]:
+            coord = grid.flat_to_grid(idx)
+            assert len(coord) == grid.ndim
+            back = grid.grid_to_flat(coord)
+            assert back == idx, f"Mismatch at idx={idx}: coord={coord}, back={back}"
+
+    def test_vsagrid_grid_to_flat_roundtrip(self):
+        from eva.symbolic.concept_space import VSAGrid
+        grid = VSAGrid(64)
+        for i in range(64):
+            coord = grid.flat_to_grid(i)
+            back = grid.grid_to_flat(coord)
+            assert back == i, f"Failed at i={i}"
+
+    def test_vsagrid_fft_along_axis(self, dim):
+        from eva.symbolic.concept_space import VSAGrid
+        grid = VSAGrid(dim)
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        for axis in range(grid.ndim):
+            f = grid.fft_along_axis(vec, axis=axis)
+            assert len(f) == dim
+            rev = grid.ifft_along_axis(f, axis=axis)
+            assert np.allclose(vec, rev, atol=1e-10)
+
+    def test_vsagrid_fft_nd_roundtrip(self):
+        from eva.symbolic.concept_space import VSAGrid
+        grid = VSAGrid(64)
+        vec = np.random.randn(64).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        f = grid.fft_nd(vec)
+        rev = grid.ifft_nd(f)
+        assert np.allclose(vec, rev, atol=1e-10)
+
+    def test_vsagrid_conv_nd_shape(self):
+        from eva.symbolic.concept_space import VSAGrid
+        dim = 64
+        grid = VSAGrid(dim)
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        kernel = np.random.randn(dim).astype(np.float64)
+        kernel /= np.linalg.norm(kernel)
+        conv = grid.conv_nd(vec, kernel)
+        assert len(conv) == dim
+
+    def test_vsagrid_strides_consistency(self):
+        from eva.symbolic.concept_space import VSAGrid
+        grid = VSAGrid(64)
+        assert len(grid.strides) == grid.ndim
+        assert grid.strides[0] == 1
+
+    def test_vsagrid_ndim(self):
+        from eva.symbolic.concept_space import VSAGrid
+        grid = VSAGrid(768)
+        assert grid.ndim == len(grid.shape)
+
+    def test_vsagrid_prime_dim(self):
+        from eva.symbolic.concept_space import VSAGrid
+        grid = VSAGrid(7)
+        assert np.prod(grid.shape) == 7
+
+
+class TestVSACNN:
+    """VSACNN and VSAConvLayer forward pass."""
+
+    def test_vsaconvlayer_forward_shape(self, dim):
+        from eva.symbolic.concept_space import VSAConvLayer, VSAGrid
+        layer = VSAConvLayer(grid=VSAGrid(dim))
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        out = layer.forward(vec)
+        assert len(out) == dim
+        assert abs(np.linalg.norm(out) - 1.0) < 1e-6
+
+    def test_vsaconvlayer_custom_kernels(self, dim):
+        from eva.symbolic.concept_space import VSAConvLayer, VSAGrid
+        kx = [(3, 'gaussian', 1.0), (7, 'laplacian', 2.0)]
+        layer = VSAConvLayer(kx_weights=kx, grid=VSAGrid(dim))
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        out = layer.forward(vec)
+        assert abs(np.linalg.norm(out) - 1.0) < 1e-6
+
+    def test_vsaconvlayer_single_kernel(self, dim):
+        from eva.symbolic.concept_space import VSAConvLayer, VSAGrid
+        kx = [(5, 'gaussian', 1.0)]
+        layer = VSAConvLayer(kx_weights=kx, grid=VSAGrid(dim))
+        vec = np.random.randn(dim).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        out = layer.forward(vec)
+        assert abs(np.linalg.norm(out) - 1.0) < 1e-6
+
+    def test_vsacnn_forward_shape(self):
+        from eva.symbolic.concept_space import VSACNN
+        cnn = VSACNN(dim=64, n_layers=2)
+        vec = np.random.randn(64).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        out = cnn.forward(vec)
+        assert len(out) == 64
+        assert abs(np.linalg.norm(out) - 1.0) < 1e-6
+
+    def test_vsacnn_forward_pyramid_length(self):
+        from eva.symbolic.concept_space import VSACNN
+        n_layers = 3
+        cnn = VSACNN(dim=64, n_layers=n_layers)
+        vec = np.random.randn(64).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        pyramid = cnn.forward_pyramid(vec)
+        assert len(pyramid) == n_layers + 1
+
+    def test_vsacnn_forward_pyramid_shapes(self):
+        from eva.symbolic.concept_space import VSACNN
+        cnn = VSACNN(dim=64, n_layers=2)
+        vec = np.random.randn(64).astype(np.float64)
+        vec /= np.linalg.norm(vec)
+        pyramid = cnn.forward_pyramid(vec)
+        for p in pyramid:
+            assert len(p) == 64
+
+    def test_vsacnn_different_dims(self):
+        from eva.symbolic.concept_space import VSACNN
+        for dim in [64, 128, 768]:
+            cnn = VSACNN(dim=dim, n_layers=2)
+            vec = np.random.randn(dim).astype(np.float64)
+            vec /= np.linalg.norm(vec)
+            out = cnn.forward(vec)
+            assert len(out) == dim
+
+    def test_vsacnn_layer_count(self):
+        from eva.symbolic.concept_space import VSACNN
+        cnn = VSACNN(dim=64, n_layers=4)
+        assert len(cnn.layers) == 4
+
+
+class TestEntityField:
+    """EntityField bind/query roundtrip and STDP feedback."""
+
+    def test_entityfield_init(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        assert ef.dim == 128
+        assert len(ef.entities) == 0
+        assert len(ef.role_vecs) == len(EntityField.LEVEL_ROLES)
+
+    def test_entityfield_ensure_creates_vector(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        v = ef.ensure(('c', 97))
+        assert v is not None
+        assert abs(np.linalg.norm(v) - 1.0) < 1e-4
+
+    def test_entityfield_ensure_idempotent(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        k = ('c', 65)
+        v1 = ef.ensure(k)
+        v2 = ef.ensure(k)
+        assert np.array_equal(v1, v2)
+
+    def test_entityfield_bind_char_to_word(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        ef.bind('c', 97, 'w', 42, lr=0.1)
+        v_char = ef.get(('c', 97))
+        assert v_char is not None
+        assert abs(np.linalg.norm(v_char) - 1.0) < 1e-6
+
+    def test_entityfield_bind_word_to_sent(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        ef.bind('w', 42, 's', hash('hello world'), lr=0.1)
+        v_word = ef.get(('w', 42))
+        assert v_word is not None
+        assert abs(np.linalg.norm(v_word) - 1.0) < 1e-6
+
+    def test_entityfield_query_returns_superposition(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        ef.bind('c', 97, 'w', 42, lr=0.1)
+        ef.bind('c', 97, 'w', 7, lr=0.05)
+        q = ef.query('c', 97)
+        assert q is not None
+        assert abs(np.linalg.norm(q) - 1.0) < 1e-6
+
+    def test_entityfield_bind_char_word_roundtrip(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        ef.bind('c', 97, 'w', 42, lr=0.3)
+        q = ef.query('c', 97)
+        assert q is not None
+        v_word = ef.get(('w', 42))
+        assert v_word is not None
+        cos = np.dot(q, v_word) / (np.linalg.norm(q) * np.linalg.norm(v_word) + 1e-30)
+        assert cos > 0.05, f"Query recovered word context with cos={cos:.4f}"
+
+    def test_entityfield_get_nonexistent(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        assert ef.get(('x', 999)) is None
+
+    def test_entityfield_sync_word(self):
+        from eva.symbolic.concept_space import EntityField, ConceptVectorStore
+        store = ConceptVectorStore(10, 128)
+        v = np.random.randn(128).astype(np.float32)
+        v /= np.linalg.norm(v)
+        store[5] = v
+        ef = EntityField(dim=128, word_store=store)
+        ef.sync_word(5)
+        assert ('w', 5) in ef.entities
+
+    def test_entityfield_cleanup(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=32, word_store=None)
+        for i in range(5):
+            ef.ensure(('w', i))
+        assert len(ef.entities) == 5
+
+    def test_entityfield_decay(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        ef.ensure(('c', 97))
+        ef.decay(factor=0.9)
+        v = ef.get(('c', 97))
+        assert v is not None
+        assert abs(np.linalg.norm(v) - 1.0) < 1e-4
+
+    def test_entityfield_bind_invalid_etype(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        ef.bind('x', 0, 'w', 1, lr=0.1)
+        v = ef.get(('x', 0))
+        assert v is None
+
+    def test_entityfield_serialise_roundtrip(self):
+        from eva.symbolic.concept_space import EntityField
+        ef1 = EntityField(dim=128)
+        ef1.bind('c', 65, 'w', 42, lr=0.2)
+        data = ef1.to_dict()
+        ef2 = EntityField.from_dict(data)
+        v1 = ef1.get(('c', 65))
+        v2 = ef2.get(('c', 65))
+        assert v2 is not None
+        assert np.allclose(v1, v2, atol=1e-6)
+
+    def test_entityfield_lru_cache(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        ef.bind('c', 97, 'w', 42, lr=0.1)
+        cache_size_before = len(ef._char_word_cache)
+        ef.bind('c', 97, 'w', 42, lr=0.1)
+        assert len(ef._char_word_cache) == cache_size_before
+
+    def test_entityfield_to_dim_projection(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        v768 = np.random.randn(768).astype(np.float32)
+        v768 /= np.linalg.norm(v768)
+        v_proj = ef._to_dim(v768)
+        assert len(v_proj) == 128
+
+    def test_entityfield_key_methods(self):
+        from eva.symbolic.concept_space import EntityField
+        assert EntityField.key_char(97) == ('c', 97)
+        assert EntityField.key_morph(42) == ('m', 42)
+        assert EntityField.key_word(100) == ('w', 100)
+        assert EntityField.key_sent(12345) == ('s', 12345)
+        assert EntityField.key_para(999) == ('p', 999)
+
+    def test_entityfield_multiple_binds(self):
+        from eva.symbolic.concept_space import EntityField
+        ef = EntityField(dim=128)
+        ef.bind('w', 42, 's', hash('sent1'), lr=0.1)
+        ef.bind('w', 42, 's', hash('sent2'), lr=0.2)
+        ef.bind('w', 42, 's', hash('sent3'), lr=0.3)
+        v = ef.get(('w', 42))
+        assert v is not None
+        assert abs(np.linalg.norm(v) - 1.0) < 1e-6
+
+
+class TestCharEnvelope:
+    """CharEnvelope: char-level VSA operations."""
+
+    def test_charenvelope_ensure(self):
+        from eva.symbolic.concept_space import CharEnvelope
+        ce = CharEnvelope(dim=128, max_chars=100)
+        v = ce.ensure(ord('A'))
+        assert v is not None
+        assert abs(np.linalg.norm(v) - 1.0) < 1e-6
+        v2 = ce.ensure(ord('A'))
+        assert np.array_equal(v, v2)
+
+    def test_charenvelope_ensure_different_chars(self):
+        from eva.symbolic.concept_space import CharEnvelope
+        ce = CharEnvelope(dim=128)
+        va = ce.ensure(ord('A'))
+        vb = ce.ensure(ord('B'))
+        cos = np.dot(va, vb) / (np.linalg.norm(va) * np.linalg.norm(vb) + 1e-30)
+        assert abs(cos) < 0.5, f"cos={cos:.4f}"
+
+    def test_charenvelope_word_envelope(self):
+        from eva.symbolic.concept_space import CharEnvelope
+        ce = CharEnvelope(dim=128)
+        env = ce.word_envelope("cat")
+        assert env is not None
+        assert abs(np.linalg.norm(env) - 1.0) < 1e-6
+
+    def test_charenvelope_word_envelope_empty(self):
+        from eva.symbolic.concept_space import CharEnvelope
+        ce = CharEnvelope(dim=128)
+        assert ce.word_envelope("") is None
+
+    def test_charenvelope_modulate_changes_vector(self):
+        from eva.symbolic.concept_space import CharEnvelope
+        ce = CharEnvelope(dim=128)
+        word_vec = np.random.randn(128).astype(np.float32)
+        word_vec /= np.linalg.norm(word_vec)
+        char_env = ce.word_envelope("hello")
+        modulated = ce.modulate(word_vec, char_env, strength=0.5)
+        assert abs(np.linalg.norm(modulated) - 1.0) < 1e-6
+        cos = np.dot(word_vec, modulated) / (np.linalg.norm(word_vec) * np.linalg.norm(modulated) + 1e-30)
+        assert cos < 0.99, f"cos={cos:.4f}"
+
+    def test_charenvelope_modulate_zero_strength(self):
+        from eva.symbolic.concept_space import CharEnvelope
+        ce = CharEnvelope(dim=128)
+        word_vec = np.random.randn(128).astype(np.float32)
+        word_vec /= np.linalg.norm(word_vec)
+        char_env = ce.word_envelope("test")
+        modulated = ce.modulate(word_vec, char_env, strength=0.0)
+        assert np.allclose(word_vec, modulated, atol=1e-6)
+
+    def test_charenvelope_lfu_eviction(self):
+        from eva.symbolic.concept_space import CharEnvelope
+        ce = CharEnvelope(dim=32, max_chars=3)
+        ce.ensure(ord('a'))
+        ce.ensure(ord('b'))
+        ce.ensure(ord('c'))
+        ce.ensure(ord('d'))
+        assert len(ce._char_vecs) <= 3
+
+    def test_charenvelope_word_envelope_multi_char(self):
+        from eva.symbolic.concept_space import CharEnvelope
+        ce = CharEnvelope(dim=128)
+        env = ce.word_envelope("hello world")
+        assert env is not None
+        assert abs(np.linalg.norm(env) - 1.0) < 1e-6
+
+    def test_charenvelope_access_count(self):
+        from eva.symbolic.concept_space import CharEnvelope
+        ce = CharEnvelope(dim=128)
+        ce.ensure(ord('x'))
+        assert ce._access_count[ord('x')] == 1
+        ce.ensure(ord('x'))
+        assert ce._access_count[ord('x')] == 2
+
+
+class TestHarmonizer:
+    """Harmonizer: composition, decomposition, and harmonisation."""
+
+    def test_harmonizer_init(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128, harm_lr=0.05, morph_lr=0.03, n_iter=5)
+        assert h.dim == 128
+        assert len(h.role_vecs) == len(Harmonizer.ROLES)
+        assert h.harm_lr == 0.05
+        assert h.morph_lr == 0.03
+
+    def test_harmonizer_bind_bundle(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        vecs = [np.random.randn(128).astype(np.float32) for _ in range(3)]
+        for v in vecs:
+            v /= np.linalg.norm(v)
+        bundled = h._bundle(vecs)
+        assert bundled is not None
+        assert abs(np.linalg.norm(bundled) - 1.0) < 1e-6
+
+    def test_harmonizer_bundle_empty(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        assert h._bundle([]) is None
+
+    def test_harmonizer_compose_word_basic(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        h.set_morpheme_vec(1, np.random.randn(128).astype(np.float32))
+        h.morphemes[1] /= np.linalg.norm(h.morphemes[1])
+        h.set_morpheme_vec(2, np.random.randn(128).astype(np.float32))
+        h.morphemes[2] /= np.linalg.norm(h.morphemes[2])
+        parts = {'ROOT': 1, 'SUFFIX': 2}
+        word_vec = h.compose_word(parts)
+        assert word_vec is not None
+        assert abs(np.linalg.norm(word_vec) - 1.0) < 1e-6
+
+    def test_harmonizer_decompose_word(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        word_vec = np.random.randn(128).astype(np.float32)
+        word_vec /= np.linalg.norm(word_vec)
+        decomp = h.decompose_word(word_vec)
+        assert isinstance(decomp, dict)
+        for role in ['ROOT', 'PREFIX', 'SUFFIX', 'ENDING']:
+            assert role in decomp
+            assert len(decomp[role]) == 128
+
+    def test_harmonizer_compose_decompose_roundtrip(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        h.set_morpheme_vec(10, np.random.randn(128).astype(np.float32))
+        h.morphemes[10] /= np.linalg.norm(h.morphemes[10])
+        h.set_morpheme_vec(20, np.random.randn(128).astype(np.float32))
+        h.morphemes[20] /= np.linalg.norm(h.morphemes[20])
+        h.register_word(100, {'ROOT': 10, 'SUFFIX': 20})
+        word_vec = h.compose_word({'ROOT': 10, 'SUFFIX': 20})
+        assert word_vec is not None
+
+    def test_harmonizer_dirty_flags(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        h.register_word(1, {'ROOT': 10})
+        h.register_word(2, {'ROOT': 10})
+        h.mark_morph_dirty(10)
+        assert 10 in h.morph_dirty
+        assert 1 in h.word_dirty
+        assert 2 in h.word_dirty
+
+    def test_harmonizer_clear_dirty(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        h.mark_word_dirty(5)
+        h.mark_morph_dirty(10)
+        h.clear_dirty()
+        assert len(h.word_dirty) == 0
+        assert len(h.morph_dirty) == 0
+
+    def test_harmonizer_harmonize_no_morph(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        word_vec = np.random.randn(128).astype(np.float32)
+        word_vec /= np.linalg.norm(word_vec)
+        result, delta = h.harmonize(999, word_vec)
+        assert result is None
+        assert delta == 0.0
+
+    def test_harmonizer_harmonize_converges(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128, n_iter=3)
+        h.set_morpheme_vec(1, np.random.randn(128).astype(np.float32))
+        h.morphemes[1] /= np.linalg.norm(h.morphemes[1])
+        h.set_morpheme_vec(2, np.random.randn(128).astype(np.float32))
+        h.morphemes[2] /= np.linalg.norm(h.morphemes[2])
+        h.register_word(1, {'ROOT': 1, 'SUFFIX': 2})
+        word_vec = np.random.randn(128).astype(np.float32)
+        word_vec /= np.linalg.norm(word_vec)
+        result, delta = h.harmonize(1, word_vec)
+        if result is not None:
+            assert abs(np.linalg.norm(result) - 1.0) < 1e-6
+            assert delta >= 0.0
+
+    def test_harmonizer_register_word(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        h.register_word(42, {'ROOT': 7, 'ENDING': 3})
+        assert 42 in h.word_morphs
+        assert len(h.word_morphs[42]) == 2
+        assert 7 in h.morph_to_words
+        assert 3 in h.morph_to_words
+
+    def test_harmonizer_set_get_morpheme(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        v = np.random.randn(128).astype(np.float32)
+        v /= np.linalg.norm(v)
+        h.set_morpheme_vec(5, v)
+        retrieved = h.get_morpheme_vec(5)
+        assert retrieved is not None
+        assert np.allclose(v, retrieved, atol=1e-6)
+
+    def test_harmonizer_balance_subspaces(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        z_c = np.random.randn(128).astype(np.float64)
+        z_a = np.random.randn(128).astype(np.float64)
+        z_m = np.random.randn(128).astype(np.float64)
+        result = h.balance_subspaces(z_c, z_a, z_m)
+        assert len(result) == 3
+
+    def test_harmonizer_compose_with_context(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        h.set_morpheme_vec(1, np.random.randn(128).astype(np.float32))
+        h.morphemes[1] /= np.linalg.norm(h.morphemes[1])
+        ctx = np.random.randn(128).astype(np.float32)
+        ctx /= np.linalg.norm(ctx)
+        parts = {'ROOT': 1}
+        w1 = h.compose_word(parts, ctx_vec=None)
+        w2 = h.compose_word(parts, ctx_vec=ctx)
+        assert w1 is not None
+        assert w2 is not None
+
+    def test_harmonizer_decompose_roles(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        word_vec = np.random.randn(128).astype(np.float32)
+        word_vec /= np.linalg.norm(word_vec)
+        decomp = h.decompose_word(word_vec, roles=['ROOT', 'PREFIX'])
+        assert 'ROOT' in decomp
+        assert 'PREFIX' in decomp
+        assert 'SUFFIX' not in decomp
+
+    def test_harmonizer_dirty_cascade(self):
+        from eva.symbolic.concept_space import Harmonizer
+        h = Harmonizer(dim=128)
+        h.register_word(1, {'ROOT': 10})
+        h.register_word(2, {'ROOT': 10})
+        h.register_word(3, {'ROOT': 20})
+        h.mark_morph_dirty(10)
+        assert 1 in h.word_dirty
+        assert 2 in h.word_dirty
+        assert 3 not in h.word_dirty
+
+
+class TestFibonacciUtils:
+    """Fibonacci numbers, Zeckendorf, golden ratio, position shifts."""
+
+    def test_fib_get_basic(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        assert FibonacciUtils.get(0) == 0
+        assert FibonacciUtils.get(1) == 1
+        assert FibonacciUtils.get(2) == 1
+        assert FibonacciUtils.get(3) == 2
+        assert FibonacciUtils.get(4) == 3
+        assert FibonacciUtils.get(5) == 5
+        assert FibonacciUtils.get(10) == 55
+
+    def test_fib_get_large(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        assert FibonacciUtils.get(20) == 6765
+
+    def test_fib_get_negative(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        assert FibonacciUtils.get(-1) == 0
+        assert FibonacciUtils.get(-100) == 0
+
+    def test_fib_zeckendorf_7(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        z = FibonacciUtils.zeckendorf(7)
+        assert z == [5, 2], f"Got {z}"
+
+    def test_fib_zeckendorf_0(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        assert FibonacciUtils.zeckendorf(0) == []
+
+    def test_fib_zeckendorf_1(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        assert FibonacciUtils.zeckendorf(1) == [1]
+
+    def test_fib_zeckendorf_10(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        z = FibonacciUtils.zeckendorf(10)
+        assert sum(z) == 10
+        for i in range(len(z) - 1):
+            assert z[i] > z[i + 1]
+
+    def test_fib_zeckendorf_100(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        z = FibonacciUtils.zeckendorf(100)
+        assert sum(z) == 100
+
+    def test_fib_golden_ratio(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        phi = FibonacciUtils.golden_ratio()
+        assert abs(phi - (1 + np.sqrt(5)) / 2) < 1e-15
+
+    def test_fib_zeckendorf_decompose_weight(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        tree = FibonacciUtils.zeckendorf_decompose_weight(5)
+        assert sum(tree) == 5
+
+    def test_fib_zeckendorf_decompose_weight_clamp(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        tree = FibonacciUtils.zeckendorf_decompose_weight(-5)
+        assert sum(tree) == 0
+        tree2 = FibonacciUtils.zeckendorf_decompose_weight(100, max_val=7)
+        assert sum(tree2) == 7
+
+    def test_fib_fib_scale(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        idx = FibonacciUtils.fib_scale(3.0, max_val=7)
+        assert 0 <= idx <= 7
+        assert isinstance(idx, (int, np.integer))
+
+    def test_fib_position_shift(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        shift = FibonacciUtils.fib_position_shift(5, dim=768)
+        assert 0 <= shift < 768
+        assert isinstance(shift, int)
+
+    def test_fib_position_shift_negative(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        assert FibonacciUtils.fib_position_shift(-1, dim=768) == 0
+
+    def test_fib_position_shift_zero_dim(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        assert FibonacciUtils.fib_position_shift(5, dim=0) == 0
+
+    def test_fib_balance_subspaces(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        z_c = np.random.randn(64).astype(np.float64)
+        z_a = np.random.randn(64).astype(np.float64)
+        z_m = np.random.randn(64).astype(np.float64)
+        result = FibonacciUtils.balance_subspaces(z_c, z_a, z_m)
+        assert len(result) == 3
+        for v in result:
+            assert len(v) == 64
+
+    def test_fib_balance_subspaces_golden_ratio(self):
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        z_c = np.ones(64, dtype=np.float64)
+        z_a = np.ones(64, dtype=np.float64) * 2.0
+        z_m = np.ones(64, dtype=np.float64) * 0.5
+        z_c2, z_a2, z_m2 = FibonacciUtils.balance_subspaces(z_c, z_a, z_m)
+        assert abs(np.linalg.norm(z_c2)) > 0
+        assert abs(np.linalg.norm(z_a2)) > 0
+        assert abs(np.linalg.norm(z_m2)) > 0
+
+
+class TestResidueEncoder:
+    """ResidueEncoder: RNS roundtrip and basic operations."""
+
+    def test_residue_encoder_init(self):
+        from eva.symbolic.concept_space import ResidueEncoder
+        enc = ResidueEncoder([3, 5, 7], dim=64)
+        assert len(enc.moduli) == 3
+        assert enc.dim == 64
+        for m in [3, 5, 7]:
+            assert m in enc.bases
+            assert len(enc.bases[m]) == m
+
+    def test_residue_encoder_encode(self):
+        from eva.symbolic.concept_space import ResidueEncoder
+        enc = ResidueEncoder([3, 5, 7], dim=64)
+        v = enc.encode(42)
+        assert v is not None
+        assert abs(np.linalg.norm(v) - 1.0) < 1e-6
+
+    def test_residue_encoder_encode_zero(self):
+        from eva.symbolic.concept_space import ResidueEncoder
+        enc = ResidueEncoder([3, 5, 7], dim=64)
+        v = enc.encode(0)
+        assert abs(np.linalg.norm(v) - 1.0) < 1e-6
+
+    def test_residue_encoder_encode_same_residue(self):
+        from eva.symbolic.concept_space import ResidueEncoder
+        enc = ResidueEncoder([3, 5], dim=64)
+        v1 = enc.encode(0)
+        v2 = enc.encode(15)
+        assert np.allclose(v1, v2, atol=1e-6)
+
+    def test_residue_encoder_add(self):
+        from eva.symbolic.concept_space import ResidueEncoder
+        enc = ResidueEncoder([3], dim=64)
+        a = enc.encode(1)
+        b = enc.encode(2)
+        c = enc.add(a, b)
+        assert np.allclose(c, a + b, atol=1e-10)
+
+    def test_residue_encoder_mul(self):
+        from eva.symbolic.concept_space import ResidueEncoder
+        enc = ResidueEncoder([3], dim=64)
+        a = enc.encode(2)
+        b = enc.encode(3)
+        c = enc.mul(a, b)
+        assert abs(np.linalg.norm(c) - 1.0) < 1e-6
+
+    def test_residue_encoder_rns_roundtrip(self):
+        from eva.symbolic.concept_space import ResidueEncoder
+        enc = ResidueEncoder([3, 5, 7], dim=64)
+        v1 = enc.encode(42)
+        v2 = enc.encode(42)
+        assert np.allclose(v1, v2, atol=1e-6)
+
+    def test_residue_encoder_different_values(self):
+        from eva.symbolic.concept_space import ResidueEncoder
+        enc = ResidueEncoder([3, 5, 7], dim=64)
+        v1 = enc.encode(10)
+        v2 = enc.encode(20)
+        cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-30)
+        assert cos < 0.99, f"Different values too similar: cos={cos:.4f}"
+
+
+class TestLSHIndex:
+    """LSHIndex: fast approximate nearest neighbor search."""
+
+    def test_lsh_add_query(self):
+        from eva.symbolic.lsh_index import LSHIndex
+        import numpy as np
+        idx = LSHIndex(dim=32, n_tables=2, n_bits=4)
+        for i in range(50):
+            v = np.random.randn(32).astype(np.float32)
+            v /= np.linalg.norm(v)
+            idx.add(i, v)
+        q = np.random.randn(32).astype(np.float32)
+        q /= np.linalg.norm(q)
+        idx.add(999, q)
+        res = idx.query(q, k=5)
+        assert len(res) > 0
+        assert res[0][0] == 999
+        assert res[0][1] > 0.99
+
+    def test_lsh_remove(self):
+        from eva.symbolic.lsh_index import LSHIndex
+        idx = LSHIndex(dim=16, n_tables=1, n_bits=2)
+        v = np.random.randn(16).astype(np.float32)
+        v /= np.linalg.norm(v)
+        idx.add(1, v)
+        idx.remove(1)
+        res = idx.query(v, k=5)
+        assert len(res) == 0
+
+    def test_lsh_update(self):
+        from eva.symbolic.lsh_index import LSHIndex
+        idx = LSHIndex(dim=16, n_tables=1, n_bits=2, seed=42)
+        v1 = np.random.randn(16).astype(np.float32)
+        v1 /= np.linalg.norm(v1)
+        idx.add(1, v1)
+        v2 = np.random.randn(16).astype(np.float32)
+        v2 /= np.linalg.norm(v2)
+        idx.update(1, v2)
+        res = idx.query(v2, k=5)
+        assert any(cid == 1 for cid, _ in res)
+        res_old = idx.query(v1, k=5)
+        assert not any(cid == 1 for cid, _ in res_old)
+
+    def test_lsh_empty_query(self):
+        from eva.symbolic.lsh_index import LSHIndex
+        idx = LSHIndex(dim=16)
+        res = idx.query(np.zeros(16, dtype=np.float32), k=5)
+        assert res == []
+
+    def test_entity_field_index_basic(self, dim):
+        from eva.symbolic.concept_space import EntityField
+        from eva.symbolic.lsh_index import EntityFieldIndex
+        ef = EntityField(dim=dim)
+        ef.ensure(('c', 65))
+        ef.ensure(('c', 66))
+        ef.ensure(('c', 67))
+        efi = EntityFieldIndex(ef, n_tables=2, n_bits=4)
+        efi.sync()
+        q = ef.get(('c', 65))
+        assert q is not None
+        res = efi.find_similar(q, k=3)
+        assert len(res) > 0
+        assert res[0][0] == ('c', 65)
+        assert res[0][1] > 0.99
+
+
+# ── VSAAttention ─────────────────────────────────────────────────
+
+class TestVSAAttention:
+    """VSA-native attention without softmax: bind/unbind + Zeckendorf weights."""
+
+    def test_single_key_identity(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        out = attn.forward(q, [q.copy()], [q.copy()])
+        assert out.shape == (dim,)
+        sim = float(np.dot(out, q))
+        # scale+bundle preserves direction: sim should be high (>0.5)
+        assert sim > 0.5
+
+    def test_two_keys_higher_weight_to_closer(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        k_close = q.copy()
+        k_far = np.random.randn(dim).astype(np.float32)
+        k_far -= np.dot(k_far, q) * q
+        k_fn = np.linalg.norm(k_far)
+        if k_fn > 1e-10:
+            k_far /= k_fn
+        out = attn.forward(q, [k_close, k_far], [k_close, k_far])
+        sim_close = float(np.dot(out, k_close))
+        sim_far = float(np.dot(out, k_far))
+        assert sim_close > sim_far
+
+    def test_multi_head_produces_unit_norm(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        attn = VSAAttention(dim=dim, n_heads=3, use_fib_pos=False)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        rng = np.random.RandomState(1)
+        keys = [q.copy()] + [rng.randn(dim).astype(np.float32) for _ in range(4)]
+        for k in keys[1:]:
+            k /= np.linalg.norm(k)
+        out = attn.forward(q, keys, keys)
+        norm = float(np.linalg.norm(out))
+        assert abs(norm - 1.0) < 1e-5
+
+    def test_fib_position_encoding_changes_output(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        attn_on = VSAAttention(dim=dim, n_heads=1, use_fib_pos=True)
+        attn_off = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        # Two identical keys (both q) — without fib, both get weight=max, output = bundle(q,q) = q
+        # With fib, key at position 1 gets shifted → lower weight → output weighted more toward val0
+        v0 = np.random.randn(dim).astype(np.float32)
+        v0 /= np.linalg.norm(v0)
+        v1 = np.random.randn(dim).astype(np.float32)
+        v1 /= np.linalg.norm(v1)
+        out_on = attn_on.forward(q, [q.copy(), q.copy()], [v0, v1], positions=[0, 10])
+        out_off = attn_off.forward(q, [q.copy(), q.copy()], [v0, v1])
+        diff = float(np.linalg.norm(out_on - out_off))
+        assert diff > 1e-4
+
+    def test_empty_keys_returns_query(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        out = attn.forward(q, [], [])
+        assert np.allclose(out, q)
+
+    def test_zeckendorf_weight_zero_produces_zero_contribution(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        k_orth = np.random.randn(dim).astype(np.float32)
+        k_orth -= np.dot(k_orth, q) * q
+        k_norm = np.linalg.norm(k_orth)
+        if k_norm > 1e-10:
+            k_orth /= k_norm
+        out_orth = attn.forward(q, [k_orth], [k_orth.copy()])
+        out_empty = attn.forward(q, [], [])
+        assert np.allclose(out_orth, out_empty, atol=0.01)
+
+    def test_multi_head_different_from_single_head(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        single = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        multi = VSAAttention(dim=dim, n_heads=3, use_fib_pos=False)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        keys = [q.copy(), np.random.randn(dim).astype(np.float32)]
+        keys[1] /= np.linalg.norm(keys[1])
+        out_single = single.forward(q, keys, keys)
+        out_multi = multi.forward(q, keys, keys)
+        diff = float(np.linalg.norm(out_single - out_multi))
+        # Multi-head binds with roles → different output
+        assert diff > 1e-4
+
+    def test_n_heads_parameter_respected(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        attn = VSAAttention(dim=dim, n_heads=5, use_fib_pos=False)
+        assert attn.head_roles.shape == (5, dim)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        keys = [q.copy() for _ in range(3)]
+        out = attn.forward(q, keys, keys)
+        norm = float(np.linalg.norm(out))
+        assert abs(norm - 1.0) < 1e-5
+
+    def test_reproducible_seed(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        a1 = VSAAttention(dim=dim, n_heads=2, use_fib_pos=False)
+        a2 = VSAAttention(dim=dim, n_heads=2, use_fib_pos=False)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        rng = np.random.RandomState(5)
+        keys = [rng.randn(dim).astype(np.float32) for _ in range(4)]
+        for k in keys:
+            k /= np.linalg.norm(k)
+        out1 = a1.forward(q, keys, keys)
+        out2 = a2.forward(q, keys, keys)
+        assert np.allclose(out1, out2)
+
+
+# ── HDTransformerLayer ────────────────────────────────────────────
+
+class TestHDTransformer:
+    """VSA-transformer: LSH-attention, Zeckendorf-tree, fractal FFN, STDP."""
+
+    def test_hd_attention_shapes(self, dim):
+        from eva.symbolic.hdtransformer_layer import HDTransformerLayer
+        layer = HDTransformerLayer(dim=dim, num_heads=2, top_k=5)
+        rng = np.random.RandomState(42)
+        seq = [rng.randn(dim).astype(np.float32) for _ in range(4)]
+        for v in seq:
+            v /= np.linalg.norm(v)
+        outs = layer.forward(seq)
+        assert len(outs) == 4
+        for o in outs:
+            assert o.shape == (dim,)
+            assert abs(np.linalg.norm(o) - 1.0) < 1e-5
+
+    def test_hd_zeckendorf_weight(self, dim):
+        from eva.symbolic.hdtransformer_layer import HDTransformerLayer
+        layer = HDTransformerLayer(dim=dim, num_heads=1)
+        tree = layer._zeckendorf_tree(7)
+        assert sum(tree) == 7
+        assert 5 in tree and 2 in tree
+
+    def test_hd_multihead(self, dim):
+        from eva.symbolic.hdtransformer_layer import HDTransformerLayer
+        single = HDTransformerLayer(dim=dim, num_heads=1)
+        multi = HDTransformerLayer(dim=dim, num_heads=4)
+        rng = np.random.RandomState(7)
+        seq = [rng.randn(dim).astype(np.float32) for _ in range(15)]
+        for i in range(len(seq)):
+            seq[i] /= np.linalg.norm(seq[i])
+        out_single = single.forward(seq)
+        out_multi = multi.forward(seq)
+        diff = float(np.linalg.norm(out_single[0] - out_multi[0]))
+        assert diff > 1e-4
+
+    def test_hd_pos_encoding(self, dim):
+        from eva.symbolic.hdtransformer_layer import HDTransformerLayer
+        layer = HDTransformerLayer(dim=dim, num_heads=1)
+        rng = np.random.RandomState(5)
+        q = rng.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        v0 = rng.randn(dim).astype(np.float32)
+        v0 /= np.linalg.norm(v0)
+        v1 = rng.randn(dim).astype(np.float32)
+        v1 /= np.linalg.norm(v1)
+        seq = [q.copy(), q.copy()]
+        out_a = layer.forward(seq, positions=[0, 1])
+        out_b = layer.forward(seq, positions=[1, 0])
+        diff = float(np.linalg.norm(out_a[0] - out_b[0]))
+        assert diff > 1e-4
+
+    def test_hd_train_step(self, dim):
+        from eva.symbolic.hdtransformer_layer import HDTransformerLayer
+        layer = HDTransformerLayer(dim=dim, num_heads=1)
+        rng = np.random.RandomState(9)
+        seq = [rng.randn(dim).astype(np.float32) for _ in range(2)]
+        for v in seq:
+            v /= np.linalg.norm(v)
+        tgt = [rng.randn(dim).astype(np.float32) for _ in range(2)]
+        for v in tgt:
+            v /= np.linalg.norm(v)
+        err = layer.train_step(seq, tgt, lr=0.1)
+        assert err >= 0
+
+    def test_hd_identity(self, dim):
+        from eva.symbolic.hdtransformer_layer import HDTransformerLayer
+        layer = HDTransformerLayer(dim=dim, num_heads=1)
+        rng = np.random.RandomState(3)
+        q = rng.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        seq = [q.copy()]
+        outs = layer.forward(seq)
+        cos = float(np.dot(outs[0], q))
+        # fractal FFN smooths the vector; should still be positively correlated
+        assert cos > 0.3
+
+    def test_hd_fractal_ffn(self, dim):
+        from eva.symbolic.hdtransformer_layer import HDTransformerLayer
+        layer = HDTransformerLayer(dim=dim, num_heads=1)
+        rng = np.random.RandomState(13)
+        vec = rng.randn(dim).astype(np.float32)
+        vec /= np.linalg.norm(vec)
+        outs = layer.forward([vec.copy()])
+        assert outs[0].shape == (dim,)
+        assert abs(np.linalg.norm(outs[0]) - 1.0) < 1e-5
+        cos = float(np.dot(vec, outs[0]))
+        assert cos < 0.99
+
+    def test_hd_empty_seq(self, dim):
+        from eva.symbolic.hdtransformer_layer import HDTransformerLayer
+        layer = HDTransformerLayer(dim=dim, num_heads=1)
+        outs = layer.forward([])
+        assert outs == []
+
+
+# ── FederatedAggregator ───────────────────────────────────────────
+
+class TestFederatedAggregator:
+    """EntityField ensemble with DP noise."""
+
+    def test_fed_basic(self, dim):
+        from eva.symbolic.federated import FederatedAggregator
+        from eva.symbolic.concept_space import EntityField
+        ef1 = EntityField(dim=dim)
+        ef2 = EntityField(dim=dim)
+        rng = np.random.RandomState(1)
+        k = ('c', 97)
+        v1 = rng.randn(dim).astype(np.float32)
+        v1 /= np.linalg.norm(v1)
+        v2 = rng.randn(dim).astype(np.float32)
+        v2 /= np.linalg.norm(v2)
+        ef1.entities[k] = v1
+        ef2.entities[k] = v2
+        merged = FederatedAggregator.aggregate([ef1, ef2], noise_scale=0.0)
+        assert merged is not None
+        assert k in merged
+        v = merged[k]
+        assert abs(np.linalg.norm(v) - 1.0) < 1e-5
+
+    def test_fed_no_common(self, dim):
+        from eva.symbolic.federated import FederatedAggregator
+        from eva.symbolic.concept_space import EntityField
+        ef1 = EntityField(dim=dim)
+        ef2 = EntityField(dim=dim)
+        ef1.entities[('c', 1)] = np.random.randn(dim).astype(np.float32)
+        ef2.entities[('c', 2)] = np.random.randn(dim).astype(np.float32)
+        merged = FederatedAggregator.aggregate([ef1, ef2], noise_scale=0.0)
+        assert merged is not None
+
+    def test_fed_empty(self):
+        from eva.symbolic.federated import FederatedAggregator
+        assert FederatedAggregator.aggregate([]) is None

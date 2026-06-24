@@ -68,9 +68,10 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         super().__init__(config)
         self.config = config
 
-        # Load data files from the standard real_data directory
-        data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "real_data")
-        self._data_dir = data_dir
+        from eva.symbolic.fcf_config import EnvironmentResolver
+        src_data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "real_data")
+        self._env = EnvironmentResolver()
+        self._env._data_dir_override = src_data_dir
         self._bpe_fallback: Optional[str] = None
 
         # Lazy load: components are initialized on first use
@@ -87,10 +88,9 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
             if self._space is not None:
                 return
 
-        data_dir = self._data_dir
-        space_path = os.path.join(data_dir, "concept_space.json")
-        lattice_path = os.path.join(data_dir, "syntax_lattice.json")
-        bpe_path = os.path.join(data_dir, "bpe_ru_146k.model")
+        space_path = self._env.cs_path
+        lattice_path = self._env.lattice_path
+        bpe_path = self._env.bpe_model_path
 
         if not os.path.exists(space_path):
             raise FileNotFoundError(f"ConceptSpace not found at {space_path}. Ensure the model directory contains concept_space.json.")
@@ -252,9 +252,11 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
         self.config.save_pretrained(save_directory)
         self._load()  # ensure loaded
         # Save model state
-        self._space.save(os.path.join(save_directory, "concept_space.json"))
-        self._lattice.save(os.path.join(save_directory, "syntax_lattice.json"))
-        # Save gen config
+        from eva.symbolic.fcf_config import EnvironmentResolver
+        _save_env = EnvironmentResolver()
+        _save_env._data_dir_override = save_directory
+        self._space.save(_save_env.cs_path)
+        self._lattice.save(_save_env.lattice_path)
         gen_config_path = os.path.join(save_directory, "gen_config.json")
         with open(gen_config_path, 'w', encoding='utf-8') as f:
             json.dump(self.generator.config, f, ensure_ascii=False)
@@ -263,10 +265,10 @@ class FCFModel(PreTrainedModel, HFGenerationMixin):
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         config = FCFConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
         model = cls(config)
-        # Load model state from the same directory
-        model._data_dir = pretrained_model_name_or_path
+        # Override data_dir to the pretrained model directory
+        model._env._data_dir_override = pretrained_model_name_or_path
         # Fallback BPE path if model not in custom dir
-        if not os.path.exists(os.path.join(pretrained_model_name_or_path, 'bpe_ru_146k.model')):
-            model._bpe_fallback = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'real_data', 'bpe_ru_146k.model')
+        if not os.path.exists(model._env.bpe_model_path):
+            model._bpe_fallback = model._env.bpe_model_path
         model._load()
         return model

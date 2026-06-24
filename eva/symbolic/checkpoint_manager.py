@@ -1,28 +1,58 @@
-"""CheckpointManager — fully async checkpoint save/cleanup."""
+"""CheckpointManager — atomic write-ahead checkpointing with crash recovery."""
 
 import os
 import json
-from concurrent.futures import ThreadPoolExecutor
+import logging
+import threading
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+logger = logging.getLogger(__name__)
 
 
-class CheckpointManager:
-    """Threaded async checkpoint manager.
+class CheckpointError(Exception):
+    """Raised when checkpoint save fails.
+    Carries tag and original exception."""
 
-    Saves concept space + lattice + optimizer state in a background thread.
-    The main training loop is not blocked by disk I/O.
+
+class AtomicCheckpointManager:
+    """Threaded async checkpoint manager with write-ahead tmp + atomic rename.
+
+    - Every save() writes to .tmp files first, then atomic rename.
+    - Stale .tmp files are recovered on construction.
+    - Errors are logged and accumulated; wait() re-raises on request.
 
     Args:
-        data_dir: directory for temporary files during save
+        data_dir: directory for checkpoint files
         cleanup_keep: number of checkpoints to keep (oldest removed)
         max_workers: thread pool size (default 1)
     """
 
+    WAL_FILE = '_checkpoint_wal.json'
+
     def __init__(self, data_dir='.', cleanup_keep=5, max_workers=1):
-        self.data_dir = data_dir
+        self.data_dir = Path(data_dir)
         self.cleanup_keep = max(cleanup_keep, 1)
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        self._futures = []
-        self._saved_tags = []
+        self._futures: list = []
+        self._saved_tags: list = []
+        self._errors: list = []
+        self._lock = threading.Lock()
+        self._recover_tmp_files()
+
+    def _recover_tmp_files(self):
+        """Recover stale .tmp files from a previous crash."""
+        for tmp in self.data_dir.glob('*.tmp'):
+            final = tmp.with_suffix('')
+            if final.exists():
+                tmp.unlink(missing_ok=True)
+                logger.warning("Recovered: removed stale %s", tmp.name)
+            else:
+                try:
+                    tmp.rename(final)
+                    logger.info("Recovered: renamed %s \u2192 %s", tmp.name, final.name)
+                except OSError:
+                    tmp.unlink(missing_ok=True)
 
     def save(self, tag, cs, lattice, opt=None, extras=None, ckpt_state=None):
         """Submit async save. Returns immediately.
@@ -32,80 +62,83 @@ class CheckpointManager:
             cs: ConceptSpace instance (must have .save method)
             lattice: SyntaxLattice instance (must have .save method)
             opt: optional ParameterOptimizer (must have save_state)
-            extras: dict of {path: data_callable} for extra files
+            extras: dict of {suffix: callable(path)} for extra files
             ckpt_state: optional dict saved as checkpoint_state.json after save
         """
         future = self._executor.submit(
             self._sync_save, tag, cs, lattice, opt, extras or {}, ckpt_state)
-        self._futures.append(future)
-        self._saved_tags.append(tag)
+        with self._lock:
+            self._futures.append(future)
+            self._saved_tags.append(tag)
 
-    def wait(self):
-        """Wait for all pending saves to complete."""
-        for f in self._futures:
-            f.result()
-        self._futures.clear()
+    def wait(self, raise_on_error=True):
+        """Wait for all pending saves to complete.
+
+        Args:
+            raise_on_error: if True, raises CheckpointError on first failure.
+                            if False, errors are logged and accumulated.
+        """
+        errors = []
+        with self._lock:
+            futures = self._futures[:]
+            self._futures.clear()
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                errors.append(e)
+                logger.error("Checkpoint failed: %s", e)
+        if errors and raise_on_error:
+            raise CheckpointError(f"{len(errors)} checkpoint(s) failed") from errors[0]
 
     def shutdown(self):
-        """Shut down the thread pool."""
-        self.wait()
+        """Shut down the thread pool after flushing pending saves."""
+        self.wait(raise_on_error=False)
         self._executor.shutdown(wait=True)
 
     def _sync_save(self, tag, cs, lattice, opt, extras, ckpt_state):
         """Synchronous save (runs in thread pool)."""
-        cs_path = os.path.join(self.data_dir, f'concept_space_{tag}.json')
-        lat_path = os.path.join(self.data_dir, f'syntax_lattice_{tag}.json')
-        tmp_cs = cs_path + '.tmp'
-        tmp_lat = lat_path + '.tmp'
         try:
-            cs.save(tmp_cs)
-            lattice.save(tmp_lat)
-            os.replace(tmp_cs, cs_path)
-            os.replace(tmp_lat, lat_path)
+            self._do_save(tag, cs, lattice, opt, extras, ckpt_state)
         except Exception as e:
-            print(f"[CheckpointManager] save({tag}) failed: {e}", file=__import__('sys').stderr)
-            for p in [tmp_cs, tmp_lat]:
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except OSError:
-                    pass
-            return
+            logger.error("Checkpoint %s: %s", tag, e)
+            raise
+
+    def _do_save(self, tag, cs, lattice, opt, extras, ckpt_state):
+        cs_path = self.data_dir / f'concept_space_{tag}.json'
+        lat_path = self.data_dir / f'syntax_lattice_{tag}.json'
+        tmp_cs = cs_path.with_suffix('.json.tmp')
+        tmp_lat = lat_path.with_suffix('.json.tmp')
+
+        cs.save(str(tmp_cs))
+        lattice.save(str(tmp_lat))
+        tmp_cs.rename(cs_path)
+        tmp_lat.rename(lat_path)
+
         if opt is not None:
-            opt_path = os.path.join(self.data_dir, f'concept_space_{tag}.opt.json')
-            tmp_opt = opt_path + '.tmp'
-            try:
-                state = opt.save_state()
-                with open(tmp_opt, 'w', encoding='utf-8') as f:
-                    json.dump(state, f)
-                os.replace(tmp_opt, opt_path)
-            except Exception as e:
-                print(f"[CheckpointManager] opt save({tag}) failed: {e}", file=__import__('sys').stderr)
-                try:
-                    if os.path.exists(tmp_opt):
-                        os.remove(tmp_opt)
-                except OSError:
-                    pass
-        # Save checkpoint_state AFTER successful rename (atomic consistency)
+            opt_path = self.data_dir / f'concept_space_{tag}.opt.json'
+            tmp_opt = opt_path.with_suffix('.opt.json.tmp')
+            state = opt.save_state()
+            with open(tmp_opt, 'w', encoding='utf-8') as f:
+                json.dump(state, f)
+            tmp_opt.rename(opt_path)
+
         if ckpt_state is not None:
             ckpt_state_path = ckpt_state.get('_path')
             if ckpt_state_path:
                 ckpt_data = {k: v for k, v in ckpt_state.items() if k != '_path'}
-                try:
-                    tmp_state = ckpt_state_path + '.tmp'
-                    with open(tmp_state, 'w', encoding='utf-8') as f:
-                        json.dump(ckpt_data, f)
-                    os.replace(tmp_state, ckpt_state_path)
-                except Exception as e:
-                    print(f"[CheckpointManager] state save failed: {e}", file=__import__('sys').stderr)
-        # Cleanup old checkpoints (also async)
-        self._cleanup_old()
+                state_path = Path(ckpt_state_path)
+                tmp_state = state_path.with_suffix('.json.tmp')
+                with open(tmp_state, 'w', encoding='utf-8') as f:
+                    json.dump(ckpt_data, f)
+                tmp_state.rename(state_path)
+
         for suffix, data_callable in extras.items():
-            path = os.path.join(self.data_dir, f'{tag}_{suffix}')
-            try:
-                data_callable(path)
-            except Exception as e:
-                print(f"[CheckpointManager] extras({suffix}) failed: {e}", file=__import__('sys').stderr)
+            path = self.data_dir / f'{tag}_{suffix}'
+            data_callable(str(path))
+
+        with self._lock:
+            self._cleanup_old()
 
     def _cleanup_old(self):
         """Remove old checkpoints, keeping the `cleanup_keep` most recent."""
@@ -119,9 +152,12 @@ class CheckpointManager:
         """Remove all files associated with a tag."""
         for prefix in ['concept_space_', 'syntax_lattice_']:
             for ext in ['.json', '.npz', '.codes.npz', '.opt.json']:
-                path = os.path.join(self.data_dir, f'{prefix}{tag}{ext}')
-                if os.path.exists(path):
+                path = self.data_dir / f'{prefix}{tag}{ext}'
+                if path.exists():
                     try:
-                        os.remove(path)
+                        path.unlink()
                     except OSError:
                         pass
+
+
+CheckpointManager = AtomicCheckpointManager

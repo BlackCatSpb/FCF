@@ -112,6 +112,7 @@ class STDPTrainer:
                 cos_threshold=_c.beam_cos_threshold,
                 max_beams=_c.beam_max,
                 rebuild_interval=_c.beam_rebuild_interval,
+                eps=_c.beam_eps,
             )
         else:
             self.manifold = None
@@ -725,10 +726,11 @@ class STDPTrainer:
 
             # Transition Manifold: push переходы для каждой контекстной пары
             if self.manifold is not None:
+                _eps_m = self.manifold._eps
                 for vc, elr in zip(valid_ctx, valid_elr):
-                    if elr > 1e-10:
+                    if elr > _eps_m:
                         T = self.manifold._to_tangent(v_gen, vc)
-                        if np.linalg.norm(T) > 1e-10:
+                        if np.linalg.norm(T) > _eps_m:
                             self.manifold.push(T)
 
             if n_updates > 0 and total_elr > 0:
@@ -761,12 +763,11 @@ class STDPTrainer:
                     # Beam pull: притяжение к ближайшему лучу
                     if self.manifold is not None:
                         cent, sim, _cnt = self.manifold.nearest_beam(v_new)
-                        if cent is not None and sim > self.manifold.cos_threshold * 0.8:
-                            from eva.symbolic.fcf_config import FCFConfig
-                            _bs = FCFConfig().beam_pull_strength
-                            v_new = v_new + cent * _bs
+                        from eva.symbolic.fcf_config import FCFConfig as _FCfg
+                        if cent is not None and sim > self.manifold.cos_threshold * _FCfg().beam_pull_sim_ratio:
+                            v_new = v_new + cent * _FCfg().beam_pull_strength
                     nv = np.linalg.norm(v_new)
-                    if nv > 1e-10:
+                    if nv > _FCfg().beam_eps:
                         v_new /= nv
                     cs._apply_vector_update(gen_cid, v_new)
 
@@ -918,13 +919,14 @@ class STDPTrainer:
 
             # Transition Manifold: push переходы ctx→tgt (семплируем для скорости)
             if self.manifold is not None and N > 0:
-                max_push = min(N, 200)  # не более 200 за батч
+                from eva.symbolic.fcf_config import FCFConfig as _FCfg
+                max_push = min(N, _FCfg().beam_batch_push_max)
                 idxs = torch.randperm(N, device=device)[:max_push]
                 vc = gen._vecs_t[ctx_t[idxs]].float()
                 vg = gen._vecs_t[tgt_t[idxs]].float()
                 cos = (vg * vc).sum(dim=1, keepdim=True).clamp(min=-1, max=1)
                 T_dir = vg - cos * vc
-                T_norm = T_dir.norm(dim=1, keepdim=True).clamp(min=1e-10)
+                T_norm = T_dir.norm(dim=1, keepdim=True).clamp(min=_FCfg().beam_eps)
                 T_dir /= T_norm
                 T_cpu = T_dir.cpu().numpy().astype(np.float32)
                 self.manifold.push_batch(T_cpu)
@@ -984,15 +986,14 @@ class STDPTrainer:
                 v_gpu = gen._vecs_t[gen_cid].float()
                 v_new_gpu = v_gpu + grad_gpu[gi] * base_lr_val
                 # Beam pull: притяжение к ближайшему лучу
-                if self.manifold is not None and self.manifold.n_beams() > 3:
+                from eva.symbolic.fcf_config import FCFConfig as _FCfg2
+                if self.manifold is not None and self.manifold.n_beams() >= _FCfg2().beam_pull_min_beams:
                     v_cpu = v_new_gpu.cpu().numpy().astype(np.float32)
                     cent, sim, _cnt = self.manifold.nearest_beam(v_cpu)
-                    if cent is not None and sim > self.manifold.cos_threshold * 0.7:
-                        from eva.symbolic.fcf_config import FCFConfig
-                        _bs = FCFConfig().beam_pull_strength
-                        v_new_gpu = v_new_gpu + torch.from_numpy(cent).to(v_new_gpu.device) * _bs
+                    if cent is not None and sim > self.manifold.cos_threshold * _FCfg2().beam_pull_sim_ratio:
+                        v_new_gpu = v_new_gpu + torch.from_numpy(cent).to(v_new_gpu.device) * _FCfg2().beam_pull_strength
                 nv = v_new_gpu.norm()
-                if nv > 1e-10:
+                if nv > _FCfg2().beam_eps:
                     v_new_gpu /= nv
                 _deferred_updates.append((gen_cid, v_new_gpu))
 

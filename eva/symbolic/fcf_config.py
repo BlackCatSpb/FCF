@@ -665,7 +665,13 @@ class FCFConfig:
     beam_max: int = 100               # макс. число лучей
     beam_rebuild_interval: int = 100   # перестраивать каждые N переходов
     beam_pull_strength: float = 0.01  # сила притяжения к лучу в STDP
+    beam_pull_sim_ratio: float = 0.7  # косинус порог для pull (доля от cos_threshold)
+    beam_pull_min_beams: int = 3      # мин. лучей для включения pull
     beam_rrf_weight: float = 0.15     # вес beam_score в RRF _branch
+    beam_rrf_sim_ratio: float = 0.6   # косинус порог для RRF (доля от cos_threshold)
+    beam_rrf_min_beams: int = 3       # мин. лучей для включения RRF-сигнала
+    beam_batch_push_max: int = 200    # макс. переходов за батч (семплирование)
+    beam_eps: float = 1e-10           # epsilon для нормы
     beam_levels: list = field(default_factory=lambda: ['token'])
 
     # ── Semantic Bootstrap ───────────────────

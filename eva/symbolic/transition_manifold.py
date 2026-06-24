@@ -22,11 +22,15 @@ class TransitionManifold:
 
     def __init__(self, dim: int = 768, buffer_size: int = 10000,
                  cos_threshold: float = 0.8, max_beams: int = 100,
-                 rebuild_interval: int = 100):
+                 rebuild_interval: int = 100, eps: float = 1e-10,
+                 min_count_base: int = 3, min_count_divisor: int = 4):
         self.dim = dim
         self.cos_threshold = cos_threshold
         self.max_beams = max_beams
         self.rebuild_interval = rebuild_interval
+        self._eps = eps
+        self._min_count_base = min_count_base
+        self._min_count_divisor = min_count_divisor
 
         # Кольцевой буфер (фиксированный numpy, без фрагментации)
         self._buf = np.zeros((buffer_size, dim), dtype=np.float32)
@@ -104,7 +108,7 @@ class TransitionManifold:
 
         for T in samples:
             norm = np.linalg.norm(T)
-            if norm < 1e-10:
+            if norm < self._eps:
                 continue
             T_norm = T / norm
             matched = False
@@ -114,7 +118,7 @@ class TransitionManifold:
                     # VSA bundle: weighted average + renormalisation
                     new_cent = cent * cnt + T_norm
                     nc = np.linalg.norm(new_cent)
-                    if nc > 1e-10:
+                    if nc > self._eps:
                         new_cent = new_cent / nc
                     # дисперсия: EMA квадрата расстояния
                     dist_sq = max(0.0, 1.0 - sim * sim)
@@ -126,7 +130,7 @@ class TransitionManifold:
                 new_beams.append((T_norm.copy(), 1, 0.0))
 
         # Отсев лучей с малым числом попаданий
-        min_count = max(3, n_samples // (self.max_beams * 4))
+        min_count = max(self._min_count_base, n_samples // (self.max_beams * self._min_count_divisor))
         self.beams = [(c, cnt, v) for c, cnt, v in new_beams if cnt >= min_count]
 
     def _to_tangent(self, v_next: np.ndarray, v_prev: np.ndarray) -> np.ndarray:
@@ -134,4 +138,4 @@ class TransitionManifold:
         cos_sim = float(np.dot(v_next, v_prev))
         T = v_next - cos_sim * v_prev
         n = np.linalg.norm(T)
-        return T / n if n > 1e-10 else np.zeros(self.dim, dtype=np.float32)
+        return T / n if n > self._eps else np.zeros(self.dim, dtype=np.float32)

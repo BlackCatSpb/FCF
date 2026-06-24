@@ -658,6 +658,16 @@ class FCFConfig:
     max_grad_norm: float = 1.0  # clip gradient norm to prevent explosive updates
     neg_lr_ratio: float = 0.5
 
+    # ── Transition Manifold (паутина переходов) ──
+    beam_dim: int = 0                 # 0 = auto (== dim)
+    beam_buffer_size: int = 10000     # макс. переходов в буфере
+    beam_cos_threshold: float = 0.8   # порог объединения в луч
+    beam_max: int = 100               # макс. число лучей
+    beam_rebuild_interval: int = 100   # перестраивать каждые N переходов
+    beam_pull_strength: float = 0.01  # сила притяжения к лучу в STDP
+    beam_rrf_weight: float = 0.15     # вес beam_score в RRF _branch
+    beam_levels: list = field(default_factory=lambda: ['token'])
+
     # ── Semantic Bootstrap ───────────────────
     # Learning rate for lattice-derived contrastive pulls
     bootstrap_lr: float = 0.05

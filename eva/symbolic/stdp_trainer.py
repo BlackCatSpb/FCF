@@ -101,9 +101,20 @@ class STDPTrainer:
     """
     def __init__(self, gen, subspace_lr=None):
         self.gen = gen
-        self.subspace_lr = subspace_lr  # (lr_c, lr_a, lr_m) or None for uniform LR
-        # G-45: Persistent CUDA events (created once, reused across batches)
-        pass  # profiling stubs removed (G-55)
+        self.subspace_lr = subspace_lr
+        from eva.symbolic.fcf_config import FCFConfig
+        from eva.symbolic.transition_manifold import TransitionManifold
+        _c = FCFConfig()
+        if _c.beam_buffer_size > 0:
+            self.manifold = TransitionManifold(
+                dim=_c.beam_dim or gen.cs.dim,
+                buffer_size=_c.beam_buffer_size,
+                cos_threshold=_c.beam_cos_threshold,
+                max_beams=_c.beam_max,
+                rebuild_interval=_c.beam_rebuild_interval,
+            )
+        else:
+            self.manifold = None
 
 
     # ═══════════════════════════════════════════════════
@@ -712,6 +723,14 @@ class STDPTrainer:
             total_delta = ((ctx_mat * elr_arr[:, None]).sum(axis=0) -
                           v_gen * (y * elr_arr).sum())
 
+            # Transition Manifold: push переходы для каждой контекстной пары
+            if self.manifold is not None:
+                for vc, elr in zip(valid_ctx, valid_elr):
+                    if elr > 1e-10:
+                        T = self.manifold._to_tangent(v_gen, vc)
+                        if np.linalg.norm(T) > 1e-10:
+                            self.manifold.push(T)
+
             if n_updates > 0 and total_elr > 0:
                 grad = total_delta / max(total_elr, 1e-10)
                 gn = float(np.linalg.norm(grad))
@@ -739,6 +758,13 @@ class STDPTrainer:
                     cs._apply_subspace_update(gen_cid, grad, base_lr_val, self.subspace_lr)
                 else:
                     v_new = v_gen + grad * base_lr_val
+                    # Beam pull: притяжение к ближайшему лучу
+                    if self.manifold is not None:
+                        cent, sim, _cnt = self.manifold.nearest_beam(v_new)
+                        if cent is not None and sim > self.manifold.cos_threshold * 0.8:
+                            from eva.symbolic.fcf_config import FCFConfig
+                            _bs = FCFConfig().beam_pull_strength
+                            v_new = v_new + cent * _bs
                     nv = np.linalg.norm(v_new)
                     if nv > 1e-10:
                         v_new /= nv
@@ -890,6 +916,19 @@ class STDPTrainer:
             acc, elr_grouped, cnt, _, _ = self._gpu_stdp_core(
                 ctx_t, tgt_t, meta_t, unique_gen, inv_t, gen, cs, gradient_noise_scale)
 
+            # Transition Manifold: push переходы ctx→tgt (семплируем для скорости)
+            if self.manifold is not None and N > 0:
+                max_push = min(N, 200)  # не более 200 за батч
+                idxs = torch.randperm(N, device=device)[:max_push]
+                vc = gen._vecs_t[ctx_t[idxs]].float()
+                vg = gen._vecs_t[tgt_t[idxs]].float()
+                cos = (vg * vc).sum(dim=1, keepdim=True).clamp(min=-1, max=1)
+                T_dir = vg - cos * vc
+                T_norm = T_dir.norm(dim=1, keepdim=True).clamp(min=1e-10)
+                T_dir /= T_norm
+                T_cpu = T_dir.cpu().numpy().astype(np.float32)
+                self.manifold.push_batch(T_cpu)
+
         # G-46: Persistent _mom_t tensor (replace CPU dict)
         if momentum_mu > 0:
             if gen._mom_t is None:
@@ -944,6 +983,14 @@ class STDPTrainer:
             else:
                 v_gpu = gen._vecs_t[gen_cid].float()
                 v_new_gpu = v_gpu + grad_gpu[gi] * base_lr_val
+                # Beam pull: притяжение к ближайшему лучу
+                if self.manifold is not None and self.manifold.n_beams() > 3:
+                    v_cpu = v_new_gpu.cpu().numpy().astype(np.float32)
+                    cent, sim, _cnt = self.manifold.nearest_beam(v_cpu)
+                    if cent is not None and sim > self.manifold.cos_threshold * 0.7:
+                        from eva.symbolic.fcf_config import FCFConfig
+                        _bs = FCFConfig().beam_pull_strength
+                        v_new_gpu = v_new_gpu + torch.from_numpy(cent).to(v_new_gpu.device) * _bs
                 nv = v_new_gpu.norm()
                 if nv > 1e-10:
                     v_new_gpu /= nv

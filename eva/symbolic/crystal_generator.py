@@ -827,6 +827,7 @@ class CrystalGenerator:
 
         # 5. RRF scoring
         _fc = FormulaCoefficients()
+        manifold = getattr(getattr(self, '_trainer', None), 'manifold', None)
         combined = {}
         for cid in all_cids:
             rrf = 0.0
@@ -838,6 +839,16 @@ class CrystalGenerator:
                 rrf += _fc.rrf_hdc * hdc_candidates[cid] / (K + 1)
             if cid in vector_sim:
                 rrf += _fc.rrf_vector * vector_sim[cid] / (K + 1)
+            # Beam score: насколько переход prev_cid→cid лежит на известном луче
+            if manifold is not None and manifold.n_beams() > 3:
+                v_c = self.cs.concept_vector(cid)
+                v_p = self.cs.concept_vector(prev_cid)
+                if v_c is not None and v_p is not None:
+                    T = manifold._to_tangent(v_c, v_p)
+                    if np.linalg.norm(T) > 1e-10:
+                        _beam_cent, beam_sim, _beam_cnt = manifold.nearest_beam(T)
+                        if beam_sim > manifold.cos_threshold * 0.6:
+                            rrf += _cfg.branch_conf_scale * beam_sim / (K + 1)
             freq = self.lattice.concept_freq.get(cid, 0)
             prior = _fc.rrf_prior / (K + 1) * (1.0 - min(freq / _fc.rrf_prior_freq_cap, 1.0))
             rrf += prior

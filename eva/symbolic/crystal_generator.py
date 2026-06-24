@@ -44,8 +44,9 @@ from eva.symbolic.hormonal_system import HormonalSystem
 from eva.symbolic.fcf_config import FormulaCoefficients, FCFConfig
 
 
-_BOS_ID = 1
-_EOS_ID = 2
+from eva.symbolic.fcf_config import FCFConfig
+_BOS_ID = FCFConfig().bos_token_id
+_EOS_ID = FCFConfig().eos_token_id
 
 
 @dataclass
@@ -773,6 +774,7 @@ class CrystalGenerator:
             return []
         prev_cid = seq[-1]
         cids = seq[-3:] if len(seq) >= 3 else seq
+        _cfg = FCFConfig()
         K = 3
 
         # 1. Graph-based semantic paths (BMSSP-EVA, replaces single-hop connections)
@@ -788,7 +790,7 @@ class CrystalGenerator:
 
         # 2. N-gram syntax (filter to semantic tokens only)
         syn_preds = self.lattice.predict(cids)
-        syn_ranked = {cid: i + 1 for i, (cid, _) in enumerate(syn_preds[:80])
+        syn_ranked = {cid: i + 1 for i, (cid, _) in enumerate(syn_preds[:FCFConfig().graph_search_syn_preds_limit])
                       if self._is_semantic_token(cid)}
 
         # 2b. HDC n-gram fallback (always participates in RRF for stability)
@@ -797,9 +799,9 @@ class CrystalGenerator:
             ctx_cids = list(reversed(cids[-2:]))
             if hasattr(self.cs.fractal, 'hdc_memory'):
                 hdc_preds = self.cs.fractal.hdc_predict(
-                    ctx_cids, self.cs.fractal.codes, k=30)
+                    ctx_cids, self.cs.fractal.codes, k=FCFConfig().graph_search_hdc_k)
                 for hcid, hscore in hdc_preds:
-                    if self._is_semantic_token(hcid) and hscore > 0.05:
+                    if self._is_semantic_token(hcid) and hscore > FCFConfig().graph_search_hdc_score_min:
                         hdc_candidates[hcid] = hscore
 
         # 3. All candidates from learned signals
@@ -810,13 +812,13 @@ class CrystalGenerator:
         vector_sim = {}
         if v_prev is not None:
             if hasattr(self.cs.fractal, '_sector_index') and self.cs.fractal._sector_index:
-                sim_candidates = self.cs.fractal.search_in_sector(prev_cid, depth=1, k=40)
-                if len(sim_candidates) < 5:
-                    sim_candidates = self.cs.fractal.focal_refine(prev_cid, start_depth=0, target_k=20)
+                sim_candidates = self.cs.fractal.search_in_sector(prev_cid, depth=_cfg.graph_search_sector_depth, k=_cfg.graph_search_sector_k)
+                if len(sim_candidates) < _cfg.graph_search_focal_k // 4:
+                    sim_candidates = self.cs.fractal.focal_refine(prev_cid, start_depth=0, target_k=_cfg.graph_search_focal_k)
             else:
-                sim_candidates = self.cs.topk_similar_concepts(prev_cid, k=20, sample_size=500)
+                sim_candidates = self.cs.topk_similar_concepts(prev_cid, k=_cfg.graph_search_focal_k, sample_size=_cfg.graph_search_focal_sample_size)
             for cid, sim in sim_candidates:
-                if cid not in all_cids and sim > 0.05:
+                if cid not in all_cids and sim > _cfg.graph_search_sim_threshold:
                     all_cids.add(cid)
                 vector_sim[cid] = sim
 
@@ -855,11 +857,12 @@ class CrystalGenerator:
                     sim_to_query = float(np.dot(v, cn))
                     # ideal: not too close (parroting), not too far (drift)
                     # bonus = 0.0 at sim=0, peaking at sim=0.5, then decays
-                    intent_bonus = max(0, sim_to_query * (1.0 - sim_to_query)) * 0.3
+                    intent_bonus = max(0, sim_to_query * (1.0 - sim_to_query)) * _cfg.branch_intent_bonus_scale
                     combined[cid] *= (1.0 + intent_bonus)
 
         # 7. Anti-repetition + n-gram blocking
-        recent = seq[-6:] if len(seq) >= 6 else seq
+        _w = _cfg.branch_antirep_window
+        recent = seq[-_w:] if len(seq) >= _w else seq
         ngram_set = set()
         if len(seq) >= self.block_ngram - 1:
             for i in range(len(seq) - (self.block_ngram - 2)):
@@ -867,7 +870,7 @@ class CrystalGenerator:
         for cid in list(combined.keys()):
             count = recent.count(cid)
             if count > 0:
-                combined[cid] *= math.exp(-0.3 * count)
+                combined[cid] *= math.exp(-_cfg.branch_antirep_penalty * count)
             if len(seq) >= self.block_ngram - 2:
                 candidate_ngram = tuple(seq[-(self.block_ngram - 2):] + [cid])
                 if candidate_ngram in ngram_set:
@@ -894,7 +897,7 @@ class CrystalGenerator:
                         if overlap == 0:
                             combined.pop(cid, None)
                         else:
-                            combined[cid] *= (1.0 + math.log(overlap + 1) * 0.1)
+                            combined[cid] *= (1.0 + math.log(overlap + 1) * _cfg.branch_overlap_log_scale)
 
         if not combined:
             return []
@@ -931,11 +934,11 @@ class CrystalGenerator:
             cut = max(1, cut)
             truncated = sorted_probs[:cut].copy()
             truncated /= truncated.sum()
-            n_candidates = min(15 + int(15 * theta_temp), cut)
+            n_candidates = min(_cfg.branch_n_candidates_base + int(_cfg.branch_n_candidates_base * theta_temp), cut)
             idx = np.random.choice(cut, size=n_candidates, replace=False, p=truncated)
             scored = [(result[order[i]][0], math.log(sorted_probs[i] + 1e-10)) for i in idx]
         else:
-            n_candidates = min(15 + int(15 * theta_temp), len(result))
+            n_candidates = min(_cfg.branch_n_candidates_base + int(_cfg.branch_n_candidates_base * theta_temp), len(result))
             scored = [(result[i][0], math.log(probs[i] + 1e-10))
                       for i in range(n_candidates)]
         return scored

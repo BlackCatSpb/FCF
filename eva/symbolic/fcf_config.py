@@ -194,6 +194,8 @@ class MetricPairBuilder:
         pairs = []
         wc = morph_vocab.word_cache
         words = list(wc.keys())
+        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+        _R.rng('antonym_shuffle')
         random.seed(42)
         random.shuffle(words)
         found = 0
@@ -522,6 +524,12 @@ class FCFConfig:
     def get_field_dims(self):
         return {'l_c': self.l_c, 'l_a': self.l_a, 'l_m': self.l_m}
 
+    # ── Special token IDs ────────────────────
+    bos_token_id: int = 1
+    eos_token_id: int = 2
+    pad_token_id: int = 0
+    unk_token_id: int = 0
+
     # ── Seed ─────────────────────────────────
     global_seed: int = 42
 
@@ -658,9 +666,11 @@ class FCFConfig:
     harm_lr: float = 0.05
     morph_lr: float = 0.03
     n_harm_iterations: int = 5
+    harm_damping: float = 0.5
     morph_confidence_threshold: float = 0.8
     envelope_decay: float = 0.95
     harm_slow_start_epochs: int = 5
+    entity_field_max_entities: int = 50000
 
     # ── Engine ────────────────────────────────
     use_torch: bool = True
@@ -675,6 +685,11 @@ class FCFConfig:
     periodic_save_every: int = 5000
 
     # ── P1-A: crystal_generator graph search ─
+    fractal_l1_lambda: float = 0.001
+    fractal_n_field_bits: int = 512
+    fractal_field_lr: float = 0.01
+    fractal_max_latent_dim_mult: int = 4
+    fractal_hdc_bundle_lr: float = 0.1
     graph_search_B: float = 2.0
     graph_search_max_candidates: int = 30
     graph_search_max_depth: int = 5
@@ -694,6 +709,8 @@ class FCFConfig:
     branch_overlap_log_scale: float = 0.1
     branch_conf_scale: float = 0.5
     branch_adaptive_bw_min_ratio: float = 0.5
+    branch_antirep_penalty: float = 0.3
+    branch_intent_bonus_scale: float = 0.3
 
     # ── P1-B: parameter_optimizer ─────────────
     metric_maxlen_primary: int = 10

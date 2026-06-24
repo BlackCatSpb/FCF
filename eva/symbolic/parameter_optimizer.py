@@ -15,21 +15,27 @@ from eva.symbolic.fcf_config import FCFConfig, AdaptRule, ParamDef
 
 
 class Param:
-    """A single parameter with feasibility corridor."""
+    """A single parameter with feasibility corridor.
 
-    __slots__ = ('name', 'min', 'max', 'default', 'current', 'step_scale')
+    Stores a reference to its ParamDef so that ``toward_default()``
+    re-reads the current default from FCFConfig — enabling runtime
+    config cascade without reconstruction.
+    """
 
-    def __init__(self, name, min_val, max_val, default, step_scale=0.1):
+    __slots__ = ('name', 'min', 'max', 'default', 'current', 'step_scale', '_def')
+
+    def __init__(self, name, min_val, max_val, default, step_scale=0.1, param_def=None):
         self.name = name
         self.min = min_val
         self.max = max_val
         self.default = default
         self.current = default
         self.step_scale = step_scale
+        self._def = param_def
 
     @classmethod
     def from_def(cls, d: ParamDef) -> 'Param':
-        return cls(d.name, d.min_val, d.max_val, d.default, d.step_scale)
+        return cls(d.name, d.min_val, d.max_val, d.default, d.step_scale, param_def=d)
 
     def set(self, value):
         self.current = max(self.min, min(self.max, value))
@@ -46,6 +52,9 @@ class Param:
         return self.current
 
     def toward_default(self, rate=0.03):
+        # re-read default from ParamDef for config cascade
+        if self._def is not None:
+            self.default = self._def.default
         old = self.current
         diff = self.default - self.current
         if abs(diff) < 1e-10:
@@ -113,23 +122,24 @@ class ParameterOptimizer:
         for param in config.params:
             self.p[param.name] = Param.from_def(param)
 
+        _c = self.config
         self.m = {
-            'mean_cos': MetricBuffer(10),
-            'std_cos':  MetricBuffer(10),
-            'vec_ppl':  MetricBuffer(8),
-            'acc1':     MetricBuffer(8),
-            'vacc1':    MetricBuffer(8),
-            'delta':    MetricBuffer(8),
-            'ppl':      MetricBuffer(8),
-            'ng_new':   MetricBuffer(6),
+            'mean_cos': MetricBuffer(_c.metric_maxlen_primary),
+            'std_cos':  MetricBuffer(_c.metric_maxlen_primary),
+            'vec_ppl':  MetricBuffer(_c.metric_maxlen_secondary),
+            'acc1':     MetricBuffer(_c.metric_maxlen_secondary),
+            'vacc1':    MetricBuffer(_c.metric_maxlen_secondary),
+            'delta':    MetricBuffer(_c.metric_maxlen_secondary),
+            'ppl':      MetricBuffer(_c.metric_maxlen_secondary),
+            'ng_new':   MetricBuffer(_c.metric_maxlen_tiny),
         }
 
         self._prev_mean_cos = 0.0
         self._vacc1_stuck = 0
         self._step = 0
-        self._flat_thresh = 0.002    # |cos| below this = flat (symmetric plateau)
-        self._flat_steps = 0         # consecutive steps with |cos| below thresh
-        self._cos_trend_buffer = deque(maxlen=5)  # abs(cos) history for plateau detection
+        self._flat_thresh = _c.opt_flat_threshold
+        self._flat_steps = 0
+        self._cos_trend_buffer = deque(maxlen=_c.opt_cos_trend_window)
         self._full_stuck_counter = 0
 
     def _eval_trigger(self, trigger: str, ctx: dict) -> bool:
@@ -137,12 +147,11 @@ class ParameterOptimizer:
         try:
             # Full stuck: all metrics in plateau simultaneously
             if trigger == 'full_stuck':
-                return self._full_stuck_counter >= 5
-            # Plateau triggers
+                return self._full_stuck_counter >= self.config.opt_full_stuck_threshold
             if trigger == 'vec_ppl_plateau':
-                return self.m['vec_ppl'].plateau(patience=3, rel_thresh=0.002)
+                return self.m['vec_ppl'].plateau(patience=self.config.plateau_patience, rel_thresh=self.config.plateau_rel_thresh_ppl)
             if trigger == 'acc1_plateau':
-                return self.m['acc1'].plateau(patience=3, rel_thresh=0.02)
+                return self.m['acc1'].plateau(patience=self.config.plateau_patience, rel_thresh=self.config.plateau_rel_thresh_acc1)
 
             # vacc1 stuck
             if trigger.startswith('vacc1_stuck >= '):
@@ -160,7 +169,7 @@ class ParameterOptimizer:
                 std_cos = ctx.get('std_cos')
                 if std_cos is None or std_cos <= 0:
                     return False
-                t = ctx.get('inh_threshold', 0.1)
+                t = ctx.get('inh_threshold', self.config.opt_inh_threshold_fallback)
                 est_frac = math.erfc(t / (std_cos * math.sqrt(2)))
                 ctx['_est_frac'] = est_frac
                 return est_frac > thresh
@@ -170,7 +179,7 @@ class ParameterOptimizer:
                 std_cos = ctx.get('std_cos')
                 if std_cos is None or std_cos <= 0:
                     return False
-                t = ctx.get('inh_threshold', 0.1)
+                t = ctx.get('inh_threshold', self.config.opt_inh_threshold_fallback)
                 est_frac = math.erfc(t / (std_cos * math.sqrt(2)))
                 ctx['_est_frac'] = est_frac
                 return est_frac < thresh
@@ -268,7 +277,7 @@ class ParameterOptimizer:
             has_drift = any(r.action == 'toward_default' for r in param.rules)
             if not rule_applied and has_drift:
                 old = p.current
-                p.toward_default(0.02)
+                p.toward_default(self.config.opt_toward_default_rate)
                 if abs(p.current - old) > 1e-8:
                     changes[param.name] = p.current
 
@@ -309,13 +318,13 @@ class ParameterOptimizer:
         mean_cos = kw.get('mean_cos')
         vec_ppl = kw.get('vec_ppl')
         cos_plateau = mean_cos is not None and abs(mean_cos) < self._flat_thresh
-        ppl_plateau = vec_ppl is not None and self.m['vec_ppl'].plateau(patience=3, rel_thresh=0.005)
+        ppl_plateau = vec_ppl is not None and self.m['vec_ppl'].plateau(patience=self.config.plateau_patience, rel_thresh=self.config.plateau_rel_thresh_default)
         v1_stuck = vacc1 is not None and vacc1 == 0.0
         if cos_plateau and ppl_plateau and v1_stuck:
             self._full_stuck_counter += 1
         else:
             self._full_stuck_counter = 0
-        if self._full_stuck_counter >= 5:
+        if self._full_stuck_counter >= self.config.opt_full_stuck_threshold:
             changes['full_stuck'] = True
 
         self._prev_mean_cos = kw.get('mean_cos', self._prev_mean_cos)
@@ -364,22 +373,21 @@ class ParameterOptimizer:
 class PlateauDetector:
     """Мягкий детектор плато с EMA loss + std threshold (§4 Training Dynamics V18).
 
-    Заменяет жёсткий `_full_stuck_counter >= 3 → ×0.95` на:
-    - EMA loss с окном 100 шагов
-    - Адаптивный порог (std loss / mean loss)
-    - Плавный линейный decay (-1%/шаг после patience)
-    - Автоматическое восстановление при выходе из плато
+    All defaults from FCFConfig.detector_* fields.
     """
 
-    def __init__(self, window=100, patience=20, threshold_std=0.5, min_decay=0.1, recovery_factor=0.05):
-        self.window = window
-        self.patience = patience
-        self.threshold_std = threshold_std
-        self.min_decay = min_decay
-        self.recovery_factor = recovery_factor
+    def __init__(self, config=None, window=None, patience=None, threshold_std=None,
+                 min_decay=None, recovery_factor=None):
+        from eva.symbolic.fcf_config import FCFConfig
+        _c = config if config is not None else FCFConfig()
+        self.window = window if window is not None else _c.detector_window
+        self.patience = patience if patience is not None else _c.detector_patience
+        self.threshold_std = threshold_std if threshold_std is not None else _c.detector_threshold_std
+        self.min_decay = min_decay if min_decay is not None else _c.detector_min_decay
+        self.recovery_factor = recovery_factor if recovery_factor is not None else _c.detector_recovery_factor
         self.losses = []
         self.ema_loss = None
-        self.ema_alpha = 0.05
+        self.ema_alpha = _c.detector_ema_alpha
         self._plateau_steps = 0
         self._decay_factor = 1.0
         self._last_reduction_step = 0
@@ -402,8 +410,9 @@ class PlateauDetector:
                 if self._plateau_steps > 0:
                     self._plateau_steps = max(0, self._plateau_steps - 1)
         if self._plateau_steps >= self.patience:
+            from eva.symbolic.fcf_config import FCFConfig
             steps_in_plateau = self._plateau_steps - self.patience
-            decay = 1.0 - (steps_in_plateau * 0.01)
+            decay = 1.0 - (steps_in_plateau * FCFConfig().detector_decay_per_step)
             self._decay_factor = max(self.min_decay, decay)
             self._last_reduction_step = step
         else:

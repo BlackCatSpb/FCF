@@ -236,34 +236,36 @@ class FractalField:
     v = normalize(code @ basis) — unchanged.
     """
 
-    def __init__(self, dim=768, latent_dim=2048, l_c=None, l_a=None, l_m=None, l1_lambda=0.001,
-                 n_field_bits=512, field_lr=0.01, max_latent_dim=None, arch_controller=None):
-        self.dim = dim
-        self.latent_dim = latent_dim
-        self.max_latent_dim = max_latent_dim or latent_dim * 4
-        self.l1_lambda = l1_lambda
+    def __init__(self, dim=None, latent_dim=None, l_c=None, l_a=None, l_m=None, l1_lambda=None,
+                 n_field_bits=None, field_lr=None, max_latent_dim=None, arch_controller=None):
+        from eva.symbolic.fcf_config import FCFConfig
+        _c = FCFConfig()
+        self.dim = dim if dim is not None else _c.dim
+        self.latent_dim = latent_dim if latent_dim is not None else _c.latent_dim
+        self.max_latent_dim = max_latent_dim or self.latent_dim * _c.fractal_max_latent_dim_mult
+        self.l1_lambda = l1_lambda if l1_lambda is not None else _c.fractal_l1_lambda
 
         # Adaptive architecture controller (reads from FCFConfig.subspace_*)
-        self.arch = arch_controller or AdaptiveArchitectureController(latent_dim=latent_dim)
+        self.arch = arch_controller or AdaptiveArchitectureController(latent_dim=self.latent_dim)
         if l_c is not None and l_a is not None and l_m is not None:
-            self.arch.l_c_ratio = l_c / latent_dim
-            self.arch.l_a_ratio = l_a / latent_dim
-            self.arch.l_m_ratio = l_m / latent_dim
+            self.arch.l_c_ratio = l_c / self.latent_dim
+            self.arch.l_a_ratio = l_a / self.latent_dim
+            self.arch.l_m_ratio = l_m / self.latent_dim
         self.l_c = self.arch.l_c
         self.l_a = self.arch.l_a
         self.l_m = self.arch.l_m
 
         # Fractal basis: (latent_dim, dim) with orthonormal columns
         from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
-        mat = _R.rng('basis').randn(latent_dim, dim).astype(np.float32)
+        mat = _R.rng('basis').randn(self.latent_dim, self.dim).astype(np.float32)
         Q, _ = np.linalg.qr(mat, mode='reduced')
         self.basis = Q.astype(np.float32)
         # Latent codes: cid → (latent_dim,) array
         self.codes = {}
 
         # Learnable field projection: code @ W_proj → binarized field bits
-        self.n_field_bits = n_field_bits
-        self.field_lr = field_lr
+        self.n_field_bits = n_field_bits if n_field_bits is not None else _c.fractal_n_field_bits
+        self.field_lr = field_lr if field_lr is not None else _c.fractal_field_lr
         self.W_proj: Optional[np.ndarray] = None  # [latent_dim, n_field_bits]
         self.field_bits: Dict[int, np.ndarray] = {}
         self._fb_dirty = False
@@ -356,26 +358,28 @@ class FractalField:
     def init_concept(self, cid, rng_seed=None):
         """Initialize a concept with split subspace code.
 
-        z_c: sparse identity pattern (~12% active)
+        z_c: sparse identity pattern (~3% active)
         z_a: small noise (context attention starts neutral)
         z_m: near zero (meta-gates start open)
         """
+        from eva.symbolic.fcf_config import FCFConfig
+        _fi = FCFConfig()
         seed = rng_seed if rng_seed is not None else cid * 137 + 42
         rng = np.random.RandomState(abs(seed) % (2**31))
 
         z = np.zeros(self.latent_dim, dtype=np.float32)
 
         # z_c: sparse identity (~3% active, room to grow via STDP)
-        n_active = max(int(self.l_c * 0.03), 8)
+        n_active = max(int(self.l_c * _fi.fractal_init_z_c_active_pct), _fi.fractal_init_z_c_active_min)
         idxs = rng.choice(self.l_c, n_active, replace=False)
         vals = rng.randn(n_active).astype(np.float32)
         z[:self.l_c][idxs] = vals
 
         # z_a: small noise
-        z[self.l_c:self.l_c + self.l_a] = rng.randn(self.l_a).astype(np.float32) * 0.01
+        z[self.l_c:self.l_c + self.l_a] = rng.randn(self.l_a).astype(np.float32) * _fi.fractal_init_z_a_scale
 
         # z_m: near zero — meta gates start neutral
-        z[self.l_c + self.l_a:] = rng.randn(self.l_m).astype(np.float32) * 0.001
+        z[self.l_c + self.l_a:] = rng.randn(self.l_m).astype(np.float32) * _fi.fractal_init_z_m_scale
 
         # Rescale so |code @ basis| = 1
         v_raw = z @ self.basis
@@ -388,12 +392,14 @@ class FractalField:
 
     # ── Field bits ───────────────────────────────────────────
 
-    def init_fields(self, n_anchors=1024):
+    def init_fields(self, n_anchors=None):
         """Initialize binary field bit arrays for all concepts.
 
         field_bits[cid] = np.uint8 array of n_anchors/8 bytes.
         Used by octree encoding path (build_octree_fields).
         """
+        from eva.symbolic.fcf_config import FCFConfig
+        n_anchors = n_anchors or FCFConfig().fractal_init_field_n_anchors
         self.field_bits = {}
         n_bytes = (n_anchors + 7) // 8
         for cid in self.codes:
@@ -468,7 +474,8 @@ class FractalField:
                 bit_ratio = all_bits.mean(axis=0)
                 collapsed = np.where((bit_ratio > 0.85) | (bit_ratio < 0.15))[0]
                 if len(collapsed) > 0:
-                    rng = np.random.RandomState(42 + self._capacity_growths)
+                    from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+                    rng = _R.rng(f'collapse_reset_{self._capacity_growths}')
                     self.W_proj[:, collapsed] = rng.randn(self.latent_dim, len(collapsed)).astype(np.float32)
                     print(f"  Collapse guard: reset {len(collapsed)}/{self.n_field_bits} degenerate hyperplanes")
             except Exception:
@@ -520,7 +527,8 @@ class FractalField:
             new_latent_dim = ((new_latent_dim + 7) // 8) * 8
 
             # Generate new orthogonal basis vectors
-            rng = np.random.RandomState(42 + self._capacity_growths)
+            from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+            rng = _R.rng(f'grow_capacity_{self._capacity_growths}')
             n_new = new_latent_dim - old_dim
             mat = rng.randn(n_new, self.dim).astype(np.float32)
             # Orthogonalise against existing basis
@@ -1056,7 +1064,8 @@ class EntityField:
     ETYPE_TO_ROLE = {'c': 'CHAR', 'm': 'MORPH', 'w': 'WORD', 's': 'SENT', 'p': 'PARA'}
 
     def __init__(self, dim=None, word_store=None, dim_coord=None):
-        self.dim = dim or (dim_coord.latent_dim if dim_coord else 2048)
+        _c = FCFConfig()
+        self.dim = dim or (dim_coord.latent_dim if dim_coord else _c.latent_dim)
         self.word_store = word_store  # optional reference to ConceptVectorStore
         self.dim_coord = dim_coord
 
@@ -1081,7 +1090,7 @@ class EntityField:
         # P1.7: EntityField cleanup — TTL + size cap
         self._entity_access_time: Dict[tuple, float] = {}
         self._entity_batch_counter = 0
-        self._max_entities = 50000  # 50K × 2048 × fp32 ≈ 400MB cap
+        self._max_entities = _c.entity_field_max_entities  # 50K × 2048 × fp32 ≈ 400MB cap
 
     # ── Key helpers ──────────────────────────────────────────
     @staticmethod
@@ -1116,8 +1125,8 @@ class EntityField:
     # ── Core: ensure, get, set, sync_word ────────────────────
     def ensure(self, key):
         if key not in self.entities:
-            seed = hash(key) % (2**31 - 1)
-            rng = np.random.RandomState(seed)
+            from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+            rng = _R.rng(f'entityfield_{key}')
             v = rng.randn(self.dim).astype(np.float32)
             n = float(np.linalg.norm(v))
             self.entities[key] = (v / n).astype(np.float16) if n > 1e-10 else v.astype(np.float16)
@@ -1161,7 +1170,7 @@ class EntityField:
         cache_tag = (key, ctx_key)
         if cache_tag in self._char_word_cache:
             return
-        if len(self._char_word_cache) > 50000:
+        if len(self._char_word_cache) > FCFConfig().entity_field_max_entities:
             evict = self._char_word_cache_evict.pop(0) if self._char_word_cache_evict else next(iter(self._char_word_cache))
             self._char_word_cache.pop(evict, None)
         self._char_word_cache[cache_tag] = True
@@ -1222,7 +1231,7 @@ class EntityField:
 
     @classmethod
     def from_dict(cls, data, word_store=None):
-        ef = cls(dim=data.get('ef_dim', 2048), word_store=word_store)
+        ef = cls(dim=data.get('ef_dim', FCFConfig().latent_dim), word_store=word_store)
         keys = data.get('ef_keys', [])
         vecs = data.get('ef_vecs', np.empty((0, ef.dim), dtype=np.float32))
         for k, v in zip(keys, vecs):
@@ -1259,8 +1268,8 @@ class CharEnvelope:
                 evict = min(self._access_count, key=self._access_count.get)
                 self._char_vecs.pop(evict, None)
                 self._access_count.pop(evict, None)
-            seed = hash(('char_env', codepoint)) % (2**31 - 1)
-            rng = np.random.RandomState(seed)
+            from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
+            rng = _R.rng(f'charenv_{codepoint}')
             v = rng.randn(self.dim).astype(np.float32)
             n = np.linalg.norm(v)
             self._char_vecs[codepoint] = v / n if n > 1e-10 else v
@@ -1301,12 +1310,14 @@ class Harmonizer:
 
     ROLES = ['ROOT', 'PREFIX', 'SUFFIX', 'ENDING', 'WORD_POS', 'WORD_ROLE']
 
-    def __init__(self, dim=None, harm_lr=0.05, morph_lr=0.03, n_iter=5, dim_coord=None):
-        self.dim = dim or (dim_coord.latent_dim if dim_coord else 2048)
-        self.harm_lr = harm_lr
-        self.morph_lr = morph_lr
-        self.n_iter = n_iter
-        self.damping = 0.5
+    def __init__(self, dim=None, harm_lr=None, morph_lr=None, n_iter=None, dim_coord=None):
+        from eva.symbolic.fcf_config import FCFConfig
+        _c = FCFConfig()
+        self.dim = dim or _c.latent_dim
+        self.harm_lr = harm_lr if harm_lr is not None else _c.harm_lr
+        self.morph_lr = morph_lr if morph_lr is not None else _c.morph_lr
+        self.n_iter = n_iter if n_iter is not None else _c.n_harm_iterations
+        self.damping = _c.harm_damping
 
         # Initialise quasi-orthogonal role vectors
         from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
@@ -1563,11 +1574,13 @@ class Harmonizer:
     @classmethod
     def from_dict(cls, data):
         """Restore harmonizer from serialized dict."""
+        from eva.symbolic.fcf_config import FCFConfig
+        _c = FCFConfig()
         harm = cls(
-            dim=data.get('harm_dim', 2048),
-            harm_lr=data.get('harm_lr', 0.05),
-            morph_lr=data.get('morph_lr', 0.03),
-            n_iter=data.get('n_iter', 5),
+            dim=data.get('harm_dim', _c.latent_dim),
+            harm_lr=data.get('harm_lr', _c.harm_lr),
+            morph_lr=data.get('morph_lr', _c.morph_lr),
+            n_iter=data.get('n_iter', _c.n_harm_iterations),
         )
         morph_ids = data.get('harm_morph_ids', np.array([], dtype=np.int64))
         morph_vecs = data.get('harm_morph_vecs', np.empty((0, harm.dim), dtype=np.float32))
@@ -1625,11 +1638,12 @@ class ConceptSpace:
         self._after_update_hook = None
 
         # ── Morphological harmonizer (levels 1-2: morpheme ↔ word) ──
+        _c = FCFConfig()
         self.harmonizer = Harmonizer(dim=self.dims.latent_dim)
-        self._morph_conf_threshold = 0.8
+        self._morph_conf_threshold = _c.morph_confidence_threshold
         self._morph_vocab = None  # loaded on demand
         self._harm_n_checkpoints = 0
-        self._harm_slow_start_epochs = 5
+        self._harm_slow_start_epochs = _c.harm_slow_start_epochs
 
         # ── EntityField: recursive semantic field (char↔word↔sent↔para) ──
         self.entity_field = EntityField(dim=self.dims.latent_dim, word_store=self.concept_vectors, dim_coord=self.dims)

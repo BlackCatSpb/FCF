@@ -24,7 +24,8 @@ import math, json, os, random
 import threading
 from typing import Dict, List, Optional
 from eva.symbolic.dimension_coordinator import DimensionCoordinator
-from eva.symbolic.adaptive_controller import AdaptiveArchitectureController, SubspaceConfig
+from eva.symbolic.adaptive_controller import AdaptiveArchitectureController
+from eva.symbolic.fcf_config import FCFConfig
 
 # ── FFT-HRR VSA primitives ─────────────────────────────────────
 # Circular convolution (bind) and circular correlation (unbind)
@@ -242,14 +243,12 @@ class FractalField:
         self.max_latent_dim = max_latent_dim or latent_dim * 4
         self.l1_lambda = l1_lambda
 
-        # Adaptive architecture controller
-        self.arch = arch_controller or AdaptiveArchitectureController(
-            config=SubspaceConfig(growth_factor=self.max_latent_dim / latent_dim),
-            latent_dim=latent_dim)
+        # Adaptive architecture controller (reads from FCFConfig.subspace_*)
+        self.arch = arch_controller or AdaptiveArchitectureController(latent_dim=latent_dim)
         if l_c is not None and l_a is not None and l_m is not None:
-            self.arch.config.l_c_ratio = l_c / latent_dim
-            self.arch.config.l_a_ratio = l_a / latent_dim
-            self.arch.config.l_m_ratio = l_m / latent_dim
+            self.arch.l_c_ratio = l_c / latent_dim
+            self.arch.l_a_ratio = l_a / latent_dim
+            self.arch.l_m_ratio = l_m / latent_dim
         self.l_c = self.arch.l_c
         self.l_a = self.arch.l_a
         self.l_m = self.arch.l_m
@@ -272,13 +271,13 @@ class FractalField:
         # HDC n-gram memory: prefix_cids_tuple → bundled latent repr (LRU-capped)
         self.hdc_memory: Dict[tuple, np.ndarray] = {}
         self.hdc_memory_counts: Dict[tuple, int] = {}
-        self.hdc_memory_max = 20000  # P1.5: 20K entries for better coverage
+        self.hdc_memory_max = FCFConfig().fractal_hdc_memory_max
         self._hdc_access_order: List[tuple] = []  # (unused after P3.6 LFU, kept for compat)
         self._capacity_lock = threading.Lock()
 
         # Per-concept adaptive L1 lambda (dynamic dimensionality)
         self.l1_lambda_per_cid: Dict[int, float] = {}
-        self.l1_target_density = self.arch.config.l1_target_density
+        self.l1_target_density = self.arch.l1_target_density
         self.l1_density_window: Dict[int, list] = {}
 
         # Cache
@@ -292,7 +291,7 @@ class FractalField:
         # Sector index for focal search (field-in-field)
         self._sector_W: List[np.ndarray] = []  # per-level W_proj
         self._sector_index: Dict[int, Dict[tuple, list]] = {}  # depth → {prefix → [cids]}
-        self._sector_depths: list = self.arch.config.sector_depths
+        self._sector_depths: list = self.arch.sector_depths
 
     def _apply_l1(self, code: np.ndarray, ce: float = 0.0, cid: Optional[int] = None) -> np.ndarray:
         """Soft-threshold z_c subspace: high CE → weak L1 (allows densification).
@@ -514,7 +513,7 @@ class FractalField:
             if old_dim >= self.max_latent_dim:
                 return old_dim
             if new_latent_dim is None:
-                new_latent_dim = int(old_dim * self.arch.config.growth_factor)
+                new_latent_dim = int(old_dim * self.arch.growth_factor)
             new_latent_dim = min(new_latent_dim, self.max_latent_dim)
             new_latent_dim = max(new_latent_dim, old_dim + 8)
             # Ensure new dim respects subspace alignment

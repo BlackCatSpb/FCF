@@ -24,7 +24,7 @@ _META_NEXT_CID = 8
 _META_ANTONYM = 9
 
 
-from eva.symbolic.fcf_config import EnvironmentResolver
+from eva.symbolic.fcf_config import EnvironmentResolver, FormulaCoefficients
 
 # P1.8: Антоним-словарь из JSON с fallback на хардкод
 _ANTONYM_PATH = EnvironmentResolver().antonym_path
@@ -447,6 +447,7 @@ class STDPTrainer:
         cs = gen.cs
         T = len(ids)
         n_pairs = 0
+        _fc = FormulaCoefficients()
 
         # GPU path: pre-gather frequency/error tensors for O(1) per-pair lookups
         use_gpu_freq = use_torch and gen._cf_t is not None
@@ -482,7 +483,7 @@ class STDPTrainer:
                 if use_gpu_freq:
                     fa = _cf_arr[i]
                     fb = _cf_arr[j]
-                    freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
+                    freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * _fc.freq_weight_log_scale)
                     # Inline PMI with pre-gathered GPU tensors + minimal CPU dict for sparse ngrams
                     if dist == 1:
                         counter = _ngrams2_dict.get((ids[i],))
@@ -515,7 +516,7 @@ class STDPTrainer:
                 else:
                     fa = gen.lattice.concept_freq.get(ids[i], 0)
                     fb = gen.lattice.concept_freq.get(ids[j], 0)
-                    freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * 0.15)
+                    freq_weight = 1.0 / (1.0 + math.log(max(max(fa, fb), 1)) * _fc.freq_weight_log_scale)
                     pmi_w_raw = gen._pmi_weight(ids[i], ids[j], distance=dist,
                                                   min_weight=pmi_gate_min)
                     _skip, pmi_w = gen._apply_pmi_gate(pmi_w_raw, pmi_strength, pmi_gate_min, ids[j])
@@ -530,16 +531,16 @@ class STDPTrainer:
                         overlap = cs.fractal.field_overlap(ids[i], ids[j])
                     else:
                         overlap = 0
-                    fw = min(1.0 + math.log(overlap + 1) * 2.0, 3.0) if overlap > 0 else 0.1
+                    fw = min(1.0 + math.log(overlap + 1) * _fc.field_weight_log_scale, _fc.field_weight_cap) if overlap > 0 else _fc.field_weight_floor
                     field_weight = 1.0 + (fw - 1.0) * field_gate
 
-                lr = base_lr * max(freq_weight, 0.05) * pmi_w * field_weight
-                lr *= (0.5 + gen.hormones.acetylcholine * 0.5) * (0.5 + gen.hormones.dopamine * 0.5)
+                lr = base_lr * max(freq_weight, _fc.freq_weight_min) * pmi_w * field_weight
+                lr *= (_fc.hormonal_mod_baseline + gen.hormones.acetylcholine * _fc.hormonal_mod_scale) * (_fc.hormonal_mod_baseline + gen.hormones.dopamine * _fc.hormonal_mod_scale)
                 theta_gate = math.exp(-min(abs(j-i), 5) / max(gen.theta_tau, 1.0))
-                gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, 0.1)))
+                gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, _fc.theta_fast_min)))
                 n_pairs += 1
-                theta_slow = math.exp(-min(abs(j-i), 10) / max(gen.theta_tau * 3.0, 1.0))
-                slow_lr = lr * max(theta_slow, 0.02) * 0.3
+                theta_slow = math.exp(-min(abs(j-i), 10) / max(gen.theta_tau * _fc.theta_tau_slow_mult, 1.0))
+                slow_lr = lr * max(theta_slow, _fc.theta_slow_min) * _fc.theta_slow_scale
                 if slow_lr > 1e-6:
                     gen_updates[ids[j]].append((ids[i], slow_lr))
                     n_pairs += 1
@@ -789,6 +790,7 @@ class STDPTrainer:
     def _gpu_stdp_core(self, ctx_t, tgt_t, meta_t, unique_gen, inv_t, gen, cs,
                        gradient_noise_scale=0.0):
         """Pure-tensor core of _gpu_stdp_apply. torch.compile-friendly."""
+        _fc = FormulaCoefficients()
         D = cs.dim
         N = len(ctx_t)
         ng = len(unique_gen)
@@ -802,22 +804,21 @@ class STDPTrainer:
             prev_cid_t = meta_t[:, _META_PREV_CID].long()
             next_cid_t = meta_t[:, _META_NEXT_CID].long()
             fa_t = gen._cf_t[prev_cid_t]; fb_t = gen._cf_t[next_cid_t]
-            fw_t = 1.0 / (1.0 + torch.log(torch.max(torch.stack([fa_t, fb_t]), dim=0).values.clamp(min=1)) * 0.15)
+            fw_t = 1.0 / (1.0 + torch.log(torch.max(torch.stack([fa_t, fb_t]), dim=0).values.clamp(min=1)) * _fc.freq_weight_log_scale)
             pmi_w_t = meta_t[:, _META_PMI]; field_w_t = meta_t[:, _META_FIELD_W]
         else:
             pmi_w_t = meta_t[:, _META_PMI]; fw_t = meta_t[:, _META_FW]; field_w_t = meta_t[:, _META_FIELD_W]
         dw_t = torch.exp(-dist / 2.0)
 
-        lr = torch.clamp(fw_t, min=0.05) * dw_t * pmi_w_t * field_w_t
-        lr *= (0.5 + gen.hormones.acetylcholine * 0.5) * (0.5 + gen.hormones.dopamine * 0.5)
-        # Minesweeper: cluster-potential modulation per target CID
+        lr = torch.clamp(fw_t, min=_fc.freq_weight_min) * dw_t * pmi_w_t * field_w_t
+        lr *= (_fc.hormonal_mod_baseline + gen.hormones.acetylcholine * _fc.hormonal_mod_scale) * (_fc.hormonal_mod_baseline + gen.hormones.dopamine * _fc.hormonal_mod_scale)
         if gen._cluster_potential is not None and gen._cluster_map is not None:
             lr *= gen._cluster_potential[gen._cluster_map[tgt_t]]
         dist_clamped = torch.clamp(dist, max=10.0)
         theta_fast = torch.exp(-dist_clamped.clamp(max=5.0) / max(gen.theta_tau, 1.0))
-        theta_slow = torch.exp(-dist_clamped / max(gen.theta_tau * 3.0, 1.0))
+        theta_slow = torch.exp(-dist_clamped / max(gen.theta_tau * _fc.theta_tau_slow_mult, 1.0))
         slow_mask = meta_t[:, _META_SLOW] if meta_t.shape[1] > _META_SLOW else torch.zeros(N, device=device)
-        theta = (1 - slow_mask) * torch.clamp(theta_fast, min=0.1) + slow_mask * torch.clamp(theta_slow, min=0.02) * 0.3
+        theta = (1 - slow_mask) * torch.clamp(theta_fast, min=_fc.theta_fast_min) + slow_mask * torch.clamp(theta_slow, min=_fc.theta_slow_min) * _fc.theta_slow_scale
         effective_lr = lr * theta
 
         vc = gen._vecs_t[ctx_t].float(); vg = gen._vecs_t[tgt_t].float()

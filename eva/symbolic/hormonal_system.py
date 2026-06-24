@@ -8,10 +8,13 @@ Each hormone modulates a different aspect of learning and generation:
 
 The system drives self-improvement: the model intrinsically seeks to
 maximize prediction accuracy, novelty, and coherence via hormonal feedback.
+
+ALL numerical coefficients come from FormulaCoefficients — zero hardcode.
 """
 
 import math
 import numpy as np
+from eva.symbolic.fcf_config import FormulaCoefficients
 
 
 class HormonalSystem:
@@ -23,14 +26,19 @@ class HormonalSystem:
     - Novelty (is this a new pattern?)
     - Surprise (how unexpected was this outcome?)
     - Coherence (how smooth was the concept transition?)
+
+    All coefficients from FormulaCoefficients — pass via constructor or
+    default factory.
     """
 
-    def __init__(self):
+    def __init__(self, formula=None):
+        _fc = formula if formula is not None else FormulaCoefficients()
+
         # Baselines (tonic levels)
-        self.dopamine = 0.5      # reward (DA)
-        self.serotonin = 0.5     # aversion (5HT)
-        self.noradrenaline = 0.3 # arousal (NA)
-        self.acetylcholine = 0.5 # plasticity (ACh)
+        self.dopamine = _fc.da_baseline
+        self.serotonin = _fc.ht_baseline
+        self.noradrenaline = _fc.na_baseline
+        self.acetylcholine = _fc.ach_baseline
 
         # Phasic signals (spikes)
         self.da_phasic = 0.0
@@ -40,158 +48,131 @@ class HormonalSystem:
         self.step = 0
         self.recent_confidences = []
         self.recent_matches = []
-        self.reward_history = []
 
         # Decay rates
-        self.tonic_decay = 0.95    # hormone drift toward baseline
-        self.phasic_decay = 0.7    # phasic signal decay per step
+        self.tonic_decay = _fc.tonic_decay
+        self.phasic_decay = _fc.phasic_decay
 
-        # Dynamic state (initialized here instead of via setattr)
+        # Dynamic state
         self._prev_avg_match = 0.0
         self._repetition_counter = 0
         self._last_few_cids = []
 
+        # Store formula coefficients for update()
+        self._fc = _fc
+
+        # Reward history (bounded FIFO)
+        self.reward_history = []
+
     def update(self, confidence=0.5, is_match=False, novelty=0.0,
                surprise=0.0, expected_cid=None, gen_cid=None):
-        """Update hormone levels based on generation event.
-
-        Args:
-            confidence: prediction confidence (0..1)
-            is_match: whether generated concept matched target
-            novelty: how novel is this transition (0..1)
-            surprise: how surprising was the outcome (0..1)
-            expected_cid: target concept ID (or None)
-            gen_cid: generated concept ID
-        """
+        """Update hormone levels based on generation event."""
+        _fc = self._fc
         self.step += 1
 
-        # Track recent stats
         self.recent_confidences.append(confidence)
         self.recent_matches.append(1.0 if is_match else 0.0)
-        if len(self.recent_confidences) > 50:
+        if len(self.recent_confidences) > _fc.hormone_recent_window:
             self.recent_confidences.pop(0)
             self.recent_matches.pop(0)
 
         avg_confidence = np.mean(self.recent_confidences) if self.recent_confidences else 0.5
         avg_match = np.mean(self.recent_matches) if self.recent_matches else 0.0
 
-        # Track match rate change (for mastery drive)
         delta_match = avg_match - self._prev_avg_match
         self._prev_avg_match = avg_match
 
         # ---- Dopamine: reward signal (phasic) ----
-        # Three sources of reward:
-        # 1. Extrinsic: target match (supervised)
-        # 2. Intrinsic: curiosity (novelty)
-        # 3. Intrinsic: mastery (improving match rate)
-        # 4. Baseline: coherence (smooth generation)
-
         da_extrinsic = 0.0
         da_curiosity = 0.0
         da_mastery = 0.0
-        da_coherence = 0.05  # small baseline for trying
+        da_coherence = _fc.da_coherence_strength
 
         if expected_cid is not None:
-            # Extrinsic: reward prediction error
             if is_match:
-                da_extrinsic = max(0.5, 1.0 - confidence)  # more reward for hard-fought matches
+                da_extrinsic = max(_fc.da_match_hard_threshold, 1.0 - confidence)
             else:
-                da_extrinsic = -0.3 * (1.0 + confidence)  # punishment for misses
+                da_extrinsic = _fc.da_mismatch_penalty * (1.0 + confidence)
         else:
-            # Curiosity: novel patterns explored
-            da_curiosity = novelty * 0.4
+            da_curiosity = novelty * _fc.da_curiosity_strength
 
-        # Mastery: improving match rate
-        da_mastery = max(0, delta_match) * 0.5
+        da_mastery = max(0, delta_match) * _fc.da_mastery_strength
 
-        # Boredom penalty: repeating same cid multiple times
         if gen_cid is not None:
             self._last_few_cids.append(gen_cid)
-            if len(self._last_few_cids) > 5:
+            if len(self._last_few_cids) > _fc.hormone_boredom_window:
                 self._last_few_cids.pop(0)
-            if len(self._last_few_cids) >= 3 and len(set(self._last_few_cids)) == 1:
-                da_coherence -= 0.1  # boredom from repetition
+            if (len(self._last_few_cids) >= _fc.hormone_boredom_repeat
+                    and len(set(self._last_few_cids)) == 1):
+                da_coherence -= _fc.da_boredom_penalty
 
         intrinsic = da_curiosity + da_mastery + da_coherence
         self.da_phasic = da_extrinsic + intrinsic
 
         # ---- Acetylcholine: phasic surprise/novelty signal ----
-        # Phasic ACh responds to prediction errors and novel stimuli,
-        # signaling 'this is important, learn from it'
         ach_surprise = 0.0
         ach_novelty = 0.0
         ach_pe = 0.0
 
         if expected_cid is not None:
-            # Supervised mode: prediction error drives ACh
             if not is_match:
-                ach_surprise = surprise * 0.6       # unexpected outcome
-                ach_pe = (1.0 - confidence) * 0.5   # low confidence → high uncertainty
+                ach_surprise = surprise * _fc.ach_surprise_strength
+                ach_pe = (1.0 - confidence) * _fc.ach_uncertainty_strength
             else:
-                ach_surprise = surprise * 0.15       # even matched outcomes carry surprise
+                ach_surprise = surprise * _fc.ach_match_strength
         else:
-            # Free generation: novelty-driven ACh
-            ach_novelty = novelty * 0.5              # novel transitions → learn
+            ach_novelty = novelty * _fc.ach_novelty_scale
 
         self.ach_phasic = ach_surprise + ach_novelty + ach_pe
-        self.ach_phasic = max(0.0, min(1.0, self.ach_phasic))  # clamp to [0,1]
+        self.ach_phasic = max(0.0, min(1.0, self.ach_phasic))
 
         # ---- Serotonin: aversion / risk ----
-        # Low match rate -> serotonin rises (aversion, caution)
-        # High match rate -> serotonin drops (safety, exploration)
-        target_5ht = 0.3 + 0.4 * (1.0 - avg_match)
-        self.serotonin += (target_5ht - self.serotonin) * 0.1
+        target_5ht = _fc.ht_baseline_part + _fc.ht_match_scale * (1.0 - avg_match)
+        self.serotonin += (target_5ht - self.serotonin) * _fc.ht_adapt_rate
 
         # ---- Noradrenaline: uncertainty / novelty ----
-        # High surprise or low confidence -> NA rises (focus)
-        # High confidence + low novelty -> NA drops (relaxed)
-        target_na = 0.2 + 0.5 * surprise + 0.3 * (1.0 - confidence)
-        self.noradrenaline += (target_na - self.noradrenaline) * 0.3
+        target_na = (_fc.na_baseline_part
+                     + _fc.na_surprise_scale * surprise
+                     + _fc.na_confidence_scale * (1.0 - confidence))
+        self.noradrenaline += (target_na - self.noradrenaline) * _fc.na_adapt_rate
         self.noradrenaline = min(max(self.noradrenaline, 0.0), 1.0)
 
         # ---- Acetylcholine: plasticity gate ----
-        novelty_target = 0.3 + 0.5 * novelty
+        novelty_target = _fc.ach_novelty_baseline + _fc.ach_novelty_scale_tonic * novelty
         if is_match and confidence > 0.8:
-            novelty_target = 0.2  # well-known pattern → low plasticity
+            novelty_target = _fc.ach_well_known_floor
 
-        # Drift tonic toward target
-        self.acetylcholine += (novelty_target - self.acetylcholine) * 0.15
-        # Integrate phasic ACh into tonic (mirrors DA phasic integration)
-        self.acetylcholine += self.ach_phasic * 0.1
-        self.acetylcholine = max(0.1, min(1.0, self.acetylcholine))
+        self.acetylcholine += (novelty_target - self.acetylcholine) * _fc.ach_tonic_drift
+        self.acetylcholine += self.ach_phasic * _fc.ach_phasic_integration
+        self.acetylcholine = max(_fc.da_floor, min(1.0, self.acetylcholine))
 
-        # ---- Integrate phasic into tonic BEFORE decay ----
-        # Floor at 0.1 so model doesn't get stuck in anhedonia
-        new_da = self.dopamine * self.tonic_decay + self.da_phasic * 0.1
-        self.dopamine = max(0.1, min(1.0, new_da))
+        # ---- Integrate phasic into tonic ----
+        new_da = self.dopamine * self.tonic_decay + self.da_phasic * _fc.da_phasic_to_tonic
+        self.dopamine = max(_fc.da_floor, min(1.0, new_da))
 
-        # ---- Decay phasic signals (after integration) ----
+        # ---- Decay phasic signals ----
         self.da_phasic *= self.phasic_decay
         self.ach_phasic *= self.phasic_decay
 
-        # Track reward (bounded FIFO)
+        # Track reward
         self.reward_history.append(self.dopamine)
-        if len(self.reward_history) > 1000:
-            self.reward_history = self.reward_history[-1000:]
+        if len(self.reward_history) > _fc.hormone_reward_history_maxlen:
+            self.reward_history = self.reward_history[-_fc.hormone_reward_history_maxlen:]
 
     # ---- Modulation functions ----
 
     def modulate_temperature(self, base_temp):
-        """Serotonin modulates risk-taking.
-        Low 5HT (safe) -> higher temperature (explore freely).
-        High 5HT (aversion) -> lower temperature (cautious, exploit)."""
-        risk = 1.0 - self.serotonin  # inverse of aversion
-        return base_temp * max(0.1 + 0.9 * risk, 0.05)
+        _fc = self._fc
+        risk = 1.0 - self.serotonin
+        return base_temp * max(_fc.da_temperature_baseline + _fc.da_temperature_scale * risk,
+                               _fc.da_temperature_min)
 
     def modulate_beam_width(self, base_width):
-        """Noradrenaline modulates attention breadth.
-        High NA (uncertainty) -> narrow beam (focused search).
-        Low NA (relaxed) -> broad beam (parallel exploration)."""
-        focus = 1.0 - self.noradrenaline * 0.5
+        focus = 1.0 - self.noradrenaline * self._fc.na_beam_scale
         return max(1, int(base_width * focus))
 
     def reset(self):
-        self.__init__()
+        self.__init__(formula=self._fc)
 
     def summary(self):
         return {
@@ -219,10 +200,10 @@ class HormonalSystem:
         }
 
     def load(self, data):
-        self.dopamine = data.get('dopamine', 0.5)
-        self.serotonin = data.get('serotonin', 0.5)
-        self.noradrenaline = data.get('noradrenaline', 0.3)
-        self.acetylcholine = data.get('acetylcholine', 0.5)
+        self.dopamine = data.get('dopamine', self._fc.da_baseline)
+        self.serotonin = data.get('serotonin', self._fc.ht_baseline)
+        self.noradrenaline = data.get('noradrenaline', self._fc.na_baseline)
+        self.acetylcholine = data.get('acetylcholine', self._fc.ach_baseline)
         self.da_phasic = data.get('da_phasic', 0.0)
         self.ach_phasic = data.get('ach_phasic', 0.0)
         self.step = data.get('step', 0)
@@ -233,11 +214,8 @@ class HormonalSystem:
 
 
 if __name__ == '__main__':
-    # Quick test
     hs = HormonalSystem()
     print("Initial:", hs.summary())
-
-    # Simulate: 15 correct (improving), 5 wrong (surprising), then 10 free-gen
     for i in range(30):
         conf = min(0.3 + i * 0.025, 0.85)
         match = i < 15

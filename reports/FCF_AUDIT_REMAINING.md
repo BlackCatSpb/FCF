@@ -1,77 +1,174 @@
-# Анализ архитектурного отчёта — выводы и решения (финальный)
+# Phase 7 Final Audit — Remaining Hardcode (24.06.2026)
 
-## 1. Все исправления (3 сессии)
+## Executive Summary
 
-### Сессия 1 (базовые P0-P3)
-| ID | Проблема | Статус |
-|----|----------|--------|
-| P0 (5.5) | concept_freq int32 → float32 | ✅ |
-| P1 (S-1) | field_weight cap 3.0 | ✅ |
-| P1 (3.1) | _vecs_t stale — hook | ✅ |
-| P1 (A-1) | CS↔CG circular dependency — callback | ✅ |
-| P2 (A-3) | GenerationResult dataclass | ✅ |
-| P2 (5.3) | total_freq cache | ✅ |
-| P2 (4.1) | Continuous curriculum | ✅ |
-| P3 (5.4) | concept_error FIFO OrderedDict | ✅ |
-| P3 (5.6) | word_to_cid removal | ✅ |
-| P2 (5.3) | concept_freq float32 | ✅ |
+**Phases 0–6 завершены.** Остаётся **~120 значений хардкода** в ~15 файлах.  
+Ключевое открытие: `FormulaCoefficients` содержит все необходимые коэффициенты, но 2 файла (гормоны, STDP) их **не читают** — это P0-баги.
 
-### Сессия 2 (P0-P3 + новые методы)
-| ID | Проблема | Статус |
-|----|----------|--------|
-| P0-1 | non_blocking=True в _build_torch_tensors | ✅ |
-| P1-1 | PPMI-based contrastive objective | ✅ |
-| P1-2 | Field pre-filter в _branch | ✅ |
-| P1-3 | Gradient clipping (max_grad_norm) | ✅ |
-| P2-1 | _torch_dirty ordering | ✅ |
-| P2-2 | Basis re-orthogonalization на чекпоинтах | ✅ |
-| P2-3 | Batch centroid pull | ✅ |
-| P3-1 | _quiet fix для load-операций | ✅ |
-| P3-2 | OOM fallback + VRAM мониторинг | ✅ |
-| P3-3 | Hormonal STDP gate (ACh/DA) | ✅ |
-| P3-4 | Adaptive beam width | ✅ |
-| P3-6 | Field destab fallback (_destab_field_fallback) | ✅ |
+## Приоритеты
 
-### Сессия 3 (текущая — группы A-C)
-| ID | Проблема | Статус | Файлы |
-|----|----------|--------|-------|
-| **A1** (3.2) | _fb_dirty flag — _fb_t stale после мутаций field_bits | ✅ | `concept_space.py:112,183`, `crystal_generator.py:149,205` |
-| **A2** (5.1) | Type hints для _branch, _gpu_stdp_apply, _cpu_stdp_apply, _apply_vector_update, save | ✅ | `crystal_generator.py:475,688,841`, `concept_space.py:511,724` |
-| **A3** (4.5) | decay_every по парам, а не строкам | ✅ | `fcf_config.py:212`, `crystal_generator.py:1158,1356`, `train_full.py:386,530,544,575` |
-| **B1** (S-3) | Adaptive neg_sampling через concept_error | ✅ | `crystal_generator.py:979-981,1023-1024,1060-1061` |
-| **B2** (4.2) | full_stuck rule — детектор плато всех метрик | ✅ | `parameter_optimizer.py:132,138,299-338`, `fcf_config.py:180,188`, `train_full.py:689-696` |
-| **C1** (A-2) | FCFConfig — PathConfig + MetricPairBuilder | ✅ | `fcf_config.py:68-440` |
-| **C2** (S-4) | GPU field_overlap — torch.bitwise_and | ✅ | `crystal_generator.py:1187-1196` |
-| **C3** (5.7) | Unit tests (28 тестов) | ✅ | `tests/test_stdp.py` |
+### P0 — Конфиг есть, код его игнорирует (~30 значений)
 
-## 2. Статус: 100% проблем закрыто
+| # | Файл | Что | Сколько | Статус |
+|---|------|-----|---------|--------|
+| 1 | `hormonal_system.py:30-190` | init baselines + update formulas | ~20 | **Не читает FormulaCoefficients** |
+| 2 | `stdp_trainer.py:485-542` | freq_weight, field_weight, hormonal_mod | ~10 | **Не читает FormulaCoefficients** |
 
-Все проблемы из отчёта V3 (P0-P3) и 6 новых методов — исправлены.
+Оба файла имеют поля-дубликаты в `FormulaCoefficients` (fcf_config.py:363-430), используют хардкод.
 
-### Что было сделано в сессии 3
+### P1 — Нет полей в FCFConfig (~40 значений)
 
-#### Группа A: Быстрые исправления
-1. **`_fb_dirty` flag** — `FractalField` теперь выставляет `_fb_dirty=True` при `init_fields()`; `_ensure_torch` проверяет флаг и перестраивает `_fb_t`.
-2. **Type hints** — добавлены аннотации для `_branch` → `List[Tuple[int, float]]`, `_gpu_stdp_apply` → `np.ndarray`, `_cpu_stdp_apply` → `None`, `_apply_vector_update`, `ConceptSpace.save`.
-3. **`decay_every_pairs`** — `_build_pairs_from_ids` возвращает число пар; `train_batch` возвращает `total_pairs`; `train_full.py` триггерит decay по парам (`CFG.decay_every_pairs=32000`).
+| # | Файл | Категория | Сколько | Статус |
+|---|------|-----------|---------|--------|
+| 3 | `crystal_generator.py` | Graph search + branch params | ~15 | Нет в config |
+| 4 | `parameter_optimizer.py` | Plateau/metric/maxlen/detector | ~15 | Нет в config |
+| 5 | `adaptive_controller.py` | SubspaceConfig + update() const | ~15 | Нет в config |
+| 6 | `concept_space.py` | FractalField capacity + init scales | ~7 | Нет в config |
 
-#### Группа B: Улучшения обучения
-4. **Adaptive neg_sampling** — `neg_elr` умножается на `(1 + concept_error * 2.0)` в GPU/CPU negative sampling и contrastive objective.
-5. **`full_stuck` rule** — `ParameterOptimizer` детектирует плато всех метрик (`cos_plateau AND ppl_plateau AND vacc1_stuck`); при `>=5` шагах — `changes['full_stuck']=True`; `train_full.py` форсирует `fluctuate_fractal`.
+### P2 — Дублирование и скрипты (~50 значений)
 
-#### Группа C: Архитектурные
-6. **FCFConfig refactoring** — выделены `PathConfig` (12 path properties) и `MetricPairBuilder` (5 static методов + `build_defaults()`). `FCFConfig` сохраняет backward-compat свойства, делегирующие `self.paths.*`.
-7. **GPU field_overlap** — в `_build_pairs_from_ids`: при `use_torch=True` overlap считается через `torch.bitwise_and(_fb_t[...], _fb_t[...]).sum()` вместо `np.unpackbits`.
-8. **Unit tests** — 28 тестов в `tests/test_stdp.py`: ConceptVectorStore, FractalField, ConceptSpace, STDP, negative sampling, contrastive objective, ParameterOptimizer (full_stuck, vacc1_stuck, save/load), FCFConfig (PathConfig, MetricPairBuilder, backward-compat), edge cases.
+| # | Файлы | Что | Сколько | Статус |
+|---|-------|-----|---------|--------|
+| 7 | `crystal_generator.py:47-48`, `model/*.py` | Special token IDs (0/1/2) | 6 | Дубли в 3 файлах |
+| 8 | `concept_space.py:364,472` | Прямые `RandomState()` | 2 | Не через SeedRegistry |
+| 9 | `train_full.py`, `inference.py`, `filter_corpus.py`, `eval_checkpoint.py`, `visualize.py` | Seeds, sample_size, thresholds | ~25 | Не централизованы |
 
-## 3. Итог
+## Детальный список всех значений
 
-| Метрика | Значение |
-|---------|----------|
-| Проблем из отчёта V3 | 59 (6 P0 + 23 P1 + 23 P2 + 7 P3) |
-| Новых методов из V3 | 17 |
-| Исправлено | **76/76 (100%)** |
-| Файлов изменено | 6 (+2 новых отчёта + tests/) |
-| Коммитов за 3 сессии | 1 (текущая) + 8 (предыдущие) |
-| Тестов | 28 ✅ |
-| Коммит | `36d5aae` — `fix: implement all 8 remaining groups from architect audit (A1-C3)` |
+### P0-A: hormonal_system.py (20 значений)
+
+| Строка | Сейчас | Должен читать |
+|--------|--------|---------------|
+| 30 | `self.dopamine = 0.5` | `_fc.da_baseline` (есть: 398) |
+| 31 | `self.serotonin = 0.5` | `_fc.ht_baseline` (есть: 399) |
+| 32 | `self.noradrenaline = 0.3` | `_fc.na_baseline` (есть: 400) |
+| 33 | `self.acetylcholine = 0.5` | `_fc.ach_baseline` (есть: 401) |
+| 46 | `self.tonic_decay = 0.95` | `_fc.tonic_decay` (есть: 402) |
+| 47 | `self.phasic_decay = 0.7` | `_fc.phasic_decay` (есть: 403) |
+| 92 | `da_coherence = 0.05` | `_fc.da_coherence_strength` (есть: 404) |
+| 102 | `novelty * 0.4` | `* _fc.da_curiosity_strength` (есть: 405) |
+| 105 | `max(0, delta_match) * 0.5` | `* _fc.da_mastery_strength` (есть: 406) |
+| 113 | `da_coherence -= 0.1` | `- _fc.da_boredom_penalty` (есть: 407) |
+| 128 | `surprise * 0.6` | `* _fc.ach_surprise_strength` (есть: 410) |
+| 129 | `(1.0 - confidence) * 0.5` | `* _fc.ach_uncertainty_strength` (есть: 411) |
+| 131 | `surprise * 0.15` | `* _fc.ach_match_strength` (есть: 412) |
+| 134 | `novelty * 0.5` | `* _fc.ach_novelty_scale` (есть: 413) |
+| 142 | `0.3 + 0.4 * (1.0 - avg_match)` | `_fc.ht_baseline_part + _fc.ht_match_scale * ...` (есть: 417-418) |
+| 143 | `(target - self.serotonin) * 0.1` | `* _fc.ht_adapt_rate` (есть: 419) |
+| 148 | `0.2 + 0.5 * surprise + 0.3 * (1.0 - confidence)` | `_fc.na_baseline_part + ...` (есть: 420-422) |
+| 149 | `(target - self.na) * 0.3` | `* _fc.na_adapt_rate` (есть: 423) |
+| 153 | `0.3 + 0.5 * novelty` | `_fc.ach_novelty_baseline + _fc.ach_novelty_scale_tonic * novelty` (есть: 424-425) |
+| 155 | `novelty_target = 0.2` | `_fc.ach_well_known_floor` (есть: 426) |
+| 158 | `(target - self.ach) * 0.15` | `* _fc.ach_tonic_drift` (есть: 427) |
+| 160 | `self.ach_phasic * 0.1` | `* _fc.ach_phasic_integration` (есть: 416) |
+| 165 | `self.da_phasic * 0.1` | `* _fc.da_phasic_to_tonic` (есть: 408) |
+| 184 | `max(0.1 + 0.9 * risk, 0.05)` | Через `_fc.da_temperature_min/scale` (есть: 428-429) |
+| 190 | `1.0 - self.na * 0.5` | Через `_fc.na_beam_scale` (есть: 430) |
+
+### P0-B: stdp_trainer.py — _build_pairs (10 значений)
+
+| Строка | Сейчас | Должен читать |
+|--------|--------|---------------|
+| 485 | `* 0.15` | `* _fc.freq_weight_log_scale` |
+| 533 | `* 2.0` | `* _fc.field_weight_log_scale` |
+| 533 | `min(..., 3.0)` | `min(..., _fc.field_weight_cap)` |
+| 534 | `else 0.1` | `else _fc.field_weight_floor` |
+| 536 | `max(freq_weight, 0.05)` | `max(freq_weight, _fc.freq_weight_min)` |
+| 537 | `(0.5 + ...)` | `(_fc.hormonal_mod_baseline + ...)` |
+| 537 | `* 0.5` | `* _fc.hormonal_mod_scale` |
+| 539 | `max(theta_gate, 0.1)` | `max(theta_gate, _fc.theta_fast_min)` (есть: 317) |
+| 541 | `* 3.0` | `* _fc.theta_tau_slow_mult` (есть: 313) |
+| 542 | `max(theta_slow, 0.02) * 0.3` | `* _fc.theta_slow_min * _fc.theta_slow_scale` (есть: 318-319) |
+
+### P1-A: crystal_generator.py — graph search (15 значений)
+
+| Строка | Параметр | Сейчас |
+|--------|----------|--------|
+| 693 | `_graph_search(B=2.0)` | `2.0` |
+| 693 | `max_candidates=30` | `30` |
+| 693 | `max_depth=5` | `5` |
+| 727 | `connections_of(u, top_k=8)` | `8` |
+| 780 | `_graph_search(B=1.2, max_candidates=30)` | `1.2`, `30` |
+| 787 | `syn_preds[:80]` | `80` |
+| 796 | `hdc_predict(k=30)` | `30` |
+| 798 | `hscore > 0.05` | `0.05` |
+| 809 | `search_in_sector(depth=1, k=40)` | `40` |
+| 809 | `if len(sim_candidates) < 5` | `5` |
+| 811 | `focal_refine(target_k=20)` | `20` |
+| 813 | `topk_similar_concepts(k=20, sample_size=500)` | `500` |
+| 815 | `sim > 0.05` | `0.05` |
+| 620 | `seq[-6:]` | `6` |
+| 930, 934 | `n_candidates = min(15 + int(15 * theta_temp), ...)` | `15` |
+
+### P1-B: parameter_optimizer.py (15 значений)
+
+| Строка | Параметр | Сейчас |
+|--------|----------|--------|
+| 48 | `toward_default(rate=0.03)` | `0.03` |
+| 65 | `MetricBuffer(maxlen=10)` | `10` |
+| 80 | `plateau(patience=3, rel_thresh=0.005)` | `3`, `0.005` |
+| 117 | `MetricBuffer(10)` | `10` |
+| 118 | `MetricBuffer(10)` | `10` |
+| 119-124 | `MetricBuffer(8) × 5`, `MetricBuffer(6)` | `8`, `6` |
+| 130 | `_flat_thresh = 0.002` | `0.002` |
+| 132 | `_cos_trend_buffer(maxlen=5)` | `5` |
+| 140 | `_full_stuck_counter >= 5` | `5` |
+| 143 | `plateau(rel_thresh=0.002)` | `0.002` |
+| 145 | `plateau(rel_thresh=0.02)` | `0.02` |
+| 163,173 | `ctx.get('inh_threshold', 0.1)` | `0.1` |
+| 374 | `PlateauDetector(100, 20, 0.5, 0.1, 0.05)` | все args |
+| 382 | `ema_alpha = 0.05` | `0.05` |
+| 406 | `steps_in_plateau * 0.01` | `0.01` |
+
+### P1-C: adaptive_controller.py (15 значений)
+
+| Строка | Параметр | Сейчас |
+|--------|----------|--------|
+| 21 | `l_c_ratio = 0.6` | `0.6` |
+| 22 | `l_a_ratio = 0.25` | `0.25` |
+| 23 | `l_m_ratio = 0.15` | `0.15` |
+| 26 | `density_threshold_grow = 0.15` | `0.15` |
+| 27 | `density_threshold_prune = 0.01` | `0.01` |
+| 28 | `l1_target_density = 0.08` | `0.08` |
+| 29 | `growth_factor = 1.5` | `1.5` |
+| 32 | `sector_depths = [4, 10, 20]` | `[4, 10, 20]` |
+| 89 | `np.abs(z_c) > 1e-4` | `1e-4` |
+| 97 | `> 10000` | `10000` |
+| 103 | `_n_updates > 10` | `10` |
+| 106 | `min(ratio * 1.03, 0.75)` | `1.03`, `0.75` |
+| 108 | `max(ratio * 0.97, 0.3)` | `0.97`, `0.3` |
+| 113 | `remaining * 0.6` | `0.6` |
+| 114 | `remaining * 0.4` | `0.4` |
+
+### P1-D: concept_space.py FractalField (7 значений)
+
+| Строка | Параметр | Сейчас |
+|--------|----------|--------|
+| 275 | `hdc_memory_max = 20000` | `20000` |
+| 370 | `n_active = max(int(l_c * 0.03), 8)` | `0.03`, `8` |
+| 376 | `z_a * 0.01` | `0.01` |
+| 379 | `z_m * 0.001` | `0.001` |
+| 392 | `init_fields(n_anchors=1024)` | `1024` |
+| 498 | `new_lambda = current * 1.1` | `1.1` |
+
+## Итого по фазам
+
+| Фаза | Значения | Файлы | Приоритет |
+|------|----------|-------|-----------|
+| P0-A | 20 | 2 | Critical |
+| P0-B | 10 | 2 | Critical |
+| P1-A | 15 | 2 | High |
+| P1-B | 15 | 2 | High |
+| P1-C | 15 | 2 | High |
+| P1-D | 7 | 2 | Medium |
+| P2-A | 6 | 4 | Medium |
+| P2-B | 2 | 1 | Medium |
+| P2-C | 25 | 5 | Low |
+| **Total** | **~115** | **~15** | |
+
+## Примечания
+
+1. **FormulaCoefficients уже полный** — не нужно добавлять поля, нужно читать. HormonalSystem + STDPTrainer игнорируют существующий конфиг.
+2. **SubspaceConfig — кандидат на удаление** — дублирует функционал FCFConfig. После P1-C можно убрать класс, читать напрямую из config.
+3. **Special token IDs** — простая централизация, но 3 файла. После P2-A удалить `_BOS_ID`/`_EOS_ID` глобалы.
+4. **crystal_generator.py** — `ce_max = min(3 * vocab_size // 4, 100000)` — hardcoded `100000` останется как formula-константа (максимальный размер error tracker).

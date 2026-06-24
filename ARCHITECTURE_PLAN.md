@@ -6,399 +6,273 @@
 
 ---
 
-## Итоги анализа хардкода
+## Статус завершённых фаз
 
-**~200+ хардкод-значений.** Категории:
-
-| Категория | Кол-во | Критичность |
-|-----------|--------|-------------|
-| Размерности (768/2048/1024) | ~15 файлов | Критичная |
-| Seeds (28 вхождений, 4 разных seed) | 28 | Высокая |
-| Subspace ratios + architectural thresholds | ~20 | Высокая |
-| Формульные коэффициенты (RRF, гормоны, θ, PMI) | ~50 | Средняя |
-| Пути к файлам | ~25+ | Средняя |
-| Дефолты функций (дублируют конфиг) | ~30 | Низкая |
-
----
-
-## Фаза 0: EnvironmentResolver — единый источник путей
-
-### Проблема
-Имя модели `bpe_ru_146k.model` — **10× дублируется** в 8 файлах. 3 разных паттерна конструирования пути. При смене модели нужно менять 8 файлов.
-
-### Решение
-`EnvironmentResolver` — единый класс для всех путей:
-
-```python
-class EnvironmentResolver:
-    def __init__(self, base_dir=None, model_name=None, data_dir=None):
-        self.base_dir = base_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.data_dir = data_dir or os.environ.get('FCF_DATA_DIR',
-                                                   os.path.join(self.base_dir, 'real_data'))
-        self.model_name = model_name or os.environ.get('FCF_MODEL_NAME')
-
-    @property
-    def sp_model_path(self):
-        # Авто-детект: если model_name не задан, ищем первый *.model в data_dir
-        if self.model_name:
-            return os.path.join(self.data_dir, self.model_name)
-        models = glob(os.path.join(self.data_dir, '*.model'))
-        return models[0] if models else None
-
-    @property
-    def morph_vocab_path(self): ...
-    @property
-    def concept_space_path(self): ...
-    @property
-    def syntax_lattice_path(self): ...
-    @property
-    def antonyms_path(self): ...
-    @property
-    def qwen_knowledge_path(self): ...
-```
-
-### Затрагиваемые файлы
-`fcf_config.py`, `morph_vocab.py`, `crystal_generator.py`, `concept_space.py`, `stdp_trainer.py`, `qwen_knowledge.py`, `modeling_fcf.py`, `tokenization_fcf.py`, `nn_check.py`, `check_dim.py`, `checkpoint_manager.py`, `syntax_lattice.py`
-
-### Риски
-- Совместимость с HF `modeling_fcf.py` — пути должны резолвиться относительно `pretrained_model_name_or_path`
-- Fallback: если файл не найден → понятная ошибка с именем ожидаемого файла
+| Фаза | Статус | Коммит |
+|------|--------|--------|
+| **0** EnvironmentResolver (пути) | ✅ | Phase 0 |
+| **1** AdaptiveDimensionResolver + _hrr_bind fix | ✅ | Phase 1 |
+| **2** SeedRegistry (28 RNG) | ✅ | Phase 2 |
+| **3** AdaptiveArchitectureController | ✅ | Phase 3 |
+| **4** FormulaCoefficients датакласс | ✅ | Phase 4 |
+| **5** SemanticPiece (VSA токенизация) | ✅ | Phase 5 |
+| **6** Defaults pattern (None → config) | ✅ | Phase 6 |
 
 ---
 
-## Фаза 1: AdaptiveDimensionResolver — динамические размерности
+## Фаза 7: Оставшийся хардкод (Phase 7)
 
-### Проблема
-4 жёстких размерности: `vec_dim=768`, `latent_dim=2048`, `entity_dim=2048`, `harm_dim=2048`. entity_dim == harm_dim == latent_dim (все 2048) — дублирование.
+### Выводы повторного аудита (24.06.2026)
 
-### Решение
+**Ключевое открытие:** `FormulaCoefficients` содержит **все** необходимые коэффициенты (35 полей для гормонов, 10 для STDP, 15 для RRF/θ/PMI), но файлы `hormonal_system.py` и `stdp_trainer.py` **их не читают** — используют хардкод. Это не просто "значения не в конфиге", а **семантический баг**: конфиг есть, он игнорируется.
 
-**Единственный вход:** `vocab_size` от SentencePiece.
+**Итого:** ~120 значений в ~15 файлах, из них ~30 — баги (конфиг есть, не читается), ~40 — нет полей в `FCFConfig`, ~50 — скрипты/дублирование.
 
-```python
-class AdaptiveDimensionResolver:
-    def __init__(self, vocab_size, vram_limit_mb=2048):
-        self.vocab_size = vocab_size
-
-        # SNR требование: D >= 10 * log2(V) для надёжного unbind
-        self.min_vec_dim = int(10 * math.log2(vocab_size))
-
-        # VRAM лимит: V * D * 6.34 bytes (vectors + codes)
-        self.max_vec_dim = int(vram_limit_mb * 1024 * 1024 / (vocab_size * 6.34))
-
-        # vec_dim: ближайшая степень 2 в диапазоне [min, max]
-        self.vec_dim = self._power_of_2(min(self.max_vec_dim, 2048))
-
-        # latent_dim: vec_dim * ratio (2.67 для 768→2048)
-        self.latent_ratio = 2.67  # начальный, адаптируется
-        self.latent_dim = int(self.vec_dim * self.latent_ratio)
-
-        # entity_dim == harm_dim == latent_dim
-        self.entity_dim = self.latent_dim
-
-    @property
-    def grid_shape(self):
-        return VSAGrid.factorize(self.vec_dim)
-```
-
-**Проверка GPU-совместимости:**
-- `_vecs_t: (V, D, fp16)` — авто-размер
-- `_codes_t: (V, latent_dim, bf16)` — авто-размер
-- `_fused_buf: (min(V, 4096), D+1)` — авто-размер
-- `basis.T @ basis ≈ eye(D)` — уже параметризовано
-
-**Отказ от entity_dim / harm_dim:**
-- Harmonizer и EntityField работают напрямую с latent_dim
-- Projection (768→2048) в EntityField убирается — все уровни в одном пространстве
-- `_to_dim()` — упрощается до identity (или assert)
-
-### Риски
-1. **VSAGrid.factorize(D)** — протестирован только для 768 и 64. Для произвольного D (например 512, 1024) может не найти разложение на множители ≤ 8. Нужен fallback: `factorize_with_padding(dim)` — дополняет до ближайшего раскладываемого.
-2. **GPU VRAM** — на 2GB карте при V=146K и D=1024: `(146000*1024*2 + 146000*2730*2) ≈ 1.1 GB`. Помещается, но впритык. Нужен флаг `vram_limit_mb` с запасом.
+| Категория | Кол-во | Приоритет |
+|-----------|--------|-----------|
+| Баги: конфиг есть, код не читает | ~30 | **P0** |
+| Нет полей в FCFConfig | ~40 | **P1** |
+| Scripts / дублирование | ~50 | **P2** |
 
 ---
 
-## Фаза 2: SeedRegistry — единый источник seed
+## P0: Чтение существующего конфига (2 файла, ~30 значений)
 
-### Проблема
-28 вызовов `RandomState()`, 4 разных seed (42, 0, 1, 7). При смене master_seed воспроизводимость ломается.
+### P0-A: `hormonal_system.py` не читает FormulaCoefficients
 
-### Решение
+**Файл:** `eva/symbolic/hormonal_system.py`
+
+**Симптом:** все 35 коэффициентов в `FormulaCoefficients` (строки 398–430 `fcf_config.py`) существуют, но `HormonalSystem.__init__` и `update()` используют хардкод.
+
+**Что менять:**
 ```python
-class SeedRegistry:
-    def __init__(self, master_seed=42):
-        self.master_seed = master_seed
-        self._requested = {}  # name → seed
+class HormonalSystem:
+    def __init__(self, config=None):
+        _fc = (config.formula if config else FCFConfig().formula)
+        self.dopamine = _fc.da_baseline       # вместо 0.5
+        self.serotonin = _fc.ht_baseline      # вместо 0.5
+        self.noradrenaline = _fc.na_baseline  # вместо 0.3
+        self.acetylcholine = _fc.ach_baseline # вместо 0.5
+        self.tonic_decay = _fc.tonic_decay    # вместо 0.95
+        self.phasic_decay = _fc.phasic_decay  # вместо 0.7
 
-    def get(self, name):
-        if name in self._requested:
-            return self._requested[name]
-        seed = (self.master_seed + hash(name)) % (2**31 - 1)
-        self._requested[name] = seed
-        return seed
-
-    def rng(self, name):
-        return np.random.RandomState(self.get(name))
+    def update(self, ..., _fc=None):
+        _fc = _fc or FormulaCoefficients()
+        da_coherence = _fc.da_coherence_strength       # вместо 0.05
+        da_curiosity = novelty * _fc.da_curiosity_strength  # вместо * 0.4
+        da_mastery = max(0, delta_match) * _fc.da_mastery_strength  # вместо * 0.5
+        ...
 ```
 
-**Именованные seed:**
-- `basis` — FractalField basis init
-- `field_bits` — FractalField W_proj init
-- `entity_roles` — EntityField role vectors
-- `entity_proj` — EntityField projection
-- `harm_roles` — Harmonizer role vectors
-- `fluctuate` — FractalField fluctuation
-- `rng` / `item_rng` / `inhibit_rng` — ConceptSpace RNGs
-- `rescued` — Cluster repulsion fallback
-- `morph_init` — Morpheme vector init
-- `residue` — ResidueEncoder init
-- `vsa_utils` — Random masks
-- `vsa_attention` — Head roles
-- `semantic_bootstrap` — Bootstrap RNG
-- `lsh_index` — LSH permutation tables
-- (`test_rng*` — для тестов, через seed registry с `test_` prefix)
+**Файлы для изменений:** `hormonal_system.py`, `crystal_generator.py` (передача config в HormonalSystem)
 
-**Правило:** `rng(name)` → `RandomState(master_seed + hash(name))`. Для тестов: можно переопределить `master_seed` для воспроизводимости конкретного сценария.
+### P0-B: `stdp_trainer.py` STDP формулы не читают FormulaCoefficients
+
+**Файл:** `eva/symbolic/stdp_trainer.py`
+
+**Симптом:** `_build_pairs` использует `freq_weight_log_scale=0.15`, `field_weight_log_scale=2.0`, `field_weight_cap=3.0`, `field_weight_floor=0.1`, `hormonal_mod_baseline=0.5`, `hormonal_mod_scale=0.5` — все есть в `FormulaCoefficients` (строки 363–373 fcf_config.py), но код читает `_fc` только для PMI.
+
+**Что менять:**
+```python
+_fc = FormulaCoefficients()
+# freq_weight:
+freq_weight = 1.0 / (1.0 + math.log(...) * _fc.freq_weight_log_scale)
+# field_weight:
+fw = min(1.0 + math.log(overlap + 1) * _fc.field_weight_log_scale, _fc.field_weight_cap) if overlap > 0 else _fc.field_weight_floor
+# hormonal modulation:
+lr *= (_fc.hormonal_mod_baseline + gen.hormones.acetylcholine * _fc.hormonal_mod_scale)
+```
 
 ---
 
-## Фаза 3: AdaptiveArchitectureController — динамические соотношения
+## P1: Добавить поля в FCFConfig + читать (4 файла, ~40 значений)
 
-### Проблема
-`l_c/l_a/l_m` = 60%/25%/15% — жёсткая формула `*3//5 / //4 / остаток`. Пороги роста/прунинга — числовые константы.
+### P1-A: `crystal_generator.py` — Graph search и Branch параметры
 
-### Решение
-
-**Начальные соотношения — из конфига:**
+**Новые поля в FCFConfig:**
 ```python
-@dataclass
-class SubspaceConfig:
-    l_c_ratio: float = 0.6    # ~φ²/(φ²+φ+1)
-    l_a_ratio: float = 0.25   # ~φ/(φ²+φ+1)
-    l_m_ratio: float = 0.15   # ~1/(φ²+φ+1)
+# Graph search defaults
+graph_search_B: float = 1.2
+graph_search_max_candidates: int = 30
+graph_search_max_depth: int = 5
+graph_search_connections_topk: int = 8
+graph_search_syn_preds_limit: int = 80
+graph_search_hdc_k: int = 30
+graph_search_hdc_score_min: float = 0.05
+graph_search_sector_k: int = 40
+graph_search_sector_depth: int = 1
+graph_search_focal_k: int = 20
+graph_search_focal_sample_size: int = 500
+graph_search_sim_threshold: float = 0.05
+
+# Branch params
+branch_antirep_window: int = 6
+branch_n_candidates_base: int = 15
+branch_overlap_log_scale: float = 0.1
+branch_conf_scale: float = 0.5
+branch_adaptive_bw_min_ratio: float = 0.5
+branch_eos_punct: str = ".,!?;:…—–"
 ```
 
-**Адаптивный контроллер:**
+**Файлы:** `fcf_config.py`, `crystal_generator.py`
+
+### P1-B: `parameter_optimizer.py` — Plateau/Metric/Detector
+
+**Новые поля в FCFConfig:**
 ```python
-class AdaptiveArchitectureController:
-    def __init__(self, config, dim_resolver):
-        self.ratios = SubspaceConfig()
-        self.dim_resolver = dim_resolver
+# MetricBuffer defaults
+metric_maxlen_primary: int = 10
+metric_maxlen_secondary: int = 8
+metric_maxlen_tiny: int = 6
 
-    def update(self, codes):
-        """Обновить соотношения на основе статистик кодов."""
-        # Density z_c
-        z_c_active = np.mean(np.abs(codes[:, :self.l_c]) > 1e-4, axis=1)
-        mean_density = np.mean(z_c_active)
+# Plateau detection
+plateau_patience: int = 3
+plateau_rel_thresh_default: float = 0.005
+plateau_rel_thresh_ppl: float = 0.002
+plateau_rel_thresh_acc1: float = 0.02
 
-        # Если плотность ниже цели → увеличить l_c (больше ёмкости identity)
-        if mean_density < self.l1_target_density * 0.5:
-            self.ratios.l_c_ratio = min(self.ratios.l_c_ratio * 1.05, 0.75)
+# ParameterOptimizer defaults
+opt_flat_threshold: float = 0.002
+opt_cos_trend_window: int = 5
+opt_full_stuck_threshold: int = 5
+opt_toward_default_rate: float = 0.03
+opt_inh_threshold_fallback: float = 0.1
 
-        # Если плотность выше цели → уменьшить l_c
-        elif mean_density > self.l1_target_density * 2.0:
-            self.ratios.l_c_ratio = max(self.ratios.l_c_ratio * 0.95, 0.3)
-
-        # Пересчитать l_a и l_m
-        remaining = 1.0 - self.ratios.l_c_ratio
-        self.ratios.l_a_ratio = remaining * 0.6  # 60% остатка на attention
-        self.ratios.l_m_ratio = remaining * 0.4  # 40% на meta
+# PlateauDetector defaults
+detector_window: int = 100
+detector_patience: int = 20
+detector_threshold_std: float = 0.5
+detector_min_decay: float = 0.1
+detector_recovery_factor: float = 0.05
+detector_ema_alpha: float = 0.05
+detector_decay_per_step: float = 0.01
 ```
 
-**Динамические пороги:**
-```python
-@property
-def density_threshold_grow(self):
-    """Авто-порог: 90-й перцентиль плотности всех концептов."""
-    densities = per_concept_density(all_codes)
-    return np.quantile(densities, 0.9)
+**Файлы:** `fcf_config.py`, `parameter_optimizer.py`
 
-@property
-def density_threshold_prune(self):
-    """Авто-порог: 10-й перцентиль."""
-    return np.quantile(densities, 0.1)
+### P1-C: `adaptive_controller.py` — SubspaceConfig + update()
+
+**Новые поля в FCFConfig (дублируют SubspaceConfig + internal):**
+```python
+# SubspaceConfig defaults
+subspace_l_c_ratio: float = 0.6
+subspace_l_a_ratio: float = 0.25
+subspace_l_m_ratio: float = 0.15
+subspace_density_threshold_grow: float = 0.15
+subspace_density_threshold_prune: float = 0.01
+subspace_l1_target_density: float = 0.08
+subspace_growth_factor: float = 1.5
+subspace_sector_depths: list = field(default_factory=lambda: [4, 10, 20])
+
+# AdaptiveController update()
+subspace_density_epsilon: float = 1e-4
+subspace_density_history_maxlen: int = 10000
+subspace_warmup_updates: int = 10
+subspace_adjust_up_rate: float = 1.03
+subspace_adjust_up_max: float = 0.75
+subspace_adjust_down_rate: float = 0.97
+subspace_adjust_down_min: float = 0.3
+subspace_redistribute_a_ratio: float = 0.6
+subspace_redistribute_m_ratio: float = 0.4
 ```
 
-### Затрагиваемые константы
-- `l_c/l_a/l_m` ratios (6 вхождений)
-- `_density_threshold_grow = 0.15`
-- `_density_threshold_prune = 0.01`
-- `l1_target_density = 0.08`
-- `_growth_factor = 1.5`
-- `_sector_depths = [4, 10, 20]`
+**Файлы:** `fcf_config.py`, `adaptive_controller.py`
+
+### P1-D: `concept_space.py` — Capacity лимиты
+
+```python
+# FractalField defaults
+fractal_hdc_memory_max: int = 20000
+fractal_init_z_c_active_pct: float = 0.03
+fractal_init_z_c_active_min: int = 8
+fractal_init_z_a_scale: float = 0.01
+fractal_init_z_m_scale: float = 0.001
+fractal_init_field_n_anchors: int = 1024
+fractal_l1_density_window: int = 100
+fractal_l1_adjust_rate: float = 0.1
+fractal_l1_lambda_cap: float = 0.1
+```
+
+При этом `hdc_memory_max` уже используется как лимит — заменить чтением из config.
 
 ---
 
-## Фаза 4: Formula coefficients → config + adaptive
+## P2: Централизация и скрипты (~50 значений)
 
-### 4.1 RRF weights (генерация)
+### P2-A: Special token IDs (3 файла)
 
-**Сейчас:** `graph=0.7, syntax=0.15, hdc=0.10, vec=0.15, prior=0.02` — жёстко в `crystal_generator.py:824-833`.
-
-**Решение:**
 ```python
-@dataclass
-class RRFConfig:
-    graph_weight: float = 0.7
-    syntax_weight: float = 0.15
-    hdc_weight: float = 0.10
-    vector_weight: float = 0.15
-    prior_weight: float = 0.02
-    adaptation_rate: float = 0.01  # скорость адаптации весов
-
-# Адаптация: на валидации считаем acc@1 каждой ручки
-def adapt_rrf_weights(weights, signal_accuracies, temperature=3.0):
-    """Softmax взвешивание по качеству каждой ручки."""
-    logits = np.array([w * acc * temperature
-                      for w, acc in zip(weights, signal_accuracies)])
-    return softmax(logits)
+# В FCFConfig:
+special_pad_id: int = 0
+special_bos_id: int = 1
+special_eos_id: int = 2
 ```
 
-### 4.2 Гормональная система
+Убрать глобальные `_BOS_ID = 1`, `_EOS_ID = 2` из `crystal_generator.py:47-48`.
+В `configuration_fcf.py:31-33` и `tokenization_fcf.py:28-30` читать из config.
 
-**Сейчас:** десятки числовых коэффициентов в формулах `hormonal_system.py:30-190`.
+### P2-B: SeedRegistry — оставшиеся прямые вызовы
 
-**Решение:** вынести ВСЕ числа в `hormonal_coeffs` config:
-```python
-@dataclass
-class HormonalCoeffs:
-    # Baselines
-    da_baseline: float = 0.5
-    ht_baseline: float = 0.5
-    na_baseline: float = 0.3
-    ach_baseline: float = 0.5
+- `concept_space.py:364`: `np.random.RandomState(cid * 137 + 42)` → `_R.rng('init_concept')`
+- `concept_space.py:472`: `np.random.RandomState(42 + self._capacity_growths)` → `_R.rng('field_collapse')`
+- `crystal_generator.py:89`: `RNGRegistry(master_seed=42)` → читать `config.global_seed`
 
-    # Decays
-    tonic_decay: float = 0.95
-    phasic_decay: float = 0.7
+### P2-C: Скрипты
 
-    # DA formula
-    da_coherence_strength: float = 0.05
-    da_extrinsic_match: float = 0.5
-    da_extrinsic_mismatch: float = -0.3
-    da_novelty_strength: float = 0.2
-
-    # 5HT formula
-    ht_target_adapt: float = 0.3
-    ht_match_scale: float = 0.4
-
-    # NA formula
-    na_baseline_part: float = 0.2
-    na_surprise_scale: float = 0.5
-    na_confidence_scale: float = 0.3
-
-    # ACh formula
-    ach_novelty_scale: float = 0.5
-    ach_uncertainty_scale: float = 0.3
-    ach_drift_up: float = 0.15
-    ach_drift_down: float = 0.1
-
-    # Modulation
-    da_temperature_strength: float = 0.9
-    na_beam_strength: float = 0.5
-```
-
-Сами формулы остаются в коде (они — алгоритм, не конфиг). Коэффициенты — из config.
-
-### 4.3 Прочие формульные константы
-
-- **θ-распад:** `theta_tau=12.0, tau*3.0` — уже в config, нормально
-- **PMI mapping:** `pmi/2.0 + 0.2, clamp(2.0)` — вынести в `pmi_mapping_slope, pmi_mapping_intercept, pmi_mapping_max`
-- **Anti-repetition:** `exp(-0.3 * count)` — `antirep_penalty=0.3`
-- **Edge weight (graph):** `max(0.20, 1.0 - min(ppmi/8.0, 1.0) * 0.7)` — `edge_weight_min=0.20, edge_ppmi_max=8.0, edge_weight_strength=0.7`
-- **Target boost:** `5.0 * (1.0 - theta * 0.5)` — `target_boost_scale=5.0, target_boost_decay=0.5`
-- **Novelty freq cap:** `/50` — `novelty_freq_cap=50`
+- `train_full.py`: `random.seed(42)` → `config.global_seed`; `N_FIELD_BITS = 512` → `config.field_bits`
+- `inference.py`: `sample_size=500` → config; default seeds
+- `filter_corpus.py`: regex thresholds (4, 2, 3, 10, 0.5) — если используются в тренировке, то в config
+- `eval_checkpoint.py`, `visualize.py`: `seed=42` → config
 
 ---
 
-## Фаза 5: VSA-native SemanticPiece — многоуровневая токенизация
+## Итоговый порядок реализации Phase 7
 
-### Проблема
-SentencePiece BPE — чёрный ящик, не знающий про VSA-уровни. Harmonizer пытается восстановить морфемы через хардкод-списки префиксов.
+| Шаг | Что | Файлы | Сложность | Зависимости |
+|-----|-----|-------|-----------|-------------|
+| **P0-A** | hormonal_system.py читает FC | 2 | ☆ | Нет (config уже есть) |
+| **P0-B** | stdp_trainer.py читает FC | 2 | ☆ | P0-A |
+| **P1-A** | crystal_generator graph/branch params | 2 | ☆☆ | Нет |
+| **P1-B** | parameter_optimizer plateau/metric | 2 | ☆☆ | Нет |
+| **P1-C** | adaptive_controller subspace params | 2 | ☆ | Нет |
+| **P1-D** | concept_space capacity params | 2 | ☆ | Нет |
+| **P2-A** | Special token IDs | 4 | ☆ | Нет |
+| **P2-B** | Seeds через Registry | 3 | ☆ | Нет |
+| **P2-C** | Scripts consolidation | 5 | ☆☆ | P2-A/B |
 
-### Решение
+**Рекомендуемый порядок:** P0-A → P0-B → P1-A → P1-B → P1-C → P1-D → P2-A → P2-B → P2-C
 
-**BPE остаётся для первичной токенизации (инициализация).** VSA-уровни надстраиваются поверх:
-
-```
-BPE (инициализация)
-    ↓ CID
-Character VSA (CharEnvelope)
-    ↓ STDP char→char bind
-Morph VSA (новый: обучение морфем через STDP)
-    ↓ STDP morph→word bind
-Word VSA (Harmonizer, без хардкода)
-    ↓ EntityField
-Sentence VSA
-    ↓ EntityField
-Paragraph / Knowledge Cluster VSA
-```
-
-**Char→Morph обучение:**
-- После BPE токенизации: каждый CID → текст → последовательность Unicode codepoints
-- CharEnvelope строит char vectors
-- STDP на char bi-grams: `bind(c₁, ρ(c₂))` → "soft morph token"
-- Если char→char bind стабильно высок (когезия) → фиксируется как morph vector
-- Popout через LSH: похожие char n-grams → один morph vector
-
-**Morph→Word обучение:**
-- Harmonizer получает морфемы не из хардкод-списка, а из STDP char→morph
-- `word = compose([(morph₁, ROOT), (morph₂, SUFFIX), ...])`
-- Роль-векторы (ROOT/PREFIX/SUFFIX) — обучемые, не фиксированные
-- STDP тюнит: word_vector → pull к compose(word) → backprop ошибки на morph vectors
-
-**Cross-level генерация:**
-- `generate(topic=<cluster_vec>)` → top-down bias на sent level
-- `generate(sent=<sent_vec>)` → top-down bias на word level
-- EntityField binds: любой уровень может быть стартовой точкой
-- Остальные уровни достраиваются через cross-level unbind
-
-### Зависимости
-- `CharEnvelope` — уже есть, доработка к STDP-обучению char→char
-- `Harmonizer` — уже есть, убрать хардкод-декомпозицию, заменить на STDP
-- `EntityField` — уже есть, обучение char↔morph (сейчас только char↔word)
-- BPE — остаётся для seed vectors
-
-### Риски
-- **Качество морфем без хардкода:** STDP может не найти русские морфемы в char-последовательностях. Нужен warm-start: инициализировать morph vectors из существующего `_decompose_word`, потом дообучать.
-- **Vocab explosion:** каждый char n-gram → morph vector → 146K + десятки тысяч. Нужен LSH-index для дедупликации (уже есть `LSHIndex`).
-- **Скорость:** char-level STDP на каждом батче — дорого. Нужен sampling: только для новых/редких CIDs.
+**Критическая зависимость:** P0-A не зависит ни от чего; P0-B можно параллельно.
 
 ---
 
-## Фаза 6: Единообразие дефолтов
+## Пограничные случаи
 
-### Проблема
-Все функции дублируют дефолты из конфига: `pmi_strength=1.0, neg_samples=1, ...`. При изменении конфига сигнатуры не синхронизируются.
+### HormonalSystem без config
+`HormonalSystem()` создаётся в `crystal_generator.py:94` без config. Решение: `HormonalSystem(config=None)` → `FCFConfig().formula`.
 
-### Решение
-```python
-# Везде:
-def train_from_text(self, text, base_lr=None, ...):
-    base_lr = base_lr if base_lr is not None else self.config.get('learning_rate', 0.1)
-    pmi_strength = pmi_strength if pmi_strength is not None else self.config.get('pmi_strength', 1.0)
-    ...
-```
+### ParameterOptimizer MetricBuffer разных размеров
+10/8/6 для разных метрик — не случайные числа, а эвристики под частоту обновления. Решение: NamedTuple в config: `metric_maxlen_map: dict = field(default_factory=lambda: {'mean_cos': 10, 'std_cos': 10, 'vec_ppl': 8, ...})`.
 
-Паттерн: `None → config.get(key, fallback)`. Никаких жёстких дефолтов в сигнатурах, кроме `None`.
+### SubspaceConfig дублирование
+`SubspaceConfig` в `adaptive_controller.py` — отдельный dataclass, дублирующий часть FCFConfig. Решение: убрать `SubspaceConfig`, читать напрямую из `FCFConfig.subspace_*`.
+
+### _BOS_ID/_EOS_ID в crystal_generator как глобалы
+После централизации — убрать `_BOS_ID = 1`, `_EOS_ID = 2` на уровне модуля. Заменить на `self.config.special_bos_id`. В `generate()` и `_encode_input()` — проверка через config.
 
 ---
 
-## Итоговый порядок реализации
+## Критерии готовности Phase 7
 
-| Фаза | Что | Затрагивает файлов | Сложность | Зависимости |
-|------|-----|--------------------|-----------|-------------|
-| **0** | EnvironmentResolver (пути) | 12 | ☆☆ | Нет |
-| **1** | AdaptiveDimensionResolver | 15 | ☆☆☆ | Фаза 0 (путь к SP) |
-| **2** | SeedRegistry | 28 | ☆ | Фаза 1 (DimsResolver как singleton) |
-| **3** | AdaptiveArchitectureController | 6 | ☆☆☆ | Фаза 1 |
-| **4** | Formula coefficients | ~15 | ☆☆ | Фаза 0, 3 |
-| **5** | SemanticPiece (VSA tokenizer) | ~10 | ☆☆☆☆☆ | Фазы 0-4 |
-| **6** | Единообразие дефолтов | ~20 | ☆ | Фаза 0 |
-
-**Рекомендуемый порядок:** 0 → 1 → 2 → 6 → 3 → 4 → 5
-
-Фазы 0-2-6 — "housekeeping" (можно быстро), фазы 3-4 — "гибкость" (средне), фаза 5 — "архитектурная перестройка" (долго).
+- [ ] Все тесты проходят (294 + новые)
+- [ ] `hormonal_system.py` не содержит хардкод-коэффициентов — все из `FormulaCoefficients`
+- [ ] `stdp_trainer.py` не содержит хардкод-коэффициентов STDP — все из `FormulaCoefficients`
+- [ ] `crystal_generator.py` graph search читает все параметры из config
+- [ ] `parameter_optimizer.py` plateau/metric читает все пороги из config
+- [ ] `adaptive_controller.py` не имеет `SubspaceConfig` — читает из `FCFConfig`
+- [ ] `concept_space.py` capacity лимиты читает из config
+- [ ] Special token IDs — одно место `FCFConfig`, а не 3 файла
+- [ ] Оставшиеся прямые `RandomState()` — через SeedRegistry
 
 ---
 

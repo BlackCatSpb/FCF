@@ -41,7 +41,7 @@ except ImportError:
 
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.hormonal_system import HormonalSystem
-from eva.symbolic.fcf_config import FormulaCoefficients
+from eva.symbolic.fcf_config import FormulaCoefficients, FCFConfig
 
 
 _BOS_ID = 1
@@ -91,7 +91,7 @@ class CrystalGenerator:
         if not self.cs.concept_usage:
             self.cs.init_homeostasis()
         self.branch_rngs = {}
-        self.hormones = HormonalSystem()
+        self.hormones = HormonalSystem(formula=FormulaCoefficients())
 
         # Per-concept prediction error EMA (Level 2: error-based PMI gate)
         ce_max = min(3 * self.cs.vocab_size // 4, 100000)
@@ -690,7 +690,7 @@ class CrystalGenerator:
 
     # ── Graph-based semantic search ──────────────────────────────
 
-    def _graph_search(self, sources, B=2.0, max_candidates=30, max_depth=5):
+    def _graph_search(self, sources, B=None, max_candidates=None, max_depth=None):
         """BMSSP-EVA: single multi-source BFS for semantic paths.
 
         Args:
@@ -699,6 +699,10 @@ class CrystalGenerator:
             max_candidates: max results to return
             max_depth: max BFS steps (safety bound, B is the primary limiter)
         """
+        _cfg = FCFConfig()
+        if B is None: B = _cfg.graph_search_B
+        if max_candidates is None: max_candidates = _cfg.graph_search_max_candidates
+        if max_depth is None: max_depth = _cfg.graph_search_max_depth
         if not sources:
             return {}
         sources = list(set(sources))
@@ -724,7 +728,7 @@ class CrystalGenerator:
             step += 1
             next_frontier = []
             for u in frontier:
-                conns = self.lattice.connections_of(u, top_k=8, use_ppmi=True)
+                conns = self.lattice.connections_of(u, top_k=FCFConfig().graph_search_connections_topk, use_ppmi=True)
                 for v, conn_info in conns:
                     if not self._is_semantic_token(v):
                         continue
@@ -777,7 +781,7 @@ class CrystalGenerator:
         if sources_key not in self._graph_cache:
             if len(self._graph_cache) >= self._graph_cache_max:
                 self._graph_cache.popitem(last=False)
-            self._graph_cache[sources_key] = self._graph_search(sources, B=1.2, max_candidates=30)
+            self._graph_cache[sources_key] = self._graph_search(sources, B=1.2, max_candidates=FCFConfig().graph_search_max_candidates)
         else:
             self._graph_cache.move_to_end(sources_key)
         graph_candidates = self._graph_cache[sources_key]

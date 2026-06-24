@@ -427,7 +427,16 @@ class FormulaCoefficients:
     ach_tonic_drift: float = 0.15
     da_temperature_min: float = 0.05
     da_temperature_scale: float = 0.9
+    da_temperature_baseline: float = 0.1
     na_beam_scale: float = 0.5
+
+    # HormonalSystem supplementary constants (Phase 7)
+    da_mismatch_penalty: float = -0.3
+    da_match_hard_threshold: float = 0.5
+    hormone_recent_window: int = 50
+    hormone_boredom_window: int = 5
+    hormone_boredom_repeat: int = 3
+    hormone_reward_history_maxlen: int = 1000
 
 
 # ──────────────────────────────────────────────
@@ -664,6 +673,80 @@ class FCFConfig:
     # ── Manage ────────────────────────────────
     cleanup_keep: int = 5       # сколько чекпоинтов хранить
     periodic_save_every: int = 5000
+
+    # ── P1-A: crystal_generator graph search ─
+    graph_search_B: float = 2.0
+    graph_search_max_candidates: int = 30
+    graph_search_max_depth: int = 5
+    graph_search_connections_topk: int = 8
+    graph_search_syn_preds_limit: int = 80
+    graph_search_hdc_k: int = 30
+    graph_search_hdc_score_min: float = 0.05
+    graph_search_sector_k: int = 40
+    graph_search_sector_depth: int = 1
+    graph_search_focal_k: int = 20
+    graph_search_focal_sample_size: int = 500
+    graph_search_sim_threshold: float = 0.05
+
+    # ── P1-A: crystal_generator branch ────────
+    branch_antirep_window: int = 6
+    branch_n_candidates_base: int = 15
+    branch_overlap_log_scale: float = 0.1
+    branch_conf_scale: float = 0.5
+    branch_adaptive_bw_min_ratio: float = 0.5
+
+    # ── P1-B: parameter_optimizer ─────────────
+    metric_maxlen_primary: int = 10
+    metric_maxlen_secondary: int = 8
+    metric_maxlen_tiny: int = 6
+    plateau_patience: int = 3
+    plateau_rel_thresh_default: float = 0.005
+    plateau_rel_thresh_ppl: float = 0.002
+    plateau_rel_thresh_acc1: float = 0.02
+    opt_flat_threshold: float = 0.002
+    opt_cos_trend_window: int = 5
+    opt_full_stuck_threshold: int = 5
+    opt_toward_default_rate: float = 0.03
+    opt_inh_threshold_fallback: float = 0.1
+
+    # ── P1-B: PlateauDetector ─────────────────
+    detector_window: int = 100
+    detector_patience: int = 20
+    detector_threshold_std: float = 0.5
+    detector_min_decay: float = 0.1
+    detector_recovery_factor: float = 0.05
+    detector_ema_alpha: float = 0.05
+    detector_decay_per_step: float = 0.01
+
+    # ── P1-C: adaptive_controller subspace ────
+    subspace_l_c_ratio: float = 0.6
+    subspace_l_a_ratio: float = 0.25
+    subspace_l_m_ratio: float = 0.15
+    subspace_density_threshold_grow: float = 0.15
+    subspace_density_threshold_prune: float = 0.01
+    subspace_l1_target_density: float = 0.08
+    subspace_growth_factor: float = 1.5
+    subspace_sector_depths: list = field(default_factory=lambda: [4, 10, 20])
+    subspace_density_epsilon: float = 1e-4
+    subspace_density_history_maxlen: int = 10000
+    subspace_warmup_updates: int = 10
+    subspace_adjust_up_rate: float = 1.03
+    subspace_adjust_up_max: float = 0.75
+    subspace_adjust_down_rate: float = 0.97
+    subspace_adjust_down_min: float = 0.3
+    subspace_redistribute_a_ratio: float = 0.6
+    subspace_redistribute_m_ratio: float = 0.4
+
+    # ── P1-D: concept_space FractalField ──────
+    fractal_hdc_memory_max: int = 20000
+    fractal_init_z_c_active_pct: float = 0.03
+    fractal_init_z_c_active_min: int = 8
+    fractal_init_z_a_scale: float = 0.01
+    fractal_init_z_m_scale: float = 0.001
+    fractal_init_field_n_anchors: int = 1024
+    fractal_l1_density_window: int = 100
+    fractal_l1_adjust_rate: float = 0.1
+    fractal_l1_lambda_cap: float = 0.1
 
     # ──────────────────────────────────────────
     #  Генерация пар из MorphVocab/корпуса

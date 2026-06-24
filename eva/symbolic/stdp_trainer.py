@@ -110,11 +110,27 @@ class STDPTrainer:
     # Public API
     # ═══════════════════════════════════════════════════
 
-    def train_from_text(self, text, base_lr=None, context_window=2, pmi_strength=1.0,
-                         pmi_gate_min=0.20, neg_samples=1, inh_strength=0.05, inh_threshold=0.10,
-                         neg_lr_ratio=0.5, field_gate=True, use_torch=None, destab_scale=0.0,
-                         momentum_mu=0.9, gradient_noise_scale=0.0, fluctuation_amp=0.003):
-        """Train on one text line. Returns number of STDP pairs built."""
+    def _unwrap(self, val, key, fallback):
+        if val is not None:
+            return val
+        from eva.symbolic.fcf_config import FCFConfig
+        return getattr(FCFConfig(), key, fallback)
+
+    def train_from_text(self, text, base_lr=None, context_window=None, pmi_strength=None,
+                         pmi_gate_min=None, neg_samples=None, inh_strength=None, inh_threshold=None,
+                         neg_lr_ratio=None, field_gate=True, use_torch=None, destab_scale=None,
+                         momentum_mu=None, gradient_noise_scale=None, fluctuation_amp=None):
+        cf = lambda k, f: self._unwrap(None, k, f)  # noqa
+        context_window = cf('context_window', 2) if context_window is None else context_window
+        pmi_strength = cf('pmi_strength', 1.0) if pmi_strength is None else pmi_strength
+        pmi_gate_min = cf('pmi_gate_min', 0.20) if pmi_gate_min is None else pmi_gate_min
+        neg_samples = cf('neg_samples', 1) if neg_samples is None else neg_samples
+        inh_strength = cf('inh_strength', 0.05) if inh_strength is None else inh_strength
+        inh_threshold = cf('inh_threshold', 0.10) if inh_threshold is None else inh_threshold
+        neg_lr_ratio = cf('neg_lr_ratio', 0.5) if neg_lr_ratio is None else neg_lr_ratio
+        destab_scale = cf('destab_scale', 0.0) if destab_scale is None else destab_scale
+        momentum_mu = cf('momentum_mu', 0.9) if momentum_mu is None else momentum_mu
+        fluctuation_amp = cf('fluctuation_amp', 0.003) if fluctuation_amp is None else fluctuation_amp
         n = self._train(text, base_lr, context_window, pmi_strength, pmi_gate_min,
                         neg_samples, inh_strength, inh_threshold, neg_lr_ratio,
                         field_gate, use_torch, destab_scale, batch=False,
@@ -122,10 +138,21 @@ class STDPTrainer:
         self.gen._sync_dirty_cpu()
         return n
 
-    def train_batch(self, texts, base_lr=None, context_window=2, pmi_strength=1.0,
-                     pmi_gate_min=0.20, neg_samples=1, inh_strength=0.05, inh_threshold=0.10,
-                     neg_lr_ratio=0.5, field_gate=True, use_torch=None, destab_scale=0.0,
-                     momentum_mu=0.9, gradient_noise_scale=0.0, fluctuation_amp=0.003):
+    def train_batch(self, texts, base_lr=None, context_window=None, pmi_strength=None,
+                     pmi_gate_min=None, neg_samples=None, inh_strength=None, inh_threshold=None,
+                     neg_lr_ratio=None, field_gate=True, use_torch=None, destab_scale=None,
+                     momentum_mu=None, gradient_noise_scale=None, fluctuation_amp=None):
+        cf = lambda k, f: self._unwrap(None, k, f)
+        context_window = context_window if context_window is not None else cf('context_window', 2)
+        pmi_strength = pmi_strength if pmi_strength is not None else cf('pmi_strength', 1.0)
+        pmi_gate_min = pmi_gate_min if pmi_gate_min is not None else cf('pmi_gate_min', 0.20)
+        neg_samples = neg_samples if neg_samples is not None else cf('neg_samples', 1)
+        inh_strength = inh_strength if inh_strength is not None else cf('inh_strength', 0.05)
+        inh_threshold = inh_threshold if inh_threshold is not None else cf('inh_threshold', 0.10)
+        neg_lr_ratio = neg_lr_ratio if neg_lr_ratio is not None else cf('neg_lr_ratio', 0.5)
+        destab_scale = destab_scale if destab_scale is not None else cf('destab_scale', 0.0)
+        momentum_mu = momentum_mu if momentum_mu is not None else cf('momentum_mu', 0.9)
+        fluctuation_amp = fluctuation_amp if fluctuation_amp is not None else cf('fluctuation_amp', 0.003)
         """Train on a batch of texts (GPU batched). Returns total pairs."""
         n = self._train(texts, base_lr, context_window, pmi_strength, pmi_gate_min,
                         neg_samples, inh_strength, inh_threshold, neg_lr_ratio,

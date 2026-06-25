@@ -431,7 +431,13 @@ class STDPTrainer:
             # P2.6: cache sent_vec built from concept vectors (768D) for morpheme harmonisation
             sv_768 = cs.fractal.hdc_ngram_repr([cs.concept_vectors.get(c) for c in ids if cs.concept_vectors.get(c) is not None])
             if sv_768 is not None:
-                sent_vec_cache[sent_key] = sv_768
+                # Encode 768D → latent_dim (2048) for Harmonizer compatibility
+                if cs.fractal.basis is not None:
+                    sv_latent = sv_768 @ cs.fractal.basis.T
+                    sv_ln = float(np.linalg.norm(sv_latent))
+                    sent_vec_cache[sent_key] = sv_latent / sv_ln if sv_ln > 1e-10 else sv_latent
+                else:
+                    sent_vec_cache[sent_key] = sv_768
 
         # ── 3. Morpheme harmonisation ──
         dirty_words = list(harm.word_dirty)

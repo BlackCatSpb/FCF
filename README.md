@@ -154,7 +154,22 @@ python scripts/seed_embeddings.py --cs real_data/concept_space.json --sp real_da
 
 После этого запускать `train_full.py` как обычно. Редкие токены начинают не с шума, а с осмысленного семантического положения — меньше шагов STDP до стабилизации.
 
-Флаги: `--all` — залить все концепты; `--threshold N` — порог частоты (по умолч. 3); `--device cuda` — GPU.
+Флаги:
+- `--all` — залить все концепты
+- `--threshold N` — порог частоты (по умолч. 3)
+- `--morph-bundle` — режим композиции: слово → VSA bundle(root_emb, ending_emb) вместо прямого эмбеддинга (cos=0.917 с e5(word), валидировано)
+- `--device cuda` — GPU
+
+### Двухуровневый морфологический токенизатор
+
+**Уровень 1** — SentencePiece BPE (256K), обученный на корпусе с морфемной разметкой:
+```bash
+python scripts/train_morph_bpe.py --corpus real_data/full_corpus_ru.txt \
+    --output real_data/bpe_morph --vocab-size 256000 --device cpu
+```
+Скрипт: (1) разбивает каждое слово на PREFIX+ROOT+ENDING, (2) вставляет разделитель между частями, (3) тренирует BPE на аннотированном корпусе, (4) валидирует через e5 (VSA bundle of morphs vs whole word), (5) выводит статистику покрытия.
+
+**Уровень 2** — fallback-анализатор: если слово не найдено в morph_vocab, раскладывается на морфемы через правила → e5(morpheme) → VSA bundle → концепт-вектор. Встроен в `--morph-bundle` режим `seed_embeddings.py`.
 
 ---
 

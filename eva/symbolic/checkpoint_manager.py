@@ -112,8 +112,8 @@ class AtomicCheckpointManager:
 
         cs.save(str(tmp_cs))
         lattice.save(str(tmp_lat))
-        tmp_cs.rename(cs_path)
-        tmp_lat.rename(lat_path)
+        os.replace(str(tmp_cs), str(cs_path))
+        os.replace(str(tmp_lat), str(lat_path))
 
         if opt is not None:
             opt_path = self.data_dir / f'concept_space_{tag}.opt.json'
@@ -121,7 +121,7 @@ class AtomicCheckpointManager:
             state = opt.save_state()
             with open(tmp_opt, 'w', encoding='utf-8') as f:
                 json.dump(state, f)
-            tmp_opt.rename(opt_path)
+            os.replace(str(tmp_opt), str(opt_path))
 
         if ckpt_state is not None:
             ckpt_state_path = ckpt_state.get('_path')
@@ -131,7 +131,7 @@ class AtomicCheckpointManager:
                 tmp_state = state_path.with_suffix('.json.tmp')
                 with open(tmp_state, 'w', encoding='utf-8') as f:
                     json.dump(ckpt_data, f)
-                tmp_state.rename(state_path)
+                os.replace(str(tmp_state), str(state_path))
 
         for suffix, data_callable in extras.items():
             path = self.data_dir / f'{tag}_{suffix}'

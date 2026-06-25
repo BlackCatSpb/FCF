@@ -3,7 +3,7 @@
 Replaces transformer attention with:
   1. Cosine similarity query↔key
   2. Discretisation → Zeckendorf weights (Fibonacci 0-7)
-  3. Weighted aggregation via scale(value × weight/max) ⊕ bundle
+  3. Weighted aggregation via bind(weight_hv, value) ⊕ bundle
 
 Multi-head: each head binds aggregated output with quasi-orthogonal role.
 Position encoding: optional Fibonacci shift per token position.
@@ -12,6 +12,7 @@ Position encoding: optional Fibonacci shift per token position.
 import numpy as np
 from eva.symbolic.fibonacci_utils import FibonacciUtils
 from eva.symbolic.concept_space import _hybrid_bind
+from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
 
 
 class VSAAttention:
@@ -24,13 +25,14 @@ class VSAAttention:
         use_fib_pos: apply Fibonacci position encoding (default True)
     """
 
-    def __init__(self, dim=768, n_heads=4, max_weight=7, use_fib_pos=True):
+    def __init__(self, dim=768, n_heads=4, max_weight=7, use_fib_pos=True,
+                 use_bind_weighting=True):
         self.dim = dim
         self.n_heads = n_heads
         self.max_weight = max_weight
         self.use_fib_pos = use_fib_pos
+        self.use_bind_weighting = use_bind_weighting
 
-        from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
         mat = _R.rng('vsa_attention').randn(n_heads, dim).astype(np.float32)
         Q, _ = np.linalg.qr(mat.T, mode='reduced')
         self.head_roles = Q.T.copy()
@@ -47,19 +49,34 @@ class VSAAttention:
     def _fib_position_shift(self, vec, t):
         return np.roll(vec, FibonacciUtils.fib_position_shift(t, self.dim))
 
+    def _weight_vector(self, weight, max_val=7):
+        """Generate HD vector for a given weight via seed_registry.
+
+        Исправление V21: semantic divergence — заменено линейное масштабирование
+        value * (p/7) на bind(weight_hv, value). Вес кодируется как quasi-orthogonal
+        HD-вектор, bind с value сохраняет VSA-структуру.
+        """
+        key = f'vsa_weight_{weight}_{max_val}'
+        v = _R.rng(key).randn(self.dim).astype(np.float32)
+        n = float(np.linalg.norm(v))
+        return v / n if n > 1e-10 else v
+
     def _scale_bundle(self, value, weight):
-        """Weighted value: scale by weight/max, decompose via Zeckendorf, bundle."""
+        """Weighted value: bind(weight_hv, value) per Zeckendorf part → bundle."""
         if weight <= 0:
             return None
+        if not self.use_bind_weighting:
+            return value * (weight / self.max_weight)
         parts = self._zeckendorf_tree(weight)
         result = None
         for p in parts:
-            scaled = value * (p / self.max_weight)
-            sn = np.linalg.norm(scaled)
-            if sn > 1e-10:
-                scaled /= sn
-            result = scaled if result is None else result + scaled
-        return result
+            weight_hv = self._weight_vector(p, self.max_weight)
+            bound = _hybrid_bind(value, weight_hv)
+            result = bound if result is None else result + bound
+        if result is None:
+            return None
+        rn = float(np.linalg.norm(result))
+        return result / rn if rn > 1e-10 else result
 
     def forward(self, query, keys, values, positions=None):
         n = len(keys)

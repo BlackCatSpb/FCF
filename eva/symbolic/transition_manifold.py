@@ -98,11 +98,11 @@ class TransitionManifold:
     def _rebuild_beams(self) -> None:
         """Жадная VSA-кластеризация: каждый переход → ближайший луч или новый."""
         n_valid = min(self._total, self._buf_size)
-        samples = self._buf[:n_valid]
         if n_valid < 2:
             return
 
-        np.random.shuffle(samples)  # случайный порядок для стабильности
+        samples = self._buf[:n_valid].copy()  # copy чтобы не модифицировать буфер на месте
+        np.random.shuffle(samples)
         new_beams = []
         n_samples = len(samples)
 
@@ -133,9 +133,14 @@ class TransitionManifold:
         min_count = max(self._min_count_base, n_samples // (self.max_beams * self._min_count_divisor))
         self.beams = [(c, cnt, v) for c, cnt, v in new_beams if cnt >= min_count]
 
-    def _to_tangent(self, v_next: np.ndarray, v_prev: np.ndarray) -> np.ndarray:
-        """Компонента v_next, ортогональная v_prev (направление перехода на сфере)."""
-        cos_sim = float(np.dot(v_next, v_prev))
-        T = v_next - cos_sim * v_prev
-        n = np.linalg.norm(T)
+    def _vsa_transition(self, v_next: np.ndarray, v_prev: np.ndarray) -> np.ndarray:
+        """VSA transition vector: unbind(v_next, v_prev).
+
+        Исправление V21: semantic divergence — заменён Riemannian tangent vector
+        (v_next - cos_sim * v_prev) на _hybrid_unbind(v_next, v_prev).
+        bind(T, v_prev) ≈ v_next — свойство VSA unbind.
+        """
+        from eva.symbolic.concept_space import _hybrid_unbind
+        T = _hybrid_unbind(v_next, v_prev)
+        n = float(np.linalg.norm(T))
         return T / n if n > self._eps else np.zeros(self.dim, dtype=np.float32)

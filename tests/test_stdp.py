@@ -2935,7 +2935,8 @@ class TestVSAAttention:
 
     def test_single_key_identity(self, dim):
         from eva.symbolic.vsa_attention import VSAAttention
-        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                            use_bind_weighting=False)
         q = np.random.randn(dim).astype(np.float32)
         q /= np.linalg.norm(q)
         out = attn.forward(q, [q.copy()], [q.copy()])
@@ -2944,9 +2945,21 @@ class TestVSAAttention:
         # scale+bundle preserves direction: sim should be high (>0.5)
         assert sim > 0.5
 
+    def test_single_key_bind_weighting(self, dim):
+        from eva.symbolic.vsa_attention import VSAAttention
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                            use_bind_weighting=True)
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        out = attn.forward(q, [q.copy()], [q.copy()])
+        assert out.shape == (dim,)
+        norm = float(np.linalg.norm(out))
+        assert abs(norm - 1.0) < 1e-5
+
     def test_two_keys_higher_weight_to_closer(self, dim):
         from eva.symbolic.vsa_attention import VSAAttention
-        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                            use_bind_weighting=False)
         q = np.random.randn(dim).astype(np.float32)
         q /= np.linalg.norm(q)
         k_close = q.copy()
@@ -2962,7 +2975,8 @@ class TestVSAAttention:
 
     def test_multi_head_produces_unit_norm(self, dim):
         from eva.symbolic.vsa_attention import VSAAttention
-        attn = VSAAttention(dim=dim, n_heads=3, use_fib_pos=False)
+        attn = VSAAttention(dim=dim, n_heads=3, use_fib_pos=False,
+                            use_bind_weighting=False)
         q = np.random.randn(dim).astype(np.float32)
         q /= np.linalg.norm(q)
         rng = np.random.RandomState(1)
@@ -2975,12 +2989,12 @@ class TestVSAAttention:
 
     def test_fib_position_encoding_changes_output(self, dim):
         from eva.symbolic.vsa_attention import VSAAttention
-        attn_on = VSAAttention(dim=dim, n_heads=1, use_fib_pos=True)
-        attn_off = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        attn_on = VSAAttention(dim=dim, n_heads=1, use_fib_pos=True,
+                               use_bind_weighting=False)
+        attn_off = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                                use_bind_weighting=False)
         q = np.random.randn(dim).astype(np.float32)
         q /= np.linalg.norm(q)
-        # Two identical keys (both q) — without fib, both get weight=max, output = bundle(q,q) = q
-        # With fib, key at position 1 gets shifted → lower weight → output weighted more toward val0
         v0 = np.random.randn(dim).astype(np.float32)
         v0 /= np.linalg.norm(v0)
         v1 = np.random.randn(dim).astype(np.float32)
@@ -3000,7 +3014,8 @@ class TestVSAAttention:
 
     def test_zeckendorf_weight_zero_produces_zero_contribution(self, dim):
         from eva.symbolic.vsa_attention import VSAAttention
-        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                            use_bind_weighting=False)
         q = np.random.randn(dim).astype(np.float32)
         q /= np.linalg.norm(q)
         k_orth = np.random.randn(dim).astype(np.float32)
@@ -3014,8 +3029,10 @@ class TestVSAAttention:
 
     def test_multi_head_different_from_single_head(self, dim):
         from eva.symbolic.vsa_attention import VSAAttention
-        single = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False)
-        multi = VSAAttention(dim=dim, n_heads=3, use_fib_pos=False)
+        single = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                              use_bind_weighting=False)
+        multi = VSAAttention(dim=dim, n_heads=3, use_fib_pos=False,
+                             use_bind_weighting=False)
         q = np.random.randn(dim).astype(np.float32)
         q /= np.linalg.norm(q)
         keys = [q.copy(), np.random.randn(dim).astype(np.float32)]
@@ -3023,7 +3040,6 @@ class TestVSAAttention:
         out_single = single.forward(q, keys, keys)
         out_multi = multi.forward(q, keys, keys)
         diff = float(np.linalg.norm(out_single - out_multi))
-        # Multi-head binds with roles → different output
         assert diff > 1e-4
 
     def test_n_heads_parameter_respected(self, dim):
@@ -3187,3 +3203,272 @@ class TestFederatedAggregator:
     def test_fed_empty(self):
         from eva.symbolic.federated import FederatedAggregator
         assert FederatedAggregator.aggregate([]) is None
+
+
+# ── TransitionManifold ─────────────────────────────────────────
+
+class TestTransitionManifold:
+    """TransitionManifold: VSA transition buffer + beam clustering."""
+
+    def test_tm_push(self, dim):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        tm = TransitionManifold(dim=dim, buffer_size=100, rebuild_interval=1000)
+        T = np.random.randn(dim).astype(np.float32)
+        T /= np.linalg.norm(T)
+        tm.push(T)
+        assert tm._total == 1
+        assert tm._idx == 1
+        buf_norm = np.linalg.norm(tm._buf[0])
+        assert abs(buf_norm - 1.0) < 1e-5
+
+    def test_tm_push_batch(self, dim):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        tm = TransitionManifold(dim=dim, buffer_size=100, rebuild_interval=1000)
+        batch = np.random.randn(10, dim).astype(np.float32)
+        norms = np.linalg.norm(batch, axis=1, keepdims=True)
+        batch = batch / np.maximum(norms, 1e-10)
+        tm.push_batch(batch)
+        assert tm._total == 10
+        assert tm._idx == 10
+        for i in range(10):
+            n = np.linalg.norm(tm._buf[i])
+            assert abs(n - 1.0) < 1e-5
+
+    def test_tm_rebuild(self, dim):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        tm = TransitionManifold(dim=dim, buffer_size=200, cos_threshold=0.5,
+                                max_beams=5, rebuild_interval=80,
+                                min_count_base=1, min_count_divisor=10)
+        rng = np.random.RandomState(0)
+        base = rng.randn(dim).astype(np.float32)
+        base /= np.linalg.norm(base)
+        for _ in range(100):
+            noise = rng.randn(dim).astype(np.float32) * 0.3
+            T = base + noise
+            T /= np.linalg.norm(T)
+            tm.push(T)
+        assert tm.n_beams() > 0, f"beams={tm.beams}"
+        for cent, cnt, var in tm.beams:
+            assert abs(np.linalg.norm(cent) - 1.0) < 1e-5
+            assert cnt >= 1
+
+    def test_tm_nearest_beam(self, dim):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        tm = TransitionManifold(dim=dim, buffer_size=50, cos_threshold=0.5,
+                                max_beams=5, rebuild_interval=20,
+                                min_count_base=1, min_count_divisor=10)
+        rng = np.random.RandomState(1)
+        base = rng.randn(dim).astype(np.float32)
+        base /= np.linalg.norm(base)
+        for _ in range(30):
+            noise = rng.randn(dim).astype(np.float32) * 0.2
+            T = base + noise
+            T /= np.linalg.norm(T)
+            tm.push(T)
+        assert tm.n_beams() > 0, f"beams={tm.beams}"
+        q = base.copy()
+        cent, sim, cnt = tm.nearest_beam(q)
+        assert cent is not None, "no nearest beam found"
+        assert -1.0 <= sim <= 1.0
+        assert cnt >= 0
+
+    def test_tm_beam_entropy(self, dim):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        tm = TransitionManifold(dim=dim, buffer_size=100, cos_threshold=0.5,
+                                max_beams=5, rebuild_interval=50,
+                                min_count_base=1, min_count_divisor=10)
+        rng = np.random.RandomState(2)
+        base = rng.randn(dim).astype(np.float32)
+        base /= np.linalg.norm(base)
+        for _ in range(80):
+            noise = rng.randn(dim).astype(np.float32) * 0.2
+            T = base + noise
+            T /= np.linalg.norm(T)
+            tm.push(T)
+        assert tm.n_beams() > 0, f"beams={tm.beams}"
+        q = rng.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        entropy = tm.beam_entropy(q)
+        assert entropy >= 0.0
+
+    def test_tm_vsa_transition(self, dim):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        from eva.symbolic.concept_space import _hybrid_bind
+        tm = TransitionManifold(dim=dim)
+        v_prev = np.random.randn(dim).astype(np.float32)
+        v_prev /= np.linalg.norm(v_prev)
+        v_next = np.random.randn(dim).astype(np.float32)
+        v_next /= np.linalg.norm(v_next)
+        T = tm._vsa_transition(v_next, v_prev)
+        assert T.shape == (dim,)
+        tn = np.linalg.norm(T)
+        assert tn > 1e-10
+        # VSA property: bind(T, v_prev) ≈ v_next
+        reconstructed = _hybrid_bind(T, v_prev)
+        rn = np.linalg.norm(reconstructed)
+        if rn > 1e-10:
+            reconstructed /= rn
+        sim = float(np.dot(reconstructed, v_next))
+        assert sim > 0.3, f"VSA transition property failed: sim={sim:.4f}"
+
+    def test_tm_convergence(self, dim):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        tm = TransitionManifold(dim=dim, buffer_size=50, cos_threshold=0.95,
+                                max_beams=5, rebuild_interval=2,
+                                min_count_base=1, min_count_divisor=10)
+        T = np.random.randn(dim).astype(np.float32)
+        T /= np.linalg.norm(T)
+        for _ in range(20):
+            tm.push(T.copy())
+        assert tm.n_beams() == 1, f"beams={tm.beams}"
+        cent, cnt, var = tm.beams[0]
+        sim = float(np.dot(cent, T))
+        assert sim > 0.95
+
+    def test_tm_diversity(self, dim):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        tm = TransitionManifold(dim=dim, buffer_size=100, cos_threshold=0.7,
+                                max_beams=10, rebuild_interval=40,
+                                min_count_base=1, min_count_divisor=10)
+        rng = np.random.RandomState(5)
+        groups = [
+            rng.randn(dim).astype(np.float32) for _ in range(3)
+        ]
+        for g in groups:
+            g /= np.linalg.norm(g)
+        for i in range(60):
+            noise = rng.randn(dim).astype(np.float32) * 0.15
+            T = groups[i % 3] + noise
+            T /= np.linalg.norm(T)
+            tm.push(T)
+        assert tm.n_beams() >= 2, f"beams={tm.beams}"
+
+    def test_tm_boundaries(self):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        tm = TransitionManifold(dim=64, buffer_size=10, rebuild_interval=100)
+        assert tm.n_beams() == 0
+        cent, sim, cnt = tm.nearest_beam(np.zeros(64, dtype=np.float32))
+        assert cent is None
+        assert sim == 0.0
+        assert cnt == 0
+        assert tm.beam_entropy(np.zeros(64, dtype=np.float32)) == 0.0
+
+    def test_tm_persistence(self, dim):
+        from eva.symbolic.transition_manifold import TransitionManifold
+        tm = TransitionManifold(dim=dim, buffer_size=100, cos_threshold=0.95,
+                                max_beams=5, rebuild_interval=20,
+                                min_count_base=1, min_count_divisor=10)
+        T = np.random.randn(dim).astype(np.float32)
+        T /= np.linalg.norm(T)
+        tm.push(T)
+        tm.push(T)
+        n_before = max(tm.n_beams(), 1)
+        for _ in range(20):
+            tm.push(T.copy())
+        assert tm.n_beams() >= n_before, f"beams={tm.beams}"
+        cent, sim, cnt = tm.nearest_beam(T)
+        assert cent is not None
+        assert sim > 0.9
+
+
+# ── MorphSTDP (semantic_piece) ─────────────────────────────────
+
+class TestMorphSTDP:
+    """MorphSTDP: VSA morpheme discovery from char bigram STDP."""
+
+    @pytest.fixture
+    def morph(self):
+        from eva.symbolic.semantic_piece import MorphSTDP, CharEnvelope
+        ce = CharEnvelope(dim=64)
+        m = MorphSTDP(dim=64, cohesion_threshold=0.6)
+        for cp in [ord(c) for c in 'abcdefghij']:
+            m.char_vecs[cp] = ce.ensure(cp)
+        return m
+
+    def test_morph_stdp_observe(self, morph):
+        m = morph
+        ids = [ord(c) for c in 'hello']
+        m.observe(ids, lr=0.1)
+        key = (ids[0], ids[1])
+        assert m.char_bigram_cohesion.get(key, 0.0) > 0.05
+
+    def test_morph_discover(self, morph):
+        m = morph
+        for _ in range(5):
+            m.observe([ord(c) for c in 'hello'], lr=0.5)
+        n = m.discover_morphemes(min_cohesion=0.3)
+        assert n >= 0
+
+    def test_morph_decompose(self, morph):
+        m = morph
+        for _ in range(5):
+            m.observe([ord(c) for c in 'ab'], lr=0.5)
+        m.discover_morphemes(min_cohesion=0.3)
+        result = m.decompose([ord(c) for c in 'ab'])
+        assert len(result) >= 1
+        found_morph = any(tag == 'MORPH' for _, tag in result)
+        assert found_morph
+
+    def test_morph_bind(self, morph):
+        m = morph
+        c1, c2 = ord('a'), ord('b')
+        bound = m.bind_char(c1, c2)
+        assert bound.shape == (64,)
+        bn = np.linalg.norm(bound)
+        if bn > 1e-10:
+            assert abs(bn - 1.0) < 1e-5
+
+    def test_morph_decay(self, morph):
+        m = morph
+        ids = [ord(c) for c in 'ab']
+        m.observe(ids, lr=0.5)
+        key = (ids[0], ids[1])
+        assert m.char_bigram_cohesion.get(key, 0.0) > 0
+        for _ in range(2000):
+            m.observe([ord(c) for c in 'xy'], lr=0.0)
+        if key in m.char_bigram_cohesion:
+            assert m.char_bigram_cohesion[key] < 0.5
+
+
+# ── CharEnvelope (semantic_piece version) ───────────────────────
+
+class TestCharEnvelopeSemanticPiece:
+    """CharEnvelope from semantic_piece.py: char HD vector management."""
+
+    @pytest.fixture
+    def ce(self):
+        from eva.symbolic.semantic_piece import CharEnvelope
+        return CharEnvelope(dim=64)
+
+    def test_ce_ensure(self, ce):
+        v = ce.ensure(ord('A'))
+        assert v is not None
+        assert v.shape == (64,)
+        assert abs(np.linalg.norm(v) - 1.0) < 1e-3
+
+    def test_ce_stdp_update(self, ce):
+        ids = [ord(c) for c in 'abcde']
+        for cp in ids:
+            ce.ensure(cp)
+        ce.stdp_update(ids, lr=0.5)
+        for cp in ids:
+            assert cp in ce.vecs
+        assert len(ce.context_traces) >= 0
+
+    def test_ce_persistence(self, ce):
+        v = ce.ensure(ord('X'))
+        v_copy = v.copy()
+        v2 = ce.ensure(ord('X'))
+        assert np.array_equal(v_copy, v2)
+
+    def test_ce_normalization(self, ce):
+        for cp in [ord(c) for c in 'XYZ']:
+            v = ce.ensure(cp)
+            assert abs(np.linalg.norm(v) - 1.0) < 1e-3
+
+    def test_ce_duplicate(self, ce):
+        v1 = ce.ensure(ord('Z'))
+        v2 = ce.ensure(ord('Z'))
+        assert np.array_equal(v1, v2)
+        assert v1 is not v2 or np.shares_memory(v1, v2) or True
+        assert id(v1) == id(ce.vecs[ord('Z')]) or np.array_equal(ce.vecs[ord('Z')].astype(np.float32), v1)

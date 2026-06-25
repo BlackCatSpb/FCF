@@ -14,7 +14,7 @@ ALL numerical coefficients come from FormulaCoefficients — zero hardcode.
 
 import math
 import numpy as np
-from eva.symbolic.fcf_config import FormulaCoefficients
+from eva.symbolic.fcf_config import FormulaCoefficients, FCFConfig
 
 
 class HormonalSystem:
@@ -32,7 +32,7 @@ class HormonalSystem:
     """
 
     def __init__(self, formula=None):
-        _fc = formula if formula is not None else FormulaCoefficients()
+        _fc = formula if formula is not None else FCFConfig().formula
 
         # Baselines (tonic levels)
         self.dopamine = _fc.da_baseline

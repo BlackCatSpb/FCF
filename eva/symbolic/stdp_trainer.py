@@ -24,7 +24,7 @@ _META_NEXT_CID = 8
 _META_ANTONYM = 9
 
 
-from eva.symbolic.fcf_config import EnvironmentResolver, FormulaCoefficients
+from eva.symbolic.fcf_config import EnvironmentResolver, FCFConfig
 
 # P1.8: Антоним-словарь из JSON с fallback на хардкод
 _ANTONYM_PATH = EnvironmentResolver().antonym_path
@@ -459,7 +459,7 @@ class STDPTrainer:
         cs = gen.cs
         T = len(ids)
         n_pairs = 0
-        _fc = FormulaCoefficients()
+        _fc = FCFConfig().formula
 
         # GPU path: pre-gather frequency/error tensors for O(1) per-pair lookups
         use_gpu_freq = use_torch and gen._cf_t is not None
@@ -729,7 +729,7 @@ class STDPTrainer:
                 _eps_m = self.manifold._eps
                 for vc, elr in zip(valid_ctx, valid_elr):
                     if elr > _eps_m:
-                        T = self.manifold._to_tangent(v_gen, vc)
+                        T = self.manifold._vsa_transition(v_gen, vc)
                         if np.linalg.norm(T) > _eps_m:
                             self.manifold.push(T)
 
@@ -817,7 +817,7 @@ class STDPTrainer:
     def _gpu_stdp_core(self, ctx_t, tgt_t, meta_t, unique_gen, inv_t, gen, cs,
                        gradient_noise_scale=0.0):
         """Pure-tensor core of _gpu_stdp_apply. torch.compile-friendly."""
-        _fc = FormulaCoefficients()
+        _fc = FCFConfig().formula
         D = cs.dim
         N = len(ctx_t)
         ng = len(unique_gen)

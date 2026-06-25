@@ -147,7 +147,7 @@ class CharEnvelope:
     def ensure(self, cp: int) -> np.ndarray:
         """Get (or create) char vector."""
         if cp not in self.vecs:
-            v = _R.rng('char_init').randn(self.dim).astype(np.float32)
+            v = _R.rng(f'char_init_{cp}').randn(self.dim).astype(np.float32)
             v /= max(np.linalg.norm(v), 1e-10)
             self.vecs[cp] = v.astype(np.float16)
         v = self.vecs[cp]

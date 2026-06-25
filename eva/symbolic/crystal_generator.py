@@ -92,7 +92,7 @@ class CrystalGenerator:
         if not self.cs.concept_usage:
             self.cs.init_homeostasis()
         self.branch_rngs = {}
-        self.hormones = HormonalSystem(formula=FormulaCoefficients())
+        self.hormones = HormonalSystem(formula=FCFConfig().formula)
 
         # Per-concept prediction error EMA (Level 2: error-based PMI gate)
         ce_max = min(3 * self.cs.vocab_size // 4, 100000)
@@ -316,11 +316,11 @@ class CrystalGenerator:
             self._skip2_t = torch.zeros(V, device=dev, dtype=torch.float32)
         self._rebuild_freq_tensors()
 
-        # Initialize EMA as a copy of vecs_t (fp16 to save 112MB)
+        # EMA as fp16 matching vecs_t dtype (saves conversion, -0 VRAM but faster)
         if self._ema_vecs_t is None or self._ema_vecs_t.shape[0] != V or self._ema_vecs_t.device != dev:
-            self._ema_vecs_t = self._vecs_t.clone().to(torch.bfloat16)
+            self._ema_vecs_t = self._vecs_t.clone().to(torch.float16)
         else:
-            self._ema_vecs_t.copy_(self._vecs_t.to(torch.bfloat16))
+            self._ema_vecs_t.copy_(self._vecs_t.to(torch.float16))
         self._ema_steps = 0
 
         if self._mom_t is None or self._mom_t.shape[0] != V or self._mom_t.device != dev:
@@ -633,7 +633,7 @@ class CrystalGenerator:
 
                     self.cs.update_usage(cid)
 
-                    _f = FormulaCoefficients()
+                    _f = FCFConfig().formula
                     novelty = 1.0 - min(self.lattice.concept_freq.get(cid, 0) / _f.novelty_freq_cap, 1.0)
                     surprise = 0.1 if is_match else 0.5
                     self.hormones.update(confidence=conf, is_match=is_match,
@@ -735,7 +735,7 @@ class CrystalGenerator:
                         continue
                     # Edge weight from PPMI: high PPMI = specific connection = low weight (short path)
                     ppmi = conn_info.get('ppmi', 0.0)
-                    _f = FormulaCoefficients()
+                    _f = FCFConfig().formula
                     w = max(_f.edge_weight_min, 1.0 - min(ppmi / _f.edge_ppmi_cap, 1.0) * _f.edge_weight_strength)
                     dv = d[u] + w
                     if dv >= B:
@@ -826,7 +826,7 @@ class CrystalGenerator:
             return []
 
         # 5. RRF scoring
-        _fc = FormulaCoefficients()
+        _fc = FCFConfig().formula
         manifold = getattr(getattr(self, '_trainer', None), 'manifold', None)
         combined = {}
         for cid in all_cids:
@@ -844,7 +844,7 @@ class CrystalGenerator:
                 v_c = self.cs.concept_vector(cid)
                 v_p = self.cs.concept_vector(prev_cid)
                 if v_c is not None and v_p is not None:
-                    T = manifold._to_tangent(v_c, v_p)
+                    T = manifold._vsa_transition(v_c, v_p)
                     if np.linalg.norm(T) > FCFConfig().beam_eps:
                         _beam_cent, beam_sim, _beam_cnt = manifold.nearest_beam(T)
                         if beam_sim > manifold.cos_threshold * FCFConfig().beam_rrf_sim_ratio:

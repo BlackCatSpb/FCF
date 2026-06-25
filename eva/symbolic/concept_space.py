@@ -59,8 +59,8 @@ def _set_alpha_curriculum(epoch, total_epochs, decay='exp'):
     _ALPHA_DECAY = decay
 
 def _alpha_from_curriculum(alpha_max=None, alpha_min=None, decay_rate=None):
-    from eva.symbolic.fcf_config import FormulaCoefficients
-    _fc = FormulaCoefficients()
+    from eva.symbolic.fcf_config import FCFConfig
+    _fc = FCFConfig().formula
     alpha_max = alpha_max if alpha_max is not None else _fc.hybrid_alpha_max
     alpha_min = alpha_min if alpha_min is not None else _fc.hybrid_alpha_min
     decay_rate = decay_rate if decay_rate is not None else _fc.hybrid_alpha_decay_rate

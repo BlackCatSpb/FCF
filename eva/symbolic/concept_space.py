@@ -1760,8 +1760,7 @@ class ConceptSpace:
                                for m, r in word_morphs]
                 composed = self.harmonizer.compose_word([(r, v) for r, v in morph_parts if v is not None])
                 if composed is not None:
-                    # Encode 768D harmonizer output → 2048D latent code
-                    latent_code = composed @ self.fractal.basis.T
+                    latent_code = composed.copy()
                     ln = float(np.linalg.norm(latent_code))
                     if ln > 1e-10:
                         latent_code /= ln
@@ -1931,7 +1930,8 @@ class ConceptSpace:
             if morph_id in ids_done:
                 continue
             ids_done.add(morph_id)
-            v = rng.randn(self.dim).astype(np.float32)
+            harm_dim = self.harmonizer.dim
+            v = rng.randn(harm_dim).astype(np.float32)
             v /= max(np.linalg.norm(v), 1e-10)
             self.harmonizer.set_morpheme_vec(morph_id, v)
             n_morph += 1

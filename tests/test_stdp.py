@@ -353,7 +353,7 @@ class TestEdgeCases:
         assert list(s.items()) == []
         assert len(s) == 0
 
-    def test_octree_fields_config(self):
+    def test_zeckendorf_fields_config(self):
         cfg = FCFConfig()
         assert cfg.octree_min_lcp >= 1
         assert cfg.octree_gamma > 0
@@ -523,22 +523,22 @@ class TestV5Safety:
         result = gen.generate(seed_word='', max_words=3)
         assert result is not None
 
-    # ── QN-10: build_octree_fields Correctness ──
-    def test_octree_fields_symmetric(self, cs, lattice):
+    # ── QN-10: build_zeckendorf_fields Correctness ──
+    def test_zeckendorf_fields_symmetric(self, cs, lattice):
         n = min(5, len(lattice.concept_freq))
         if n < 2:
             pytest.skip("Too few concepts for octree test")
-        cs.build_octree_fields(lattice, n_anchors=n)
+        cs.build_zeckendorf_fields(lattice, n_anchors=n)
         H = cs.H
         if H is not None:
             H_dense = H.toarray() if hasattr(H, 'toarray') else H
             assert np.allclose(H_dense, H_dense.T, atol=1e-6)
 
-    def test_octree_fields_diag_zero(self, cs, lattice):
+    def test_zeckendorf_fields_diag_zero(self, cs, lattice):
         n = min(5, len(lattice.concept_freq))
         if n < 2:
             pytest.skip("Too few concepts for octree test")
-        cs.build_octree_fields(lattice, n_anchors=n)
+        cs.build_zeckendorf_fields(lattice, n_anchors=n)
         H = cs.H
         if H is not None:
             H_dense = H.toarray() if hasattr(H, 'toarray') else H

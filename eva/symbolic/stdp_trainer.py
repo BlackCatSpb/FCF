@@ -669,14 +669,27 @@ class STDPTrainer:
 
                 lr = base_lr * max(freq_weight, _fc.freq_weight_min) * pmi_w * field_weight
                 lr *= (_fc.hormonal_mod_baseline + gen.hormones.acetylcholine * _fc.hormonal_mod_scale) * (_fc.hormonal_mod_baseline + gen.hormones.dopamine * _fc.hormonal_mod_scale)
-                theta_gate = math.exp(-min(abs(j-i), 5) / max(gen.theta_tau, 1.0))
-                gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, _fc.theta_fast_min)))
-                n_pairs += 1
-                theta_slow = math.exp(-min(abs(j-i), 10) / max(gen.theta_tau * _fc.theta_tau_slow_mult, 1.0))
-                slow_lr = lr * max(theta_slow, _fc.theta_slow_min) * _fc.theta_slow_scale
-                if slow_lr > 1e-6:
-                    gen_updates[ids[j]].append((ids[i], slow_lr))
+                if FCFConfig().use_temporal_zeckendorf:
+                    from eva.symbolic.fibonacci_utils import TemporalZeckendorf as _TZ
+                    _tz = _TZ()
+                    fast_th, slow_th = _tz.theta(abs(j-i))
+                    theta_gate = max(fast_th, _fc.theta_fast_min)
+                    gen_updates[ids[j]].append((ids[i], lr * theta_gate))
                     n_pairs += 1
+                    theta_slow = max(slow_th, _fc.theta_slow_min) * _fc.theta_slow_scale
+                    slow_lr = lr * theta_slow if fast_th > _fc.theta_fast_min else 0.0
+                    if slow_lr > 1e-6:
+                        gen_updates[ids[j]].append((ids[i], slow_lr))
+                        n_pairs += 1
+                else:
+                    theta_gate = math.exp(-min(abs(j-i), 5) / max(gen.theta_tau, 1.0))
+                    gen_updates[ids[j]].append((ids[i], lr * max(theta_gate, _fc.theta_fast_min)))
+                    n_pairs += 1
+                    theta_slow = math.exp(-min(abs(j-i), 10) / max(gen.theta_tau * _fc.theta_tau_slow_mult, 1.0))
+                    slow_lr = lr * max(theta_slow, _fc.theta_slow_min) * _fc.theta_slow_scale
+                    if slow_lr > 1e-6:
+                        gen_updates[ids[j]].append((ids[i], slow_lr))
+                        n_pairs += 1
 
                 if use_torch:
                     ci = cid_to_idx.get(ids[i])

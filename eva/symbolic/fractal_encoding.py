@@ -33,7 +33,7 @@ def _init():
     try:
         from eva.symbolic.fcf_config import FCFConfig as _FCFConfig, EnvironmentResolver
         __cfg = _FCFConfig()
-        _GAMMA = __cfg.octree_gamma
+        _GAMMA = getattr(__cfg, 'octree_gamma', 0.618)
         import sentencepiece as spm
         _LEVELS = _compute_levels_from_vocab(
             spm.SentencePieceProcessor(
@@ -44,8 +44,8 @@ def _init():
         try:
             from eva.symbolic.fcf_config import FCFConfig as _FCFConfig
             __cfg = _FCFConfig()
-            _LEVELS = __cfg.octree_levels
-            _GAMMA = __cfg.octree_gamma
+            _LEVELS = getattr(__cfg, 'path_levels', 16)
+            _GAMMA = getattr(__cfg, 'octree_gamma', 0.618)
         except Exception:
             _LEVELS = 16
             _GAMMA = 0.5

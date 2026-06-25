@@ -396,7 +396,7 @@ class FractalField:
         """Initialize binary field bit arrays for all concepts.
 
         field_bits[cid] = np.uint8 array of n_anchors/8 bytes.
-        Used by octree encoding path (build_octree_fields).
+        Used by Zeckendorf path (build_zeckendorf_fields).
         """
         from eva.symbolic.fcf_config import FCFConfig
         n_anchors = n_anchors or FCFConfig().fractal_init_field_n_anchors
@@ -540,11 +540,13 @@ class FractalField:
             for cid in self.codes:
                 self.codes[cid] = np.append(self.codes[cid], np.zeros(n_new, dtype=np.float32))
 
-            # Update subspace ratios
+            # Update subspace ratios (φ² : φ : 1)
             old_l_c, old_l_a, old_l_m = self.l_c, self.l_a, self.l_m
             self.latent_dim = new_latent_dim
-            self.l_c = new_latent_dim * 3 // 5
-            self.l_a = new_latent_dim // 4
+            phi = (1.0 + 5.0 ** 0.5) / 2.0
+            total = phi * phi + phi + 1.0
+            self.l_c = max(8, int(new_latent_dim * phi * phi / total))
+            self.l_a = max(8, int(new_latent_dim * phi / total))
             self.l_m = new_latent_dim - self.l_c - self.l_a
             # Shift existing code entries to new subspace positions
             for cid in self.codes:
@@ -641,8 +643,10 @@ class FractalField:
                 self.codes[cid] = self.codes[cid][live]
 
             self.latent_dim = new_latent_dim
-            self.l_c = new_latent_dim * 3 // 5
-            self.l_a = new_latent_dim // 4
+            phi = (1.0 + 5.0 ** 0.5) / 2.0
+            total = phi * phi + phi + 1.0
+            self.l_c = max(8, int(new_latent_dim * phi * phi / total))
+            self.l_a = max(8, int(new_latent_dim * phi / total))
             self.l_m = new_latent_dim - self.l_c - self.l_a
 
             if self.W_proj is not None:
@@ -1738,7 +1742,7 @@ class ConceptSpace:
                         ef.sync_word(cid, v)
         return {'reinit': reinit_count, 'e5': e5_count, 'method': 'morph_bundle' if morph_bundle else 'direct_e5' if e5_model else 'random'}
 
-    def build_octree_fields(self, lattice, n_anchors=1024, min_lcp=1, gamma=0.5, path_overrides=None):
+    def build_zeckendorf_fields(self, lattice, n_anchors=1024, min_lcp=1, gamma=0.5, path_overrides=None):
         """Build H matrix and field_bits from nested Zeckendorf encoding.
 
         Replaces PMI-based build_anchor_matrix + build_fields_from_lattice.
@@ -1750,11 +1754,11 @@ class ConceptSpace:
         Uses prefix grouping for O(n_concepts + n_anchors) field_bits construction.
 
         Args:
-            lattice: SyntaxLattice instance (needed for concept_freq)
-            n_anchors: number of anchor concepts (top by frequency)
-            min_lcp: minimum LCP for field_bits (2 → only LCP≥2 anchors)
-            gamma: octree weight decay
-            path_overrides: dict {cid: tuple_path} for custom octree paths
+            lattice: SyntaxLattice with concept_freq
+            n_anchors: number of anchor concepts
+            min_lcp: minimum LCP to create field bit
+            gamma: Zeckendorf weight decay
+            path_overrides: dict {cid: tuple_path} for custom Zeckendorf paths
                            (e.g. from MorphVocab for morphological encoding)
 
         Sets:

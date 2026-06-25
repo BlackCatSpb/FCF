@@ -250,7 +250,7 @@ if RESUME is not None:
                 use_harm = sp if not (NO_HARMONIZE or NO_MORPHEME_FIELD) else None
                 cs.build_learned_fields(n_field_bits=N_FIELD_BITS, sp=use_harm)
             else:
-                cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
+                cs.build_zeckendorf_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
                                        gamma=CFG.octree_gamma, path_overrides=path_overrides)
             if SEED_E5:
                 e5 = _load_e5(E5_DEVICE)
@@ -295,7 +295,7 @@ else:
             use_harm = sp if not (NO_HARMONIZE or NO_MORPHEME_FIELD) else None
             cs.build_learned_fields(n_field_bits=N_FIELD_BITS, sp=use_harm)
         else:
-            cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
+            cs.build_zeckendorf_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
                                    gamma=CFG.octree_gamma, path_overrides=path_overrides)
         if SEED_E5:
             e5 = _load_e5(E5_DEVICE)

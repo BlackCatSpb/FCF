@@ -181,3 +181,23 @@ class TemporalZeckendorf:
         if k == 0:
             return 0.0
         return (1.0 - gamma ** k) / (1.0 - gamma)
+
+    def theta(self, distance: int, fast_window: int = 5, slow_window: int = 10) -> tuple[float, float]:
+        """Zeckendorf-based temporal decay for STDP, replaces exp(-d/tau).
+
+        Returns (fast_theta, slow_theta) — both in (0, 1], decreasing with distance.
+        No free tau parameter: the Fibonacci hierarchy IS the decay schedule.
+        """
+        if distance <= 0:
+            return (1.0, 1.0)
+        idx = self._largest_fib_idx(distance)
+        base = (self._max_depth - idx) / max(self._max_depth, 1)
+        if distance <= fast_window:
+            fast = base
+        else:
+            fast = 0.0
+        if distance <= slow_window:
+            slow = base
+        else:
+            slow = 0.0
+        return (max(fast, 0.0), max(slow, 0.0))

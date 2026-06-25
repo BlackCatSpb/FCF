@@ -520,16 +520,25 @@ class FCFConfig:
     latent_dim: int = 2048
     n_anchors: int = 2048
     max_n: int = 4
-    octree_levels: int = 16
+    path_levels: int = 16               # Zeckendorf path depth (also accessible as octree_levels)
 
     @property
-    def l_c(self) -> int: return self.latent_dim * 3 // 5
+    def l_c(self) -> int:
+        phi = (1.0 + 5.0 ** 0.5) / 2.0
+        total = phi * phi + phi + 1.0
+        return max(8, int(self.latent_dim * phi * phi / total))
 
     @property
-    def l_a(self) -> int: return self.latent_dim // 4
+    def l_a(self) -> int:
+        phi = (1.0 + 5.0 ** 0.5) / 2.0
+        total = phi * phi + phi + 1.0
+        return max(8, int(self.latent_dim * phi / total))
 
     @property
-    def l_m(self) -> int: return self.latent_dim - self.l_c - self.l_a
+    def l_m(self) -> int:
+        phi = (1.0 + 5.0 ** 0.5) / 2.0
+        total = phi * phi + phi + 1.0
+        return self.latent_dim - self.l_c - self.l_a
 
     def get_field_dims(self):
         return {'l_c': self.l_c, 'l_a': self.l_a, 'l_m': self.l_m}
@@ -646,9 +655,9 @@ class FCFConfig:
     min_words: int = 3
     concept_temp: float = 0.5
 
-    # ── Defaults для build_octree_fields ──────
+    # ── Defaults для build_zeckendorf_fields ──
     octree_min_lcp: int = 2
-    octree_gamma: float = 1.0 / ((1.0 + 5.0 ** 0.5) / 2.0)  # 1/φ ≈ 0.618
+    octree_gamma: float = 1.0 / ((1.0 + 5.0 ** 0.5) / 2.0)
 
     # ── Val split ─────────────────────────────
     val_pct: float = 0.05
@@ -762,9 +771,9 @@ class FCFConfig:
     detector_decay_per_step: float = 0.01
 
     # ── P1-C: adaptive_controller subspace ────
-    subspace_l_c_ratio: float = 0.6
-    subspace_l_a_ratio: float = 0.25
-    subspace_l_m_ratio: float = 0.15
+    subspace_l_c_ratio: float = 0.5            # φ²/(φ²+φ+1)
+    subspace_l_a_ratio: float = 0.309           # φ/(φ²+φ+1)  (overwritten by adaptive_controller)
+    subspace_l_m_ratio: float = 0.191           # 1/(φ²+φ+1)  (overwritten by adaptive_controller)
     subspace_density_threshold_grow: float = 0.15
     subspace_density_threshold_prune: float = 0.01
     subspace_l1_target_density: float = 0.08
@@ -777,8 +786,8 @@ class FCFConfig:
     subspace_adjust_up_max: float = 0.75
     subspace_adjust_down_rate: float = 0.97
     subspace_adjust_down_min: float = 0.3
-    subspace_redistribute_a_ratio: float = 0.6
-    subspace_redistribute_m_ratio: float = 0.4
+    subspace_redistribute_a_ratio: float = (1.0 + 5.0 ** 0.5) / (3.0 + 5.0 ** 0.5)  # φ/(φ+1) ≈ 0.618
+    subspace_redistribute_m_ratio: float = 2.0 / (3.0 + 5.0 ** 0.5)                  # 1/(φ+1) ≈ 0.382
 
     # ── P1-D: concept_space FractalField ──────
     fractal_hdc_memory_max: int = 17711     # F₂₂
@@ -795,6 +804,7 @@ class FCFConfig:
     use_morph_stdp: bool = False        # MorphSTDP in _harmonize_batch
     use_vsa_attention: bool = False     # VSAAttention in _branch
     use_hd_transformer: bool = False    # HDTransformerLayer in _train
+    use_temporal_zeckendorf: bool = False  # TemporalZeckendorf replaces exp(-dist/theta_tau)
     morph_stdp_cohesion: float = 0.6    # cohesion threshold
     morph_stdp_discover_every: int = 100  # discover every N batches
     use_morph_manifold: bool = False    # TransitionManifold for morph sequences

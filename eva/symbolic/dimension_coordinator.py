@@ -140,10 +140,12 @@ class DimensionCoordinator:
 
     @property
     def subspace(self) -> dict:
+        phi = (1.0 + 5.0 ** 0.5) / 2.0
+        total = phi * phi + phi + 1.0
         return {
-            'l_c': self.latent_dim * 3 // 5,
-            'l_a': self.latent_dim // 4,
-            'l_m': self.latent_dim - (self.latent_dim * 3 // 5) - (self.latent_dim // 4),
+            'l_c': max(8, int(self.latent_dim * phi * phi / total)),
+            'l_a': max(8, int(self.latent_dim * phi / total)),
+            'l_m': self.latent_dim - max(8, int(self.latent_dim * phi * phi / total)) - max(8, int(self.latent_dim * phi / total)),
         }
 
 

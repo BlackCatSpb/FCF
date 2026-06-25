@@ -37,7 +37,7 @@ class MorphVocab:
         self.word_cache = {}
         # CID -> word (reverse index for O(1) decode)
         self._cid_to_word = {}
-        # CID -> custom octree path tuple (service/fallback CIDs not stored here)
+        # CID -> custom Zeckendorf path tuple (service/fallback CIDs not stored here)
         self._path_override = {}
 
         # Service POS tags

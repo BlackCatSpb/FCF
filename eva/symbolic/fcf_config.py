@@ -781,6 +781,13 @@ class FCFConfig:
     fractal_l1_adjust_rate: float = 0.1
     fractal_l1_lambda_cap: float = 0.1
 
+    # ── Dead code integration ────────────────────────────────────
+    use_morph_stdp: bool = False        # MorphSTDP in _harmonize_batch
+    use_vsa_attention: bool = False     # VSAAttention in _branch
+    use_hd_transformer: bool = False    # HDTransformerLayer in _train
+    morph_stdp_cohesion: float = 0.6    # cohesion threshold
+    morph_stdp_discover_every: int = 100  # discover every N batches
+
     # ──────────────────────────────────────────
     #  Генерация пар из MorphVocab/корпуса
     # ──────────────────────────────────────────

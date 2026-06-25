@@ -854,6 +854,21 @@ class CrystalGenerator:
             rrf += prior
             combined[cid] = rrf
 
+        # 5a. VSAAttention re-ranking (P1.9)
+        if FCFConfig().use_vsa_attention:
+            if not hasattr(self, '_vsa_attn'):
+                from eva.symbolic.vsa_attention import VSAAttention
+                self._vsa_attn = VSAAttention(dim=self.cs.dim, n_heads=1, use_fib_pos=False)
+            ctx_vecs = [self.cs.concept_vector(c) for c in seq[-5:] if self.cs.concept_vector(c) is not None]
+            if len(ctx_vecs) >= 1 and v_prev is not None:
+                attn_out = self._vsa_attn.forward(v_prev, ctx_vecs, ctx_vecs)
+                attn_sims = {cid: float(np.dot(self.cs.concept_vector(cid) or np.zeros(self.cs.dim), attn_out))
+                             for cid in all_cids}
+                max_as = max(attn_sims.values()) if attn_sims else 1.0
+                if max_as > 1e-10:
+                    for cid in list(combined.keys()):
+                        combined[cid] += _fc.rrf_vector * (attn_sims.get(cid, 0.0) / max_as) / (K + 1)
+
         # 5. Homeostatic boost
         for cid in list(combined.keys()):
             h_boost = self.cs.homeostatic_boost(cid)

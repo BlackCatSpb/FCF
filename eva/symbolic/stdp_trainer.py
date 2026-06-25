@@ -248,6 +248,25 @@ class STDPTrainer:
                 self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
             self._contrastive_objective(gen_updates, field_gate)
 
+        # ── HDTransformerLayer refinement (P1.9) ──
+        if FCFConfig().use_hd_transformer:
+            if not hasattr(self, '_hd_transformer'):
+                from eva.symbolic.hdtransformer_layer import HDTransformerLayer
+                self._hd_transformer = HDTransformerLayer(dim=cs.dim, num_heads=2, top_k=5)
+            for ids in all_ids:
+                seq = [cs.concept_vector(c) for c in ids if cs.concept_vector(c) is not None]
+                if len(seq) >= 2:
+                    out = self._hd_transformer.forward(seq)
+                    for j, cid in enumerate(ids):
+                        if j < len(out) and cs.concept_vector(cid) is not None:
+                            pull = out[j] - cs.concept_vector(cid)
+                            pn = float(np.linalg.norm(pull))
+                            if pn > 1e-10:
+                                new_v = cs.concept_vector(cid) + pull * 0.1
+                                nn = float(np.linalg.norm(new_v))
+                                if nn > 1e-10:
+                                    cs._apply_vector_update(cid, new_v / nn)
+
         # ── Centroid pull + lattice update (reuses cached ids from first loop) ──
         self._centroid_pull_batch(all_ids, base_lr)
         self._cluster_centroid_pull(all_ids, base_lr, pull_strength=0.05)
@@ -294,6 +313,15 @@ class STDPTrainer:
         ef._entity_batch_counter += 1
         if ef._entity_batch_counter % 100 == 0 and len(ef.entities) > ef._max_entities:
             ef.cleanup()
+
+        # P1.9: Lazy init MorphSTDP if enabled
+        _c = FCFConfig()
+        if _c.use_morph_stdp and not hasattr(self, '_morph_stdp_batches'):
+            from eva.symbolic.semantic_piece import MorphSTDP
+            self._morph_stdp = MorphSTDP(dim=cs.dim, cohesion_threshold=_c.morph_stdp_cohesion)
+            self._morph_stdp_batches = 0
+        if hasattr(self, '_morph_stdp_batches'):
+            self._morph_stdp_batches += 1
 
         # ── 1. Sync GPU→CPU + sync word vectors into entity_field ──
         all_cids = list(focus_cids | set(morph_cids))
@@ -343,6 +371,18 @@ class STDPTrainer:
                         cp = ord(ch)
                         ef.bind('c', cp, 'w', cid, lr=0.05)
                         ef.bind('w', cid, 'c', cp, lr=0.05)
+
+            # ---- 2a-bis. MorphSTDP observation (P1.9) ----
+            if getattr(self, '_morph_stdp', None) is not None:
+                for cid in ids:
+                    word_text = None
+                    if hasattr(gen, 'sp') and gen.sp is not None:
+                        try:
+                            word_text = gen.sp.IdToPiece(int(cid)).replace('\u2581', ' ').strip()
+                        except Exception:
+                            pass
+                    if word_text and len(word_text) >= 2:
+                        self._morph_stdp.observe([ord(ch) for ch in word_text], lr=0.1)
 
             # ---- 2b. word → sent ----
             sent_key = hash(tuple(ids))
@@ -436,6 +476,22 @@ class STDPTrainer:
                 batch_v = np.stack([cs.concept_vectors[cid] for cid in harmonize_cids])
                 batch_t = torch.from_numpy(batch_v).to(device=gen._vecs_t.device, dtype=gen._vecs_t.dtype, non_blocking=True)
                 gen._vecs_t[torch.tensor(harmonize_cids, device=gen._vecs_t.device)] = batch_t
+
+        # ── P1.9: Periodic MorphSTDP discovery → Harmonizer ──
+        morph_stdp = getattr(self, '_morph_stdp', None)
+        if morph_stdp is not None and self._morph_stdp_batches % _c.morph_stdp_discover_every == 0:
+            n_new = morph_stdp.discover_morphemes(min_cohesion=_c.morph_stdp_cohesion)
+            if n_new > 0 and hasattr(cs, 'morph_vocab'):
+                for morph_id, chars in morph_stdp.morph_to_chars.items():
+                    mkey = ('MORPH', morph_id)
+                    if mkey not in harm.word_morphs:
+                        harm.word_morphs[mkey] = []
+                    if mkey not in cs.morph_vocab:
+                        cs.morph_vocab[mkey] = ''.join(chr(c) for c in chars)
+                    mv = morph_stdp.morphemes.get(morph_id)
+                    if mv is not None and mkey not in cs.concept_vectors:
+                        cs.concept_vectors[mkey] = mv.copy()
+                        cs.concept_norms[mkey] = 1.0
 
         # ── 5. Cleanup ──
         if gen._dirty_cids:

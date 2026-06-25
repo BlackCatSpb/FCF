@@ -74,7 +74,7 @@ class CrystalGenerator:
         self.max_words = self.config.get('max_words', 30)
         self.min_words = self.config.get('min_words', 3)
         self._graph_cache = OrderedDict()
-        self._graph_cache_max = 5000
+        self._graph_cache_max = 4181  # F₁₉
         self.base_concept_temp = self.config.get('concept_temp', 0.5)
         self.temperature = self.config.get('temperature', 1.0)
         self.theta_tau = self.config.get('theta_tau', 12.0)

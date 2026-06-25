@@ -441,10 +441,10 @@ class FormulaCoefficients:
     # HormonalSystem supplementary constants (Phase 7)
     da_mismatch_penalty: float = -0.3
     da_match_hard_threshold: float = 0.5
-    hormone_recent_window: int = 50
+    hormone_recent_window: int = 55      # F₁₀
     hormone_boredom_window: int = 5
     hormone_boredom_repeat: int = 3
-    hormone_reward_history_maxlen: int = 1000
+    hormone_reward_history_maxlen: int = 987  # F₁₆
 
 
 # ──────────────────────────────────────────────
@@ -619,22 +619,22 @@ class FCFConfig:
     ])
 
     # ── Расписания ────────────────────────────
-    lr_warmup_lines: int = 1000
-    lr_cosine_T0: int = 5000
-    lr_cosine_mult: float = 1.5
+    lr_warmup_lines: int = 987       # F₁₆
+    lr_cosine_T0: int = 6765         # F₂₀
+    lr_cosine_mult: float = (1.0 + 5.0 ** 0.5) / 2.0  # φ ≈ 1.618
     checkpoint_every: int = 4181      # F₁₉
-    eval_every_fast: int = 1000
-    eval_every_slow: int = 2000
-    eval_fast_lines: int = 64      # TN-9: lines for fast eval (PPL only)
-    eval_full_lines: int = 300     # TN-9: lines for full eval (all metrics)
+    eval_every_fast: int = 987      # F₁₆
+    eval_every_slow: int = 1597     # F₁₇
+    eval_fast_lines: int = 55      # F₁₀ — lines for fast eval (PPL only)
+    eval_full_lines: int = 233     # F₁₃ — lines for full eval (all metrics)
     eval_every_full: int = 5000   # TN-12: full eval interval (fast eval at eval_every_fast)
-    batch_size_start: int = 8      # TN-5: initial batch size (warmup)
-    batch_size_end: int = 32       # TN-5: final batch size
-    fluctuate_every: int = 2000
-    decay_every_fast: int = 2000
-    decay_every_slow: int = 3000
-    decay_every_pairs: int = 32000
-    decay_warmup_lines: int = 5000   # TN-15: ramp decay_rate from 0.998 to target
+    batch_size_start: int = 8      # TN-5, F₆
+    batch_size_end: int = 32       # TN-5
+    fluctuate_every: int = 1597    # F₁₇
+    decay_every_fast: int = 1597   # F₁₇
+    decay_every_slow: int = 2584   # F₁₈
+    decay_every_pairs: int = 28657 # F₂₃
+    decay_warmup_lines: int = 6765 # F₂₀
 
     # ── Гиперы FAST-режима ────────────────────
     fast_lr: float = 0.15
@@ -707,7 +707,7 @@ class FCFConfig:
     eval_max_lines: int = 300
 
     # ── Manage ────────────────────────────────
-    cleanup_keep: int = 5       # сколько чекпоинтов хранить
+    cleanup_keep: int = 8          # F₆
     periodic_save_every: int = 4181      # F₁₉
 
     # ── P1-A: crystal_generator graph search ─
@@ -753,7 +753,7 @@ class FCFConfig:
     opt_inh_threshold_fallback: float = 0.1
 
     # ── P1-B: PlateauDetector ─────────────────
-    detector_window: int = 100
+    detector_window: int = 89     # F₁₁
     detector_patience: int = 20
     detector_threshold_std: float = 0.5
     detector_min_decay: float = 0.1
@@ -771,7 +771,7 @@ class FCFConfig:
     subspace_growth_factor: float = 1.5
     subspace_sector_depths: list = field(default_factory=lambda: [4, 10, 20])
     subspace_density_epsilon: float = 1e-4
-    subspace_density_history_maxlen: int = 10000
+    subspace_density_history_maxlen: int = 10946  # F₂₁
     subspace_warmup_updates: int = 10
     subspace_adjust_up_rate: float = 1.03
     subspace_adjust_up_max: float = 0.75

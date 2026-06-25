@@ -1068,7 +1068,7 @@ class TestDeadCode:
 
     def test_graph_cache_maxlen(self, gen):
         """Verify graph cache maxlen is 5000 (REG-V9-10)."""
-        assert gen._graph_cache_max == 5000
+        assert gen._graph_cache_max == 4181  # F₁₉
 
     def test_push_total_removed(self, gen):
         """Verify push_total/lr_scale are not allocated (G-57)."""

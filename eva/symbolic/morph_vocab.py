@@ -1,7 +1,7 @@
 from collections import Counter, defaultdict
 import json, os, sys, time
 import numpy as np
-from eva.symbolic.fractal_encoding import path as oct_path, digits
+from eva.symbolic.fractal_encoding import path as zck_path
 from eva.symbolic.fcf_config import EnvironmentResolver
 
 try:
@@ -14,16 +14,16 @@ _ENV = EnvironmentResolver()
 
 
 class MorphVocab:
-    """Morphological vocabulary with custom octree paths per concept.
+    """Morphological vocabulary with custom Zeckendorf paths per concept.
 
     CID range: 0..N_cids-1 (flat, matches SP vocab).
-    Each concept can have a custom octree_path stored in _path_override.
+    Each concept can have a custom Zeckendorf path stored in _path_override.
 
     Path types:
-        service word (ADP, CCONJ, etc.): path = digits(cid)   [standard]
-        content word (known lemma+form):  path = digits(lemma_rank)[:12]
-                                           + digits(form_rank)[:4]
-        BPE fallback:                     path = digits(cid)   [standard]
+        service word (ADP, CCONJ, etc.): path = ZCK(cid)           [standard]
+        content word (known lemma+form):  path = ZCK(lemma_rank)[:12]
+                                            + ZCK(form_rank)[:4]
+        BPE fallback:                     path = ZCK(cid)           [standard]
     """
 
     def __init__(self, sp_model_path=None, vocab_size=146000):
@@ -49,11 +49,11 @@ class MorphVocab:
         self._form_rank = {}     # grammeme string -> rank (0..N)
         self._word_info = {}     # word -> (lemma, grammeme, is_service)
 
-    def octree_path(self, cid):
-        """Custom octree path for concept cid."""
+    def zeckendorf_path(self, cid):
+        """Custom Zeckendorf path for concept cid."""
         if cid in self._path_override:
             return self._path_override[cid]
-        return oct_path(cid)
+        return zck_path(cid)
 
     # ── Build from corpus ──────────────────────────────────────
 
@@ -166,9 +166,9 @@ class MorphVocab:
             if lemma_rank is None:
                 continue
 
-            # path = path(lemma_rank)[:12] + path(form_rank)[:4]
-            lp = oct_path(lemma_rank)[:12]
-            fp = oct_path(form_rank)[:4] if form_rank is not None else (0,) * 4
+            # path = ZCK(lemma_rank)[:12] + ZCK(form_rank)[:4]
+            lp = zck_path(lemma_rank)[:12]
+            fp = zck_path(form_rank)[:4] if form_rank is not None else (0,) * 4
             self._path_override[cid] = lp + fp
 
         print(f"  Cached: {len(self.word_cache)} words"

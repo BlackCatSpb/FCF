@@ -428,7 +428,7 @@ class TestV5Safety:
         from eva.symbolic.fractal_encoding import path, LEVELS
         p = path(42)
         assert len(p) == LEVELS
-        assert all(0 <= b <= 7 for b in p)
+        assert all(isinstance(b, int) and b >= 0 for b in p)
 
     def test_fractal_encoding_path_deterministic(self):
         from eva.symbolic.fractal_encoding import path

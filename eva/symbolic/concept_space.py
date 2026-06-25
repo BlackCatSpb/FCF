@@ -1739,11 +1739,13 @@ class ConceptSpace:
         return {'reinit': reinit_count, 'e5': e5_count, 'method': 'morph_bundle' if morph_bundle else 'direct_e5' if e5_model else 'random'}
 
     def build_octree_fields(self, lattice, n_anchors=1024, min_lcp=1, gamma=0.5, path_overrides=None):
-        """Build H matrix and field_bits from nested octree encoding.
+        """Build H matrix and field_bits from nested Zeckendorf encoding.
 
         Replaces PMI-based build_anchor_matrix + build_fields_from_lattice.
-        Each concept ID → decimal digits → octant path (0..7 per level).
+        Each concept ID → Zeckendorf representation (Fibonacci sum) → path.
         H[i,j] = (1 - γ^{LCP}) / (1 - γ) where LCP = longest common prefix.
+        Zeckendorf paths give longer common prefixes for semantically related
+        concept IDs than arbitrary base-8 octree paths.
 
         Uses prefix grouping for O(n_concepts + n_anchors) field_bits construction.
 
@@ -1763,12 +1765,12 @@ class ConceptSpace:
         import numpy as np
         from scipy.sparse import csr_matrix
         from collections import defaultdict
-        from eva.symbolic.fractal_encoding import path as octree_path_default, H_weighted
+        from eva.symbolic.fractal_encoding import path as zeckendorf_path_default, H_weighted
 
         def get_path(cid):
             if path_overrides and cid in path_overrides:
                 return path_overrides[cid]
-            return octree_path_default(cid)
+            return zeckendorf_path_default(cid)
 
         # 1. Select anchors (top by frequency)
         sorted_cids = sorted(lattice.concept_freq.keys(),

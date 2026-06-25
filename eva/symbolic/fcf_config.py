@@ -471,6 +471,10 @@ class FCFConfig:
     def bpe_model_path(self) -> str:
         return self.paths.bpe_model_path
 
+    @bpe_model_path.setter
+    def bpe_model_path(self, path: str) -> None:
+        self.paths.bpe_model_path = path
+
     @property
     def morph_vocab_path(self) -> str:
         return self.paths.morph_vocab_path

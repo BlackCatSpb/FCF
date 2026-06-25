@@ -108,6 +108,12 @@ class EnvironmentResolver:
             return os.path.join(self.data_dir, detected)
         return os.path.join(self.data_dir, 'bpe_ru_146k.model')
 
+    @bpe_model_path.setter
+    def bpe_model_path(self, path: str) -> None:
+        """Override BPE model path (e.g. from --morph-bpe)."""
+        name = os.path.basename(path)
+        self.model_name = name
+
     @property
     def corpus_path(self) -> str:
         return os.path.join(self.data_dir, 'full_corpus_ru_clean.txt')

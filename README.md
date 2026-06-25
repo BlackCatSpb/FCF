@@ -162,14 +162,25 @@ python scripts/seed_embeddings.py --cs real_data/concept_space.json --sp real_da
 
 ### Двухуровневый морфологический токенизатор
 
-**Уровень 1** — SentencePiece BPE (256K), обученный на корпусе с морфемной разметкой:
+**Уровень 1** — SentencePiece BPE (256K), обученный на корпусе с морфемной разметкой `\u037E`:
 ```bash
-python scripts/train_morph_bpe.py --corpus real_data/full_corpus_ru.txt \
-    --output real_data/bpe_morph --vocab-size 256000 --device cpu
-```
-Скрипт: (1) разбивает каждое слово на PREFIX+ROOT+ENDING, (2) вставляет разделитель между частями, (3) тренирует BPE на аннотированном корпусе, (4) валидирует через e5 (VSA bundle of morphs vs whole word), (5) выводит статистику покрытия.
+# 1. Подготовить корпус с морфемными разделителями
+python scripts/prepare_wiki_corpus.py --download --morph-annotate
 
-**Уровень 2** — fallback-анализатор: если слово не найдено в morph_vocab, раскладывается на морфемы через правила → e5(morpheme) → VSA bundle → концепт-вектор. Встроен в `--morph-bundle` режим `seed_embeddings.py`.
+# 2. Обучить морфемный BPE (pretokenized — корпус уже размечен)
+python scripts/train_morph_bpe.py --corpus real_data/full_corpus_ru_morph.txt \
+    --output real_data/bpe_morph --vocab-size 256000 --pretokenized --validate
+```
+Результат: `bpe_morph.model` (256K vocab, 6 MB). Покрытие: 20.7% слов 1 токен, 71.3% ≤2, 99.7% ≤5. VSA bundle cos=0.9436 с e5(word).
+
+**Уровень 2** — fallback-анализатор `eva/morph.py`: pymorphy3 → rule-based decomposition → e5(morpheme) → VSA bundle → концепт-вектор. Встроен в `--e5-morph-bundle` режим `train_full.py`.
+
+**Свежий запуск:**
+```bash
+python train_full.py --fresh --learned-fields --morph-bpe real_data/bpe_morph.model \
+    --seed-e5 --e5-morph-bundle
+```
+Или через ярлык `EVA_Training.lnk`, который сам определяет наличие `bpe_morph.model`.
 
 ---
 
@@ -254,6 +265,10 @@ FCF/
 - ✅ **--no-harmonize / --no-morpheme-field** для GPU < 2GB
 - ✅ **Preharm checkpoint** — rollback до первой гармонизации
 - ✅ **Phase transition analysis** — PCA+визуализация на каждом чекпоинте
+- ✅ **Morph-aware BPE** (256K) — обучен на Wikipedia-RuDataset (1.94M док., 9.3M предл.) с морфемными разделителями `\u037E`. Покрытие: 20.7% слов одним токеном, 99.7% — ≤5 токенов
+- ✅ **`eva/morph.py`** — единый модуль морфемного разбора: pymorphy3 + rule-based fallback, аннотация корпуса, e5-валидация VSA-бандла (cos=0.9436)
+- ✅ **`scripts/prepare_wiki_corpus.py`** — загрузка, очистка, сплит, опциональная морф-аннотация для BPE-тренировки
+- ✅ **`scripts/validate_bpe_model.py`** — покрытие, sample-encoding, e5 alignment
 - ✅ Организация репозитория: скрипты → scripts/, документация → docs/, логи → logs/
 
 ---

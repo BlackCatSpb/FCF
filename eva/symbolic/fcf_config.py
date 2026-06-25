@@ -114,7 +114,7 @@ class EnvironmentResolver:
 
     @property
     def raw_corpus_path(self) -> str:
-        return os.path.join(self.data_dir, 'full_corpus_ru.txt')
+        return os.path.join(self.data_dir, 'full_corpus_ru_morph.txt')
 
     @property
     def morph_vocab_path(self) -> str:

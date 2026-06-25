@@ -72,6 +72,21 @@ sys.stdout = TeeOut()
 sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
 V = sp.vocab_size()
 
+# ── e5 seeding helper ───────────────────────────────────────────
+
+_E5_MODEL = None
+
+def _load_e5(device='cpu'):
+    global _E5_MODEL
+    if _E5_MODEL is not None:
+        return _E5_MODEL
+    from sentence_transformers import SentenceTransformer
+    print(f"  Loading multilingual-e5-base on {device}...", end=' ', flush=True)
+    t0 = time.time()
+    _E5_MODEL = SentenceTransformer('intfloat/multilingual-e5-base', device=device)
+    print(f"{time.time()-t0:.1f}s")
+    return _E5_MODEL
+
 # ── Helpers ─────────────────────────────────────────────────────
 
 def load_checkpoint_state():
@@ -104,6 +119,10 @@ parser.add_argument('--field-bits', type=int, default=512, help='number of learn
 parser.add_argument('--no-harmonize', action='store_true', help='disable morphological harmonizer (fallback to STDP-only)')
 parser.add_argument('--no-morpheme-field', action='store_true', help='disable morpheme field (GPU < 2GB fallback)')
 parser.add_argument('--no-hebbian-field', action='store_true', help='disable Hebbian entity field (VSA field bindings off)')
+parser.add_argument('--seed-e5', action='store_true', help='seed rare concepts with multilingual-e5-base instead of random')
+parser.add_argument('--e5-device', default='cpu', help='device for e5 model (cpu/cuda)')
+parser.add_argument('--e5-morph-bundle', action='store_true', help='VSA bundle of morpheme e5 vecs (requires --seed-e5)')
+parser.add_argument('--morph-bpe', default=None, help='path to morph-aware SentencePiece .model (replaces default BPE)')
 args = parser.parse_args()
 
 RESUME = args.resume
@@ -116,6 +135,18 @@ NO_HARMONIZE = args.no_harmonize
 NO_MORPHEME_FIELD = args.no_morpheme_field
 NO_HEBBIAN_FIELD = args.no_hebbian_field
 RESUME_CLUSTER_POTENTIAL = None
+SEED_E5 = args.seed_e5
+E5_DEVICE = args.e5_device
+E5_MORPH_BUNDLE = args.e5_morph_bundle
+MORPH_BPE_PATH = args.morph_bpe
+
+# Override BPE model path if --morph-bpe specified
+if MORPH_BPE_PATH:
+    CFG.bpe_model_path = MORPH_BPE_PATH
+    print(f"  Using morph-aware BPE: {MORPH_BPE_PATH}")
+    # Reload SentencePiece with new model
+    sp = spm.SentencePieceProcessor(model_file=MORPH_BPE_PATH)
+    V = sp.vocab_size()
 
 print(f"vocab_size = {V}")
 
@@ -221,9 +252,14 @@ if RESUME is not None:
             else:
                 cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
                                        gamma=CFG.octree_gamma, path_overrides=path_overrides)
-            n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3)
-            if n_rare:
-                print(f"  Item-memory: {n_rare} rare concepts re-initialized as random unit vectors")
+            if SEED_E5:
+                e5 = _load_e5(E5_DEVICE)
+                n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3,
+                                        e5_model=e5, sp=sp, morph_bundle=E5_MORPH_BUNDLE)
+            else:
+                n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3)
+            if n_rare['reinit']:
+                print(f"  Item-memory: {n_rare['reinit']} rare concepts ({n_rare['e5']} e5, method={n_rare['method']})")
         except Exception as e:
             print(f"FATAL: build_{fields_label}_fields failed: {e}", file=sys.stderr)
             sys.exit(1)
@@ -261,9 +297,14 @@ else:
         else:
             cs.build_octree_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
                                    gamma=CFG.octree_gamma, path_overrides=path_overrides)
-        n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3)
-        if n_rare:
-            print(f"  Item-memory: {n_rare} rare concepts re-initialized as random unit vectors")
+        if SEED_E5:
+            e5 = _load_e5(E5_DEVICE)
+            n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3,
+                                    e5_model=e5, sp=sp, morph_bundle=E5_MORPH_BUNDLE)
+        else:
+            n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3)
+        if n_rare['reinit']:
+            print(f"  Item-memory: {n_rare['reinit']} rare concepts ({n_rare['e5']} e5, method={n_rare['method']})")
     except Exception as e:
         print(f"FATAL: build_{fields_label}_fields failed: {e}", file=sys.stderr)
         sys.exit(1)

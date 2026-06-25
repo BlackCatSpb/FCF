@@ -1,21 +1,32 @@
 """
 Train a morpheme-aware SentencePiece BPE model for FCF.
 
-Level 1: BPE trained on corpus pre-segmented at morpheme boundaries.
-         The separator token \u037E (GREEK QUESTION MARK) marks morpheme
-         junctions, biasing BPE toward learning morpheme-sized tokens.
+Two modes:
+  1. Streaming mode (default):  read corpus line-by-line, annotate morphemes
+     on-the-fly via eva.morph, write augmented text, train BPE.
+  2. Pretokenized mode:         corpus already contains \u037E morpheme
+     separators (produced by prepare_wiki_corpus.py --morph-annotate).
+     Just train BPE directly.
 
-Level 2: Fallback analyzer — runtime decomposition for words not in
-         SentencePiece vocabulary, using e5 embeddings and VSA bundle.
+Memory-efficient: O(max_line_length), never loads entire corpus.
 
 Usage:
-    # Step 1: train morph-aware BPE
-    python scripts/train_morph_bpe.py --corpus real_data/full_corpus_ru.txt \
-        --output real_data/bpe_morph --vocab-size 256000 --device cpu
+    # Streaming mode (annotate on-the-fly)
+    python scripts/train_morph_bpe.py --corpus real_data/full_corpus_ru_clean.txt \
+        --output real_data/bpe_morph --vocab-size 256000
 
-    # Step 2: seed concept vectors with e5 + morph decomposition
-    python scripts/seed_embeddings.py --cs real_data/concept_space.json \
-        --sp real_data/bpe_morph.model --all --device cpu
+    # Pretokenized mode (corpus already has \u037E)
+    python scripts/train_morph_bpe.py --corpus real_data/full_corpus_ru_morph.txt \
+        --output real_data/bpe_morph --vocab-size 256000 --pretokenized
+
+    # Full pipeline with validation
+    python scripts/train_morph_bpe.py --corpus real_data/full_corpus_ru_morph.txt \
+        --output real_data/bpe_morph --vocab-size 256000 --pretokenized \
+        --validate --sample-words 1000
+
+    # Quick test run
+    python scripts/train_morph_bpe.py --corpus real_data/sample.txt \
+        --output real_data/bpe_morph_test --vocab-size 16000 --max-lines 10000
 """
 
 import argparse
@@ -23,198 +34,286 @@ import os
 import sys
 import time
 import math
-import numpy as np
 from collections import Counter
+from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-# -- Morpheme boundary separator token --
-# Using a rare Unicode char that won't appear in normal text
-SEP = '\u037E'  # Greek question mark
-
-# Russian consonants for ending detection
-CONSONANTS = set('\u0431\u0432\u0433\u0434\u0436\u0437\u0439\u043a\u043b'
-                 '\u043c\u043d\u043f\u0440\u0441\u0442\u0444\u0445\u0446'
-                 '\u0447\u0448\u0449')
+from eva.morph import SEP, annotate_corpus_line, _has_cyrillic, vocab_coverage
 
 
-def decompose_word(word):
-    """Rule-based Russian morpheme decomposition: prefix+root+ending.
-    Returns list of parts or None."""
-    w = word.lower().strip()
-    if len(w) < 3:
-        return None
-
-    prefixes = ['вз','воз','вос','вы','до','за','из','ис','на','над','наи',
-                'не','недо','низ','нис','о','об','обез','обес','пере','по',
-                'под','подо','пра','пред','пре','при','про','раз','рас',
-                'со','с','у','без','бес','вне','внутри','меж','между',
-                'после','сверх','через','анти','архи','гипер','де','дис',
-                'ин','контр','суб','супер','ультра','экс']
-    endings = ['а','ы','е','у','ой','ую','ою','ей','ий','ие','ия','ию',
-               'ием','иях','ами','ях','ах','ов','ев','ём','ем','ам','ом',
-               'ею','о','ых','им','ими','ешь','ет','ем','ете','ут','ют',
-               'ат','ят','ал','ла','ло','ли','ть','ти','чь','л','на','ся',
-               'сь','ого','его','ому','ему','ым','им','ыми','ими','ых','их']
-
-    parts = []
-    rest = w
-
-    # Prefix
-    for p in sorted(prefixes, key=len, reverse=True):
-        if rest.startswith(p) and len(rest) > len(p) + 2:
-            parts.append(('PREFIX', p))
-            rest = rest[len(p):]
-            break
-
-    # Ending
-    for e in sorted(endings, key=len, reverse=True):
-        if len(rest) > len(e) + 1 and rest.endswith(e) and \
-                rest[-(len(e) + 1)] in CONSONANTS:
-            parts.append(('ENDING', e))
-            rest = rest[:-len(e)]
-            break
-
-    if rest:
-        parts.append(('ROOT', rest))
-
-    if len(parts) >= 2:
-        return parts
-    return None
+# ── Streaming corpus annotation ───────────────────────────────────
 
 
-def augment_corpus(words, max_words=0):
-    """Add SEP between morpheme parts for BPE training.
-    Returns (augmented_text, stats_dict)."""
+def annotate_corpus_stream(
+    input_path: str,
+    output_path: str,
+    max_lines: int = 0,
+    progress_interval: int = 100000,
+) -> dict:
+    """Read corpus line-by-line, annotate morphemes, write augmented.
+
+    Returns stats dict.
+    """
     stats = Counter()
-    augmented = []
-    total = len(words)
-    limit = max_words if max_words > 0 else total
-
-    for i, w in enumerate(words):
-        if i >= limit:
-            break
-        parts = decompose_word(w)
-        if parts:
-            # Insert SEP between morpheme parts: "при+нос+и+ть"
-            morph_text = SEP.join(p for _, p in parts)
-            augmented.append(morph_text)
-            stats['decomposed'] += 1
-        else:
-            augmented.append(w)
-            stats['kept_whole'] += 1
-
-        if (i + 1) % 50000 == 0:
-            pct = 100 * (i + 1) / limit
-            print(f"  [{pct:5.1f}%] {i+1}/{limit} words", flush=True)
-
-    return '\n'.join(augmented), stats
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Train morph-aware BPE for FCF')
-    parser.add_argument('--corpus', required=True, help='Path to Russian corpus')
-    parser.add_argument('--output', required=True, help='Output prefix for BPE model')
-    parser.add_argument('--vocab-size', type=int, default=256000, help='BPE vocabulary size')
-    parser.add_argument('--max-words', type=int, default=0, help='Max words to process (0=all)')
-    parser.add_argument('--device', default='cpu', help='Torch device for e5 (cpu/cuda)')
-    args = parser.parse_args()
-
-    # -- 1. Load corpus --
-    print("Loading corpus...", flush=True)
-    with open(args.corpus, 'r', encoding='utf-8') as f:
-        text = f.read()
-    words = sorted(set(text.split()))
-    print(f"  Unique words: {len(words)}")
-    print(f"  Total chars: {len(text):,}")
-
-    # -- 2. Decompose and augment --
-    print(f"\nDecomposing words (max={args.max_words or 'all'})...", flush=True)
     t0 = time.time()
-    aug_text, stats = augment_corpus(words, args.max_words)
-    print(f"  Done in {time.time()-t0:.1f}s")
-    print(f"  Decomposed: {stats['decomposed']}")
-    print(f"  Kept whole: {stats['kept_whole']}")
+    with open(input_path, 'r', encoding='utf-8') as fin, \
+         open(output_path, 'w', encoding='utf-8') as fout:
+        for i, line in enumerate(fin):
+            if max_lines and i >= max_lines:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            annotated = annotate_corpus_line(line)
+            fout.write(annotated + '\n')
+            stats['lines'] += 1
+            if (i + 1) % progress_interval == 0:
+                elapsed = time.time() - t0
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                print(f"  [{i+1:>9}] {rate:.0f} L/s", flush=True)
+    elapsed = time.time() - t0
+    stats['elapsed_s'] = elapsed
+    stats['lines_per_sec'] = stats['lines'] / elapsed if elapsed > 0 else 0
+    return dict(stats)
 
-    # -- 3. Validate decomposition quality with e5 --
-    print(f"\nValidating decomposition quality with e5...", flush=True)
-    try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer('intfloat/multilingual-e5-base', device=args.device)
 
-        sample_words = [w for w in words if len(decompose_word(w) or []) >= 2][:500]
-        if sample_words:
-            word_embs = model.encode(sample_words, normalize_embeddings=True,
-                                     show_progress_bar=False, batch_size=512)
-            sims = []
-            for word, target in zip(sample_words, word_embs):
-                parts = decompose_word(word)
-                if parts:
-                    m_texts = [p for _, p in parts]
-                    m_embs = model.encode(m_texts, normalize_embeddings=True,
-                                          show_progress_bar=False)
-                    bundle = np.mean(m_embs, axis=0)
-                    bundle /= np.linalg.norm(bundle)
-                    sims.append(float(np.dot(bundle, target)))
+# ── BPE training ──────────────────────────────────────────────────
 
-            arr = np.array(sims)
-            print(f"  Samples: {len(sample_words)}")
-            print(f"  Bundle cos: mean={arr.mean():.4f} std={arr.std():.4f}")
-            print(f"  Ceiling (self-cos): 1.0000")
-            # Baseline: random
-            rng = np.random.RandomState(42)
-            rnd_sims = []
-            for target in word_embs:
-                rnd = rng.randn(768).astype(np.float32)
-                rnd /= np.linalg.norm(rnd)
-                rnd_sims.append(float(np.dot(rnd, target)))
-            print(f"  Random baseline: mean={np.mean(rnd_sims):.4f} std={np.std(rnd_sims):.4f}")
-    except Exception as e:
-        print(f"  Validation skipped: {e}")
 
-    # -- 4. Train SentencePiece on augmented text --
-    print(f"\nTraining SentencePiece (vocab_size={args.vocab_size})...", flush=True)
-    aug_path = args.output + '_augmented.txt'
-    with open(aug_path, 'w', encoding='utf-8') as f:
-        f.write(aug_text)
+def train_bpe(
+    input_path: str,
+    output_prefix: str,
+    vocab_size: int,
+    num_threads: int = 4,
+) -> dict:
+    """Train SentencePiece BPE model on the augmented corpus.
 
+    Returns model metadata dict.
+    """
     import sentencepiece as spm
+
     t0 = time.time()
+    print(f"  Input:  {input_path}", flush=True)
+    print(f"  Output: {output_prefix}.model", flush=True)
+    print(f"  Vocab:  {vocab_size}", flush=True)
+
+    # pad_id=-1: no padding piece (prevents conflict with unk_id=0)
+    # hard_vocab_limit=False: allows slightly smaller final vocab when
+    #   byte-fallback tokens consume some slots (common with byte_fallback=True)
     spm.SentencePieceTrainer.train(
-        input=aug_path,
-        model_prefix=args.output,
-        vocab_size=args.vocab_size,
+        input=input_path,
+        model_prefix=output_prefix,
+        vocab_size=vocab_size,
         character_coverage=1.0,
-        pad_id=0, unk_id=0, bos_id=1, eos_id=2,
-        pad_piece='<pad>', unk_piece='<unk>', bos_piece='<s>', eos_piece='</s>',
+        pad_id=-1,
+        unk_id=0, bos_id=1, eos_id=2,
+        unk_piece='<unk>', bos_piece='<s>', eos_piece='</s>',
         train_extremely_large_corpus=True,
         shuffle_input_sentence=False,
         split_by_unicode_script=True,
         byte_fallback=True,
-        num_threads=4,
+        hard_vocab_limit=False,
+        num_threads=num_threads,
     )
-    print(f"  Trained in {time.time()-t0:.1f}s")
-    print(f"  Model: {args.output}.model")
-    print(f"  Vocab: {args.output}.vocab")
+    elapsed = time.time() - t0
+    print(f"  Trained in {elapsed:.1f}s", flush=True)
+    return {'elapsed_s': elapsed, 'vocab_size': vocab_size}
 
-    # -- 5. Load and test --
-    sp = spm.SentencePieceProcessor()
-    sp.load(args.output + '.model')
-    print(f"\n  Vocab size: {sp.vocab_size()}")
 
-    # Test on sample words
+# ── Validation ─────────────────────────────────────────────────────
+
+
+def run_validation(
+    sp,
+    corpus_path: str,
+    sample_words: int = 500,
+    validate_e5: bool = True,
+    device: str = 'cpu',
+) -> dict:
+    """Validate the trained BPE model: coverage, sample encoding, e5 alignment."""
+    from eva.morph import validate_alignment
+
+    results = {}
+
+    # Load unique words from corpus (sample only)
+    print("  Loading unique words from corpus...", flush=True)
+    words = set()
+    with open(corpus_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            for w in line.strip().split():
+                w_clean = w.replace(SEP, '').strip().lower()
+                if len(w_clean) >= 3 and _has_cyrillic(w_clean):
+                    words.add(w_clean)
+                    if len(words) >= sample_words * 3:
+                        break
+            if len(words) >= sample_words * 3:
+                break
+    words = sorted(words)[:sample_words]
+    print(f"  Unique words: {len(words)}", flush=True)
+
+    # Coverage
+    cover = vocab_coverage(words, sp)
+    results['coverage'] = cover
+    print(f"  1-token:  {cover['1_token']*100:.1f}%", flush=True)
+    print(f"  2-tokens: {cover['2_tokens']*100:.1f}%", flush=True)
+    print(f"  5-tokens: {cover['5_tokens']*100:.1f}%", flush=True)
+    print(f"  Mean tokens/word: {cover['mean_tokens']:.2f}", flush=True)
+    print(f"  Median tokens/word: {cover['median_tokens']:.2f}", flush=True)
+
+    # Sample encodings (replace SentencePiece whitespace marker for terminal)
+    SP_WS = '\u2581'
     test_words = ['приносили', 'доходный', 'загородный', 'перестройка',
-                  'безвозмездный', 'водопроводчик', 'антиконституционный']
-    print(f"\n  Sample encodings:")
+                  'безвозмездный', 'водопроводчик', 'антиконституционный',
+                  'природа', 'выходил', 'подводный']
+    print(f"\n  Sample encodings:", flush=True)
     for w in test_words:
         ids = sp.encode(w)
-        pieces = [sp.IdToPiece(i) for i in ids]
-        print(f"    {w:25s} -> {' '.join(pieces)}")
+        pieces = [sp.IdToPiece(i).replace(SP_WS, '_') for i in ids]
+        pieces_str = ' '.join(pieces)
+        print(f"    {w:30s} -> {pieces_str:60s}  [{len(ids)} tok]", flush=True)
 
-    # -- 6. Coverage stats --
-    n_covered = sum(1 for w in words if sp.encode(w) and len(sp.encode(w)) <= 5)
-    print(f"\n  Coverage (<=5 BPE tokens): {n_covered}/{len(words)} ({100*n_covered/len(words):.1f}%)")
-    print(f"\nDone.")
+    # e5 alignment validation
+    if validate_e5:
+        print(f"\n  Validating e5 alignment ({sample_words} words)...", flush=True)
+        try:
+            align = validate_alignment(
+                words[:sample_words], sp,
+                device=device, sample_size=min(500, sample_words),
+            )
+            results['alignment'] = align
+            if 'morph_mean' in align:
+                print(f"  Morph bundle cos:  mean={align['morph_mean']:.4f} std={align['morph_std']:.4f}",
+                      flush=True)
+            if 'bpe_mean' in align:
+                print(f"  BPE bundle cos:    mean={align['bpe_mean']:.4f} std={align['bpe_std']:.4f}",
+                      flush=True)
+        except Exception as e:
+            print(f"  e5 validation skipped: {e}", flush=True)
+
+    return results
+
+
+# ── Main ───────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Train morph-aware BPE for FCF')
+    parser.add_argument('--corpus', required=True,
+                        help='Path to Russian corpus')
+    parser.add_argument('--output', required=True,
+                        help='Output prefix for BPE model')
+    parser.add_argument('--vocab-size', type=int, default=256000,
+                        help='BPE vocabulary size (default: 256000)')
+    parser.add_argument('--pretokenized', action='store_true',
+                        help='Corpus already has \\u037E morph separators (skip annotation)')
+    parser.add_argument('--max-lines', type=int, default=0,
+                        help='Max lines to process (0=all)')
+    parser.add_argument('--validate', action='store_true',
+                        help='Run post-training validation (coverage + e5)')
+    parser.add_argument('--sample-words', type=int, default=500,
+                        help='Sample words for validation')
+    parser.add_argument('--no-e5', action='store_true',
+                        help='Skip e5 validation (saves ~1 GB RAM)')
+    parser.add_argument('--device', default='cpu',
+                        help='Torch device for e5 (cpu/cuda)')
+    parser.add_argument('--threads', type=int, default=4,
+                        help='SentencePiece training threads')
+    parser.add_argument('--keep-augmented', action='store_true',
+                        help='Keep the augmented text file after training')
+    args = parser.parse_args()
+
+    t_start = time.time()
+    aug_path = args.output + '_augmented.txt'
+
+    # ── 1. Prepare augmented corpus ──────────────────────────────
+    if args.pretokenized:
+        print("[Mode] Pretokenized — using corpus as-is (already has morpheme separators)",
+              flush=True)
+        aug_path = args.corpus
+        stats = {'lines': 0, 'method': 'pretokenized'}
+        if args.max_lines:
+            # Create subset for quick testing
+            subset_path = args.output + '_subset.txt'
+            print(f"  Subsetting to {args.max_lines} lines -> {subset_path}")
+            with open(args.corpus, 'r', encoding='utf-8') as fin, \
+                 open(subset_path, 'w', encoding='utf-8') as fout:
+                for i, line in enumerate(fin):
+                    if i >= args.max_lines:
+                        break
+                    fout.write(line)
+            aug_path = subset_path
+            stats = {'lines': args.max_lines, 'method': 'pretokenized_subset'}
+        print(f"  Corpus: {aug_path}", flush=True)
+    else:
+        print("[Mode] Streaming — annotating morphemes on-the-fly", flush=True)
+        if not os.path.exists(args.corpus):
+            print(f"ERROR: Corpus not found: {args.corpus}", file=sys.stderr)
+            return 1
+        stats = annotate_corpus_stream(
+            args.corpus, aug_path,
+            max_lines=args.max_lines,
+        )
+        stats['method'] = 'streaming'
+        print(f"  Annotated {stats['lines']} lines in {stats['elapsed_s']:.1f}s "
+              f"({stats['lines_per_sec']:.0f} L/s)",
+              flush=True)
+
+    # ── 2. Train BPE ─────────────────────────────────────────────
+    print(f"\n{'='*60}", flush=True)
+    print(f"Training SentencePiece (vocab_size={args.vocab_size})...", flush=True)
+    bpe_stats = train_bpe(
+        aug_path, args.output,
+        vocab_size=args.vocab_size,
+        num_threads=args.threads,
+    )
+
+    # ── 3. Load and validate ─────────────────────────────────────
+    import sentencepiece as spm
+    sp = spm.SentencePieceProcessor()
+    sp.load(args.output + '.model')
+    print(f"\n  Vocab size: {sp.vocab_size()}", flush=True)
+    print(f"  Model: {args.output}.model", flush=True)
+    print(f"  Vocab: {args.output}.vocab", flush=True)
+
+    if args.validate:
+        print(f"\n{'='*60}", flush=True)
+        print("Validation...", flush=True)
+        val_results = run_validation(
+            sp, args.corpus,
+            sample_words=args.sample_words,
+            validate_e5=not args.no_e5,
+            device=args.device,
+        )
+    else:
+        val_results = {}
+
+    # ── 4. Cleanup ───────────────────────────────────────────────
+    if not args.keep_augmented and not args.pretokenized:
+        if os.path.exists(aug_path):
+            os.remove(aug_path)
+            print(f"\n  Removed augmented temp file: {aug_path}", flush=True)
+
+    # ── 5. Summary report ────────────────────────────────────────
+    total_elapsed = time.time() - t_start
+    print(f"\n{'='*60}", flush=True)
+    print(f"MORPH BPE TRAINING COMPLETE", flush=True)
+    print(f"  Total time:  {total_elapsed:.1f}s ({total_elapsed/60:.1f}min)", flush=True)
+    print(f"  Model:       {args.output}.model ({os.path.getsize(args.output+'.model')/1e6:.1f} MB)",
+          flush=True)
+    print(f"  Vocab size:  {sp.vocab_size()}", flush=True)
+    print(f"  Corpus:      {args.corpus}", flush=True)
+    if val_results:
+        cov = val_results.get('coverage', {})
+        if cov:
+            print(f"  Coverage:    1-tok={cov['1_token']*100:.1f}%, "
+                  f"5-tok={cov['5_tokens']*100:.1f}%, "
+                  f"mean={cov['mean_tokens']:.2f} tok/word", flush=True)
+    print(f"\nTo use with FCF:")
+    print(f"  python train_full.py --fresh --learned-fields --morph-bpe {args.output}.model "
+          f"--seed-e5 --e5-morph-bundle", flush=True)
+    print(f"{'='*60}", flush=True)
     return 0
 
 

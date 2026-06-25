@@ -17,7 +17,7 @@ real_data/concept_space*.npz
 real_data/syntax_lattice*.json
 real_data/syntax_lattice*.npz
 real_data/*.npz
-real_data/full_corpus_ru.txt
+real_data/full_corpus_ru*.txt
 real_data/val_corpus.txt
 real_data/train_log.txt
 real_data/vis/
@@ -28,6 +28,9 @@ real_data/*.tmp
 real_data/gen_*.txt
 real_data/gen_*.py
 real_data/conceptnet/
+real_data/bpe_morph.model
+real_data/bpe_morph.vocab
+real_data/wiki_download/
 checkpoints/
 *.npy
 eva/real_data/

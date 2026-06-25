@@ -52,6 +52,15 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - Cluster centroid pull: pull_strength=0.05, octree cluster anchors
 - Colab notebook updated with `LAYER_OFFSET` parameter for layers 12–24
 
+### [2026-06-24] Phase 7: FCFConfig centralisation + Transition Manifold
+- **FCFConfig — единый источник истины:** все хардкодные константы из `concept_space.py`, `crystal_generator.py`, `parameter_optimizer.py`, `stdp_trainer.py` перенесены в `fcf_config.py`. 17 новых полей, +9 полей для лучей.
+- **Все magic numbers убиты:** иниты FractalField (dim, latent_dim, l1_lambda, n_field_bits, field_lr → config), Harmonizer (harm_lr, morph_lr, n_iter, damping → config), EntityField (max_entities, dim fallback → config), Special token IDs (BOS/EOS/PAD/UNK → config), thresholds parameter_optimizer (plateau, detector, metric buffer lengths → config).
+- **Transition Manifold** (`eva/symbolic/transition_manifold.py`) — новый класс паутины переходов: копит `T = unbind(v_next, v_prev)` в кольцевом буфере (10K), жадная VSA-кластеризация в лучи (до 100). Три точки врезки: (1) beam-pull в STDP CPU/GPU после scatter_add, (2) beam_score как RRF-сигнал в `_branch`, (3) все thresholds из FCFConfig.
+- **SeedRegistry** — заменил `hash(key) % 2**31` и `RandomState(42 + growths)` во всех точках.
+- **Param cascade:** `Param._def` — ссылка на ParamDef, `toward_default()` перечитывает default.
+- **Очистка репозитория:** удалено 60+ устаревших отчётов и планов (все V1–V20).
+- **294 passed, 7 skipped** — без регрессий
+
 ## Priority Queue
 - ✅ Architecture expansion (dim=768, latent_dim=2048)
 - ✅ L1 regularisation + per-concept adaptive L1 (dynamic dimension)
@@ -62,6 +71,11 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - ✅ Focal search: search_in_sector(), focal_refine()
 - ✅ Qwen knowledge, minesweeper inversion, antonym repel, cluster centroid pull
 - ✅ Low-sim repulsion, eval logging
+- ✅ FCFConfig — все константы в конфиге
+- ✅ Transition Manifold — паутина переходов
+- ✅ SeedRegistry — централизованные сиды
+- ✅ Param cascade — live-обновление defaults
+- ✅ Очистка репозитория — удалены 60+ отчётов
 
 ## Key Decisions
 - **Adaptive sparsity via L1** — per-concept density self-regulates to 8% target
@@ -95,15 +109,53 @@ Checkpoints at real_data/concept_space_{tag}.json + syntax_lattice_{tag}.\*.
 - 145/145 тестов
 
 ## Relevant Files
-- `eva/symbolic/concept_space.py` — FractalField, EntityField, Harmonizer, VSAGrid, VSACNN, VSA-утилиты (3200+ строк)
-- `eva/symbolic/crystal_generator.py` — _branch() with HDC fallback + RRF
-- `eva/symbolic/stdp_trainer.py` — STDP, _harmonize_batch, _ANTONYM_MAP
-- `eva/symbolic/fcf_config.py` — dim=768, latent_dim=2048
+- `eva/symbolic/concept_space.py` — FractalField, EntityField, Harmonizer, VSAGrid, VSACNN, VSA-утилиты (2592 строк)
+- `eva/symbolic/crystal_generator.py` — _branch() with HDC fallback + RRF + beam_score
+- `eva/symbolic/stdp_trainer.py` — STDP, _harmonize_batch, _ANTONYM_MAP, beam-pull CPU/GPU
+- `eva/symbolic/transition_manifold.py` — новая паутина переходов (VSA-кластеризация, буфер, лучи)
+- `eva/symbolic/fcf_config.py` — единый конфиг: dim=768, latent_dim=2048, beam_*, fractal_*, subspace_*
+- `eva/symbolic/seed_registry.py` — централизованный реестр сидов (заменил hash/42)
 - `eva/symbolic/fibonacci_utils.py` — FibonacciUtils (Zeckendorf, golden ratio, fib_position_shift)
-- `eva/symbolic/parameter_optimizer.py` — ParameterOptimizer + PlateauDetector
+- `eva/symbolic/parameter_optimizer.py` — ParameterOptimizer + PlateauDetector + Param cascade
 - `eva/symbolic/qwen_knowledge.py` — three-regime get_factor
 - `train_full.py` — --learned-fields, --field-bits, soft plateau protocol
 - `data/antonyms.json` — 22-парный антоним-словарь для P1.8
 - `eval_metrics.py` — qwen-factor distribution logging
 - `precompute_qwen_knowledge.ipynb` — LAYER_OFFSET=12 for layers 12–24
 - `real_data/qwen_knowledge.npz` — 1.53M pruned pairs (10 MB)
+
+## Session 25.06.2026 — Morph-aware BPE, Wikipedia corpus, unified decomposition
+
+### Goals
+- Train morph-aware BPE (256K vocab) on Wikipedia-RuDataset (1.94M docs)
+- Create unified morpheme decomposition module (pymorphy3 + rule-based)
+- Clean up checkpoint artifacts for fresh training
+
+### Changes
+- Created `eva/morph.py` — единый модуль морфемного разбора: `decompose_word()`, `annotate_word()`, `annotate_corpus_line()`, `vocab_coverage()`, `validate_alignment()`. Ленивый pymorphy3 singleton. Покрытие: 99.7% слов ≤ 5 токенов, mean 2.19 tok/word.
+- Rewrote `scripts/train_morph_bpe.py` — streaming (не грузит 1.77 GB в память), pretokenized mode, валидация через e5, `hard_vocab_limit=False`.
+- Rewrote `scripts/prepare_wiki_corpus.py` — использует `eva.morph`, раздельные выходы `full_corpus_ru_clean.txt` (без \u037E) и `full_corpus_ru_morph.txt` (с \u037E).
+- Downloaded Wikipedia-RuDataset (1.94M rows, 597 MB Parquet) → 9.3M sentences после очистки. 105K too_short, 19K no_cyrillic отфильтровано.
+- Trained morph BPE model `real_data/bpe_morph.model` (256K vocab, 6.1 MB) на 3M sampled sentences.
+- Updated `train.bat` — автоопределение `bpe_morph.model`, `--morph-bpe` + `--seed-e5 --e5-morph-bundle`.
+- Updated `.gitignore` — `real_data/full_corpus_ru*.txt`, `bpe_morph.model/vocab`, `wiki_download/`.
+- Cleaned 22 checkpoint artifacts (4.6 GB freed): concept_space, syntax_lattice, morph_vocab, logs, vis/.
+
+### Key Decisions
+- pymorphy3 primary для runtime decomposition (высшая точность на русской морфологии)
+- Rule-based fallback для BPE training (скорость: 10K слов/с против ~100 слов/с у pymorphy3)
+- Раздельные корпуса: clean (для обучения модели) и morph (для BPE training)
+- e5 VSA bundle cos=0.9436 — BPE subword bundling несёт сильный семантический сигнал
+
+### Next
+- Full training with `--fresh --learned-fields --morph-bpe bpe_morph.model --seed-e5 --e5-morph-bundle`
+
+### Relevant Files
+- `eva/morph.py` — unified decomposition module (NEW)
+- `scripts/train_morph_bpe.py` — streaming BPE trainer (REWRITTEN)
+- `scripts/prepare_wiki_corpus.py` — corpus download/clean (REWRITTEN)
+- `scripts/validate_bpe_model.py` — BPE validation (NEW)
+- `real_data/bpe_morph.model` — 256K morph-aware BPE
+- `real_data/full_corpus_ru_clean.txt` — 9.3M clean train lines
+- `real_data/full_corpus_ru_morph.txt` — 9.3M morph-annotated lines
+- `train.bat` — autodetects bpe_morph.model

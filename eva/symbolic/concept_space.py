@@ -1636,22 +1636,107 @@ class ConceptSpace:
 
     # ── Octree encoding ──────────────────────────────────────
 
-    def reinit_rare(self, freq_map, threshold=3):
-        """Replace rare concept vectors with random unit vectors (item memory).
-        Concepts with freq < threshold get random vectors, naturally orthogonal.
+    def reinit_rare(self, freq_map, threshold=3, e5_model=None, sp=None, morph_bundle=False, device='cpu'):
+        """Replace rare concept vectors with random unit vectors or e5 embeddings.
+
+        Concepts with freq < threshold get either:
+          - random unit vectors (default, no e5_model)
+          - e5 embeddings (if e5_model provided)
+          - VSA bundle of morpheme e5 embeddings (if morph_bundle=True)
+
+        Returns dict with reinit_count and method used.
         """
         reinit_count = 0
+        e5_count = 0
+        rare_cids = []
         for cid in range(self.vocab_size):
             freq = freq_map.get(cid, 0)
             if 0 < freq < threshold:
+                rare_cids.append(cid)
+
+        if not rare_cids:
+            return {'reinit': 0, 'e5': 0, 'method': 'none'}
+
+        if e5_model is not None and sp is not None:
+            # Batch encode rare tokens with e5
+            batch_size = 512
+            for i in range(0, len(rare_cids), batch_size):
+                batch_cids = rare_cids[i:i + batch_size]
+                batch_texts = []
+                valid_cids = []
+                for cid in batch_cids:
+                    try:
+                        token = sp.IdToPiece(cid).replace('\u2581', '').strip()
+                    except Exception:
+                        token = ''
+                    if not token or len(token) < 1:
+                        continue
+                    if any(c in '.,!?;:()[]{}«»—–-\'\"1234567890' for c in token) and len(token) < 3:
+                        continue
+                    batch_texts.append(token)
+                    valid_cids.append(cid)
+
+                if morph_bundle:
+                    for cid, token in zip(valid_cids, batch_texts):
+                        parts = self._decompose_word(token)
+                        if parts:
+                            m_texts = [m for _, m in parts.items()]
+                            try:
+                                m_embs = e5_model.encode(m_texts, normalize_embeddings=True,
+                                                         show_progress_bar=False)
+                                bundle = np.mean(m_embs, axis=0).astype(np.float32)
+                                bundle /= max(np.linalg.norm(bundle), 1e-10)
+                                self.set_vec(cid, bundle)
+                                self.fractal.codes.pop(cid, None)
+                                e5_count += 1
+                            except Exception:
+                                v = self._item_rng.randn(self.dim).astype(np.float32)
+                                v /= max(np.linalg.norm(v), 1e-10)
+                                self.set_vec(cid, v)
+                                self.fractal.codes.pop(cid, None)
+                        else:
+                            v = self._item_rng.randn(self.dim).astype(np.float32)
+                            v /= max(np.linalg.norm(v), 1e-10)
+                            self.set_vec(cid, v)
+                            self.fractal.codes.pop(cid, None)
+                        reinit_count += 1
+                else:
+                    try:
+                        embs = e5_model.encode(batch_texts, normalize_embeddings=True,
+                                               show_progress_bar=False)
+                        for cid, emb in zip(valid_cids, embs):
+                            v = np.asarray(emb, dtype=np.float32)
+                            v /= max(np.linalg.norm(v), 1e-10)
+                            self.set_vec(cid, v)
+                            self.fractal.codes.pop(cid, None)
+                            e5_count += 1
+                            reinit_count += 1
+                    except Exception:
+                        for cid in valid_cids:
+                            v = self._item_rng.randn(self.dim).astype(np.float32)
+                            v /= max(np.linalg.norm(v), 1e-10)
+                            self.set_vec(cid, v)
+                            self.fractal.codes.pop(cid, None)
+                            reinit_count += 1
+        else:
+            for cid in rare_cids:
                 v = self._item_rng.randn(self.dim).astype(np.float32)
                 v /= max(np.linalg.norm(v), 1e-10)
                 self.set_vec(cid, v)
                 self.fractal.codes.pop(cid, None)
                 reinit_count += 1
+
         if reinit_count:
             self.fractal._matrix_dirty = True
-        return reinit_count
+            # Sync reinitialised vectors to EntityField so word vectors
+            # are immediately available as VSA composition.
+            ef = getattr(self, 'entity_field', None)
+            if ef is not None:
+                for cid in rare_cids:
+                    v = self.concept_vectors.get(cid)
+                    if v is not None:
+                        ef.sync_word(cid, v)
+        return {'reinit': reinit_count, 'e5': e5_count, 'method': 'morph_bundle' if morph_bundle else 'direct_e5' if e5_model else 'random'}
 
     def build_octree_fields(self, lattice, n_anchors=1024, min_lcp=1, gamma=0.5, path_overrides=None):
         """Build H matrix and field_bits from nested octree encoding.
@@ -1775,6 +1860,9 @@ class ConceptSpace:
                     v = self.fractal.compute_vector(cid)
                     if v is not None:
                         self.concept_vectors[cid] = v
+                    # Sync to EntityField for VSA-composed word vectors
+                    if hasattr(self, 'entity_field') and v is not None:
+                        self.entity_field.sync_word(cid, v)
                     n_reinit += 1
             if n_reinit:
                 print(f"  [harmonizer] {n_reinit} words initialised from morphology")
@@ -1795,7 +1883,92 @@ class ConceptSpace:
             print(f"  [harmonizer] MorphVocab load failed: {e}")
         return self._morph_vocab
 
-    def _decompose_word(self, word):
+    def _pymorphy_decompose(self, word):
+        """Fallback decomposition using pymorphy3 (Python 3.12+ compatible fork).
+
+        Returns dict of {role: string} or None if parse confidence too low.
+        """
+        import pymorphy3
+        morph = getattr(self, '_pymorphy_analyzer', None)
+        if morph is None:
+            morph = pymorphy3.MorphAnalyzer()
+            self._pymorphy_analyzer = morph
+
+        parsed = morph.parse(word)
+        if not parsed or parsed[0].score < 0.3:
+            return None
+
+        p = parsed[0]
+        nf = p.normal_form.lower()
+        w = word.lower().strip()
+
+        if w == nf or len(w) < 4:
+            return {'ROOT': nf}
+
+        # Known Russian prefixes (same as rule-based)
+        _pfx_list = ['вз', 'воз', 'вос', 'вы', 'до', 'за', 'из', 'ис',
+                     'на', 'над', 'наи', 'не', 'недо', 'низ', 'нис',
+                     'о', 'об', 'обез', 'обес', 'пере', 'по', 'под',
+                     'подо', 'пра', 'пред', 'пре', 'при', 'про',
+                     'раз', 'рас', 'со', 'с', 'у', 'без', 'бес']
+
+        # Strip known prefix from word
+        rest = w
+        pfx = ''
+        for p in sorted(_pfx_list, key=len, reverse=True):
+            if not rest.startswith(p):
+                continue
+            min_stem = 3 if len(p) == 1 else 2  # single-letter prefixes need longer stem
+            if len(rest) <= len(p) + min_stem:
+                continue
+            # If normal_form also starts with this prefix, it's part of the root
+            if nf.startswith(p) and len(nf) > len(p) + min_stem:
+                continue
+            pfx = p
+            rest = rest[len(p):]
+            break
+
+        # Strip same prefix from normal_form (if and only if word had it)
+        nf_stem = nf
+        if pfx:
+            for p in sorted(_pfx_list, key=len, reverse=True):
+                if nf_stem.startswith(p):
+                    nf_stem = nf_stem[len(p):]
+                    break
+
+        result = {}
+        if pfx:
+            result['PREFIX'] = pfx
+
+        # Align rest with nf_stem via longest common prefix
+        i = 0
+        while i < min(len(rest), len(nf_stem)) and rest[i] == nf_stem[i]:
+            i += 1
+
+        if i >= 2:
+            result['ROOT'] = rest[:i]
+            if i < len(rest):
+                result['ENDING'] = rest[i:]
+        elif len(rest) <= len(nf_stem) + 3:
+            # Word form similar length to lemma — consonant boundary split
+            _cons = set('бвгджзйклмнпрстфхцчшщ')
+            split_pos = max(2, len(rest) - 2)
+            while split_pos < len(rest) and rest[split_pos] not in _cons:
+                split_pos += 1
+            if split_pos < len(rest):
+                result['ROOT'] = rest[:split_pos]
+                result['ENDING'] = rest[split_pos:]
+            else:
+                result['ROOT'] = rest
+        else:
+            result['ROOT'] = nf_stem if len(nf_stem) >= 2 else rest[:3]
+            suffix = rest[len(result['ROOT']):] if rest.startswith(result['ROOT']) else rest[i:]
+            if suffix:
+                result['ENDING'] = suffix
+
+        return result
+
+    def _rule_decompose(self, word):
         """Rule-based Russian morpheme decomposition: prefix+stem+ending.
 
         Returns dict of {role: string} or None if confidence < threshold.
@@ -1831,25 +2004,26 @@ class ConceptSpace:
         # 1. Split prefix
         pfx = ''
         for p in sorted(prefixes, key=len, reverse=True):
-            if rest.startswith(p) and len(rest) > len(p) + 2:
-                nxt = rest[len(p)]
-                if nxt in 'аеёиоуыэюя':
-                    continue
-                pfx = p
-                rest = rest[len(p):]
-                result['PREFIX'] = pfx
-                break
+            if not rest.startswith(p):
+                continue
+            min_stem = 3 if len(p) == 1 else 2
+            if len(rest) <= len(p) + min_stem:
+                continue
+            nxt = rest[len(p)]
+            if nxt in 'аеёиоуыэюя':
+                continue
+            pfx = p
+            rest = rest[len(p):]
+            result['PREFIX'] = pfx
+            break
 
         # 2. Split ending
-        ending = ''
         for e in sorted(endings, key=len, reverse=True):
             if len(rest) > len(e) + 1 and rest.endswith(e):
-                # Check the char before ending is a consonant
                 pre = rest[-(len(e) + 1)]
                 if pre in 'бвгджзйклмнпрстфхцчшщ':
-                    ending = e
                     rest = rest[:-len(e)]
-                    result['ENDING'] = ending
+                    result['ENDING'] = e
                     break
 
         # 3. The remainder is the stem (root + suffix)
@@ -1867,13 +2041,32 @@ class ConceptSpace:
         if confidence < threshold:
             return None
 
-        # Try to also get lemma from natasha via morph_vocab if available
-        mv = self._load_morph_vocab()
-        if mv and word in mv.word_cache:
-            # morph_vocab has lemma info stored at build time
-            pass  # we could use lemma as canonical root
-
         return result
+
+    @staticmethod
+    def _has_cyrillic(text):
+        """Check if text contains at least one Cyrillic letter."""
+        return any('\u0400' <= c <= '\u04FF' for c in text)
+
+    def _decompose_word(self, word):
+        """Two-level morpheme decomposition:
+
+        1. pymorphy3 (morphological analysis) — high accuracy, 100% coverage
+        2. Rule-based (prefix+stem+ending tables) — fallback if pymorphy3 unavailable
+
+        Returns dict of {role: string} or None if all methods fail.
+        """
+        # Skip tokens without Cyrillic content
+        w = word.lower().strip()
+        if len(w) < 3 or not self._has_cyrillic(w):
+            return None
+        # Skip pure punctuation/numbers
+        if all(c in '.,!?;:()[]{}«»—–-…\'\"1234567890 ' for c in w):
+            return None
+        result = self._pymorphy_decompose(word)
+        if result is not None:
+            return result
+        return self._rule_decompose(word)
 
     def _build_morphemes(self, sp=None):
         """Build morpheme field from MorphVocab: decompose known words and
@@ -2119,7 +2312,6 @@ class ConceptSpace:
             ce_vals = gen._ce_t[cids_t].cpu().numpy()
             self.fractal._apply_l1_batch(new_codes_np, ce_vals.tolist(), cid_list=cids)
         gen._codes_master_t[cids_t] = new_codes.to(torch.float32)
-        gen._codes_t[cids_t] = new_codes.to(torch.bfloat16)
         for i, cid in enumerate(cids):
             v_new = new_vecs_np[i]
             code_new = new_codes_np[i]

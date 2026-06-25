@@ -1058,7 +1058,7 @@ class STDPTrainer:
                 gen._mom_t = torch.zeros(gen._vecs_t.shape[0], D, device=device, dtype=torch.bfloat16)
             avg_grad = acc / cnt[:, None].clamp(min=1)
             mom_new = momentum_mu * gen._mom_t[unique_gen] + (1 - momentum_mu) * avg_grad
-            gen._mom_t[unique_gen] = mom_new.to(torch.bfloat16)
+            gen._mom_t[unique_gen] = mom_new.to(torch.float16)
 
         # G-60/SN-45: GPU destabilization (replaces CPU per-element loop with tensor ops)
         if destab_scale > 0:
@@ -1100,7 +1100,7 @@ class STDPTrainer:
         for gi, gen_cid in enumerate(unique_gen):
             if not valid_mask[gi] or elr_grouped[gi] <= 0:
                 continue
-            if self.subspace_lr is not None and cs.fractal.basis is not None and gen._codes_t is not None:
+            if self.subspace_lr is not None and cs.fractal.basis is not None and gen._codes_master_t is not None:
                 _subspace_cids.append(gen_cid)
                 _subspace_grads.append(grad_gpu[gi].cpu().numpy())
             else:

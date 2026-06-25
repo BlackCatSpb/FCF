@@ -115,8 +115,7 @@ class CrystalGenerator:
         self._ce_t = None
         self._mom_t = None
         self._basis_t = None
-        self._codes_t = None
-        self._codes_master_t = None  # fp32 master for STDP gradient precision
+        self._codes_master_t = None  # bf16 latent codes for STDP gradient precision
         self._ema_vecs_t = None  # EMA copy for stable eval/generation (TN-2)
         self._ema_decay = 0.999
         self._ema_steps = 0
@@ -295,10 +294,8 @@ class CrystalGenerator:
         codes_arr = np.zeros((V, latent_dim), dtype=np.float32)
         for cid, code in cs.fractal.codes.items():
             codes_arr[cid] = code
-        if self._codes_t is None or self._codes_t.shape[0] != V or self._codes_t.device != dev:
-            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.bfloat16)
+        if self._codes_master_t is None or self._codes_master_t.shape[0] != V or self._codes_master_t.device != dev:
             self._codes_master_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float32)
-        self._codes_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
         self._codes_master_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
 
         # Concept error tensor for vectorized GPU negative sampling
@@ -324,7 +321,7 @@ class CrystalGenerator:
         self._ema_steps = 0
 
         if self._mom_t is None or self._mom_t.shape[0] != V or self._mom_t.device != dev:
-            self._mom_t = torch.zeros(V, D, device=dev, dtype=torch.bfloat16)
+            self._mom_t = torch.zeros(V, D, device=dev, dtype=torch.float16)
 
         # G-49: pre-allocate fused buffer for scatter_add (grows on demand, not full V)
         if self._fused_buf is None or self._fused_buf.shape[1] != D + 1 or self._fused_buf.device != dev:
@@ -347,7 +344,6 @@ class CrystalGenerator:
         """Mark GPU tensors as stale; triggers rebuild on next _ensure_torch.
         Call after fluctuate_fractal() or any code-level change."""
         self._mom_t = None
-        self._codes_t = None
         self._codes_master_t = None
         self._torch_dirty = True
         self._cluster_potential = None  # stale after vector flush
@@ -355,8 +351,8 @@ class CrystalGenerator:
     def _sync_after_fluctuate(self):
         """SN-54: Incremental GPU sync after fluctuate — no full O(V·D) rebuild.
 
-        Reads CPU codes → copies to GPU _codes_t → recomputes _vecs_t via
-        batched matmul (_codes_t @ _basis_t), avoiding the per-concept
+        Reads CPU codes → copies to GPU _codes_master_t → recomputes _vecs_t via
+        batched matmul (_codes_master_t @ _basis_t), avoiding the per-concept
         CPU loop + PCIe transfer of _build_torch_tensors.
         """
         cs = self.cs
@@ -371,10 +367,8 @@ class CrystalGenerator:
         for cid, code in cs.fractal.codes.items():
             codes_arr[cid] = code
 
-        if self._codes_t is None or self._codes_t.shape[0] != V:
-            self._codes_t = torch.empty(V, latent_dim, device=dev, dtype=torch.bfloat16)
+        if self._codes_master_t is None or self._codes_master_t.shape[0] != V:
             self._codes_master_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float32)
-        self._codes_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
         self._codes_master_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
 
         basis_t = self._basis_t

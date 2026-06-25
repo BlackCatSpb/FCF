@@ -1087,8 +1087,8 @@ class TestQNV11:
     def test_subspace_update_batch_basic(self, gen, cs):
         gen._torch_device = torch.device('cpu')
         gen._ensure_torch(device='cpu')
-        if not hasattr(gen, '_codes_t') or gen._codes_t is None:
-            pytest.skip("No _codes_t")
+        if not hasattr(gen, '_codes_master_t') or gen._codes_master_t is None:
+            pytest.skip("No _codes_master_t")
         lr_mix = (0.01, 0.005, 0.001)
         cids = [0, 1, 2]
         dim = cs.dim
@@ -1103,8 +1103,8 @@ class TestQNV11:
     def test_subspace_update_batch_shift(self, gen, cs):
         gen._torch_device = torch.device('cpu')
         gen._ensure_torch(device='cpu')
-        if not hasattr(gen, '_codes_t') or gen._codes_t is None:
-            pytest.skip("No _codes_t")
+        if not hasattr(gen, '_codes_master_t') or gen._codes_master_t is None:
+            pytest.skip("No _codes_master_t")
         shift_before = cs._total_shift
         lr_mix = (0.01, 0.005, 0.001)
         grads = np.random.RandomState(1).randn(2, cs.dim).astype(np.float32)
@@ -1115,8 +1115,8 @@ class TestQNV11:
     def test_subspace_update_batch_unit_norm(self, gen, cs):
         gen._torch_device = torch.device('cpu')
         gen._ensure_torch(device='cpu')
-        if not hasattr(gen, '_codes_t') or gen._codes_t is None:
-            pytest.skip("No _codes_t")
+        if not hasattr(gen, '_codes_master_t') or gen._codes_master_t is None:
+            pytest.skip("No _codes_master_t")
         cids = [0, 3, 5]
         grads = np.random.RandomState(2).randn(len(cids), cs.dim).astype(np.float32)
         cs._apply_subspace_update_batch(cids, grads, 0.02, (0.01, 0.005, 0.001), gen)
@@ -1128,8 +1128,8 @@ class TestQNV11:
     def test_subspace_update_batch_codes_sync(self, gen, cs):
         gen._torch_device = torch.device('cpu')
         gen._ensure_torch(device='cpu')
-        if not hasattr(gen, '_codes_t') or gen._codes_t is None:
-            pytest.skip("No _codes_t")
+        if not hasattr(gen, '_codes_master_t') or gen._codes_master_t is None:
+            pytest.skip("No _codes_master_t")
         code_before = dict(cs.fractal.codes)
         grads = np.random.RandomState(3).randn(2, cs.dim).astype(np.float32)
         cs._apply_subspace_update_batch([0, 1], grads, 0.02, (0.01, 0.005, 0.001), gen)
@@ -1597,30 +1597,30 @@ class TestQNV12:
         assert torch.isfinite(gen._ema_vecs_t[:2]).all(), "bf16 EMA underflow after 100 steps"
 
     @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-    def test_mom_bf16_stability(self, gen):
-        """Verify bf16 _mom_t doesn't underflow after many steps."""
+    def test_mom_fp16_stability(self, gen):
+        """Verify fp16 _mom_t doesn't underflow after many steps."""
         gen._torch_device = torch.device('cpu')
         gen._ensure_torch(device='cpu')
-        if gen._mom_t is None or gen._mom_t.dtype != torch.bfloat16:
-            pytest.skip("No bf16 mom_t")
+        if gen._mom_t is None or gen._mom_t.dtype != torch.float16:
+            pytest.skip("No fp16 mom_t")
         for _ in range(100):
-            noise = torch.randn(2, gen._mom_t.shape[1], device=gen._torch_device, dtype=torch.bfloat16) * 1e-6
+            noise = torch.randn(2, gen._mom_t.shape[1], device=gen._torch_device, dtype=torch.float16) * 1e-6
             gen._mom_t[[0, 1]] = 0.9 * gen._mom_t[[0, 1]] + 0.1 * noise
-        assert torch.isfinite(gen._mom_t[:2]).all(), "bf16 mom_t underflow after 100 steps"
+        assert torch.isfinite(gen._mom_t[:2]).all(), "fp16 mom_t underflow after 100 steps"
 
     @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-    def test_codes_fp16_roundtrip(self, gen, cs):
-        """Verify fp16 _codes_t roundtrip: read → write → read preserves norm."""
+    def test_codes_fp32_roundtrip(self, gen, cs):
+        """Verify fp32 _codes_master_t roundtrip: read → write → read preserves norm."""
         gen._torch_device = torch.device('cpu')
         gen._ensure_torch(device='cpu')
-        if gen._codes_t is None or gen._codes_t.dtype != torch.float16:
-            pytest.skip("No fp16 _codes_t")
+        if gen._codes_master_t is None or gen._codes_master_t.dtype != torch.float32:
+            pytest.skip("No fp32 _codes_master_t")
         cids_t = torch.tensor([0, 1], dtype=torch.long, device=gen._torch_device)
-        codes_in = gen._codes_t[cids_t].clone()
-        gen._codes_t[cids_t] = codes_in * 0.5  # modify
-        codes_out = gen._codes_t[cids_t]
+        codes_in = gen._codes_master_t[cids_t].clone()
+        gen._codes_master_t[cids_t] = codes_in * 0.5  # modify
+        codes_out = gen._codes_master_t[cids_t]
         diff = (codes_in * 0.5 - codes_out).abs().max()
-        assert diff < 1e-4, f"fp16 roundtrip error too large: {diff}"
+        assert diff < 1e-6, f"fp32 roundtrip error too large: {diff}"
 
     # ── QN-63: Cleanup public API (2 tests) ────────────────────────
     def test_cleanup_old_method_exists(self):
@@ -1680,8 +1680,8 @@ class TestQNV14:
         """Verify _sync_after_fluctuate produces unit-norm vectors."""
         gen._torch_device = torch.device('cpu')
         gen._ensure_torch(device='cpu')
-        if gen._codes_t is None:
-            pytest.skip("No _codes_t")
+        if gen._codes_master_t is None:
+            pytest.skip("No _codes_master_t")
         cs.fluctuate_fractal(fluctuation_amp=0.003, decay=0.9995, generator=gen)
         gen._sync_after_fluctuate()
         norms = gen._vecs_t[:min(10, gen._vecs_t.shape[0])].norm(dim=1)
@@ -1693,8 +1693,8 @@ class TestQNV14:
         """Verify _sync_after_fluctuate refreshes _ema_vecs_t (SN-58)."""
         gen._torch_device = torch.device('cpu')
         gen._ensure_torch(device='cpu')
-        if gen._codes_t is None or gen._ema_vecs_t is None:
-            pytest.skip("No _codes_t or _ema_vecs_t")
+        if gen._codes_master_t is None or gen._ema_vecs_t is None:
+            pytest.skip("No _codes_master_t or _ema_vecs_t")
         ema_before = gen._ema_vecs_t[0].clone()
         cs.fluctuate_fractal(fluctuation_amp=0.003, decay=0.9995, generator=gen)
         gen._sync_after_fluctuate()

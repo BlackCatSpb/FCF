@@ -117,6 +117,18 @@ class STDPTrainer:
         else:
             self.manifold = None
 
+        if _c.use_morph_manifold and _c.beam_buffer_size > 0:
+            self.morph_manifold = TransitionManifold(
+                dim=_c.beam_dim or gen.cs.dim,
+                buffer_size=_c.morph_manifold_buffer,
+                cos_threshold=_c.beam_cos_threshold,
+                max_beams=_c.beam_max,
+                rebuild_interval=_c.beam_rebuild_interval,
+                eps=_c.beam_eps,
+            )
+        else:
+            self.morph_manifold = None
+
 
     # ═══════════════════════════════════════════════════
     # Public API
@@ -437,6 +449,38 @@ class STDPTrainer:
                     cs._apply_vector_update(cid, new_v)
                     ef.sync_word(cid, new_v)
                     updated_cids.append(cid)
+
+        # ── P1.9: Morph-level transition manifold ──
+        mm = getattr(self, 'morph_manifold', None)
+        if mm is not None and hasattr(harm, 'word_morphs'):
+            for cid in morph_cids:
+                parts = harm.word_morphs.get(cid, [])
+                if len(parts) < 2:
+                    continue
+                morph_seqs = []
+                for morph_id, _role in parts:
+                    mv = harm.morphemes.get(morph_id)
+                    if mv is not None:
+                        morph_seqs.append(mv)
+                for i in range(len(morph_seqs) - 1):
+                    T = mm._vsa_transition(morph_seqs[i + 1], morph_seqs[i])
+                    if np.linalg.norm(T) > mm._eps:
+                        mm.push(T)
+                        cent, sim, _cnt = mm.nearest_beam(T)
+                        if cent is not None and sim > mm.cos_threshold * 0.8:
+                            pull = cent - T
+                            pn = float(np.linalg.norm(pull))
+                            if pn > 1e-10:
+                                updated_mv = morph_seqs[i] + pull * 0.01 * sim
+                                unm = float(np.linalg.norm(updated_mv))
+                                if unm > 1e-10:
+                                    morph_id_i, _role_i = parts[i]
+                                    harm.morphemes[morph_id_i] = (updated_mv / unm).astype(np.float32)
+                                updated_mv2 = morph_seqs[i + 1] + pull * 0.01 * sim
+                                unm2 = float(np.linalg.norm(updated_mv2))
+                                if unm2 > 1e-10:
+                                    morph_id_j, _role_j = parts[i + 1]
+                                    harm.morphemes[morph_id_j] = (updated_mv2 / unm2).astype(np.float32)
 
         # ── 3b. P1.3: EntityField → STDP feedback (error_clip + momentum) ──
         if morph_cids:

@@ -787,6 +787,8 @@ class FCFConfig:
     use_hd_transformer: bool = False    # HDTransformerLayer in _train
     morph_stdp_cohesion: float = 0.6    # cohesion threshold
     morph_stdp_discover_every: int = 100  # discover every N batches
+    use_morph_manifold: bool = False    # TransitionManifold for morph sequences
+    morph_manifold_buffer: int = 2000   # buffer size for morph transitions
 
     # ──────────────────────────────────────────
     #  Генерация пар из MorphVocab/корпуса

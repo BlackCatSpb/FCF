@@ -622,7 +622,7 @@ class FCFConfig:
     lr_warmup_lines: int = 1000
     lr_cosine_T0: int = 5000
     lr_cosine_mult: float = 1.5
-    checkpoint_every: int = 5000
+    checkpoint_every: int = 4181      # F₁₉
     eval_every_fast: int = 1000
     eval_every_slow: int = 2000
     eval_fast_lines: int = 64      # TN-9: lines for fast eval (PPL only)
@@ -648,7 +648,7 @@ class FCFConfig:
 
     # ── Defaults для build_octree_fields ──────
     octree_min_lcp: int = 2
-    octree_gamma: float = 0.5
+    octree_gamma: float = 1.0 / ((1.0 + 5.0 ** 0.5) / 2.0)  # 1/φ ≈ 0.618
 
     # ── Val split ─────────────────────────────
     val_pct: float = 0.05
@@ -670,7 +670,7 @@ class FCFConfig:
 
     # ── Transition Manifold (паутина переходов) ──
     beam_dim: int = 0                 # 0 = auto (== dim)
-    beam_buffer_size: int = 10000     # макс. переходов в буфере
+    beam_buffer_size: int = 10946      # F₂₁
     beam_cos_threshold: float = 0.8   # порог объединения в луч
     beam_max: int = 100               # макс. число лучей
     beam_rebuild_interval: int = 100   # перестраивать каждые N переходов
@@ -708,7 +708,7 @@ class FCFConfig:
 
     # ── Manage ────────────────────────────────
     cleanup_keep: int = 5       # сколько чекпоинтов хранить
-    periodic_save_every: int = 5000
+    periodic_save_every: int = 4181      # F₁₉
 
     # ── P1-A: crystal_generator graph search ─
     fractal_l1_lambda: float = 0.001
@@ -781,7 +781,7 @@ class FCFConfig:
     subspace_redistribute_m_ratio: float = 0.4
 
     # ── P1-D: concept_space FractalField ──────
-    fractal_hdc_memory_max: int = 20000
+    fractal_hdc_memory_max: int = 17711     # F₂₂
     fractal_init_z_c_active_pct: float = 0.03
     fractal_init_z_c_active_min: int = 8
     fractal_init_z_a_scale: float = 0.01

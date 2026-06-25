@@ -20,7 +20,7 @@ class TransitionManifold:
       rebuild_interval — через сколько переходов перестраивать лучи (100)
     """
 
-    def __init__(self, dim: int = 768, buffer_size: int = 10000,
+    def __init__(self, dim: int = 768, buffer_size: int = 10946,  # F₂₁
                  cos_threshold: float = 0.8, max_beams: int = 100,
                  rebuild_interval: int = 100, eps: float = 1e-10,
                  min_count_base: int = 3, min_count_divisor: int = 4):

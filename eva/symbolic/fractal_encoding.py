@@ -15,40 +15,18 @@ hierarchy that naturally encodes nested structure.
 try:
     from eva.symbolic.fcf_config import FCFConfig as _FCFConfig
     __cfg = _FCFConfig()
-    LEVELS = __cfg.octree_levels      # reusing config key; same semantics
+    LEVELS = __cfg.octree_levels
     GAMMA = __cfg.octree_gamma
 except (ImportError, AttributeError):
     LEVELS = 16
     GAMMA = 0.5
 
-# ── Fibonacci helpers (lightweight, no class overhead) ────────────
-
-_FIB_CACHE = {0: 0, 1: 1}
-
-
-def _fib(n: int) -> int:
-    if n < 0:
-        return 0
-    if n not in _FIB_CACHE:
-        _FIB_CACHE[n] = _fib(n - 1) + _fib(n - 2)
-    return _FIB_CACHE[n]
+from eva.symbolic.fibonacci_utils import FibonacciUtils as _FU
 
 
 def _zeckendorf(n: int) -> list[int]:
     """Decompose n into sum of non-consecutive Fibonacci numbers (Zeckendorf)."""
-    if n <= 0:
-        return [0]
-    # Find largest Fib <= n
-    i = 2
-    while _fib(i) <= n:
-        i += 1
-    fibs = [_fib(k) for k in range(i - 1, 1, -1)]
-    result = []
-    for f in fibs:
-        if n >= f:
-            result.append(f)
-            n -= f
-    return result
+    return _FU.zeckendorf(n)
 
 
 def path(val: int) -> tuple[int, ...]:

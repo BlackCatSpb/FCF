@@ -573,27 +573,29 @@ class TrainingPipeline:
             print(f"  gen({seed}): {txt}")
         if idx % (CHECKPOINT_EVERY * 5) == 0:
             _quiet(save_3d_vis, cs, self.sp, ckpt_name)
-        eval_vppl = eval_acc1 = eval_vacc1 = None
+        self.eval_vppl = getattr(self, 'eval_vppl', None)
+        self.eval_acc1 = getattr(self, 'eval_acc1', None)
+        self.eval_vacc1 = getattr(self, 'eval_vacc1', None)
         if idx > 0 and idx % self.cfg.eval_every_fast == 0:
             self._eval_count += 1
             is_full = (self._eval_count * self.cfg.eval_every_fast) % self.cfg.eval_every_full == 0
             max_lines = self.cfg.eval_full_lines if is_full else self.cfg.eval_fast_lines
             eval_result = _quiet(gen.evaluate, self.cfg.val_corpus_path, max_lines=max_lines)
             if eval_result is not None:
-                eval_vppl = eval_result.get('vec_perplexity')
+                self.eval_vppl = eval_result.get('vec_perplexity')
                 if is_full:
                     ppl = eval_result.get('perplexity')
-                    eval_acc1 = eval_result.get('accuracy_top1')
-                    eval_vacc1 = eval_result.get('vec_accuracy_top1')
+                    self.eval_acc1 = eval_result.get('accuracy_top1')
+                    self.eval_vacc1 = eval_result.get('vec_accuracy_top1')
                     self.ppl_history.append((idx, ppl))
-                    self.vppl_history.append((idx, eval_vppl))
+                    self.vppl_history.append((idx, self.eval_vppl))
                     ppl_trend = ''
                     if len(self.ppl_history) >= 2:
                         d = ppl - self.ppl_history[-2][1]
                         ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
-                    print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={eval_acc1:.3f} vPPL={eval_vppl:.0f} vacc@1={eval_vacc1:.3f}")
+                    print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={self.eval_acc1:.3f} vPPL={self.eval_vppl:.0f} vacc@1={self.eval_vacc1:.3f}")
                     # TN-4: Early Stopping + Best Checkpoint
-                    score = eval_vppl + (1.0 - eval_vacc1 if eval_vacc1 is not None else 0) * 50
+                    score = self.eval_vppl + (1.0 - self.eval_vacc1 if self.eval_vacc1 is not None else 0) * 50
                     if score < self.best_score:
                         self.best_score = score
                         self.best_ckpt_name = ckpt_name
@@ -601,10 +603,10 @@ class TrainingPipeline:
                     else:
                         self.patience_counter += 1
                 else:
-                    self.vppl_history.append((idx, eval_vppl))
-                    print(f"  vPPL={eval_vppl:.0f} (fast)")
+                    self.vppl_history.append((idx, self.eval_vppl))
+                    print(f"  vPPL={self.eval_vppl:.0f} (fast)")
         opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
-                 vec_ppl=eval_vppl, acc1=eval_acc1, vacc1=eval_vacc1)
+                 vec_ppl=self.eval_vppl, acc1=self.eval_acc1, vacc1=self.eval_vacc1)
         # T-B1: Self-paced learning rescore (once per epoch)
         if self._rescore_line is None and epoch_train is not None and start_line is not None:
             remaining = idx - start_line + 1
@@ -958,7 +960,7 @@ try:
                                          current_cos=last_cos_sim[0] if last_cos_sim else None)
                     pipeline.last_fluct_lines = idx
                 # P1.4: EMA-based batch plateau (replaces hard ×2/×0.95)
-                plateau_loss = eval_vppl if eval_vppl is not None else mean_sim * 1000
+                plateau_loss = pipeline.eval_vppl if pipeline.eval_vppl is not None else mean_sim * 1000
                 plateau_df = pipeline._plateau_detector.update(plateau_loss, idx)
                 if pipeline.opt._full_stuck_counter >= 5:
                     _batch_mult = max(1.0, min(4.0, _batch_mult * 0.85))

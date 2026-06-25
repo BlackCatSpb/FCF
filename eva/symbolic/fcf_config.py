@@ -858,6 +858,29 @@ class FCFConfig:
                 setattr(cfg, k, v)
         return cfg
 
+    # ── Hot-reload ────────────────────────────────────────────────
+
+    _observers: List = field(default_factory=list, init=False, repr=False)
+
+    def subscribe(self, fn):
+        self._observers.append(fn)
+
+    def notify_observers(self):
+        for fn in self._observers:
+            try:
+                fn(self)
+            except Exception:
+                pass
+
+    def reload(self, path=None):
+        cfg = FCFConfig.load(path)
+        for k, v in cfg.__dict__.items():
+            if not k.startswith('_') and hasattr(self, k):
+                setattr(self, k, v)
+        self.__post_init__()
+        self.notify_observers()
+        return self
+
     def __post_init__(self):
         # AM-8: Configuration Schema Validation
         assert self.dim > 0 and self.dim % 8 == 0, f"dim={self.dim} must be >0 and divisible by 8"

@@ -801,13 +801,13 @@ class FCFConfig:
     fractal_l1_lambda_cap: float = 0.1
 
     # ── Dead code integration ────────────────────────────────────
-    use_morph_stdp: bool = False        # MorphSTDP in _harmonize_batch
-    use_vsa_attention: bool = False     # VSAAttention in _branch
-    use_hd_transformer: bool = False    # HDTransformerLayer in _train
-    use_temporal_zeckendorf: bool = False  # TemporalZeckendorf replaces exp(-dist/theta_tau)
+    use_morph_stdp: bool = True         # MorphSTDP in _harmonize_batch
+    use_vsa_attention: bool = True      # VSAAttention in _branch
+    use_hd_transformer: bool = True     # HDTransformerLayer in _train
+    use_temporal_zeckendorf: bool = True  # TemporalZeckendorf replaces exp(-dist/theta_tau)
     morph_stdp_cohesion: float = 0.6    # cohesion threshold
     morph_stdp_discover_every: int = 100  # discover every N batches
-    use_morph_manifold: bool = False    # TransitionManifold for morph sequences
+    use_morph_manifold: bool = True     # TransitionManifold for morph sequences
     morph_manifold_buffer: int = 2000   # buffer size for morph transitions
 
     # ──────────────────────────────────────────

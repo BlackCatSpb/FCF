@@ -140,7 +140,21 @@ train.bat
 | `--no-harmonize` | Отключить морфологическую гармонизацию |
 | `--no-morpheme-field` | Отключить морфемное поле (GPU < 2GB) |
 
-**Требования:** Python 3.8+, PyTorch (опционально), SentencePiece, NumPy, scikit-learn.
+**Требования:** Python 3.8+, PyTorch (опционально), SentencePiece, NumPy, scikit-learn, sentence-transformers (опционально, для seed_embeddings).
+
+---
+
+### Предварительная инициализация эмбеддингами e5
+
+Для freq<3 концептов (стартуют со случайных векторов) можно залить осмысленные семантические векторы из `multilingual-e5-base` (768D, совпадает с размерностью FCF):
+
+```bash
+python scripts/seed_embeddings.py --cs real_data/concept_space.json --sp real_data/bpe_ru_146k.model --device cpu
+```
+
+После этого запускать `train_full.py` как обычно. Редкие токены начинают не с шума, а с осмысленного семантического положения — меньше шагов STDP до стабилизации.
+
+Флаги: `--all` — залить все концепты; `--threshold N` — порог частоты (по умолч. 3); `--device cuda` — GPU.
 
 ---
 

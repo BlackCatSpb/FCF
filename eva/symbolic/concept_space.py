@@ -1249,51 +1249,9 @@ class EntityField:
                 self.entities[key] /= n
 
 
-class CharEnvelope:
-    """Char-level semantic envelope (P3.1 V18): Unicode codepoint → HD vector.
-
-    Позволяет модулировать word vector на основе char-level контекста.
-    LFU eviction при превышении max_chars.
-    """
-
-    def __init__(self, dim=768, max_chars=5000):
-        self.dim = dim
-        self.max_chars = max_chars
-        self._char_vecs = {}
-        self._access_count = {}
-
-    def ensure(self, codepoint):
-        if codepoint not in self._char_vecs:
-            if len(self._char_vecs) >= self.max_chars:
-                evict = min(self._access_count, key=self._access_count.get)
-                self._char_vecs.pop(evict, None)
-                self._access_count.pop(evict, None)
-            from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
-            rng = _R.rng(f'charenv_{codepoint}')
-            v = rng.randn(self.dim).astype(np.float32)
-            n = np.linalg.norm(v)
-            self._char_vecs[codepoint] = v / n if n > 1e-10 else v
-        self._access_count[codepoint] = self._access_count.get(codepoint, 0) + 1
-        return self._char_vecs[codepoint]
-
-    def word_envelope(self, word_text):
-        """Word = ρ⁰(c₁) ⊛ ρ¹(c₂) ⊛ ρ²(c₃) ⊛ ... — order-sensitive chain."""
-        if not word_text:
-            return None
-        result = None
-        for i, ch in enumerate(word_text):
-            cv = self.ensure(ord(ch))
-            shifted = np.roll(cv, i)
-            result = shifted if result is None else _hybrid_bind(result, shifted)
-        nrm = np.linalg.norm(result)
-        return result / nrm if nrm > 1e-10 else result
-
-    def modulate(self, word_vec, char_env, strength=0.05):
-        """Модулировать word vector char-level envelope через VSA binding."""
-        bound = _hybrid_bind(char_env, word_vec)
-        result = word_vec + bound * strength
-        n = np.linalg.norm(result)
-        return result / n if n > 1e-10 else result
+from eva.symbolic.semantic_piece import CharEnvelope
+# CharEnvelope previously was a separate class here; now unified with semantic_piece.
+# API compatible: CharEnvelope(dim, max_chars=...) → ensure / word_envelope / modulate / stdp_update
 
 
 class Harmonizer:

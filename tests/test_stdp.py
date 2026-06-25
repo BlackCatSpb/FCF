@@ -2458,7 +2458,7 @@ class TestCharEnvelope:
         ce = CharEnvelope(dim=128, max_chars=100)
         v = ce.ensure(ord('A'))
         assert v is not None
-        assert abs(np.linalg.norm(v) - 1.0) < 1e-6
+        assert abs(np.linalg.norm(v) - 1.0) < 1e-4
         v2 = ce.ensure(ord('A'))
         assert np.array_equal(v, v2)
 
@@ -2475,7 +2475,7 @@ class TestCharEnvelope:
         ce = CharEnvelope(dim=128)
         env = ce.word_envelope("cat")
         assert env is not None
-        assert abs(np.linalg.norm(env) - 1.0) < 1e-6
+        assert abs(np.linalg.norm(env) - 1.0) < 1e-4
 
     def test_charenvelope_word_envelope_empty(self):
         from eva.symbolic.concept_space import CharEnvelope
@@ -2489,7 +2489,7 @@ class TestCharEnvelope:
         word_vec /= np.linalg.norm(word_vec)
         char_env = ce.word_envelope("hello")
         modulated = ce.modulate(word_vec, char_env, strength=0.5)
-        assert abs(np.linalg.norm(modulated) - 1.0) < 1e-6
+        assert abs(np.linalg.norm(modulated) - 1.0) < 1e-4
         cos = np.dot(word_vec, modulated) / (np.linalg.norm(word_vec) * np.linalg.norm(modulated) + 1e-30)
         assert cos < 0.99, f"cos={cos:.4f}"
 
@@ -2509,7 +2509,7 @@ class TestCharEnvelope:
         ce.ensure(ord('b'))
         ce.ensure(ord('c'))
         ce.ensure(ord('d'))
-        assert len(ce._char_vecs) <= 3
+        assert len(ce.vecs) <= 3
 
     def test_charenvelope_word_envelope_multi_char(self):
         from eva.symbolic.concept_space import CharEnvelope

@@ -132,26 +132,53 @@ class MorphSTDP:
 
 
 class CharEnvelope:
-    """Character HD vectors — updated from STDP char→char bind learning.
+    """Character HD vectors — unified CharEnvelope.
 
     Each Unicode codepoint gets a unit-norm HD vector.
-    Vectors are refined by STDP: chars that co-occur in similar contexts
-    are pulled together.
+    Supports STDP learning, LFU eviction, word envelope composition,
+    and VSA modulation of word vectors with char-level context.
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, max_chars: Optional[int] = None):
         self.dim = dim
+        self.max_chars = max_chars
         self.vecs: Dict[int, np.ndarray] = {}
-        self.context_traces: Dict[int, np.ndarray] = {}  # for STDP eligibility
+        self._access_count: Dict[int, int] = {}
+        self.context_traces: Dict[int, np.ndarray] = {}
 
     def ensure(self, cp: int) -> np.ndarray:
-        """Get (or create) char vector."""
         if cp not in self.vecs:
+            if self.max_chars is not None and len(self.vecs) >= self.max_chars:
+                evict = min(self._access_count, key=self._access_count.get)
+                self.vecs.pop(evict, None)
+                self._access_count.pop(evict, None)
             v = _R.rng(f'char_init_{cp}').randn(self.dim).astype(np.float32)
             v /= max(np.linalg.norm(v), 1e-10)
-            self.vecs[cp] = v.astype(np.float16)
+            v_f16 = v.astype(np.float16)
+            vn = float(np.linalg.norm(v_f16))
+            self.vecs[cp] = (v_f16 / vn).astype(np.float16) if vn > 1e-10 else v_f16
+        self._access_count[cp] = self._access_count.get(cp, 0) + 1
         v = self.vecs[cp]
         return v.astype(np.float32) if hasattr(v, 'astype') else v
+
+    def word_envelope(self, word_text: str):
+        if not word_text:
+            return None
+        from eva.symbolic.concept_space import _hybrid_bind
+        result = None
+        for i, ch in enumerate(word_text):
+            cv = self.ensure(ord(ch))
+            shifted = np.roll(cv, i)
+            result = shifted if result is None else _hybrid_bind(result, shifted)
+        nrm = float(np.linalg.norm(result))
+        return result / nrm if nrm > 1e-10 else result
+
+    def modulate(self, word_vec, char_env, strength=0.05):
+        from eva.symbolic.concept_space import _hybrid_bind
+        bound = _hybrid_bind(char_env, word_vec)
+        result = word_vec + bound * strength
+        n = float(np.linalg.norm(result))
+        return result / n if n > 1e-10 else result
 
     def stdp_update(self, cp_trace: List[int], lr: float = 0.01):
         """STDP: chars that co-occur in the same trace attract each other."""
@@ -164,7 +191,7 @@ class CharEnvelope:
                 continue
             v = self.ensure(cp)
             dist = abs(i - center)
-            w = max(0.0, 1.0 - dist * 0.2)  # Gaussian-ish decay
+            w = max(0.0, 1.0 - dist * 0.2)
             delta = (c_center - v) * lr * w
             v_new = v + delta
             vn = float(np.linalg.norm(v_new))

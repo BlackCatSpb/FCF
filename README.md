@@ -95,6 +95,8 @@ v = normalize(z · B)   — проекция через ортонормиров
 
 **N-граммы** — статистическая решётка + HDC/VSA-резерв (bind/permute/bundle/unbind при нехватке данных).
 
+**Transition Manifold** — паутина переходов: каждый раз, когда A встречается перед B, модель запоминает не только факт пары, но и **направление** `T = unbind(B, A)` — вектор перехода от A к B. Эти векторы копятся в кольцевом буфере (10K) и самоорганизуются в лучи (VSA-кластеризация, до 100). При обучении STDP — мягкое притяжение к ближайшему лучу. При генерации — дополнительный RRF-сигнал `beam_score`: если переход лежит на известном луче, кандидат получает приоритет. Это аналог непрерывности residual stream в трансформерах, но реализованный через VSA в пространстве переходов.
+
 **EntityField** — рекурсивное семантическое поле: каждый символ, морфема, слово, предложение и абзац имеют единый вектор-представление в 2048D. VSA bind/unbind связывают все уровни: `V(char) += bind(V(word), CHAR_ROLE)` — симметричная проекция контекста на каждом уровне. Unbind(V(entity), role) восстанавливает суперпозицию контекстов.
 
 **Harmonizer** — трёхуровневая VSA-гармонизация (морфема ↔ слово ↔ предложение) через compose_word/decompose_word с контекстной модуляцией корня, dirty-флагами и slow-start обучением. Обратный индекс morph→word предотвращает лавинное распространение.
@@ -148,20 +150,36 @@ train.bat
 FCF/
 ├── eva/symbolic/
 │   ├── concept_space.py         # Ядро: концепты, EntityField, Harmonizer, поле, секторы, HDC
-│   ├── crystal_generator.py     # Движок обучения и генерации
-│   ├── stdp_trainer.py          # STDP, негативная выборка, контрастив, EntityField-гармонизация
-│   ├── fcf_config.py            # Конфигурация (dim=768, latent_dim=2048)
+│   ├── crystal_generator.py     # Движок обучения и генерации (RRF + beam_score)
+│   ├── stdp_trainer.py          # STDP, негативная выборка, контрастив, harmonize_batch, beam-pull
+│   ├── transition_manifold.py   # Паутина переходов: буфер + VSA-кластеризация в лучи
+│   ├── vsa_attention.py         # VSA-внимание (Zeckendorf-weighted bind)
+│   ├── hdtransformer_layer.py   # VSA-native однослойный трансформер
+│   ├── semantic_piece.py        # CharEnvelope (LFU-эвикция, word_envelope, modulate)
+│   ├── fcf_config.py            # Единый конфиг (dim, latent_dim, beam_*, fractal_*, subspace_*)
+│   ├── seed_registry.py         # Централизованный реестр сидов
 │   ├── syntax_lattice.py        # Статистическая n-граммная решётка
 │   ├── qwen_knowledge.py        # Дистиллят Qwen как LR-модулятор
 │   ├── morph_vocab.py           # Морфологический словарь
-│   ├── checkpoint_manager.py    # Асинхронное сохранение чекпоинтов
-│   ├── parameter_optimizer.py   # Адаптация гиперпараметров
+│   ├── checkpoint_manager.py    # Асинхронное сохранение чекпоинтов + state tracking
+│   ├── parameter_optimizer.py   # Адаптация гиперпараметров + Param cascade
 │   ├── fibonacci_utils.py       # Числа Фибоначчи, Zeckendorf, золотое сечение
-│   └── ...                      # VSA-утилиты внутри concept_space.py
+│   ├── dimension_coordinator.py # VRAM-оценщик размерностей
+│   ├── adaptive_controller.py   # FormulaCoefficients
+│   ├── vector_health.py         # Диагностика векторов
+│   ├── lsh_index.py             # LSH-индекс
+│   ├── hormonal_system.py       # Нейромодуляция (легаси → FormulaCoefficients)
+│   ├── fractal_encoding.py      # Октантные пути (легаси)
+│   └── experimental/            # Экспериментальные компоненты
 ├── train_full.py                # Конвейер обучения
 ├── inference.py                 # Инференс
 ├── eval_metrics.py              # Валидация
-├── tests/                       # 145 тестов
+├── scripts/                     # Диагностические и аналитические скрипты
+├── tests/                       # 314 тестов
+├── docs/                        # Документация
+├── logs/                        # Лог-файлы
+├── data/                        # Вспомогательные данные
+├── model/                       # Reference model implementation
 └── real_data/                   # Корпус, BPE-модель, чекпойнты
 ```
 
@@ -169,14 +187,13 @@ FCF/
 
 ## Документация
 
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — полное архитектурное описание на русском (динамическая размерность, поле-в-поле, HDC-интеграция, обучение, RRF-слияние, защита от коллапса)
-- **[NEUROMORPHIC.md](NEUROMORPHIC.md)** — подробный документ о нейроморфной совместимости (6 причин, обзор российских разработок, физика мемристоров)
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — полное архитектурное описание на русском (динамическая размерность, поле-в-поле, EntityField, Harmonizer, HDC-интеграция, Transition Manifold, RRF-слияние, защита от коллапса)
 
 ---
 
 ## Статус
 
-- ✅ 145 автоматических тестов
+- ✅ 314 автоматических тестов (8 пропущено — нет SentencePiece/FP16)
 - ✅ Полный конвейер обучения на 2GB GPU
 - ✅ Динамическая ёмкость (grow/prune latent_dim)
 - ✅ Обучаемые LSH-поля с иерархическим секторным индексом
@@ -186,6 +203,10 @@ FCF/
 - ✅ Collapse Guard, HDC LRU-кэш, batched rescore
 - ✅ **EntityField** — рекурсивное семантическое поле char↔word↔sent↔para (VSA bind/unbind)
 - ✅ **Harmonizer** — морфемная гармонизация: compose_word с контекстной модуляцией, dirty-флаги, slow-start
+- ✅ **Transition Manifold** — паутина переходов: буфер + VSA-кластеризация + beam-pull в STDP + beam_score в _branch
+- ✅ **FCFConfig** — единый источник истины: все константы из кода вынесены в конфиг
+- ✅ **Param cascade** — Param хранит ссылку на ParamDef, defaults обновляются из FCFConfig
+- ✅ **SeedRegistry** — централизованный реестр сидов (вместо hash/42/RandomState)
 - ✅ **Групповая алгебра ℤ₈^d** — VSAGrid с mixed-radix FFT, convolution on group
 - ✅ **VSACNN** — иерархическая VSA-свёртка (5 типов ядер: gaussian, laplacian, gabor, dog)
 - ✅ **Zeckendorf-взвешивание** — structured weight decomposition через числа Фибоначчи
@@ -194,9 +215,17 @@ FCF/
 - ✅ **MI-based dimension importance** — mutual information per dimension
 - ✅ **Fibonacci-позиционирование** — permute сдвигом на Fibonacci(t)
 - ✅ **Золотое сечение** — balance_subspaces с весами φ : 1 : 1/φ
+- ✅ **FormulaCoefficients** — hormonal_system унифицирован как словари формул в FCFConfig
+- ✅ **Hot-reload** — FCFConfig.reload() с подпиской наблюдателей
+- ✅ **Morph-level manifold** — отдельный TransitionManifold для морфемных переходов
+- ✅ **MorphSTDP** (default OFF) — STDP для морфемных биграмм
+- ✅ **VSAAttention** (default OFF) — VSA-внимание с Zeckendorf-взвешиванием
+- ✅ **HDTransformerLayer** (default OFF) — VSA-native однослойный трансформер
+- ✅ **VRAM-безопасность** — удалён неиспользуемый _codes_t (598 MB), ema_vecs_t на CPU, чанкованный fb_overlaps
 - ✅ **--no-harmonize / --no-morpheme-field** для GPU < 2GB
 - ✅ **Preharm checkpoint** — rollback до первой гармонизации
 - ✅ **Phase transition analysis** — PCA+визуализация на каждом чекпоинте
+- ✅ Организация репозитория: скрипты → scripts/, документация → docs/, логи → logs/
 
 ---
 

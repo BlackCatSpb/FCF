@@ -441,6 +441,7 @@ class STDPTrainer:
 
         # ── 3. Morpheme harmonisation ──
         dirty_words = list(harm.word_dirty)
+        basis = cs.fractal.basis
         for cid in dirty_words:
             v = cs.concept_vectors.get(cid)
             if v is not None:
@@ -450,11 +451,25 @@ class STDPTrainer:
                         sent_key = hash(tuple(ids))
                         sv = sent_vec_cache.get(sent_key)
                         break
-                new_v, delta = harm.harmonize(cid, v, sent_vec=sv)
-                if new_v is not None:
-                    cs._apply_vector_update(cid, new_v)
-                    ef.sync_word(cid, new_v)
-                    updated_cids.append(cid)
+                if basis is not None:
+                    v_latent = v @ basis.T
+                    v_ln = float(np.linalg.norm(v_latent))
+                    v_latent = v_latent / v_ln if v_ln > 1e-10 else v_latent
+                    new_v, delta = harm.harmonize(cid, v_latent, sent_vec=sv)
+                    if new_v is not None:
+                        v_concept = new_v @ basis
+                        cvn = float(np.linalg.norm(v_concept))
+                        if cvn > 1e-10:
+                            v_concept /= cvn
+                        cs._apply_vector_update(cid, v_concept)
+                        ef.sync_word(cid, v_concept)
+                        updated_cids.append(cid)
+                else:
+                    new_v, delta = harm.harmonize(cid, v, sent_vec=sv)
+                    if new_v is not None:
+                        cs._apply_vector_update(cid, new_v)
+                        ef.sync_word(cid, new_v)
+                        updated_cids.append(cid)
 
         # ── P1.9: Morph-level transition manifold ──
         mm = getattr(self, 'morph_manifold', None)

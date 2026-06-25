@@ -12,20 +12,55 @@ Replaces the previous octree (base-8 digit) encoding with a Fibonacci-based
 hierarchy that naturally encodes nested structure.
 """
 
-try:
-    from eva.symbolic.fcf_config import FCFConfig as _FCFConfig
-    __cfg = _FCFConfig()
-    LEVELS = __cfg.octree_levels
-    GAMMA = __cfg.octree_gamma
-except (ImportError, AttributeError):
-    LEVELS = 16
-    GAMMA = 0.5
-
 from eva.symbolic.fibonacci_utils import FibonacciUtils as _FU
 
+# ── LEVELS: adaptive — max Zeckendorf depth for vocabulary ───────
+# Computed at import time; falls back to config or 16.
 
-def _zeckendorf(n: int) -> list[int]:
-    """Decompose n into sum of non-consecutive Fibonacci numbers (Zeckendorf)."""
+_LEVELS = 0
+_GAMMA = 0.5
+
+def _compute_levels_from_vocab(vocab_size: int) -> int:
+    """Max Zeckendorf decomposition length for any ID < vocab_size, +1."""
+    if vocab_size <= 1:
+        return 2
+    return len(_FU.zeckendorf(vocab_size - 1)) + 1
+
+def _init():
+    global _LEVELS, _GAMMA
+    if _LEVELS:
+        return
+    try:
+        from eva.symbolic.fcf_config import FCFConfig as _FCFConfig, EnvironmentResolver
+        __cfg = _FCFConfig()
+        _GAMMA = __cfg.octree_gamma
+        import sentencepiece as spm
+        _LEVELS = _compute_levels_from_vocab(
+            spm.SentencePieceProcessor(
+                model_file=EnvironmentResolver().bpe_model_path
+            ).vocab_size()
+        )
+    except Exception:
+        try:
+            from eva.symbolic.fcf_config import FCFConfig as _FCFConfig
+            __cfg = _FCFConfig()
+            _LEVELS = __cfg.octree_levels
+            _GAMMA = __cfg.octree_gamma
+        except Exception:
+            _LEVELS = 16
+            _GAMMA = 0.5
+
+_init()
+
+# Public API
+LEVELS = _LEVELS
+GAMMA = _GAMMA
+
+
+# ── Zeckendorf path functions ──────────────────────────────────────
+
+def zeckendorf(n: int) -> list[int]:
+    """Decompose n into sum of non-consecutive Fibonacci numbers."""
     return _FU.zeckendorf(n)
 
 
@@ -35,7 +70,7 @@ def path(val: int) -> tuple[int, ...]:
 
     Returns tuple of LEVELS ints (Fib number or 0 for padding).
     """
-    z = _zeckendorf(abs(val))
+    z = zeckendorf(abs(val))
     if len(z) >= LEVELS:
         return tuple(z[:LEVELS])
     return tuple(z + [0] * (LEVELS - len(z)))

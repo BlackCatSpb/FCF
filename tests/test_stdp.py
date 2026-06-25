@@ -445,6 +445,69 @@ class TestV5Safety:
         p2 = path(1)
         assert lcp(p1, p2) >= 0
 
+    def test_zeckendorf_lossless(self):
+        from eva.symbolic.fractal_encoding import zeckendorf
+        for n in [0, 1, 2, 3, 5, 7, 10, 42, 99, 100, 1000, 9999, 12345]:
+            z = zeckendorf(n)
+            assert sum(z) == n
+
+    def test_zeckendorf_non_consecutive(self):
+        from eva.symbolic.fractal_encoding import zeckendorf
+        for n in range(1, 200):
+            z = zeckendorf(n)
+            for i in range(len(z) - 1):
+                # No two consecutive Fibonacci numbers
+                a, b = z[i], z[i + 1]
+                from eva.symbolic.fibonacci_utils import FibonacciUtils as _FU
+                ai, bi = 2, 2
+                while _FU.get(ai) < a: ai += 1
+                while _FU.get(bi) < b: bi += 1
+                assert abs(ai - bi) >= 2, f"Consecutive Fibs at {n}: {z}"
+
+    def test_zeckendorf_quantizer_shapes(self):
+        from eva.symbolic.fibonacci_utils import ZeckendorfQuantizer
+        zq = ZeckendorfQuantizer(dim=64, max_fib_value=1000)
+        v0 = zq.encode(0.0)
+        assert v0.shape == (64,)
+        assert np.all(v0 == 0)
+        v1 = zq.encode(0.5)
+        assert v1.shape == (64,)
+        assert abs(float(np.linalg.norm(v1)) - 1.0) < 1e-5
+
+    def test_zeckendorf_quantizer_proximity(self):
+        from eva.symbolic.fibonacci_utils import ZeckendorfQuantizer
+        zq = ZeckendorfQuantizer(dim=128, max_fib_value=100000)
+        a = zq.encode(0.005)
+        b = zq.encode(0.006)
+        c = zq.encode(0.5)
+        assert zq.similarity(a, b) > zq.similarity(a, c)
+
+    def test_zeckendorf_quantizer_symmetry(self):
+        from eva.symbolic.fibonacci_utils import ZeckendorfQuantizer
+        zq = ZeckendorfQuantizer(dim=64, max_fib_value=1000)
+        a = zq.encode(0.1)
+        b = zq.encode(0.2)
+        assert abs(zq.similarity(a, b) - zq.similarity(b, a)) < 1e-6
+
+    def test_temporal_zeckendorf_trace_monotonic(self):
+        from eva.symbolic.fibonacci_utils import TemporalZeckendorf
+        tz = TemporalZeckendorf()
+        prev = -1.0
+        for t in [1, 2, 3, 5, 10, 50, 100, 500, 1000, 10000]:
+            cur = tz.trace(t)
+            assert cur > prev, f"trace({t})={cur} <= prev={prev}"
+            prev = cur
+
+    def test_temporal_zeckendorf_proximity(self):
+        from eva.symbolic.fibonacci_utils import TemporalZeckendorf
+        tz = TemporalZeckendorf()
+        assert tz.temporal_H(10, 12) > tz.temporal_H(1, 1000)
+
+    def test_temporal_zeckendorf_identity(self):
+        from eva.symbolic.fibonacci_utils import TemporalZeckendorf
+        tz = TemporalZeckendorf()
+        assert tz.temporal_H(42, 42) > 0
+
     # ── QN-8: Property-based тест generate ──
     def test_generate_returns_result(self, gen, cs):
         if gen.sp is None:

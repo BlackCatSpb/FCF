@@ -1580,6 +1580,7 @@ class ConceptSpace:
 
         # Dimension coordinator — validates all component dims at construction
         self.dims = DimensionCoordinator(vec_dim=dim, latent_dim=latent_dim)
+        self.latent_dim = self.dims.latent_dim  # shortcut
 
         # Fractal field: latent codes → full vectors via shared basis
         self.fractal = FractalField(dim=self.dims.vec_dim, latent_dim=self.dims.latent_dim)

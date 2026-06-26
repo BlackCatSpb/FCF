@@ -119,7 +119,7 @@ class STDPTrainer:
 
         if _c.use_morph_manifold and _c.beam_buffer_size > 0:
             self.morph_manifold = TransitionManifold(
-                dim=_c.beam_dim or gen.cs.dim,
+                dim=gen.cs.latent_dim,  # morph vectors are latent_dim (2048)
                 buffer_size=_c.morph_manifold_buffer,
                 cos_threshold=_c.beam_cos_threshold,
                 max_beams=_c.beam_max,

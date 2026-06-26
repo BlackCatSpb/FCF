@@ -25,6 +25,7 @@ _META_ANTONYM = 9
 
 
 from eva.symbolic.fcf_config import EnvironmentResolver, FCFConfig
+_FCF = FCFConfig()  # module-level cache for hot-path reads
 
 # P1.8: TemporalZeckendorf singleton — created once at module level, not per-pair
 _TEMPORAL_ZECKENDORF = None
@@ -114,7 +115,7 @@ class STDPTrainer:
         self.subspace_lr = subspace_lr
         from eva.symbolic.fcf_config import FCFConfig
         from eva.symbolic.transition_manifold import TransitionManifold
-        _c = FCFConfig()
+        _c = _FCF
         if _c.beam_buffer_size > 0:
             self.manifold = TransitionManifold(
                 dim=_c.beam_dim or gen.cs.dim,
@@ -152,7 +153,7 @@ class STDPTrainer:
         if val is not None:
             return val
         from eva.symbolic.fcf_config import FCFConfig
-        return getattr(FCFConfig(), key, fallback)
+        return getattr(_FCF, key, fallback)
 
     def train_from_text(self, text, base_lr=None, context_window=None, pmi_strength=None,
                          pmi_gate_min=None, neg_samples=None, inh_strength=None, inh_threshold=None,
@@ -275,7 +276,7 @@ class STDPTrainer:
             self._contrastive_objective(gen_updates, field_gate)
 
         # ── HDTransformerLayer refinement (P1.9: integrated train_step) ──
-        if FCFConfig().use_hd_transformer:
+        if _FCF.use_hd_transformer:
             if not hasattr(self, '_hd_transformer'):
                 from eva.symbolic.hdtransformer_layer import HDTransformerLayer
                 self._hd_transformer = HDTransformerLayer(dim=cs.dim, num_heads=2, top_k=5)
@@ -350,7 +351,7 @@ class STDPTrainer:
             ef.cleanup()
 
         # P1.9: Lazy init MorphSTDP if enabled
-        _c = FCFConfig()
+        _c = _FCF
         if _c.use_morph_stdp and not hasattr(self, '_morph_stdp_batches'):
             from eva.symbolic.semantic_piece import MorphSTDP
             self._morph_stdp = MorphSTDP(dim=cs.dim, cohesion_threshold=_c.morph_stdp_cohesion)
@@ -632,7 +633,7 @@ class STDPTrainer:
         cs = gen.cs
         T = len(ids)
         n_pairs = 0
-        _fc = FCFConfig().formula
+        _fc = _FCF.formula
 
         # GPU path: pre-gather frequency/error tensors for O(1) per-pair lookups
         use_gpu_freq = use_torch and gen._cf_t is not None
@@ -721,7 +722,7 @@ class STDPTrainer:
 
                 lr = base_lr * max(freq_weight, _fc.freq_weight_min) * pmi_w * field_weight
                 lr *= (_fc.hormonal_mod_baseline + gen.hormones.acetylcholine * _fc.hormonal_mod_scale) * (_fc.hormonal_mod_baseline + gen.hormones.dopamine * _fc.hormonal_mod_scale)
-                if FCFConfig().use_temporal_zeckendorf:
+                if _FCF.use_temporal_zeckendorf:
                     _tz = _get_temporal_zeckendorf()
                     fast_th, slow_th = _tz.theta(abs(j-i))
                     theta_gate = max(fast_th, _fc.theta_fast_min)
@@ -1002,7 +1003,7 @@ class STDPTrainer:
     def _gpu_stdp_core(self, ctx_t, tgt_t, meta_t, unique_gen, inv_t, gen, cs,
                        gradient_noise_scale=0.0):
         """Pure-tensor core of _gpu_stdp_apply. torch.compile-friendly."""
-        _fc = FCFConfig().formula
+        _fc = _FCF.formula
         D = cs.dim
         N = len(ctx_t)
         ng = len(unique_gen)

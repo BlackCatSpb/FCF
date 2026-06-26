@@ -102,6 +102,8 @@ class DimensionCoordinator:
     """
     vec_dim: int = 768
     latent_dim: int = 2048
+    fib_dimension: int = 2
+    use_fib_generalized: bool = False
 
     def __post_init__(self):
         if self.vec_dim % 8 != 0:
@@ -111,9 +113,11 @@ class DimensionCoordinator:
                 f"vec_dim={self.vec_dim} > latent_dim={self.latent_dim}")
 
     @classmethod
-    def from_vocab(cls, vocab_size, vram_limit_mb=2048, latent_ratio=2.67):
+    def from_vocab(cls, vocab_size, vram_limit_mb=2048, latent_ratio=2.67,
+                   fib_dimension=2, use_fib_generalized=False):
         r = AdaptiveDimensionResolver(vocab_size, vram_limit_mb, latent_ratio)
-        return cls(vec_dim=r.vec_dim, latent_dim=r.latent_dim)
+        return cls(vec_dim=r.vec_dim, latent_dim=r.latent_dim,
+                   fib_dimension=fib_dimension, use_fib_generalized=use_fib_generalized)
 
     @property
     def entity_dim(self):
@@ -141,10 +145,8 @@ class DimensionCoordinator:
     @property
     def subspace(self) -> dict:
         from eva.symbolic.fibonacci_utils import FibonacciUtils
-        from eva.symbolic.fcf_config import FCFConfig
-        cfg = FCFConfig()
-        if cfg.use_fib_generalized and cfg.fib_dimension >= 2:
-            lam = FibonacciUtils.get_lambda(cfg.fib_dimension)
+        if self.use_fib_generalized and self.fib_dimension >= 2:
+            lam = FibonacciUtils.get_lambda(self.fib_dimension)
         else:
             lam = FibonacciUtils.golden_ratio()
         total = lam * lam + lam + 1.0

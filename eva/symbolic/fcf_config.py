@@ -70,10 +70,20 @@ class MetricPair:
 # ──────────────────────────────────────────────
 
 def _auto_detect_model(data_dir: str) -> str | None:
-    """Find first *.model file in data_dir."""
+    """Find bpe_morph.model in data_dir (единственный BPE)."""
     import glob
-    models = glob.glob(os.path.join(data_dir, '*.model'))
-    return os.path.basename(models[0]) if models else None
+    models = sorted(glob.glob(os.path.join(data_dir, '*.model')))
+    # Предпочитаем bpe_morph, игнорируем bpe_ru_146k (устарел)
+    for m in models:
+        bn = os.path.basename(m)
+        if 'morph' in bn:
+            return bn
+    # Если bpe_morph нет — любой .model кроме bpe_ru_146k
+    for m in models:
+        bn = os.path.basename(m)
+        if 'ru_146k' not in bn:
+            return bn
+    return None
 
 
 @dataclass
@@ -106,11 +116,17 @@ class EnvironmentResolver:
         if detected:
             self.model_name = detected
             return os.path.join(self.data_dir, detected)
-        return os.path.join(self.data_dir, 'bpe_ru_146k.model')
+        # Единственный BPE — bpe_morph.model. Никаких fallback.
+        default = os.path.join(self.data_dir, 'bpe_morph.model')
+        if os.path.exists(default):
+            self.model_name = 'bpe_morph.model'
+            return default
+        raise FileNotFoundError(
+            f"No .model file in {self.data_dir}. "
+            f"Expected bpe_morph.model (or set FCF_MODEL_NAME).")
 
     @bpe_model_path.setter
     def bpe_model_path(self, path: str) -> None:
-        """Override BPE model path (e.g. from --morph-bpe)."""
         name = os.path.basename(path)
         self.model_name = name
 
@@ -306,10 +322,11 @@ class MetricPairBuilder:
 class FormulaCoefficients:
     """Все числовые константы формул — здесь, а не в алгоритмическом коде.
 
-    Алгоритмы остаются в коде (crystal_generator, stdp_trainer, ...),
-    коэффициенты читаются из этого датакласса.
+    При use_fib_generalized=True все λ_d-выводимые коэффициенты
+    пересчитываются через rebuild(). В defaults — значения для φ (d=2).
     """
     # RRF weights (crystal_generator.py)
+    # λ_d² : λ_d : 1 : λ_d⁻¹ : λ_d⁻² (глубины k=2..-2)
     rrf_graph: float = 0.7
     rrf_syntax: float = 0.15
     rrf_hdc: float = 0.10
@@ -317,7 +334,7 @@ class FormulaCoefficients:
     rrf_prior: float = 0.02
     rrf_prior_freq_cap: float = 1000.0
 
-    # θ-decay (crystal_generator.py, stdp_trainer.py)
+    # θ-decay (заменён TemporalZeckendorf, defaults только для fallback)
     theta_tau_default: float = 12.0
     theta_tau_slow_mult: float = 3.0
     theta_fast_clamp: float = 5.0
@@ -328,7 +345,7 @@ class FormulaCoefficients:
     theta_temp_floor: float = 0.15
 
     # PMI mapping (crystal_generator.py, stdp_trainer.py)
-    pmi_slope: float = 0.5       # 1/2
+    pmi_slope: float = 0.5
     pmi_intercept: float = 0.2
     pmi_clamp_max: float = 2.0
     pmi_strength_default: float = 1.0
@@ -337,7 +354,7 @@ class FormulaCoefficients:
     pmi_ce_error_floor: float = 0.25
 
     # Anti-repetition (crystal_generator.py)
-    antirep_decay: float = 0.3   # exp(-0.3 * count)
+    antirep_decay: float = 0.3
 
     # Edge weight from PPMI (crystal_generator.py)
     edge_weight_min: float = 0.20
@@ -351,7 +368,7 @@ class FormulaCoefficients:
     # Novelty frequency cap (crystal_generator.py)
     novelty_freq_cap: float = 50.0
 
-    # Hybrid bind alpha (concept_space.py)
+    # Hybrid bind alpha (concept_space.py) — α = λ/(λ+1)
     hybrid_bind_alpha: float = 0.7
     hybrid_alpha_max: float = 0.9
     hybrid_alpha_min: float = 0.1
@@ -368,6 +385,7 @@ class FormulaCoefficients:
     confidence_freq_scale: float = 0.5
 
     # STDP frequency weight (stdp_trainer.py)
+    # freq_weight_log_scale = 1/log(λ·V)
     freq_weight_log_scale: float = 0.15
     freq_weight_min: float = 0.05
 
@@ -387,7 +405,7 @@ class FormulaCoefficients:
     # Contrastive LR (stdp_trainer.py)
     contr_lr_ce_scale: float = 2.0
 
-    # Code mixing ratio (concept_space.py)
+    # Code mixing ratio (concept_space.py) — λ/(λ+1) : 1/(λ+1)
     code_mix_latent: float = 0.7
     code_mix_existing: float = 0.3
 
@@ -402,7 +420,12 @@ class FormulaCoefficients:
     # RRF boost for homeostasis (crystal_generator.py)
     rrf_boost_homeostasis: float = 0.3
 
-    # Intonation-based factors (hormonal_system.py references)
+    # λ_d-иерархия нейромодуляторов (глубина k):
+    #   DA (k=1) — быстрый, per-token
+    #   ACh (k=2) — средний, n-gram
+    #   NA (k=3) — средне-медленный, phrase
+    #   5HT (k=4) — медленный, sentence
+    # baseline = λ_d^{-k}, tonic_decay = 1-1/λ_d^6, phasic_decay = 1-1/λ_d^4
     da_baseline: float = 0.5
     ht_baseline: float = 0.5
     na_baseline: float = 0.3
@@ -413,7 +436,7 @@ class FormulaCoefficients:
     da_curiosity_strength: float = 0.4
     da_mastery_strength: float = 0.5
     da_boredom_penalty: float = 0.1
-    da_phasic_to_tonic: float = 0.1
+    da_phasic_to_tonic: float = 0.1      # 1/λ_d³
     da_floor: float = 0.1
     ach_surprise_strength: float = 0.6
     ach_uncertainty_strength: float = 0.5
@@ -421,7 +444,7 @@ class FormulaCoefficients:
     ach_novelty_scale: float = 0.5
     ach_drift_up: float = 0.15
     ach_drift_down: float = 0.1
-    ach_phasic_integration: float = 0.1
+    ach_phasic_integration: float = 0.1  # 1/λ_d²
     ht_baseline_part: float = 0.3
     ht_match_scale: float = 0.4
     ht_adapt_rate: float = 0.1
@@ -436,7 +459,7 @@ class FormulaCoefficients:
     da_temperature_min: float = 0.05
     da_temperature_scale: float = 0.9
     da_temperature_baseline: float = 0.1
-    na_beam_scale: float = 0.5
+    na_beam_scale: float = 0.5            # 1/λ_d
 
     # HormonalSystem supplementary constants (Phase 7)
     da_mismatch_penalty: float = -0.3
@@ -445,6 +468,72 @@ class FormulaCoefficients:
     hormone_boredom_window: int = 5
     hormone_boredom_repeat: int = 3
     hormone_reward_history_maxlen: int = 987  # F₁₆
+
+    # ──────── λ_d-rebuild ────────
+
+    def rebuild(self, lam: float, vocab_size: int = 256000):
+        """Пересчитать все λ_d-зависимые коэффициенты для данного λ.
+
+        Вызывается из FCFConfig.__post_init__ при use_fib_generalized=True.
+        """
+        import math
+
+        # ── Class A: Прямые λ_d-отношения ──
+
+        # Hybrid bind α = λ/(λ+1)
+        self.hybrid_bind_alpha = lam / (lam + 1.0)
+        self.hybrid_alpha_max = min(0.95, 1.0 - 1.0 / (lam * lam))
+        self.hybrid_alpha_min = 1.0 / (lam + 1.0)
+
+        # Code mix λ : 1
+        self.code_mix_latent = lam / (lam + 1.0)
+        self.code_mix_existing = 1.0 / (lam + 1.0)
+
+        # ── RRF weights: w_k = λ_d^k / Σλ_d^j (k ∈ [-2, 2]) ──
+        depths = {'rrf_graph': 2.0, 'rrf_syntax': 1.0, 'rrf_hdc': 0.0,
+                  'rrf_vector': -1.0, 'rrf_prior': -2.0}
+        total = sum(lam ** k for k in depths.values())
+        self.rrf_graph = (lam ** 2.0) / total
+        self.rrf_syntax = lam / total
+        self.rrf_hdc = 1.0 / total
+        self.rrf_vector = (lam ** (-1.0)) / total
+        self.rrf_prior = (lam ** (-2.0)) / total
+
+        # ── PMI mapping ──
+        self.pmi_slope = 1.0 / lam
+        self.pmi_intercept = 0.0
+        self.pmi_gate_min_default = 1.0 / (lam * lam)
+        self.pmi_clamp_max = lam
+
+        # ── Decay rates ──
+        self.antirep_decay = math.log(2.0) / lam      # half-life = λ_d
+        self.tonic_decay = 1.0 - 1.0 / (lam ** 6.0)   # τ ≈ λ_d^6
+        self.phasic_decay = 1.0 - 1.0 / (lam ** 4.0)  # τ ≈ λ_d^4 (быстрее)
+
+        # ── Hormonal baselines по глубине k ──
+        self.da_baseline = 1.0 / lam
+        self.ach_baseline = 1.0 / (lam * lam)
+        self.na_baseline = 1.0 / (lam * lam * lam)
+        self.ht_baseline = 1.0 / (lam * lam * lam * lam)
+
+        # ── Межгормональные связи ──
+        self.da_phasic_to_tonic = 1.0 / (lam * lam * lam)   # 1/λ³
+        self.ach_phasic_integration = 1.0 / (lam * lam)     # 1/λ²
+        self.na_beam_scale = 1.0 / lam                      # 1/λ
+
+        # ── Information-theoretic ──
+        self.confidence_freq_scale = 1.0 / lam
+        max_log = math.log(max(lam * vocab_size, 2.0))
+        self.freq_weight_log_scale = 1.0 / max_log
+
+        # ── Честность: подпись ──
+        # (θ-decay, edge_weight, target_boost, novelty_freq_cap,
+        #  homeostatic, intent_bonus, cluster_potential,
+        #  neg_lr, contr_lr, hormonal_mod,
+        #  field_weight, concept_usage_ema, rrf_boost_homeostasis
+        #  — без λ_d-вывода, остаются с defaults)
+
+    # ──────── end rebuild ────────
 
 
 # ──────────────────────────────────────────────
@@ -525,6 +614,7 @@ class FCFConfig:
     use_ami_correction: bool = True     # AMI (1/√count) penalty on raw PMI
     ami_alpha: float = 0.5             # strength of AMI correction
     path_levels: int = 16               # Zeckendorf path depth (also accessible as octree_levels)
+    vocab_size: int = 256000            # used by formula.rebuild() for freq scaling
 
     @property
     def l_c(self) -> int:
@@ -950,3 +1040,8 @@ class FCFConfig:
         for i, p in enumerate(self.eval_pairs):
             if isinstance(p, dict):
                 self.eval_pairs[i] = MetricPair(**p)
+        # λ_d-rebuild formula coefficients если включено
+        if self.use_fib_generalized and self.fib_dimension >= 2:
+            from eva.symbolic.fibonacci_utils import FibonacciUtils
+            lam = FibonacciUtils.get_lambda(self.fib_dimension)
+            self.formula.rebuild(lam, self.vocab_size)

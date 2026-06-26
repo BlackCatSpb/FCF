@@ -42,11 +42,11 @@ except ImportError:
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.hormonal_system import HormonalSystem
 from eva.symbolic.fcf_config import FormulaCoefficients, FCFConfig
+_FCF = FCFConfig()  # module-level cache for hot-path reads
 
 
-from eva.symbolic.fcf_config import FCFConfig
-_BOS_ID = FCFConfig().bos_token_id
-_EOS_ID = FCFConfig().eos_token_id
+_BOS_ID = _FCF.bos_token_id
+_EOS_ID = _FCF.eos_token_id
 
 
 @dataclass
@@ -92,7 +92,7 @@ class CrystalGenerator:
         if not self.cs.concept_usage:
             self.cs.init_homeostasis()
         self.branch_rngs = {}
-        self.hormones = HormonalSystem(formula=FCFConfig().formula)
+        self.hormones = HormonalSystem(formula=_FCF.formula)
 
         # Per-concept prediction error EMA (Level 2: error-based PMI gate)
         ce_max = min(3 * self.cs.vocab_size // 4, 100000)
@@ -662,7 +662,7 @@ class CrystalGenerator:
 
                     self.cs.update_usage(cid)
 
-                    _f = FCFConfig().formula
+                    _f = _FCF.formula
                     novelty = 1.0 - min(self.lattice.concept_freq.get(cid, 0) / _f.novelty_freq_cap, 1.0)
                     surprise = 0.1 if is_match else 0.5
                     self.hormones.update(confidence=conf, is_match=is_match,
@@ -729,7 +729,7 @@ class CrystalGenerator:
             max_candidates: max results to return
             max_depth: max BFS steps (safety bound, B is the primary limiter)
         """
-        _cfg = FCFConfig()
+        _cfg = _FCF
         if B is None: B = _cfg.graph_search_B
         if max_candidates is None: max_candidates = _cfg.graph_search_max_candidates
         if max_depth is None: max_depth = _cfg.graph_search_max_depth
@@ -758,13 +758,13 @@ class CrystalGenerator:
             step += 1
             next_frontier = []
             for u in frontier:
-                conns = self.lattice.connections_of(u, top_k=FCFConfig().graph_search_connections_topk, use_ppmi=True)
+                conns = self.lattice.connections_of(u, top_k=_FCF.graph_search_connections_topk, use_ppmi=True)
                 for v, conn_info in conns:
                     if not self._is_semantic_token(v):
                         continue
                     # Edge weight from PPMI: high PPMI = specific connection = low weight (short path)
                     ppmi = conn_info.get('ppmi', 0.0)
-                    _f = FCFConfig().formula
+                    _f = _FCF.formula
                     w = max(_f.edge_weight_min, 1.0 - min(ppmi / _f.edge_ppmi_cap, 1.0) * _f.edge_weight_strength)
                     dv = d[u] + w
                     if dv >= B:
@@ -803,7 +803,7 @@ class CrystalGenerator:
             return []
         prev_cid = seq[-1]
         cids = seq[-3:] if len(seq) >= 3 else seq
-        _cfg = FCFConfig()
+        _cfg = _FCF
         K = 3
 
         # 1. Graph-based semantic paths (BMSSP-EVA, replaces single-hop connections)
@@ -812,14 +812,14 @@ class CrystalGenerator:
         if sources_key not in self._graph_cache:
             if len(self._graph_cache) >= self._graph_cache_max:
                 self._graph_cache.popitem(last=False)
-            self._graph_cache[sources_key] = self._graph_search(sources, B=1.2, max_candidates=FCFConfig().graph_search_max_candidates)
+            self._graph_cache[sources_key] = self._graph_search(sources, B=1.2, max_candidates=_FCF.graph_search_max_candidates)
         else:
             self._graph_cache.move_to_end(sources_key)
         graph_candidates = self._graph_cache[sources_key]
 
         # 2. N-gram syntax (filter to semantic tokens only)
         syn_preds = self.lattice.predict(cids)
-        syn_ranked = {cid: i + 1 for i, (cid, _) in enumerate(syn_preds[:FCFConfig().graph_search_syn_preds_limit])
+        syn_ranked = {cid: i + 1 for i, (cid, _) in enumerate(syn_preds[:_FCF.graph_search_syn_preds_limit])
                       if self._is_semantic_token(cid)}
 
         # 2b. HDC n-gram fallback (always participates in RRF for stability)
@@ -828,9 +828,9 @@ class CrystalGenerator:
             ctx_cids = list(reversed(cids[-2:]))
             if hasattr(self.cs.fractal, 'hdc_memory'):
                 hdc_preds = self.cs.fractal.hdc_predict(
-                    ctx_cids, self.cs.fractal.codes, k=FCFConfig().graph_search_hdc_k)
+                    ctx_cids, self.cs.fractal.codes, k=_FCF.graph_search_hdc_k)
                 for hcid, hscore in hdc_preds:
-                    if self._is_semantic_token(hcid) and hscore > FCFConfig().graph_search_hdc_score_min:
+                    if self._is_semantic_token(hcid) and hscore > _FCF.graph_search_hdc_score_min:
                         hdc_candidates[hcid] = hscore
 
         # 3. All candidates from learned signals
@@ -855,7 +855,7 @@ class CrystalGenerator:
             return []
 
         # 5. RRF scoring
-        _fc = FCFConfig().formula
+        _fc = _FCF.formula
         manifold = getattr(getattr(self, '_trainer', None), 'manifold', None)
         combined = {}
         for cid in all_cids:
@@ -869,14 +869,14 @@ class CrystalGenerator:
             if cid in vector_sim:
                 rrf += _fc.rrf_vector * vector_sim[cid] / (K + 1)
             # Beam score: насколько переход prev_cid→cid лежит на известном луче
-            if manifold is not None and manifold.n_beams() >= FCFConfig().beam_rrf_min_beams:
+            if manifold is not None and manifold.n_beams() >= _FCF.beam_rrf_min_beams:
                 v_c = self.cs.concept_vector(cid)
                 v_p = self.cs.concept_vector(prev_cid)
                 if v_c is not None and v_p is not None:
                     T = manifold._vsa_transition(v_c, v_p)
-                    if np.linalg.norm(T) > FCFConfig().beam_eps:
+                    if np.linalg.norm(T) > _FCF.beam_eps:
                         _beam_cent, beam_sim, _beam_cnt = manifold.nearest_beam(T)
-                        if beam_sim > manifold.cos_threshold * FCFConfig().beam_rrf_sim_ratio:
+                        if beam_sim > manifold.cos_threshold * _FCF.beam_rrf_sim_ratio:
                             rrf += _cfg.branch_conf_scale * beam_sim / (K + 1)
             freq = self.lattice.concept_freq.get(cid, 0)
             prior = _fc.rrf_prior / (K + 1) * (1.0 - min(freq / _fc.rrf_prior_freq_cap, 1.0))
@@ -884,7 +884,7 @@ class CrystalGenerator:
             combined[cid] = rrf
 
         # 5a. VSAAttention re-ranking (P1.9, unified with fractal basis)
-        if FCFConfig().use_vsa_attention:
+        if _FCF.use_vsa_attention:
             if not hasattr(self, '_vsa_attn'):
                 from eva.symbolic.vsa_attention import VSAAttention
                 basis = getattr(self.cs.fractal, 'basis', None)

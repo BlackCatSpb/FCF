@@ -265,11 +265,15 @@ class FractalField:
         # Latent codes: cid → (latent_dim,) array
         self.codes = {}
 
+        # Generalized Fibonacci settings — read once, used by grow/prune
+        self._fib_dimension: int = _c.fib_dimension
+        self._use_fib_generalized: bool = _c.use_fib_generalized
+
         # Learnable field projection: code @ W_proj → binarized field bits
         self.n_field_bits = n_field_bits if n_field_bits is not None else _c.fractal_n_field_bits
         self.field_lr = field_lr if field_lr is not None else _c.fractal_field_lr
         self.W_proj: Optional[np.ndarray] = None  # [latent_dim, n_field_bits]
-        self.field_bits: Dict[int, np.ndarray] = {}
+        self.field_bits: np.ndarray = np.zeros((0, 0), dtype=np.uint8)
         self._fb_dirty = False
 
         # HDC n-gram memory: prefix_cids_tuple → bundled latent repr (LRU-capped)
@@ -545,7 +549,7 @@ class FractalField:
             from eva.symbolic.fibonacci_utils import FibonacciUtils
             old_l_c, old_l_a, old_l_m = self.l_c, self.l_a, self.l_m
             self.latent_dim = new_latent_dim
-            lam = FibonacciUtils.get_lambda(FCFConfig().fib_dimension) if FCFConfig().use_fib_generalized else FibonacciUtils.golden_ratio()
+            lam = FibonacciUtils.get_lambda(self._fib_dimension) if self._use_fib_generalized else FibonacciUtils.golden_ratio()
             total = lam * lam + lam + 1.0
             self.l_c = max(8, int(new_latent_dim * lam * lam / total))
             self.l_a = max(8, int(new_latent_dim * lam / total))
@@ -646,7 +650,7 @@ class FractalField:
 
             self.latent_dim = new_latent_dim
             from eva.symbolic.fibonacci_utils import FibonacciUtils
-            lam = FibonacciUtils.get_lambda(FCFConfig().fib_dimension) if FCFConfig().use_fib_generalized else FibonacciUtils.golden_ratio()
+            lam = FibonacciUtils.get_lambda(self._fib_dimension) if self._use_fib_generalized else FibonacciUtils.golden_ratio()
             total = lam * lam + lam + 1.0
             self.l_c = max(8, int(new_latent_dim * lam * lam / total))
             self.l_a = max(8, int(new_latent_dim * lam / total))

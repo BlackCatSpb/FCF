@@ -520,8 +520,8 @@ class FCFConfig:
     latent_dim: int = 2048
     n_anchors: int = 2048
     max_n: int = 3
-    min_ngram_count: int = 1        # min raw count for high-order n-gram transitions
-    ppmi_prune_threshold: float = 0.0  # prune 3-gram transitions with PPMI < this (>0 = ON)
+    min_ngram_count: int = 2        # prune singleton 3-gram transitions
+    ppmi_prune_threshold: float = 0.5  # prune 3-gram transitions with PPMI < 0.5
     path_levels: int = 16               # Zeckendorf path depth (also accessible as octree_levels)
 
     @property
@@ -713,7 +713,7 @@ class FCFConfig:
     # ── GPU Sector Chunking (GpuChunkManager) ──
     gpu_max_chunks: int = 32      # max sector chunks cached on GPU
     gpu_chunk_depth: int = 1      # sector depth: 0=4bit(16), 1=10bit(1024), 2=20bit(1M)
-    gpu_use_chunking: bool = False  # True = page vectors; False = full-V _vecs_t (default)
+    gpu_use_chunking: bool = True  # True = sector-aware dirty sync + vector paging
 
     # ── Engine ────────────────────────────────
     use_torch: bool = True

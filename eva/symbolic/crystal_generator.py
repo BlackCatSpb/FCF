@@ -134,6 +134,9 @@ class CrystalGenerator:
         self._total_freq_cache = None
         self._fused_buf = None  # G-49: pre-allocated fused buffer for scatter_add
 
+        # GpuChunkManager for sector-based paging (lazy init, see gpu_use_chunking)
+        self._chunk_mgr = None
+
         # GPU frequency/ngram tensors for on-GPU PMI (lazy init, synced incrementally)
         self._cf_t = None      # concept_freq [V] float32
         self._pt2_t = None     # _prefix_total for 2-grams [V] float32
@@ -334,6 +337,15 @@ class CrystalGenerator:
 
         self._torch_dirty = False
         self.cs.fractal._fb_dirty = False
+
+        # Init GpuChunkManager if enabled
+        from eva.symbolic.fcf_config import FCFConfig as _FCfg
+        _cfg = _FCfg()
+        if _cfg.gpu_use_chunking:
+            self._chunk_mgr = GpuChunkManager(self, cs, _cfg)
+            # Pre-build CID→sector mapping
+            self._chunk_mgr._build_sector_map()
+
         if dev.type == 'cuda':
             torch.cuda.synchronize()
             alloc_mb = torch.cuda.max_memory_allocated() / 1024**2
@@ -406,9 +418,28 @@ class CrystalGenerator:
             self._eval_backup = None
 
     def _sync_dirty_cpu(self):
-        """G-72: Batch-sync dirty CIDs from GPU _vecs_t to CPU concept_vectors."""
+        """G-72: Batch-sync dirty CIDs from GPU _vecs_t to CPU concept_vectors.
+
+        Uses GpuChunkManager for sector-aware sync when available (gpu_use_chunking).
+        """
         if not self._dirty_cids or self._vecs_t is None or self._torch_device is None:
             return
+
+        if self._chunk_mgr is not None:
+            # Sector-aware sync: mark sectors dirty, then sync them all
+            self._chunk_mgr.mark_dirty(list(self._dirty_cids))
+            cids = list(self._dirty_cids)
+            cids_t = torch.tensor(cids, dtype=torch.long, device=self._torch_device)
+            vecs_cpu = self._vecs_t[cids_t].cpu().numpy()
+            self._skip_gpu_sync = True
+            for cid, v_new in zip(cids, vecs_cpu):
+                self.cs._apply_vector_update(cid, v_new)
+            self._skip_gpu_sync = False
+            self._dirty_cids.clear()
+            if hasattr(self.cs.fractal, '_matrix_dirty'):
+                self.cs.fractal._matrix_dirty = True
+            return
+
         cids = list(self._dirty_cids)
         cids_t = torch.tensor(cids, dtype=torch.long, device=self._torch_device)
         vecs_cpu = self._vecs_t[cids_t].cpu().numpy()
@@ -1235,7 +1266,7 @@ class GpuChunkManager:
             return
         vecs_np = entry['vecs'].cpu().numpy()
         for i, cid in enumerate(entry['cids']):
-            self.cs.concept_vectors[cid] = vecs_np[i]
+            self.gen.cs._apply_vector_update(cid, vecs_np[i])
         self._dirty.discard(key)
 
     def mark_dirty(self, cids):

@@ -235,7 +235,9 @@ if RESUME is not None:
     if not any(lattice.ngrams.values()):
         print("  Rebuilding lattice n-grams from corpus...")
         try:
-            lattice.build(CFG.corpus_path, sp, max_n=CFG.max_n)
+            lattice.build(CFG.corpus_path, sp, max_n=CFG.max_n,
+                          min_count=CFG.min_ngram_count,
+                          ppmi_threshold=CFG.ppmi_prune_threshold)
         except Exception as e:
             print(f"FATAL: lattice.build failed: {e}", file=sys.stderr)
             sys.exit(1)

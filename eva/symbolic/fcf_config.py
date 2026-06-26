@@ -520,6 +520,8 @@ class FCFConfig:
     latent_dim: int = 2048
     n_anchors: int = 2048
     max_n: int = 3
+    min_ngram_count: int = 1        # min raw count for high-order n-gram transitions
+    ppmi_prune_threshold: float = 0.0  # prune 3-gram transitions with PPMI < this (>0 = ON)
     path_levels: int = 16               # Zeckendorf path depth (also accessible as octree_levels)
 
     @property

@@ -708,6 +708,7 @@ class FCFConfig:
     envelope_decay: float = 0.95
     harm_slow_start_epochs: int = 5
     entity_field_max_entities: int = 50000
+    harm_drift_cos: float = 0.95  # skip harmonization if cos(current, last_harmonized) > this
 
     # ── Engine ────────────────────────────────
     use_torch: bool = True

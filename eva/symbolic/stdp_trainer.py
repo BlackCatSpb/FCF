@@ -129,6 +129,10 @@ class STDPTrainer:
         else:
             self.morph_manifold = None
 
+        # Semantic harmony drift tracking: cid → last concept vector post-harmonization
+        self._last_harmonized_vec: Dict[int, np.ndarray] = {}
+        self._harm_drift_cos = _c.harm_drift_cos  # skip harmonization if cos > this
+
 
     # ═══════════════════════════════════════════════════
     # Public API
@@ -439,37 +443,54 @@ class STDPTrainer:
                 else:
                     sent_vec_cache[sent_key] = sv_768
 
-        # ── 3. Morpheme harmonisation ──
+        # ── 3. Morpheme harmonisation (semantic lazy: skip if drift < threshold) ──
         dirty_words = list(harm.word_dirty)
+        drift_cos = self._harm_drift_cos
+        skipped = 0
         basis = cs.fractal.basis
         for cid in dirty_words:
             v = cs.concept_vectors.get(cid)
-            if v is not None:
-                sv = None
-                for ids in all_ids:
-                    if cid in ids:
-                        sent_key = hash(tuple(ids))
-                        sv = sent_vec_cache.get(sent_key)
-                        break
-                if basis is not None:
-                    v_latent = v @ basis.T
-                    v_ln = float(np.linalg.norm(v_latent))
-                    v_latent = v_latent / v_ln if v_ln > 1e-10 else v_latent
-                    new_v, delta = harm.harmonize(cid, v_latent, sent_vec=sv)
-                    if new_v is not None:
-                        v_concept = new_v @ basis
-                        cvn = float(np.linalg.norm(v_concept))
-                        if cvn > 1e-10:
-                            v_concept /= cvn
-                        cs._apply_vector_update(cid, v_concept)
-                        ef.sync_word(cid, v_concept)
-                        updated_cids.append(cid)
-                else:
-                    new_v, delta = harm.harmonize(cid, v, sent_vec=sv)
-                    if new_v is not None:
-                        cs._apply_vector_update(cid, new_v)
-                        ef.sync_word(cid, new_v)
-                        updated_cids.append(cid)
+            if v is None:
+                continue
+            last_v = self._last_harmonized_vec.get(cid)
+            if last_v is not None and drift_cos > 0:
+                cos_sim = float(np.dot(v, last_v))
+                if cos_sim > drift_cos:
+                    skipped += 1
+                    continue
+            sv = None
+            for ids in all_ids:
+                if cid in ids:
+                    sent_key = hash(tuple(ids))
+                    sv = sent_vec_cache.get(sent_key)
+                    break
+            if basis is not None:
+                v_latent = v @ basis.T
+                v_ln = float(np.linalg.norm(v_latent))
+                v_latent = v_latent / v_ln if v_ln > 1e-10 else v_latent
+                new_v, delta = harm.harmonize(cid, v_latent, sent_vec=sv)
+                if new_v is not None:
+                    v_concept = new_v @ basis
+                    cvn = float(np.linalg.norm(v_concept))
+                    if cvn > 1e-10:
+                        v_concept /= cvn
+                    cs._apply_vector_update(cid, v_concept)
+                    ef.sync_word(cid, v_concept)
+                    updated_cids.append(cid)
+                    self._last_harmonized_vec[cid] = v_concept.copy()
+            else:
+                new_v, delta = harm.harmonize(cid, v, sent_vec=sv)
+                if new_v is not None:
+                    cs._apply_vector_update(cid, new_v)
+                    ef.sync_word(cid, new_v)
+                    updated_cids.append(cid)
+                    self._last_harmonized_vec[cid] = new_v.copy()
+
+        if skipped:
+            n_harm = len(dirty_words) - skipped
+            if n_harm > 0 and n_harm % 10 == 0:
+                print(f"    harmony drift-skip: {skipped}/{len(dirty_words)} skipped "
+                      f"(cos>{drift_cos}), {n_harm} harmonized")
 
         # ── P1.9: Morph-level transition manifold ──
         mm = getattr(self, 'morph_manifold', None)

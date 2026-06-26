@@ -522,24 +522,38 @@ class FCFConfig:
     max_n: int = 3
     min_ngram_count: int = 2        # prune singleton 3-gram transitions
     ppmi_prune_threshold: float = 0.5  # prune 3-gram transitions with PPMI < 0.5
+    use_ami_correction: bool = True     # AMI (1/√count) penalty on raw PMI
+    ami_alpha: float = 0.5             # strength of AMI correction
     path_levels: int = 16               # Zeckendorf path depth (also accessible as octree_levels)
 
     @property
     def l_c(self) -> int:
-        phi = (1.0 + 5.0 ** 0.5) / 2.0
-        total = phi * phi + phi + 1.0
-        return max(8, int(self.latent_dim * phi * phi / total))
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        if self.use_fib_generalized and self.fib_dimension >= 2:
+            lam = FibonacciUtils.get_lambda(self.fib_dimension)
+        else:
+            lam = FibonacciUtils.golden_ratio()
+        total = lam * lam + lam + 1.0
+        return max(8, int(self.latent_dim * lam * lam / total))
 
     @property
     def l_a(self) -> int:
-        phi = (1.0 + 5.0 ** 0.5) / 2.0
-        total = phi * phi + phi + 1.0
-        return max(8, int(self.latent_dim * phi / total))
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        if self.use_fib_generalized and self.fib_dimension >= 2:
+            lam = FibonacciUtils.get_lambda(self.fib_dimension)
+        else:
+            lam = FibonacciUtils.golden_ratio()
+        total = lam * lam + lam + 1.0
+        return max(8, int(self.latent_dim * lam / total))
 
     @property
     def l_m(self) -> int:
-        phi = (1.0 + 5.0 ** 0.5) / 2.0
-        total = phi * phi + phi + 1.0
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        if self.use_fib_generalized and self.fib_dimension >= 2:
+            lam = FibonacciUtils.get_lambda(self.fib_dimension)
+        else:
+            lam = FibonacciUtils.golden_ratio()
+        total = lam * lam + lam + 1.0
         return self.latent_dim - self.l_c - self.l_a
 
     def get_field_dims(self):
@@ -817,6 +831,10 @@ class FCFConfig:
     morph_stdp_discover_every: int = 100  # discover every N batches
     use_morph_manifold: bool = True     # TransitionManifold for morph sequences
     morph_manifold_buffer: int = 2000   # buffer size for morph transitions
+
+    # ── Обобщённые числа Фибоначчи (размерность d) ────────────────
+    fib_dimension: int = 2              # d в F^(d)_n / λ_d. 2 = классическое φ
+    use_fib_generalized: bool = False   # Включить λ_d вместо φ во всех местах
 
     # ──────────────────────────────────────────
     #  Генерация пар из MorphVocab/корпуса

@@ -33,6 +33,7 @@ class HormonalSystem:
 
     def __init__(self, formula=None):
         _fc = formula if formula is not None else FCFConfig().formula
+        _cfg = FCFConfig()
 
         # Baselines (tonic levels)
         self.dopamine = _fc.da_baseline
@@ -49,9 +50,15 @@ class HormonalSystem:
         self.recent_confidences = []
         self.recent_matches = []
 
-        # Decay rates
-        self.tonic_decay = _fc.tonic_decay
-        self.phasic_decay = _fc.phasic_decay
+        # Decay rates (optional λ_d-based when use_fib_generalized)
+        if _cfg.use_fib_generalized and _cfg.fib_dimension >= 2:
+            from eva.symbolic.fibonacci_utils import FibonacciUtils
+            lam = FibonacciUtils.get_lambda(_cfg.fib_dimension)
+            self.tonic_decay = 1.0 / lam
+            self.phasic_decay = 0.5 / lam
+        else:
+            self.tonic_decay = _fc.tonic_decay
+            self.phasic_decay = _fc.phasic_decay
 
         # Dynamic state
         self._prev_avg_match = 0.0

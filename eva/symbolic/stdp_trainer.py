@@ -26,6 +26,16 @@ _META_ANTONYM = 9
 
 from eva.symbolic.fcf_config import EnvironmentResolver, FCFConfig
 
+# P1.8: TemporalZeckendorf singleton — created once at module level, not per-pair
+_TEMPORAL_ZECKENDORF = None
+
+def _get_temporal_zeckendorf():
+    global _TEMPORAL_ZECKENDORF
+    if _TEMPORAL_ZECKENDORF is None:
+        from eva.symbolic.fibonacci_utils import TemporalZeckendorf
+        _TEMPORAL_ZECKENDORF = TemporalZeckendorf()
+    return _TEMPORAL_ZECKENDORF
+
 # P1.8: Антоним-словарь из JSON с fallback на хардкод
 _ANTONYM_PATH = EnvironmentResolver().antonym_path
 
@@ -264,24 +274,33 @@ class STDPTrainer:
                 self._negative_sampling_cpu(gen_updates, neg_lr_ratio, field_gate, neg_samples)
             self._contrastive_objective(gen_updates, field_gate)
 
-        # ── HDTransformerLayer refinement (P1.9) ──
+        # ── HDTransformerLayer refinement (P1.9: integrated train_step) ──
         if FCFConfig().use_hd_transformer:
             if not hasattr(self, '_hd_transformer'):
                 from eva.symbolic.hdtransformer_layer import HDTransformerLayer
                 self._hd_transformer = HDTransformerLayer(dim=cs.dim, num_heads=2, top_k=5)
+            _hd_err_total = 0.0
+            _hd_err_n = 0
             for ids in all_ids:
-                seq = [cs.concept_vector(c) for c in ids if cs.concept_vector(c) is not None]
-                if len(seq) >= 2:
-                    out = self._hd_transformer.forward(seq)
-                    for j, cid in enumerate(ids):
-                        if j < len(out) and cs.concept_vector(cid) is not None:
-                            pull = out[j] - cs.concept_vector(cid)
-                            pn = float(np.linalg.norm(pull))
-                            if pn > 1e-10:
-                                new_v = cs.concept_vector(cid) + pull * 0.1
-                                nn = float(np.linalg.norm(new_v))
-                                if nn > 1e-10:
-                                    cs._apply_vector_update(cid, new_v / nn)
+                valid = [c for c in ids if cs.concept_vector(c) is not None]
+                if len(valid) < 2:
+                    continue
+                seq = [cs.concept_vector(c) for c in valid]
+                target = [v.copy() for v in seq]
+                mean_err, out = self._hd_transformer.train_step(seq, target, lr=0.003)
+                _hd_err_total += mean_err
+                _hd_err_n += 1
+                for j, cid in enumerate(valid):
+                    if j < len(out):
+                        pull = out[j] - cs.concept_vector(cid)
+                        pn = float(np.linalg.norm(pull))
+                        if pn > 1e-10:
+                            new_v = cs.concept_vector(cid) + pull * 0.1
+                            nn = float(np.linalg.norm(new_v))
+                            if nn > 1e-10:
+                                cs._apply_vector_update(cid, new_v / nn)
+            if _hd_err_n > 0:
+                self._hd_err = _hd_err_total / _hd_err_n
 
         # ── Centroid pull + lattice update (reuses cached ids from first loop) ──
         self._centroid_pull_batch(all_ids, base_lr)
@@ -568,16 +587,28 @@ class STDPTrainer:
         if morph_stdp is not None and self._morph_stdp_batches % _c.morph_stdp_discover_every == 0:
             n_new = morph_stdp.discover_morphemes(min_cohesion=_c.morph_stdp_cohesion)
             if n_new > 0 and hasattr(cs, 'morph_vocab'):
+                basis = cs.fractal.basis if hasattr(cs.fractal, 'basis') else None
                 for morph_id, chars in morph_stdp.morph_to_chars.items():
-                    mkey = ('MORPH', morph_id)
-                    if mkey not in harm.word_morphs:
-                        harm.word_morphs[mkey] = []
-                    if mkey not in cs.morph_vocab:
-                        cs.morph_vocab[mkey] = ''.join(chr(c) for c in chars)
+                    # Use int key (not tuple) — Harmonizer expects int in word_morphs
+                    if morph_id not in harm.word_morphs:
+                        harm.word_morphs[morph_id] = []
+                    if morph_id not in cs.morph_vocab:
+                        cs.morph_vocab[morph_id] = ''.join(chr(c) for c in chars)
                     mv = morph_stdp.morphemes.get(morph_id)
-                    if mv is not None and mkey not in cs.concept_vectors:
-                        cs.concept_vectors[mkey] = mv.copy()
-                        cs.concept_norms[mkey] = 1.0
+                    if mv is not None and morph_id not in cs.concept_vectors:
+                        # Store 768D in concept_vectors
+                        cs.concept_vectors[morph_id] = mv.copy()
+                        cs.concept_norms[morph_id] = 1.0
+                        # Project 768D → 2048D for Harmonizer (latent space)
+                        if basis is not None:
+                            mv_latent = mv.astype(np.float32) @ basis.T
+                            mvn = float(np.linalg.norm(mv_latent))
+                            if mvn > 1e-10:
+                                harm.morphemes[morph_id] = (mv_latent / mvn).astype(np.float32)
+                            else:
+                                harm.morphemes[morph_id] = mv_latent.astype(np.float32)
+                        else:
+                            harm.morphemes[morph_id] = mv.astype(np.float32)
 
         # ── 5. Cleanup ──
         if gen._dirty_cids:
@@ -691,8 +722,7 @@ class STDPTrainer:
                 lr = base_lr * max(freq_weight, _fc.freq_weight_min) * pmi_w * field_weight
                 lr *= (_fc.hormonal_mod_baseline + gen.hormones.acetylcholine * _fc.hormonal_mod_scale) * (_fc.hormonal_mod_baseline + gen.hormones.dopamine * _fc.hormonal_mod_scale)
                 if FCFConfig().use_temporal_zeckendorf:
-                    from eva.symbolic.fibonacci_utils import TemporalZeckendorf as _TZ
-                    _tz = _TZ()
+                    _tz = _get_temporal_zeckendorf()
                     fast_th, slow_th = _tz.theta(abs(j-i))
                     theta_gate = max(fast_th, _fc.theta_fast_min)
                     gen_updates[ids[j]].append((ids[i], lr * theta_gate))
@@ -1372,12 +1402,12 @@ class STDPTrainer:
                 v_neg = cs.concept_vectors.get(neg_cid)
                 if v_neg is None:
                     continue
-                # SN-16: Field-Aware Contrastive Decoupling
+                # SN-16: Field-Aware Contrastive Decoupling (flat array via getter)
                 overlap = 0
-                fb_gen = gen.cs.fractal.field_bits.get(gen_cid)
-                fb_neg = gen.cs.fractal.field_bits.get(neg_cid)
+                fb_gen = gen.cs.fractal.get_field_bits(gen_cid)
+                fb_neg = gen.cs.fractal.get_field_bits(neg_cid)
                 if fb_gen is not None and fb_neg is not None:
-                    overlap = int((fb_gen & fb_neg).sum())
+                    overlap = int(np.unpackbits(np.bitwise_and(fb_gen, fb_neg)).sum())
                 if overlap == 0 and cos_val > 0.05:
                     pass  # aggressive push for cross-field
                 elif overlap > 0 and cos_val > 0.3:

@@ -64,7 +64,7 @@ class GenerationResult:
 class CrystalGenerator:
     """Generation as semantic navigation through BPE-token concept space."""
 
-    def __init__(self, cs, sp, lattice, config=None, qwen_knowledge=None):
+    def __init__(self, cs, sp, lattice, config=None):
         self.cs = cs
         self.sp = sp
         self.lattice = lattice
@@ -218,13 +218,15 @@ class CrystalGenerator:
     def _destab_field_fallback(self, gen_cid, v_gen):
         """Field-based destab fallback: pick a random concept with overlapping field."""
         cs = self.cs
-        if not hasattr(cs.fractal, 'field_bits') or len(cs.fractal.field_bits) < 2:
+        fb = getattr(cs.fractal, 'field_bits', None)
+        if not isinstance(fb, np.ndarray) or fb.shape[0] < 2:
             return None
         gen_fb = cs.fractal.get_field_bits(gen_cid)
         if gen_fb is None:
             return None
-        candidates = [cid for cid, fb in cs.fractal.field_bits.items()
-                      if cid != gen_cid and np.bitwise_and(gen_fb, fb).any()]
+        candidates = [cid for cid in range(fb.shape[0])
+                      if cid != gen_cid and fb[cid].any()
+                      and np.bitwise_and(gen_fb, fb[cid]).any()]
         if not candidates:
             return None
         neg_cid = candidates[self.main_rng.randint(0, len(candidates) - 1)]
@@ -361,10 +363,11 @@ class CrystalGenerator:
         self._cluster_potential = None  # stale after vector flush
 
     def _sync_after_fluctuate(self):
-        """SN-54: Incremental GPU sync after fluctuate.
+        """SN-54: Incremental GPU sync after fluctuate (chunked).
 
-        Reads CPU codes → builds temp GPU codes tensor → recomputes _vecs_t via
-        batched matmul, then discards the temp tensor (no full-V codes storage).
+        Reads CPU codes in Fibonacci-sized chunks (F₂₁=10946) → builds temp GPU
+        codes tensor per chunk → recomputes _vecs_t slices via batched matmul.
+        Peak VRAM: ~822 MB instead of ~1936 MB (was full-V codes_t = 1.2 GB).
         """
         cs = self.cs
         if self._torch_device is None or self._vecs_t is None or not hasattr(cs.fractal, 'codes'):
@@ -373,28 +376,34 @@ class CrystalGenerator:
         dev = self._torch_device
         V = cs.vocab_size
         latent_dim = cs.fractal.latent_dim
-
-        codes_arr = np.zeros((V, latent_dim), dtype=np.float32)
-        for cid, code in cs.fractal.codes.items():
-            codes_arr[cid] = code
-
-        # Build temporary GPU codes tensor (discarded after use)
-        codes_t = torch.from_numpy(codes_arr).to(dev, dtype=torch.float32)
-
         basis_t = self._basis_t
-        vecs_gpu = codes_t @ basis_t.to(dev, non_blocking=True)
-        nv = vecs_gpu.norm(dim=1, keepdim=True).clamp(min=1e-10)
-        vecs_gpu /= nv
+        chunk_size = 10946  # F₂₁ — Fibonacci chunk size for elegant VRAM scaling
+
+        # Refresh basis_t first (may have changed after fluctuate)
+        if cs.fractal.basis is not None:
+            basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(dev, non_blocking=True)
+            self._basis_t = basis_t
+
         if self._vecs_t.shape[0] != V:
-            self._vecs_t = torch.empty(V, vecs_gpu.shape[1], device=dev, dtype=torch.float16)
-        self._vecs_t.copy_(vecs_gpu.to(torch.float16), non_blocking=True)
+            self._vecs_t = torch.empty(V, self._vecs_t.shape[1], device=dev, dtype=torch.float16)
+
+        for start in range(0, V, chunk_size):
+            end = min(start + chunk_size, V)
+            n = end - start
+            codes_chunk = np.zeros((n, latent_dim), dtype=np.float32)
+            for i, cid in enumerate(range(start, end)):
+                code = cs.fractal.codes.get(cid)
+                if code is not None:
+                    codes_chunk[i] = code
+            codes_t = torch.from_numpy(codes_chunk).to(dev, dtype=torch.float32)
+            vecs_chunk = codes_t @ basis_t
+            nv = vecs_chunk.norm(dim=1, keepdim=True).clamp(min=1e-10)
+            vecs_chunk /= nv
+            self._vecs_t[start:end].copy_(vecs_chunk.to(torch.float16), non_blocking=True)
+            del codes_t, vecs_chunk, codes_chunk
 
         # Keep _codes_master_t as None — no longer stored as full-V tensor
         self._codes_master_t = None
-
-        # Refresh basis_t (may have changed after fluctuate)
-        if cs.fractal.basis is not None:
-            self._basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(dev, non_blocking=True)
 
         # Reset momentum (codes changed — old momentum is stale)
         if self._mom_t is not None:
@@ -463,17 +472,13 @@ class CrystalGenerator:
             return
         cs = self.cs
         V = cs.vocab_size
-        if hasattr(cs.fractal, 'field_bits') and cs.fractal.field_bits:
-            sample_fb = next(iter(cs.fractal.field_bits.values()))
-            fb_bytes = len(np.asarray(sample_fb, dtype=np.uint8).ravel())
+        fb = getattr(cs.fractal, 'field_bits', None)
+        if isinstance(fb, np.ndarray) and fb.shape[0] > 0:
+            fb_bytes = fb.shape[1]
+            fb_arr = fb  # flat array, direct use
         else:
             fb_bytes = (getattr(cs, 'n_anchors', 1024) + 7) // 8
-        if fb_bytes == 0:
-            fb_bytes = (getattr(cs, 'n_anchors', 1024) + 7) // 8
-        fb_arr = np.zeros((V, fb_bytes), dtype=np.uint8)
-        if hasattr(cs.fractal, 'field_bits'):
-            for cid, fb in cs.fractal.field_bits.items():
-                fb_arr[cid] = np.asarray(fb, dtype=np.uint8).ravel()
+            fb_arr = np.zeros((V, fb_bytes), dtype=np.uint8)
         if self._fb_t is None or self._fb_t.shape[0] != V or self._fb_t.device != dev:
             self._fb_t = torch.empty(V, fb_bytes, device=dev, dtype=torch.uint8)
         self._fb_t.copy_(torch.from_numpy(fb_arr), non_blocking=True)
@@ -486,18 +491,18 @@ class CrystalGenerator:
         cs = self.cs
         if dev is None:
             dev = self._torch_device
-        if not hasattr(cs.fractal, 'field_bits') or not cs.fractal.field_bits:
+        fb = getattr(cs.fractal, 'field_bits', None)
+        if not isinstance(fb, np.ndarray) or fb.shape[0] == 0:
             return
         V = cs.vocab_size
-        n_anchors = getattr(cs, 'n_anchors', 2048)
-        n_bytes = (n_anchors + 7) // 8
+        n_bytes = fb.shape[1]
         cluster_arr = np.zeros(V, dtype=np.int32)
-        for cid, fb in cs.fractal.field_bits.items():
-            fb_arr = np.asarray(fb, dtype=np.uint8).ravel()
-            if len(fb_arr) < n_bytes:
-                fb_arr = np.pad(fb_arr, (0, n_bytes - len(fb_arr)))
+        for cid in range(min(V, fb.shape[0])):
+            fb_row = fb[cid]
+            if not fb_row.any():
+                continue
             # Find first set bit
-            mask = fb_arr.view(np.uint64) if n_bytes >= 8 else fb_arr.view(np.uint32)
+            mask = fb_row.view(np.uint64) if n_bytes >= 8 else fb_row.view(np.uint32)
             bits = int(mask[0]) if len(mask) > 0 else 0
             if bits:
                 cluster_arr[cid] = (bits & -bits).bit_length() - 1  # ctz
@@ -878,16 +883,22 @@ class CrystalGenerator:
             rrf += prior
             combined[cid] = rrf
 
-        # 5a. VSAAttention re-ranking (P1.9)
+        # 5a. VSAAttention re-ranking (P1.9, unified with fractal basis)
         if FCFConfig().use_vsa_attention:
             if not hasattr(self, '_vsa_attn'):
                 from eva.symbolic.vsa_attention import VSAAttention
-                self._vsa_attn = VSAAttention(dim=self.cs.dim, n_heads=1, use_fib_pos=False)
+                basis = getattr(self.cs.fractal, 'basis', None)
+                self._vsa_attn = VSAAttention(dim=self.cs.dim, n_heads=1, use_fib_pos=False,
+                                              basis=basis)
             ctx_vecs = [self.cs.concept_vector(c) for c in seq[-5:] if self.cs.concept_vector(c) is not None]
             if len(ctx_vecs) >= 1 and v_prev is not None:
                 attn_out = self._vsa_attn.forward(v_prev, ctx_vecs, ctx_vecs)
-                attn_sims = {cid: float(np.dot(self.cs.concept_vector(cid) or np.zeros(self.cs.dim), attn_out))
-                             for cid in all_cids}
+                attn_sims = {}
+            for cid in all_cids:
+                vec = self.cs.concept_vector(cid)
+                if vec is None:
+                    vec = np.zeros(self.cs.dim)
+                attn_sims[cid] = float(np.dot(vec, attn_out))
                 max_as = max(attn_sims.values()) if attn_sims else 1.0
                 if max_as > 1e-10:
                     for cid in list(combined.keys()):
@@ -929,7 +940,8 @@ class CrystalGenerator:
                 combined.pop(cid, None)
 
         # 8. Field mask filter + bonus: exclude candidates with zero field overlap
-        if hasattr(self.cs.fractal, 'field_bits') and len(self.cs.fractal.field_bits) > 0:
+        _fb_gen = getattr(self.cs.fractal, 'field_bits', None)
+        if isinstance(_fb_gen, np.ndarray) and _fb_gen.shape[0] > 0:
             ctx_cids = seq[-3:] if len(seq) >= 3 else seq
             ctx_field = None
             for cc in ctx_cids:
@@ -1151,7 +1163,7 @@ class GpuChunkManager:
         self.device = gen._torch_device
         self.dim = config.dim
         self.latent_dim = config.latent_dim
-        self.depth = 1  # 10 bits → up to 1024 chunks
+        self.depth = getattr(config, 'gpu_chunk_depth', 1)  # 10 bits → up to 1024 chunks
         self.max_chunks = getattr(config, 'gpu_max_chunks', 32)
 
         # Chunk cache: {sector_key: {'vecs': tensor(N, D), 'cids': list}}
@@ -1198,8 +1210,9 @@ class GpuChunkManager:
         return loc[0] if loc else None
 
     def load_batch(self, cids):
-        """Load chunks for given CIDs. Returns (all_cids, compact_vecs, mapping_dict).
+        """Load chunks for given CIDs from GPU cache (fix V22: was reading from CPU).
 
+        Returns (all_cids, compact_vecs, mapping_dict).
         mapping_dict: {global_cid: local_index} for O(1) translation.
         """
         needed_keys = set()
@@ -1212,24 +1225,29 @@ class GpuChunkManager:
             if key not in self._chunks:
                 self._load_chunk(key)
 
-        # Build compact working set
+        # Build compact working set FROM GPU chunk cache
         all_cids = sorted(set(cids))
         n = len(all_cids)
         vecs_np = np.zeros((n, self.dim), dtype=np.float32)
         mapping = {}
         for i, cid in enumerate(all_cids):
-            v = self.cs.concept_vectors.get(cid)
-            if v is not None:
-                vecs_np[i] = v
+            sk = self.get_sector_key(cid)
+            if sk is not None and sk in self._chunks:
+                chunk = self._chunks[sk]
+                local_idx = chunk['cid_to_idx'].get(cid)
+                if local_idx is not None:
+                    vecs_np[i] = chunk['vecs'][local_idx].cpu().numpy()
+            else:
+                v = self.cs.concept_vectors.get(cid)
+                if v is not None:
+                    vecs_np[i] = v
             mapping[cid] = i
 
         return all_cids, vecs_np, mapping
 
     def _load_chunk(self, key):
         """Load a sector's vectors from CPU to GPU cache."""
-        # Find CIDs in this sector
-        locs = [cid for cid, loc in self._cid_loc.items() if loc[0] == key] if hasattr(self._cid_loc.get(next(iter([k for k in self._cid_loc if self._cid_loc[k][0] == key])), None), '__iter__') else []
-        # Simpler: look up from sector index
+        # Look up from sector index
         si = getattr(self.fractal, '_sector_index', {})
         cids = []
         if self.depth in si and key in si[self.depth]:
@@ -1250,7 +1268,9 @@ class GpuChunkManager:
         vecs_np = np.stack([self.cs.concept_vectors.get(cid, np.zeros(self.dim)) for cid in cids])
         vecs_t = torch.from_numpy(vecs_np).to(self.device, dtype=torch.float16)
 
-        self._chunks[key] = {'vecs': vecs_t, 'cids': cids}
+        # Store with O(1) CID→local-index lookup
+        cid_to_idx = {cid: i for i, cid in enumerate(cids)}
+        self._chunks[key] = {'vecs': vecs_t, 'cids': cids, 'cid_to_idx': cid_to_idx}
         self._lru.append(key)
 
     def _evict_chunk(self, key):

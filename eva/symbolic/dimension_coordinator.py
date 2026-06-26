@@ -140,12 +140,20 @@ class DimensionCoordinator:
 
     @property
     def subspace(self) -> dict:
-        phi = (1.0 + 5.0 ** 0.5) / 2.0
-        total = phi * phi + phi + 1.0
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        from eva.symbolic.fcf_config import FCFConfig
+        cfg = FCFConfig()
+        if cfg.use_fib_generalized and cfg.fib_dimension >= 2:
+            lam = FibonacciUtils.get_lambda(cfg.fib_dimension)
+        else:
+            lam = FibonacciUtils.golden_ratio()
+        total = lam * lam + lam + 1.0
+        l_c = max(8, int(self.latent_dim * lam * lam / total))
+        l_a = max(8, int(self.latent_dim * lam / total))
         return {
-            'l_c': max(8, int(self.latent_dim * phi * phi / total)),
-            'l_a': max(8, int(self.latent_dim * phi / total)),
-            'l_m': self.latent_dim - max(8, int(self.latent_dim * phi * phi / total)) - max(8, int(self.latent_dim * phi / total)),
+            'l_c': l_c,
+            'l_a': l_a,
+            'l_m': self.latent_dim - l_c - l_a,
         }
 
 

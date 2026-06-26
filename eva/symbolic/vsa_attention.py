@@ -26,16 +26,24 @@ class VSAAttention:
     """
 
     def __init__(self, dim=768, n_heads=4, max_weight=7, use_fib_pos=True,
-                 use_bind_weighting=True):
+                 use_bind_weighting=True, basis=None):
         self.dim = dim
         self.n_heads = n_heads
         self.max_weight = max_weight
         self.use_fib_pos = use_fib_pos
         self.use_bind_weighting = use_bind_weighting
 
-        mat = _R.rng('vsa_attention').randn(n_heads, dim).astype(np.float32)
-        Q, _ = np.linalg.qr(mat.T, mode='reduced')
-        self.head_roles = Q.T.copy()
+        if basis is not None:
+            n_avail = min(n_heads, basis.shape[0])
+            self.head_roles = basis[:n_avail].copy()
+            if n_avail < n_heads:
+                mat = _R.rng('vsa_attention').randn(n_heads - n_avail, dim).astype(np.float32)
+                Q, _ = np.linalg.qr(mat.T, mode='reduced')
+                self.head_roles = np.vstack([self.head_roles, Q.T.copy()])
+        else:
+            mat = _R.rng('vsa_attention').randn(n_heads, dim).astype(np.float32)
+            Q, _ = np.linalg.qr(mat.T, mode='reduced')
+            self.head_roles = Q.T.copy()
 
     def _quantize_weight(self, sim):
         return 0 if sim <= 0 else int(round(self.max_weight * min(sim, 1.0)))

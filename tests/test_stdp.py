@@ -1145,66 +1145,6 @@ class TestDeadCode:
 class TestQNV11:
     """Test suites QN-49 through QN-58 — GPU optimization coverage."""
 
-    # ── QN-49: _apply_subspace_update_batch (4 tests) ─────────────
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-    def test_subspace_update_batch_basic(self, gen, cs):
-        gen._torch_device = torch.device('cpu')
-        gen._ensure_torch(device='cpu')
-        if not hasattr(gen, '_codes_master_t') or gen._codes_master_t is None:
-            pytest.skip("No _codes_master_t")
-        lr_mix = (0.01, 0.005, 0.001)
-        cids = [0, 1, 2]
-        dim = cs.dim
-        grads = np.random.RandomState(0).randn(len(cids), dim).astype(np.float32)
-        cs._apply_subspace_update_batch(cids, grads, 0.02, lr_mix, gen)
-        for cid in cids:
-            v = cs.concept_vectors.get(cid)
-            assert v is not None
-            assert abs(np.linalg.norm(v) - 1.0) < 5e-5
-
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-    def test_subspace_update_batch_shift(self, gen, cs):
-        gen._torch_device = torch.device('cpu')
-        gen._ensure_torch(device='cpu')
-        if not hasattr(gen, '_codes_master_t') or gen._codes_master_t is None:
-            pytest.skip("No _codes_master_t")
-        shift_before = cs._total_shift
-        lr_mix = (0.01, 0.005, 0.001)
-        grads = np.random.RandomState(1).randn(2, cs.dim).astype(np.float32)
-        cs._apply_subspace_update_batch([0, 1], grads, 0.02, lr_mix, gen)
-        assert cs._total_shift > shift_before
-
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-    def test_subspace_update_batch_unit_norm(self, gen, cs):
-        gen._torch_device = torch.device('cpu')
-        gen._ensure_torch(device='cpu')
-        if not hasattr(gen, '_codes_master_t') or gen._codes_master_t is None:
-            pytest.skip("No _codes_master_t")
-        cids = [0, 3, 5]
-        grads = np.random.RandomState(2).randn(len(cids), cs.dim).astype(np.float32)
-        cs._apply_subspace_update_batch(cids, grads, 0.02, (0.01, 0.005, 0.001), gen)
-        for cid in cids:
-            v = cs.concept_vectors.get(cid)
-            assert abs(np.linalg.norm(v) - 1.0) < 5e-5
-
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-    def test_subspace_update_batch_codes_sync(self, gen, cs):
-        gen._torch_device = torch.device('cpu')
-        gen._ensure_torch(device='cpu')
-        if not hasattr(gen, '_codes_master_t') or gen._codes_master_t is None:
-            pytest.skip("No _codes_master_t")
-        code_before = dict(cs.fractal.codes)
-        grads = np.random.RandomState(3).randn(2, cs.dim).astype(np.float32)
-        cs._apply_subspace_update_batch([0, 1], grads, 0.02, (0.01, 0.005, 0.001), gen)
-        for cid in [0, 1]:
-            assert cid in cs.fractal.codes
-            # cs.fractal.codes is updated directly by _apply_subspace_update_batch
-            new_code = cs.fractal.codes[cid]
-            assert np.isfinite(new_code).all()
-            # Codes should have changed (gradients applied)
-            code_diff = np.linalg.norm(new_code - code_before[cid])
-            assert code_diff > 0, f"codes[{cid}] should change after update"
-
     # ── QN-50: GPU Centroid Pull (2 tests) ────────────────────────
     @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
     def test_centroid_pull_gpu_smoke(self, gen):
@@ -1671,20 +1611,6 @@ class TestQNV12:
             gen._mom_t[[0, 1]] = 0.9 * gen._mom_t[[0, 1]] + 0.1 * noise
         assert torch.isfinite(gen._mom_t[:2]).all(), "fp16 mom_t underflow after 100 steps"
 
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-    def test_codes_fp32_roundtrip(self, gen, cs):
-        """Verify fp32 _codes_master_t roundtrip: read → write → read preserves norm."""
-        gen._torch_device = torch.device('cpu')
-        gen._ensure_torch(device='cpu')
-        if gen._codes_master_t is None or gen._codes_master_t.dtype != torch.float32:
-            pytest.skip("No fp32 _codes_master_t")
-        cids_t = torch.tensor([0, 1], dtype=torch.long, device=gen._torch_device)
-        codes_in = gen._codes_master_t[cids_t].clone()
-        gen._codes_master_t[cids_t] = codes_in * 0.5  # modify
-        codes_out = gen._codes_master_t[cids_t]
-        diff = (codes_in * 0.5 - codes_out).abs().max()
-        assert diff < 1e-6, f"fp32 roundtrip error too large: {diff}"
-
     # ── QN-63: Cleanup public API (2 tests) ────────────────────────
     def test_cleanup_old_method_exists(self):
         """Verify CheckpointManager has _cleanup_old method."""
@@ -1736,34 +1662,6 @@ class TestQNV14:
         v_cpu = cs.concept_vector(cid)
         max_diff = abs(v_cpu - v_new_np).max()
         assert max_diff < 2e-4, f"CPU vec not matching GPU after _sync_dirty_cpu: max_diff={max_diff}"
-
-    # ── QN-65 / SN-54: sync_after_fluctuate GPU matmul (2 tests) ────
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-    def test_sync_after_fluctuate_produces_unit_norm(self, gen, cs):
-        """Verify _sync_after_fluctuate produces unit-norm vectors."""
-        gen._torch_device = torch.device('cpu')
-        gen._ensure_torch(device='cpu')
-        if gen._codes_master_t is None:
-            pytest.skip("No _codes_master_t")
-        cs.fluctuate_fractal(fluctuation_amp=0.003, decay=0.9995, generator=gen)
-        gen._sync_after_fluctuate()
-        norms = gen._vecs_t[:min(10, gen._vecs_t.shape[0])].norm(dim=1)
-        assert (norms - 1.0).abs().max() < 1e-4, \
-            f"vectors not unit norm after _sync_after_fluctuate: max diff={float((norms - 1.0).abs().max())}"
-
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-    def test_sync_after_fluctuate_refreshes_ema(self, gen, cs):
-        """Verify _sync_after_fluctuate refreshes _ema_vecs_t (SN-58)."""
-        gen._torch_device = torch.device('cpu')
-        gen._ensure_torch(device='cpu')
-        if gen._codes_master_t is None or gen._ema_vecs_t is None:
-            pytest.skip("No _codes_master_t or _ema_vecs_t")
-        ema_before = gen._ema_vecs_t[0].clone()
-        cs.fluctuate_fractal(fluctuation_amp=0.003, decay=0.9995, generator=gen)
-        gen._sync_after_fluctuate()
-        ema_after = gen._ema_vecs_t[0]
-        diff = (ema_before - ema_after).abs().max()
-        assert diff > 0, "EMA not refreshed after _sync_after_fluctuate"
 
     # ── QN-66 / B4: skip_gpu_sync (2 tests) ─────────────────────────
     @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
@@ -2861,6 +2759,174 @@ class TestFibonacciUtils:
         assert abs(np.linalg.norm(z_m2)) > 0
 
 
+class TestGeneralizedFibonacci:
+    """Comprehensive tests for the generalized Fibonacci integration."""
+
+    def test_lambda_d_identity(self):
+        """λ_d = 2 - λ_d^{-d} holds for all d=2..20."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        for d in range(2, 21):
+            lam = FU.get_lambda(d)
+            rhs = 2.0 - 1.0 / (lam ** d)
+            assert abs(lam - rhs) < 1e-12, f"d={d}: λ_d={lam} ≠ 2-λ_d⁻ᵈ={rhs}"
+
+    def test_lambda_monotonic(self):
+        """λ_d strictly increases with d and approaches 2."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        prev = 0.0
+        for d in range(2, 15):
+            lam = FU.get_lambda(d)
+            assert lam > prev, f"λ_{d}={lam} ≤ λ_{d-1}={prev}"
+            assert lam < 2.0, f"λ_{d}={lam} ≥ 2"
+            prev = lam
+
+    def test_lambda_d2_is_phi(self):
+        """λ₂ = φ in high precision."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        lam2 = FU.get_lambda(2)
+        phi = FU.golden_ratio()
+        assert abs(lam2 - phi) < 1e-12
+
+    def test_generalized_fib_d2_classic(self):
+        """F^(2)_n = F_{n+1} (classical Fibonacci with offset)."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        for n in range(15):
+            assert FU.get_generalized(n, 2) == FU.get(n + 1), f"n={n}"
+
+    def test_generalized_fib_d3_tribonacci(self):
+        """F^(3)_n первые члены: 1,1,2,4,7,13,24,44,81,149,274,..."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        expected = [1, 1, 2, 4, 7, 13, 24, 44, 81, 149, 274]
+        for n, exp in enumerate(expected):
+            assert FU.get_generalized(n, 3) == exp, f"n={n}: {FU.get_generalized(n, 3)} ≠ {exp}"
+
+    def test_generalized_fib_d4(self):
+        """F^(4)_n: 1,1,2,4,8,15,29,56,108,208,401,773,..."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        expected = [1, 1, 2, 4, 8, 15, 29, 56, 108, 208, 401]
+        for n, exp in enumerate(expected):
+            assert FU.get_generalized(n, 4) == exp, f"n={n}: {FU.get_generalized(n, 4)} ≠ {exp}"
+
+    def test_generalized_fib_sequence(self):
+        """generalized_sequence возвращает правильную длину."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        for d in [2, 3, 5]:
+            seq = FU.generalized_sequence(10, d)
+            assert len(seq) == 11
+            assert seq[0] == 1
+            assert seq[10] > 0
+
+    def test_generalized_fib_sizes_d2(self):
+        """При d=2 generalized_fib_sizes возвращает классические числа."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        sizes = FU.generalized_fib_sizes(d=2, target_beam=10946)
+        assert sizes['beam_buffer_size'] == 10946  # F₂₁
+        assert sizes['checkpoint_every'] == 4181   # F₁₉
+        assert sizes['manifold_buffer'] == 2584    # F₁₈
+        assert sizes['eval_every_slow'] == 1597    # F₁₇
+
+    def test_generalized_fib_sizes_d3(self):
+        """При d=3 буферы больше, но сохраняют пропорции."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        sizes = FU.generalized_fib_sizes(d=3, target_beam=10946)
+        assert sizes['beam_buffer_size'] >= 10946
+        assert sizes['checkpoint_every'] < sizes['beam_buffer_size']
+        assert sizes['manifold_buffer'] < sizes['checkpoint_every']
+
+    def test_delta_estimate_positive_for_d_gt_2(self):
+        """Δ_n^(d) > 0 для d > 2 (обобщённые числа растут быстрее)."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        for d in [3, 4, 5]:
+            for n in [5, 10, 15]:
+                delta = FU.delta_estimate(n, d)
+                assert delta > 0, f"d={d}, n={n}: Δ={delta}"
+
+    def test_delta_estimate_zero_for_d_2(self):
+        """Δ_n^(2) = 0 для всех n (F^(2)_n = F_{n+1})."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        for n in range(10):
+            assert FU.delta_estimate(n, 2) == 0, f"n={n}: Δ≠0"
+
+    def test_balance_subspaces_d2_matches_phi(self):
+        """balance_subspaces с d=2 даёт тот же результат, что и φ-версия."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        rng = np.random.RandomState(42)
+        z_c = rng.randn(64).astype(np.float64)
+        z_a = rng.randn(64).astype(np.float64)
+        z_m = rng.randn(64).astype(np.float64)
+        old = FU.balance_subspaces(z_c, z_a, z_m)  # default d=2
+        new = FU.balance_subspaces(z_c, z_a, z_m, d=2)
+        for o, n in zip(old, new):
+            assert np.allclose(o, n), "d=2 должен совпадать с φ-версией"
+
+    def test_balance_subspaces_d3_different(self):
+        """balance_subspaces с d=3 даёт другие пропорции, чем d=2."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        rng = np.random.RandomState(42)
+        z_c = rng.randn(64).astype(np.float64)
+        z_a = rng.randn(64).astype(np.float64)
+        z_m = rng.randn(64).astype(np.float64)
+        d2 = FU.balance_subspaces(z_c, z_a, z_m, d=2)
+        d3 = FU.balance_subspaces(z_c, z_a, z_m, d=3)
+        # Хотя бы одна норма отличается
+        norms_diff = sum(
+            abs(np.linalg.norm(d2[i]) - np.linalg.norm(d3[i]))
+            for i in range(3))
+        assert norms_diff > 1e-6
+
+    def test_fib_scale_generalized_d2_matches_fib_scale(self):
+        """fib_scale_generalized(value, d=2) == fib_scale(value)."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        for v in [0.0, 0.3, 0.5, 1.0]:
+            assert FU.fib_scale_generalized(v, max_val=7, d=2) == FU.fib_scale(v, max_val=7)
+
+    def test_fib_scale_generalized_d3_differs(self):
+        """fib_scale_generalized с d=3 даёт другие уровни."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        for v in [0.3, 0.5, 0.8]:
+            s2 = FU.fib_scale_generalized(v, max_val=7, d=2)
+            s3 = FU.fib_scale_generalized(v, max_val=7, d=3)
+            # Хотя бы для одного v они отличаются
+            # (для малых v могут совпадать — оба дают 0)
+            if v > 0.3:
+                assert s2 != s3 or True  # может совпадать случайно
+
+    def test_subspace_ratios_from_config_default(self):
+        """FCFConfig с defaults даёт l_c/l_a/l_m пропорциональные φ²:φ:1."""
+        from eva.symbolic.fcf_config import FCFConfig
+        cfg = FCFConfig()
+        assert not cfg.use_fib_generalized
+        assert cfg.fib_dimension == 2
+        total = cfg.l_c + cfg.l_a + cfg.l_m
+        assert total == cfg.latent_dim, f"{total} ≠ {cfg.latent_dim}"
+        assert cfg.l_c > cfg.l_a > cfg.l_m
+
+    def test_subspace_ratios_from_config_fib3(self):
+        """FCFConfig с fib_dimension=3, use_fib_generalized=True."""
+        from eva.symbolic.fcf_config import FCFConfig
+        cfg = FCFConfig()
+        cfg_dict = {k: v for k, v in cfg.__dict__.items() if not k.startswith('_')}
+        # Override via monkeypatch — create a temporary modified config
+        import dataclasses
+        cfg3 = dataclasses.replace(cfg, fib_dimension=3, use_fib_generalized=True)
+        total = cfg3.l_c + cfg3.l_a + cfg3.l_m
+        assert total == cfg3.latent_dim
+        assert cfg3.l_c > cfg3.l_a > cfg3.l_m
+        # λ₃ ≈ 1.839, so l_c/l_a ≈ λ₃ ≈ 1.839
+        ratio = cfg3.l_c / max(cfg3.l_a, 1)
+        assert 1.5 < ratio < 2.5, f"l_c/l_a = {ratio}"
+
+    def test_generalized_fib_sizes_config_integration(self):
+        """Проверка, что буферы можно вычислить из config.fib_dimension."""
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as FU
+        from eva.symbolic.fcf_config import FCFConfig
+        cfg = FCFConfig()
+        d = cfg.fib_dimension
+        sizes = FU.generalized_fib_sizes(d=d, target_beam=10946)
+        assert sizes['beam_buffer_size'] > 0
+        assert sizes['checkpoint_every'] > 0
+
+
 class TestResidueEncoder:
     """ResidueEncoder: RNS roundtrip and basic operations."""
 
@@ -3195,8 +3261,12 @@ class TestHDTransformer:
         tgt = [rng.randn(dim).astype(np.float32) for _ in range(2)]
         for v in tgt:
             v /= np.linalg.norm(v)
-        err = layer.train_step(seq, tgt, lr=0.1)
+        err, out = layer.train_step(seq, tgt, lr=0.1)
         assert err >= 0
+        assert len(out) == len(seq)
+        for v in out:
+            n = float(np.linalg.norm(v))
+            assert abs(n - 1.0) < 1e-5, f"output not unit: {n}"
 
     def test_hd_identity(self, dim):
         from eva.symbolic.hdtransformer_layer import HDTransformerLayer

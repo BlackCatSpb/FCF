@@ -704,7 +704,7 @@ LIVE_REFRESH = 1.0  # seconds between live status updates
 COS_REFRESH = 5.0   # seconds between cos/pair recomputation
 
 print("STDP training...")
-gen = CrystalGenerator(cs, sp, lattice, qwen_knowledge=None)
+gen = CrystalGenerator(cs, sp, lattice)
 gen.train_lr = opt.p['full_lr'].current
 if RESUME_CLUSTER_POTENTIAL is not None:
     import torch

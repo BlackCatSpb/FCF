@@ -93,7 +93,7 @@ class SyntaxLattice:
         self._skip2_total = {}   # prev_cid -> int (total count)
 
     def build(self, corpus_path, sp, max_n=4, min_count=2,
-              ppmi_threshold=None):
+              ppmi_threshold=None, ami_alpha=None):
         """Build n-gram model from corpus via SentencePiece.
 
         Args:
@@ -103,6 +103,9 @@ class SyntaxLattice:
             min_count: minimum raw occurrences to keep a transition
             ppmi_threshold: prune transitions with PPMI < this value
                             (None = use FCFConfig default, 0 = keep all)
+            ami_alpha: AMI correction strength (None = use FCFConfig default,
+                        0 = disable). penalty = alpha / sqrt(cnt) subtracted
+                        from raw PMI before threshold comparison.
         """
         self.max_n = max_n
         for n in range(2, max_n + 1):
@@ -141,12 +144,19 @@ class SyntaxLattice:
         print(f"    connections: {len(self.connections)}")
         self._refresh_prefix_totals()
 
-        # PPMI-based pruning for higher-order n-grams
-        if ppmi_threshold is None:
+        # PPMI-based pruning for higher-order n-grams (with optional AMI correction)
+        if ppmi_threshold is None or ami_alpha is None:
             from eva.symbolic.fcf_config import FCFConfig
-            ppmi_threshold = FCFConfig().ppmi_prune_threshold
+            cfg = FCFConfig()
+            if ppmi_threshold is None:
+                ppmi_threshold = cfg.ppmi_prune_threshold
+            if ami_alpha is None and cfg.use_ami_correction:
+                ami_alpha = cfg.ami_alpha
+            elif ami_alpha is None:
+                ami_alpha = 0.0
         if ppmi_threshold > 0 or min_count > 1:
-            self._prune_by_ppmi(threshold=ppmi_threshold, min_count=min_count)
+            self._prune_by_ppmi(threshold=ppmi_threshold, min_count=min_count,
+                                ami_alpha=ami_alpha)
 
         return self
 
@@ -160,11 +170,16 @@ class SyntaxLattice:
         for cid, counter in self.skip2.items():
             self._skip2_total[cid] = sum(counter.values())
 
-    def _prune_by_ppmi(self, threshold=0.0, min_count=1):
+    def _prune_by_ppmi(self, threshold=0.0, min_count=1, ami_alpha=0.0):
         """Remove n-gram transitions with PPMI < threshold or count < min_count.
 
         PPMI (Positive Pointwise Mutual Information):
           PPMI(c|prefix) = max(0, log2 P(c|prefix) / P(c))
+
+        With optional AMI correction (ami_alpha > 0):
+          adjusted_pmi = raw_pmi - ami_alpha / sqrt(cnt)
+        where cnt is the transition count. This penalises rare transitions
+        more heavily (1/√cnt ≈ expected PMI under independence for small cnt).
 
         Removes noise transitions (high-frequency words following everything)
         and singleton entries (count=1, statistically meaningless).
@@ -174,6 +189,7 @@ class SyntaxLattice:
         total_freq = max(sum(self.concept_freq.values()), 1)
         n_total = 0
         n_pruned = 0
+        use_ami = ami_alpha > 0
 
         for n in range(3, self.max_n + 1):
             if n not in self.ngrams:
@@ -191,7 +207,12 @@ class SyntaxLattice:
                         p_given = cnt / total_prefix
                         p_marg = self.concept_freq.get(next_c, 0.0) / total_freq
                         pmi = math.log2(max(p_given / max(p_marg, 1e-10), 1e-10))
-                        if pmi < threshold:
+                        if use_ami:
+                            penalty = ami_alpha / math.sqrt(cnt)
+                            adjusted_pmi = pmi - penalty
+                        else:
+                            adjusted_pmi = pmi
+                        if adjusted_pmi < threshold:
                             keep = False
                     if not keep:
                         del counter[next_c]
@@ -201,8 +222,9 @@ class SyntaxLattice:
 
         if n_pruned > 0:
             self._refresh_prefix_totals()
+            label = f"(AMI α={ami_alpha}) " if use_ami else ""
             pct = 100 * n_pruned / max(n_total, 1)
-            print(f"    pruned {n_pruned}/{n_total} high-order transitions ({pct:.0f}%)")
+            print(f"    pruned {n_pruned}/{n_total} high-order transitions {label}({pct:.0f}%)")
 
         return n_pruned
 

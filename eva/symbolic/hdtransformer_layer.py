@@ -12,8 +12,9 @@ No softmax. No matrix multiply. No backprop.
 
 import numpy as np
 from eva.symbolic.fibonacci_utils import FibonacciUtils
-from eva.symbolic.concept_space import _hybrid_bind, _hybrid_unbind
+from eva.symbolic.concept_space import _hybrid_bind
 from eva.symbolic.experimental.vsa_utils import _fractal_convolution, _random_masks
+from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
 
 
 class HDTransformerLayer:
@@ -48,6 +49,17 @@ class HDTransformerLayer:
         z = np.clip(z, -z_score, z_score)
         scaled = (z + z_score) / (2 * z_score) * max_val
         return int(round(np.clip(scaled, 0, max_val)))
+
+    def _weight_vector(self, weight, max_val=7):
+        """Seed-based quasi-orthogonal weight vector (fix V22: was constant vector).
+
+        Replaces np.full(dim, part/7.0) with a seed-registry HD vector,
+        matching VSAAttention._weight_vector semantics.
+        """
+        key = f'hd_weight_{weight}_{max_val}'
+        v = _R.rng(key).randn(self.dim).astype(np.float32)
+        n = float(np.linalg.norm(v))
+        return v / n if n > 1e-10 else v
 
     def _zeckendorf_tree(self, w):
         tree = FibonacciUtils.zeckendorf(w)
@@ -101,10 +113,7 @@ class HDTransformerLayer:
                 if part == 0:
                     continue
                 if self.use_bind_weighting:
-                    weight_hv = np.full(self.dim, part / 7.0, dtype=np.float32)
-                    wn = np.linalg.norm(weight_hv)
-                    if wn > 1e-10:
-                        weight_hv /= wn
+                    weight_hv = self._weight_vector(part, max_val=7)
                     weighted = _hybrid_bind(val, weight_hv)
                 else:
                     weighted = val * (part / 7.0)
@@ -175,26 +184,22 @@ class HDTransformerLayer:
 
     # ── STDP training step ────────────────────────────────────────
 
-    def train_step(self, sequence, target, lr=0.003):
-        """STDP step: compare attention output to target, correct via field.
+    def train_step(self, sequence, target=None, lr=0.003):
+        """STDP step: forward → compare to target → return (error, outputs).
 
         Args:
             sequence: list of ndarrays input
-            target: list of ndarrays target
-            lr: learning rate
+            target: optional list of ndarrays for error computation
+            lr: learning rate (reserved for future weight adaptation)
 
         Returns:
-            mean error norm
+            (mean_error, outputs) where outputs = self.forward(sequence)
         """
         outputs = self.forward(sequence)
+        if target is None:
+            return 0.0, outputs
         errors = []
         for out, tgt in zip(outputs, target):
-            error = tgt - out
-            error_norm = float(np.linalg.norm(error))
+            error_norm = float(np.linalg.norm(tgt - out))
             errors.append(error_norm)
-            if error_norm > 0.1:
-                correction = out + error * lr
-                cn = float(np.linalg.norm(correction))
-                if cn > 1e-10:
-                    correction /= cn
-        return float(np.mean(errors)) if errors else 0.0
+        return float(np.mean(errors)) if errors else 0.0, outputs

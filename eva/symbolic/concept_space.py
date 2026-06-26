@@ -237,11 +237,13 @@ class FractalField:
     """
 
     def __init__(self, dim=None, latent_dim=None, l_c=None, l_a=None, l_m=None, l1_lambda=None,
-                 n_field_bits=None, field_lr=None, max_latent_dim=None, arch_controller=None):
+                 n_field_bits=None, field_lr=None, max_latent_dim=None, arch_controller=None,
+                 vocab_size=0):
         from eva.symbolic.fcf_config import FCFConfig
         _c = FCFConfig()
         self.dim = dim if dim is not None else _c.dim
         self.latent_dim = latent_dim if latent_dim is not None else _c.latent_dim
+        self._V = vocab_size
         self.max_latent_dim = max_latent_dim or self.latent_dim * _c.fractal_max_latent_dim_mult
         self.l1_lambda = l1_lambda if l1_lambda is not None else _c.fractal_l1_lambda
 
@@ -400,10 +402,8 @@ class FractalField:
         """
         from eva.symbolic.fcf_config import FCFConfig
         n_anchors = n_anchors or FCFConfig().fractal_init_field_n_anchors
-        self.field_bits = {}
         n_bytes = (n_anchors + 7) // 8
-        for cid in self.codes:
-            self.field_bits[cid] = np.zeros(n_bytes, dtype=np.uint8)
+        self.field_bits = np.zeros((self._V, n_bytes), dtype=np.uint8)
         self._fb_dirty = True
 
     def init_learned_fields(self, field_bits=512):
@@ -419,22 +419,22 @@ class FractalField:
         self.n_field_bits = field_bits
         self._init_sector_fields()
         self._rebuild_field_bits()
-        print(f"  Learnable fields: {len(self.field_bits)}/{len(self.codes)} "
+        n_fb = int(np.count_nonzero(self.field_bits.any(axis=1))) if self.field_bits.shape[0] > 0 else 0
+        print(f"  Learnable fields: {n_fb}/{len(self.codes)} "
               f"concepts, {field_bits} bits ({len(self._sector_depths)} levels)")
         depths_str = ', '.join(str(d) for d in self._sector_depths)
         print(f"  Sector depth bits: [{depths_str}]")
 
     def _rebuild_field_bits(self):
-        """Recompute field_bits from current codes using W_proj."""
+        """Recompute field_bits from current codes using W_proj (flat array)."""
         if self.W_proj is None:
             return
         n_bytes = (self.n_field_bits + 7) // 8
-        self.field_bits = {}
+        self.field_bits = np.zeros((self._V, n_bytes), dtype=np.uint8)
         for cid, code in self.codes.items():
             raw = code @ self.W_proj  # [n_field_bits]
             bits = (raw > 0).astype(np.uint8)
-            packed = np.packbits(bits)[:n_bytes]
-            self.field_bits[cid] = packed
+            self.field_bits[cid] = np.packbits(bits)[:n_bytes]
         self._rebuild_sector_index()
         self._fb_dirty = True
 
@@ -467,10 +467,11 @@ class FractalField:
         self.W_proj = Q_w.astype(np.float32) * np.sqrt(float(self.latent_dim))
 
         # P1.3b: collapse detection — reset degenerate hyperplanes
-        if self.field_bits and len(self.field_bits) >= 10:
+        if hasattr(self, 'field_bits') and isinstance(self.field_bits, np.ndarray) and self.field_bits.shape[0] >= 10:
             try:
                 all_bits = np.array([np.unpackbits(self.field_bits[cid])[:self.n_field_bits]
-                                     for cid in self.field_bits])
+                                     for cid in range(self.field_bits.shape[0])
+                                     if cid in self.codes])
                 bit_ratio = all_bits.mean(axis=0)
                 collapsed = np.where((bit_ratio > 0.85) | (bit_ratio < 0.15))[0]
                 if len(collapsed) > 0:
@@ -540,13 +541,14 @@ class FractalField:
             for cid in self.codes:
                 self.codes[cid] = np.append(self.codes[cid], np.zeros(n_new, dtype=np.float32))
 
-            # Update subspace ratios (φ² : φ : 1)
+            # Update subspace ratios (λ_d² : λ_d : 1)
+            from eva.symbolic.fibonacci_utils import FibonacciUtils
             old_l_c, old_l_a, old_l_m = self.l_c, self.l_a, self.l_m
             self.latent_dim = new_latent_dim
-            phi = (1.0 + 5.0 ** 0.5) / 2.0
-            total = phi * phi + phi + 1.0
-            self.l_c = max(8, int(new_latent_dim * phi * phi / total))
-            self.l_a = max(8, int(new_latent_dim * phi / total))
+            lam = FibonacciUtils.get_lambda(FCFConfig().fib_dimension) if FCFConfig().use_fib_generalized else FibonacciUtils.golden_ratio()
+            total = lam * lam + lam + 1.0
+            self.l_c = max(8, int(new_latent_dim * lam * lam / total))
+            self.l_a = max(8, int(new_latent_dim * lam / total))
             self.l_m = new_latent_dim - self.l_c - self.l_a
             # Shift existing code entries to new subspace positions
             for cid in self.codes:
@@ -643,10 +645,11 @@ class FractalField:
                 self.codes[cid] = self.codes[cid][live]
 
             self.latent_dim = new_latent_dim
-            phi = (1.0 + 5.0 ** 0.5) / 2.0
-            total = phi * phi + phi + 1.0
-            self.l_c = max(8, int(new_latent_dim * phi * phi / total))
-            self.l_a = max(8, int(new_latent_dim * phi / total))
+            from eva.symbolic.fibonacci_utils import FibonacciUtils
+            lam = FibonacciUtils.get_lambda(FCFConfig().fib_dimension) if FCFConfig().use_fib_generalized else FibonacciUtils.golden_ratio()
+            total = lam * lam + lam + 1.0
+            self.l_c = max(8, int(new_latent_dim * lam * lam / total))
+            self.l_a = max(8, int(new_latent_dim * lam / total))
             self.l_m = new_latent_dim - self.l_c - self.l_a
 
             if self.W_proj is not None:
@@ -802,15 +805,22 @@ class FractalField:
         return results
 
     def get_field_bits(self, cid):
-        """Get binary field vector for a concept."""
-        return self.field_bits.get(cid)
+        """Get binary field vector for a concept (flat ndarray access)."""
+        if not hasattr(self, 'field_bits') or not isinstance(self.field_bits, np.ndarray):
+            return None
+        if 0 <= cid < self.field_bits.shape[0]:
+            return self.field_bits[cid]
+        return None
 
     def field_overlap(self, cid_a, cid_b):
-        """Count overlapping field bits between two concepts."""
-        ba = self.field_bits.get(cid_a)
-        bb = self.field_bits.get(cid_b)
-        if ba is None or bb is None or len(ba) != len(bb):
+        """Count overlapping field bits between two concepts (flat array)."""
+        if not hasattr(self, 'field_bits') or not isinstance(self.field_bits, np.ndarray):
             return 0
+        V = self.field_bits.shape[0]
+        if not (0 <= cid_a < V and 0 <= cid_b < V):
+            return 0
+        ba = self.field_bits[cid_a]
+        bb = self.field_bits[cid_b]
         return int(np.unpackbits(np.bitwise_and(ba, bb)).sum())
 
     # ── HDC/VSA n-gram fallback ────────────────────────────
@@ -965,12 +975,12 @@ class FractalField:
                 cids = np.array(list(self.codes.keys()), dtype=np.int32)
                 codes_arr = np.array([self.codes[cid] for cid in cids], dtype=np.float32)
                 kw = dict(codes=codes_arr, cids=cids, basis=self.basis)
-                # Save field bits if present
-                if hasattr(self, 'field_bits') and self.field_bits:
-                    fb_cids = np.array(list(self.field_bits.keys()), dtype=np.int32)
-                    fb_arr = np.array([self.field_bits[cid] for cid in fb_cids], dtype=np.uint8)
-                    kw['fb_cids'] = fb_cids
-                    kw['fb_arr'] = fb_arr
+                # Save field bits if present (flat ndarray)
+                if hasattr(self, 'field_bits') and isinstance(self.field_bits, np.ndarray) and self.field_bits.shape[0] > 0:
+                    non_zero = np.where(self.field_bits.any(axis=1))[0]
+                    if len(non_zero) > 0:
+                        kw['fb_cids'] = non_zero.astype(np.int32)
+                        kw['fb_arr'] = self.field_bits[non_zero]
                 np.savez_compressed(tmp_path, **kw)
                 os.replace(tmp_path, binary_path)
                 result = {
@@ -1005,13 +1015,14 @@ class FractalField:
             # Pre-extract arrays before dict comprehensions
             # (NpzFile.__getitem__ is slow on repeated access)
             field.codes = {int(cid): codes_arr[i].copy() for i, cid in enumerate(cids)}
-            # Backward compat: field bits added in v2
-            # Partial checkpoint ok — fb_cids missing → empty field_bits
+            # Backward compat: field bits added in v2 (now flat ndarray)
             if 'fb_cids' in npz.files:
                 fb_arr = npz['fb_arr']
                 fb_cids_arr = npz['fb_cids']
-                field.field_bits = {int(cid): fb_arr[i].copy()
-                                     for i, cid in enumerate(fb_cids_arr)}
+                V = field._V if hasattr(field, '_V') else int(fb_cids_arr.max()) + 1
+                fb_bytes = fb_arr.shape[1]
+                field.field_bits = np.zeros((V, fb_bytes), dtype=np.uint8)
+                field.field_bits[fb_cids_arr] = fb_arr
         else:
             field.basis = np.array(data['basis'], dtype=np.float32)
             field.codes = {int(cid): np.array(c, dtype=np.float32)
@@ -1583,7 +1594,8 @@ class ConceptSpace:
         self.latent_dim = self.dims.latent_dim  # shortcut
 
         # Fractal field: latent codes → full vectors via shared basis
-        self.fractal = FractalField(dim=self.dims.vec_dim, latent_dim=self.dims.latent_dim)
+        self.fractal = FractalField(dim=self.dims.vec_dim, latent_dim=self.dims.latent_dim,
+                                    vocab_size=self.vocab_size)
 
         # Concept vectors: dense ndarray[V, dim] with dict-like convenience
         self.concept_vectors = ConceptVectorStore(self.vocab_size, self.dim)
@@ -1824,8 +1836,9 @@ class ConceptSpace:
             bits = bytearray(n_bytes)
             for aidx in indices:
                 bits[aidx >> 3] |= 1 << (aidx & 7)
-            self.fractal.field_bits[cid] = np.frombuffer(bytes(bits),
-                                                         dtype=np.uint8).copy()
+            if cid < self.fractal.field_bits.shape[0]:
+                self.fractal.field_bits[cid] = np.frombuffer(bytes(bits),
+                                                             dtype=np.uint8).copy()
             active_counts.append(len(indices))
 
         if active_counts:
@@ -2279,11 +2292,11 @@ class ConceptSpace:
         if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
             self._after_update_hook(cid, v_new)
 
-    def _apply_subspace_update_batch(self, cids, grads, base_lr_val, subspace_lr, gen, codes_t=None):
+    def _apply_subspace_update_batch(self, cids, grads, base_lr_val, subspace_lr, gen, codes_t):
         """Batched GPU subspace update for multiple CIDs.
 
-        If codes_t is provided, uses it as compact codes tensor (n_cids, latent_dim).
-        Otherwise reads from gen._codes_master_t (full-V fallback).
+        codes_t is REQUIRED — compact codes tensor (n_cids, latent_dim).
+        The old full-V _codes_master_t fallback has been removed (V22 chunking).
         After update, writes codes back to fractal.codes CPU dict.
         """
         lr_c, lr_a, lr_m = subspace_lr
@@ -2298,13 +2311,7 @@ class ConceptSpace:
         mask[l_c + l_a:] = lr_m
 
         grads_t = torch.from_numpy(grads).to(device, dtype=torch.float32)
-
-        if codes_t is not None:
-            codes = codes_t
-        else:
-            cids_t = torch.tensor(cids, dtype=torch.long, device=device)
-            codes = gen._codes_master_t[cids_t]
-
+        codes = codes_t
         basis_t = gen._basis_t
 
         code_grads = grads_t @ basis_t.T
@@ -2342,11 +2349,6 @@ class ConceptSpace:
             self.fractal.codes[cid] = code_new
             if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
                 self._after_update_hook(cid, v_new)
-
-        # Also sync back to _codes_master_t if it exists (full-V fallback)
-        if codes_t is None and hasattr(gen, '_codes_master_t') and gen._codes_master_t is not None:
-            cids_t = torch.tensor(cids, dtype=torch.long, device=device)
-            gen._codes_master_t[cids_t] = new_codes.to(torch.float32)
 
         self.fractal._matrix_dirty = True
 

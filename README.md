@@ -233,6 +233,13 @@ FCF/
 
 ## Статус
 
+- ✅ **Zeckendorf fractal encoding** (#53) — concept_id → Fib-sum paths (вместо octree base-8)
+- ✅ **Fibonacci constants sweep** (#54) — γ=1/φ, beam_buffer=10946 (F₂₁), checkpoint=4181 (F₁₉)
+- ✅ **Fibonacci scheduling sweep** (#55) — lr_cosine_mult=φ, eval/decay на Fib-шагах, hormonal окна F₁-F₄
+- ✅ **Adaptive LEVELS + ZeckendorfQuantizer + TemporalZeckendorf** (#56) — Fib-бинары квантования и временной памяти
+- ✅ **Zeckendorf embedding sweep** (#57) — φ subspace ratios (l_c:l_a:l_m = φ²:φ:1), TemporalZeckendorf в CPU STDP
+- ✅ **Все гейты включены** (#58) — morph_stdp, vsa_attention, hd_transformer, temporal_zeckendorf, morph_manifold (default ON)
+- ✅ **max_n=3** — SyntaxLattice на 9.3M строк (4-граммы OOM на 16GB)
 - ✅ 314 автоматических тестов (8 пропущено — нет SentencePiece/FP16)
 - ✅ Полный конвейер обучения на 2GB GPU
 - ✅ Динамическая ёмкость (grow/prune latent_dim)
@@ -244,6 +251,10 @@ FCF/
 - ✅ **EntityField** — рекурсивное семантическое поле char↔word↔sent↔para (VSA bind/unbind)
 - ✅ **Harmonizer** — морфемная гармонизация: compose_word с контекстной модуляцией, dirty-флаги, slow-start
 - ✅ **Transition Manifold** — паутина переходов: буфер + VSA-кластеризация + beam-pull в STDP + beam_score в _branch
+- ✅ **Morph-level manifold** — отдельный TransitionManifold для морфемных переходов (dim=latent_dim=2048)
+- ✅ **MorphSTDP** — STDP для морфемных биграмм
+- ✅ **VSAAttention** — VSA-внимание с Zeckendorf-взвешиванием
+- ✅ **HDTransformerLayer** — VSA-native однослойный трансформер (LSH-attention + Zeckendorf-tree + fractal FFN)
 - ✅ **FCFConfig** — единый источник истины: все константы из кода вынесены в конфиг
 - ✅ **Param cascade** — Param хранит ссылку на ParamDef, defaults обновляются из FCFConfig
 - ✅ **SeedRegistry** — централизованный реестр сидов (вместо hash/42/RandomState)
@@ -257,10 +268,6 @@ FCF/
 - ✅ **Золотое сечение** — balance_subspaces с весами φ : 1 : 1/φ
 - ✅ **FormulaCoefficients** — hormonal_system унифицирован как словари формул в FCFConfig
 - ✅ **Hot-reload** — FCFConfig.reload() с подпиской наблюдателей
-- ✅ **Morph-level manifold** — отдельный TransitionManifold для морфемных переходов
-- ✅ **MorphSTDP** (default OFF) — STDP для морфемных биграмм
-- ✅ **VSAAttention** (default OFF) — VSA-внимание с Zeckendorf-взвешиванием
-- ✅ **HDTransformerLayer** (default OFF) — VSA-native однослойный трансформер
 - ✅ **VRAM-безопасность** — удалён неиспользуемый _codes_t (598 MB), ema_vecs_t на CPU, чанкованный fb_overlaps
 - ✅ **--no-harmonize / --no-morpheme-field** для GPU < 2GB
 - ✅ **Preharm checkpoint** — rollback до первой гармонизации

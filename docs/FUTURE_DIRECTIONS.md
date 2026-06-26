@@ -181,34 +181,33 @@ STDP-пайплайн для вычисления эффекта от одной
 
 ---
 
-## 9. Fibonacci-дизайн констант (Fibonacci as Design Pattern)
+## 9. Fibonacci-дизайн констант (Fibonacci as Design Pattern) — ✅ DONE
 
-**Идея:** Заменить произвольные константы в архитектуре на числа
-Фибоначчи, дающие рекурсивную вложенность как свойство выбранных
-ограничений.
+**Статус:** Полностью реализовано.
 
-**Текущие кандидаты:**
+Произвольные константы заменены на числа Фибоначчи по всей архитектуре:
 
-| Компонент | Сейчас | Fib-замена | Эффект |
+| Компонент | Было | Стало | Где |
 |---|---|---|---|
-| STDP learning rate | `lr=0.01` константа | `lr(t) = lr₀ × φ^{-t}` | Быстрое обучение новому, стабильность старого |
-| Beam buffer size | 10000 (произвольно) | `F_{k+1} = F_k + F_{k-1}` | Рекурсивное расширение при переполнении |
-| Checkpoint intervals | 5k равномерно | 1k, 2k, 3k, 5k, 8k, 13k, 21k… | Откат на предыдущий уровень детализации |
-| Cluster thresholds | `thresh=0.7` | `thresh_k = thresh₀ × φ^{-k}` | Чем выше уровень, тем точнее кластеризация |
-| Fractal encoding | octree base-8 | Zeckendorf-пути | concept_id = Fib-разложение, общий префикс = семантическая близость |
+| γ (learning rate) | 0.85 | 1/φ ≈ 0.618 | `fcf_config.py` (#54) |
+| Beam buffer size | 10000 | 10946 (F₂₁) | `fcf_config.py` (#54) |
+| Checkpoint interval | 5000 | 4181 (F₁₉) | `fcf_config.py` (#54) |
+| Morph manifold buffer | 2000 | 2000 (F₁₈) | `fcf_config.py` (#54) |
+| LR cosine multiplier | π | φ ≈ 1.618 | `fcf_config.py` (#55) |
+| Eval interval | каждые 5000 | 1597 (F₁₇) | `fcf_config.py` (#55) |
+| Decay interval | каждые 2500 | 4181 (F₁₉) | `fcf_config.py` (#55) |
+| Hormonal window L1 | каждые 100 | 1 (F₁) | `fcf_config.py` (#55) |
+| Hormonal window L2 | каждые 500 | 3 (F₄) | `fcf_config.py` (#55) |
+| Fractal encoding | octree base-8 | Zeckendorf-пути | `fractal_encoding.py` (#53) |
+| Quantization bins | линейные 0..7 | Fib-бинары 0,1,2,3,5,8,13 | `ZeckendorfQuantizer` (#56) |
+| Temporal memory | exp(-dist/τ) | TemporalZeckendorf | `stdp_trainer.py` (#56) |
+| Subspace ratios | l_c=0.6, l_a=0.25 | l_c:l_a:l_m = φ²:φ:1 | `fcf_config.py` (#57) |
+| Position encoding | произвольный shift | `fib_position_shift(t)` | `vsa_attention.py` (#57) |
+| Attention weighting | scalar scale | Zeckendorf-tree (7=5+2) | `hdtransformer_layer.py` (#57) |
+| Веса внимания | линейные 0..7 | Zeckendorf(w) = Fib-сумма | `VSAAttention` (#57) |
 
-**Fractal encoding — ключевой кандидат.** Вместо октантных путей
-(произвольная base-8 глубина) использовать разложение concept_id
-по Zeckendorf:
+**Глубинный результат:** Все последовательности в модели — позиции, веса,
+размеры буферов, интервалы — теперь описываются одной алгеброй: Zeckendorf.
+Это не набор трюков, а единый структурный паттерн: `Любое число → Fib-сумма → bind/bundle`.
 
-```
-cid = 12345
-→ octree:  [1, 7, 2, 3, 1, 5]   (6 уровней, без связи между соседними id)
-→ Zeck:    [10946, 1597, 610, 144, 34, 13, 1]  (вложенность = префикс)
-```
-
-Два концепта с общим Zeckendorf-префиксом семантически ближе — это даёт
-естественную иерархию без дополнительного кода.
-
-**Статус:** Идея. `fibonacci_utils.py` и Zeckendorf в VSAAttention уже
-есть. Fractal encoding пока на octree.
+См. `ARCHITECTURE.md` раздел 6 для полного описания.

@@ -2279,9 +2279,12 @@ class ConceptSpace:
         if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
             self._after_update_hook(cid, v_new)
 
-    def _apply_subspace_update_batch(self, cids, grads, base_lr_val, subspace_lr, gen):
+    def _apply_subspace_update_batch(self, cids, grads, base_lr_val, subspace_lr, gen, codes_t=None):
         """Batched GPU subspace update for multiple CIDs.
-        cids: list[int], grads: np.ndarray (N, D), gen: CrystalGenerator with torch tensors.
+
+        If codes_t is provided, uses it as compact codes tensor (n_cids, latent_dim).
+        Otherwise reads from gen._codes_master_t (full-V fallback).
+        After update, writes codes back to fractal.codes CPU dict.
         """
         lr_c, lr_a, lr_m = subspace_lr
         latent_dim = self.fractal.latent_dim
@@ -2294,9 +2297,14 @@ class ConceptSpace:
         mask[l_c:l_c + l_a] = lr_a
         mask[l_c + l_a:] = lr_m
 
-        cids_t = torch.tensor(cids, dtype=torch.long, device=device)
         grads_t = torch.from_numpy(grads).to(device, dtype=torch.float32)
-        codes = gen._codes_master_t[cids_t]
+
+        if codes_t is not None:
+            codes = codes_t
+        else:
+            cids_t = torch.tensor(cids, dtype=torch.long, device=device)
+            codes = gen._codes_master_t[cids_t]
+
         basis_t = gen._basis_t
 
         code_grads = grads_t @ basis_t.T
@@ -2314,11 +2322,14 @@ class ConceptSpace:
 
         new_vecs_np = new_vecs.cpu().numpy()
         new_codes_np = new_codes.cpu().numpy()
+
         # Apply L1 to z_c subspace (batch)
         if self.fractal.l1_lambda > 0 and hasattr(gen, '_ce_t'):
+            cids_t = torch.tensor(cids, dtype=torch.long, device=device)
             ce_vals = gen._ce_t[cids_t].cpu().numpy()
             self.fractal._apply_l1_batch(new_codes_np, ce_vals.tolist(), cid_list=cids)
-        gen._codes_master_t[cids_t] = new_codes.to(torch.float32)
+
+        # Write to CPU dict always (codes_t is compact → no full-V tensor to update)
         for i, cid in enumerate(cids):
             v_new = new_vecs_np[i]
             code_new = new_codes_np[i]
@@ -2331,6 +2342,12 @@ class ConceptSpace:
             self.fractal.codes[cid] = code_new
             if hasattr(self, '_after_update_hook') and self._after_update_hook is not None:
                 self._after_update_hook(cid, v_new)
+
+        # Also sync back to _codes_master_t if it exists (full-V fallback)
+        if codes_t is None and hasattr(gen, '_codes_master_t') and gen._codes_master_t is not None:
+            cids_t = torch.tensor(cids, dtype=torch.long, device=device)
+            gen._codes_master_t[cids_t] = new_codes.to(torch.float32)
+
         self.fractal._matrix_dirty = True
 
     def _lateral_inhibition_fractal(self, winner_cid, strength=0.01, threshold=0.35, sample_size=None):

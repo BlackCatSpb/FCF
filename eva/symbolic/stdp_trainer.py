@@ -1131,10 +1131,11 @@ class STDPTrainer:
         _subspace_cids = []
         _subspace_grads = []
         _deferred_updates = []
+        use_subspace = self.subspace_lr is not None and cs.fractal.basis is not None
         for gi, gen_cid in enumerate(unique_gen):
             if not valid_mask[gi] or elr_grouped[gi] <= 0:
                 continue
-            if self.subspace_lr is not None and cs.fractal.basis is not None and gen._codes_master_t is not None:
+            if use_subspace:
                 _subspace_cids.append(gen_cid)
                 _subspace_grads.append(grad_gpu[gi].cpu().numpy())
             else:
@@ -1153,7 +1154,17 @@ class STDPTrainer:
                 _deferred_updates.append((gen_cid, v_new_gpu))
 
         if _subspace_cids:
-            cs._apply_subspace_update_batch(_subspace_cids, np.array(_subspace_grads, dtype=np.float32), base_lr_val, self.subspace_lr, gen)
+            # Build compact codes tensor from CPU dict (avoids full-V _codes_master_t)
+            latent_dim = cs.fractal.latent_dim
+            codes_arr = np.zeros((len(_subspace_cids), latent_dim), dtype=np.float32)
+            for i, cid in enumerate(_subspace_cids):
+                code = cs.fractal.codes.get(cid)
+                if code is not None:
+                    codes_arr[i] = code
+            codes_t = torch.from_numpy(codes_arr).to(device=device, dtype=torch.float32)
+            cs._apply_subspace_update_batch(
+                _subspace_cids, np.array(_subspace_grads, dtype=np.float32),
+                base_lr_val, self.subspace_lr, gen, codes_t=codes_t)
 
         # G-51/G-62: Batched _vecs_t write + dirty tracking
         if _deferred_updates:

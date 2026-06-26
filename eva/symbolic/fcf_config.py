@@ -710,6 +710,11 @@ class FCFConfig:
     entity_field_max_entities: int = 50000
     harm_drift_cos: float = 0.95  # skip harmonization if cos(current, last_harmonized) > this
 
+    # ── GPU Sector Chunking (GpuChunkManager) ──
+    gpu_max_chunks: int = 32      # max sector chunks cached on GPU
+    gpu_chunk_depth: int = 1      # sector depth: 0=4bit(16), 1=10bit(1024), 2=20bit(1M)
+    gpu_use_chunking: bool = False  # True = page vectors; False = full-V _vecs_t (default)
+
     # ── Engine ────────────────────────────────
     use_torch: bool = True
     momentum_mu: float = 0.9

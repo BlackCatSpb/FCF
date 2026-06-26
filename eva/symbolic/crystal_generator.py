@@ -106,7 +106,12 @@ class CrystalGenerator:
         self._trainer = STDPTrainer(self)
         self._use_torch = _HAS_TORCH and torch.cuda.is_available()
 
-        # Torch state (lazy init, invalidated by fluctuate_fractal)
+        # ────────────────────────────────────────
+        #  GPU tensors (lazy init via _ensure_torch)
+        #  Full-V concept vectors: _vecs_t (fp16, ~224MB for 146K×768)
+        #  Codes are CPU-only; subspace updates build compact per-batch codes.
+        #  Sector-based GPU paging: see GpuChunkManager below.
+        # ────────────────────────────────────────
         self._torch_device = None
         self._torch_cid_order = []
         self._torch_cid_to_idx = {}
@@ -115,7 +120,7 @@ class CrystalGenerator:
         self._ce_t = None
         self._mom_t = None
         self._basis_t = None
-        self._codes_master_t = None  # bf16 latent codes for STDP gradient precision
+        self._codes_master_t = None  # DEPRECATED: no longer full-V; use compact per-batch codes
         self._ema_vecs_t = None  # EMA copy for stable eval/generation (TN-2)
         self._ema_decay = 0.999
         self._ema_steps = 0
@@ -289,14 +294,9 @@ class CrystalGenerator:
         if self._basis_t is None or self._basis_t.device != dev:
             self._basis_t = torch.from_numpy(cs.fractal.basis.astype(np.float32)).to(dev, non_blocking=True) if cs.fractal.basis is not None else None
 
-        # G-40: Latent codes tensor for batched subspace update
-        latent_dim = cs.fractal.latent_dim
-        codes_arr = np.zeros((V, latent_dim), dtype=np.float32)
-        for cid, code in cs.fractal.codes.items():
-            codes_arr[cid] = code
-        if self._codes_master_t is None or self._codes_master_t.shape[0] != V or self._codes_master_t.device != dev:
-            self._codes_master_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float32)
-        self._codes_master_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
+        # ── Latent codes: no full-V GPU tensor (saves ~1.2 GB for 146K×2048×fp32).
+        # Subspace updates build compact per-batch codes in _gpu_stdp_apply.
+        # ──
 
         # Concept error tensor for vectorized GPU negative sampling
         ce_arr = np.zeros(V, dtype=np.float32)
@@ -349,11 +349,10 @@ class CrystalGenerator:
         self._cluster_potential = None  # stale after vector flush
 
     def _sync_after_fluctuate(self):
-        """SN-54: Incremental GPU sync after fluctuate — no full O(V·D) rebuild.
+        """SN-54: Incremental GPU sync after fluctuate.
 
-        Reads CPU codes → copies to GPU _codes_master_t → recomputes _vecs_t via
-        batched matmul (_codes_master_t @ _basis_t), avoiding the per-concept
-        CPU loop + PCIe transfer of _build_torch_tensors.
+        Reads CPU codes → builds temp GPU codes tensor → recomputes _vecs_t via
+        batched matmul, then discards the temp tensor (no full-V codes storage).
         """
         cs = self.cs
         if self._torch_device is None or self._vecs_t is None or not hasattr(cs.fractal, 'codes'):
@@ -367,18 +366,19 @@ class CrystalGenerator:
         for cid, code in cs.fractal.codes.items():
             codes_arr[cid] = code
 
-        if self._codes_master_t is None or self._codes_master_t.shape[0] != V:
-            self._codes_master_t = torch.empty(V, latent_dim, device=dev, dtype=torch.float32)
-        self._codes_master_t.copy_(torch.from_numpy(codes_arr), non_blocking=True)
+        # Build temporary GPU codes tensor (discarded after use)
+        codes_t = torch.from_numpy(codes_arr).to(dev, dtype=torch.float32)
 
         basis_t = self._basis_t
-        # Recompute _vecs_t on GPU: (V, latent_dim) @ (latent_dim, D) → (V, D)
-        vecs_gpu = self._codes_master_t @ basis_t.to(dev, non_blocking=True)
+        vecs_gpu = codes_t @ basis_t.to(dev, non_blocking=True)
         nv = vecs_gpu.norm(dim=1, keepdim=True).clamp(min=1e-10)
         vecs_gpu /= nv
         if self._vecs_t.shape[0] != V:
             self._vecs_t = torch.empty(V, vecs_gpu.shape[1], device=dev, dtype=torch.float16)
         self._vecs_t.copy_(vecs_gpu.to(torch.float16), non_blocking=True)
+
+        # Keep _codes_master_t as None — no longer stored as full-V tensor
+        self._codes_master_t = None
 
         # Refresh basis_t (may have changed after fluctuate)
         if cs.fractal.basis is not None:
@@ -387,7 +387,6 @@ class CrystalGenerator:
         # Reset momentum (codes changed — old momentum is stale)
         if self._mom_t is not None:
             self._mom_t.zero_()
-        # SN-58: refresh EMA from new vectors after fluctuate
         if self._ema_vecs_t is not None and self._vecs_t is not None:
             self._ema_vecs_t.copy_(self._vecs_t.to(torch.bfloat16))
         self._torch_dirty = False
@@ -1087,3 +1086,169 @@ if __name__ == '__main__':
         print(f"  [{seed}] path_len={len(result.concept_path)} score={result.score:.2f}")
 
     print("OK")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GpuChunkManager — Sector-based GPU paging for concept vectors
+# ═══════════════════════════════════════════════════════════════
+
+class GpuChunkManager:
+    """Sector-based GPU memory paging for concept vectors and codes.
+
+    Instead of keeping full-(V,D) tensors on GPU, chunks concepts by their
+    fractal sector key (depth=1 → up to 1024 sectors at 10 bits).
+    For each batch, only sectors containing active CIDs are loaded onto GPU.
+
+    Architecture (matches user spec):
+      4 bits → 16 sectors (coarse, level 0)
+      10 bits → 1024 sectors (medium, level 1 — main paging unit)
+      20 bits → ~1M sectors (fine, level 2 — per-concept)
+
+    Usage:
+        mgr = GpuChunkManager(gen, cs, config)
+        # Before batch:
+        cids, vecs, mapping = mgr.load_batch(all_batch_cids)
+        # STDP operates on vecs (compact (n_active, D)) using mapping[cid]
+        # After batch:
+        mgr.write_back(modified_cids, modified_vecs)
+    """
+
+    def __init__(self, gen, cs, config):
+        self.gen = gen
+        self.cs = cs
+        self.fractal = cs.fractal
+        self.device = gen._torch_device
+        self.dim = config.dim
+        self.latent_dim = config.latent_dim
+        self.depth = 1  # 10 bits → up to 1024 chunks
+        self.max_chunks = getattr(config, 'gpu_max_chunks', 32)
+
+        # Chunk cache: {sector_key: {'vecs': tensor(N, D), 'cids': list}}
+        self._chunks = {}
+        self._lru = []
+        self._dirty = set()
+
+        # CID → (sector_key, local_idx) for O(1) lookup
+        self._cid_loc = {}
+
+        # Build from sentencepiece vocabulary if sector index not available
+        self._build_sector_map()
+
+    def _build_sector_map(self):
+        """Build CID→sector mapping from fractal._sector_index."""
+        si = getattr(self.fractal, '_sector_index', {})
+        if self.depth in si and si[self.depth]:
+            for key, cids in si[self.depth].items():
+                for idx, cid in enumerate(cids):
+                    self._cid_loc[cid] = (key, idx)
+            return
+
+        # Fallback: compute sector keys for all CIDs
+        if not hasattr(self.fractal, '_sector_W') or self.depth >= len(self.fractal._sector_W):
+            # No sector structure — create identity mapping (each CID is its own chunk)
+            for cid in range(self.cs.vocab_size):
+                self._cid_loc[cid] = (cid, 0)
+            return
+
+        for cid in range(self.cs.vocab_size):
+            code = self.fractal.codes.get(cid)
+            if code is None:
+                continue
+            Ws = np.hstack(self.fractal._sector_W[:self.depth + 1])
+            bits = (code @ Ws > 0).astype(np.uint8)
+            prefix_bytes = (sum(self.fractal._sector_depths[:self.depth + 1]) + 7) // 8
+            key = tuple(np.packbits(bits)[:prefix_bytes])
+            if key not in self._cid_loc:
+                self._cid_loc[key] = []
+            self._cid_loc[key].append(cid)
+
+    def get_sector_key(self, cid):
+        loc = self._cid_loc.get(cid)
+        return loc[0] if loc else None
+
+    def load_batch(self, cids):
+        """Load chunks for given CIDs. Returns (all_cids, compact_vecs, mapping_dict).
+
+        mapping_dict: {global_cid: local_index} for O(1) translation.
+        """
+        needed_keys = set()
+        for cid in cids:
+            sk = self.get_sector_key(cid)
+            if sk is not None:
+                needed_keys.add(sk)
+
+        for key in needed_keys:
+            if key not in self._chunks:
+                self._load_chunk(key)
+
+        # Build compact working set
+        all_cids = sorted(set(cids))
+        n = len(all_cids)
+        vecs_np = np.zeros((n, self.dim), dtype=np.float32)
+        mapping = {}
+        for i, cid in enumerate(all_cids):
+            v = self.cs.concept_vectors.get(cid)
+            if v is not None:
+                vecs_np[i] = v
+            mapping[cid] = i
+
+        return all_cids, vecs_np, mapping
+
+    def _load_chunk(self, key):
+        """Load a sector's vectors from CPU to GPU cache."""
+        # Find CIDs in this sector
+        locs = [cid for cid, loc in self._cid_loc.items() if loc[0] == key] if hasattr(self._cid_loc.get(next(iter([k for k in self._cid_loc if self._cid_loc[k][0] == key])), None), '__iter__') else []
+        # Simpler: look up from sector index
+        si = getattr(self.fractal, '_sector_index', {})
+        cids = []
+        if self.depth in si and key in si[self.depth]:
+            cids = si[self.depth][key]
+        else:
+            # Fallback: gather from _cid_loc
+            cids = [cid for cid, loc in self._cid_loc.items() if loc[0] == key]
+
+        if not cids:
+            return
+
+        # Evict if needed
+        while len(self._chunks) >= self.max_chunks:
+            oldest = self._lru.pop(0)
+            self._evict_chunk(oldest)
+
+        # Build GPU tensor
+        vecs_np = np.stack([self.cs.concept_vectors.get(cid, np.zeros(self.dim)) for cid in cids])
+        vecs_t = torch.from_numpy(vecs_np).to(self.device, dtype=torch.float16)
+
+        self._chunks[key] = {'vecs': vecs_t, 'cids': cids}
+        self._lru.append(key)
+
+    def _evict_chunk(self, key):
+        if key in self._dirty:
+            self._sync_chunk(key)
+        if key in self._chunks:
+            del self._chunks[key]
+        self._dirty.discard(key)
+
+    def _sync_chunk(self, key):
+        entry = self._chunks.get(key)
+        if entry is None:
+            return
+        vecs_np = entry['vecs'].cpu().numpy()
+        for i, cid in enumerate(entry['cids']):
+            self.cs.concept_vectors[cid] = vecs_np[i]
+        self._dirty.discard(key)
+
+    def mark_dirty(self, cids):
+        for cid in cids:
+            sk = self.get_sector_key(cid)
+            if sk is not None:
+                self._dirty.add(sk)
+
+    def sync_all(self):
+        for key in list(self._dirty):
+            self._sync_chunk(key)
+
+    def clear_cache(self):
+        self.sync_all()
+        self._chunks.clear()
+        self._lru.clear()

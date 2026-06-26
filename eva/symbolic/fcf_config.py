@@ -519,7 +519,7 @@ class FCFConfig:
     dim: int = 768
     latent_dim: int = 2048
     n_anchors: int = 2048
-    max_n: int = 4
+    max_n: int = 3
     path_levels: int = 16               # Zeckendorf path depth (also accessible as octree_levels)
 
     @property

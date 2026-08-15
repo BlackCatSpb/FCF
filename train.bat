@@ -14,7 +14,7 @@ if exist %QWEN_SEED% (
     set QWEN_ARG=
 )
 
-set COMMON=--learned-fields --field-bits 512 --vocab-size 256000 --neg-samples 3 --context-window 4 --pmi-gate 0.0
+set COMMON=--learned-fields --field-bits 512 --neg-samples 3 --context-window 4 --pmi-gate 0.0
 
 echo [EVA] Training launch at %date% %time%
 echo [EVA] Log: train.log

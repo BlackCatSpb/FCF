@@ -8,7 +8,7 @@ from eva.symbolic.fcf_config import FCFConfig, EnvironmentResolver
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
-import sentencepiece as spm
+from eva.symbolic.sp_compat import load_piece_model
 
 CORPUS = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\full_corpus_ru_clean.txt'
 CHECKPOINT_DIR = r'C:\Users\black\OneDrive\Desktop\FCF\checkpoints'
@@ -67,7 +67,7 @@ TEST_SEEDS = ['на', 'человек', 'большой', 'ходить', 'се�
 
 cfg = FCFConfig()
 env = EnvironmentResolver()
-sp = spm.SentencePieceProcessor(model_file=env.bpe_model_path)
+sp = load_piece_model(env.bpe_model_path)
 
 resume_lines = 0
 resume_pairs = 0

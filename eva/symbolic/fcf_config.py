@@ -70,8 +70,12 @@ class MetricPair:
 # ──────────────────────────────────────────────
 
 def _auto_detect_model(data_dir: str) -> str | None:
-    """Find bpe_morph.model in data_dir (единственный BPE)."""
+    """Find tokenizer in data_dir: tokenizer.json (HF BPE) or *.model (SP)."""
     import glob
+    # Приоритет: HF ByteLevel BPE tokenizer.json (WideBind-совместимый)
+    tok = os.path.join(data_dir, 'tokenizer.json')
+    if os.path.exists(tok):
+        return 'tokenizer.json'
     models = sorted(glob.glob(os.path.join(data_dir, '*.model')))
     # Предпочитаем bpe_morph, игнорируем bpe_ru_146k (устарел)
     for m in models:

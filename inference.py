@@ -14,15 +14,15 @@ os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 import numpy as np
-import sentencepiece as spm
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
 from eva.symbolic.fcf_config import FCFConfig
+from eva.symbolic.sp_compat import load_piece_model
 
 CFG = FCFConfig()
 BASE = CFG.data_dir
-sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
+sp = load_piece_model(CFG.bpe_model_path)
 
 
 def clean_sp(s):

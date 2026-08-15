@@ -5,12 +5,19 @@ Replaces transformer attention with:
   2. Discretisation → Zeckendorf weights (Fibonacci 0-7)
   3. Weighted aggregation via bind(weight_hv, value) ⊕ bundle
 
+Signed variant (use_signed_weights=True): negative similarity → negative
+Zeckendorf weight → suppression via spiral_bundle (Σmax-norm, antiknowledge
+does not dilute). Extension of the zero-spiral math (tests/test_spiral_primitives).
+
 Multi-head: each head binds aggregated output with quasi-orthogonal role.
 Position encoding: optional Fibonacci shift per token position.
 """
 
+import math
+
 import numpy as np
 from eva.symbolic.fibonacci_utils import FibonacciUtils
+from eva.symbolic.fibonacci_utils import spiral_bundle
 from eva.symbolic.concept_space import _hybrid_bind
 from eva.symbolic.seed_registry import DEFAULT_REGISTRY as _R
 
@@ -23,15 +30,18 @@ class VSAAttention:
         n_heads: number of attention heads (default 4)
         max_weight: max discrete weight (default 7)
         use_fib_pos: apply Fibonacci position encoding (default True)
+        use_signed_weights: negative sim → negative weight (suppression)
+            instead of dropping the contribution (default True)
     """
 
     def __init__(self, dim=768, n_heads=4, max_weight=7, use_fib_pos=True,
-                 use_bind_weighting=True, basis=None):
+                 use_bind_weighting=True, basis=None, use_signed_weights=True):
         self.dim = dim
         self.n_heads = n_heads
         self.max_weight = max_weight
         self.use_fib_pos = use_fib_pos
         self.use_bind_weighting = use_bind_weighting
+        self.use_signed_weights = use_signed_weights
 
         if basis is not None:
             n_avail = min(n_heads, basis.shape[0])
@@ -46,7 +56,12 @@ class VSAAttention:
             self.head_roles = Q.T.copy()
 
     def _quantize_weight(self, sim):
-        return 0 if sim <= 0 else int(round(self.max_weight * min(sim, 1.0)))
+        if not self.use_signed_weights:
+            return 0 if sim <= 0 else int(round(self.max_weight * min(sim, 1.0)))
+        # signed: half away from zero, range [-max_weight, max_weight]
+        v = float(sim) * self.max_weight
+        a = int(math.floor(v + 0.5))
+        return max(-self.max_weight, min(self.max_weight, a))
 
     def _zeckendorf_tree(self, w):
         tree = FibonacciUtils.zeckendorf(w)
@@ -70,12 +85,17 @@ class VSAAttention:
         return v / n if n > 1e-10 else v
 
     def _scale_bundle(self, value, weight):
-        """Weighted value: bind(weight_hv, value) per Zeckendorf part → bundle."""
-        if weight <= 0:
+        """Weighted value: bind(weight_hv, value) per Zeckendorf part → bundle.
+
+        Амплитуда (|weight|) кодируется Zeckendorf-частями; знак выносится
+        наружу и применяется в forward через spiral_bundle (Σmax-нормировка).
+        """
+        w = abs(weight)
+        if w <= 0:
             return None
         if not self.use_bind_weighting:
-            return value * (weight / self.max_weight)
-        parts = self._zeckendorf_tree(weight)
+            return value * (w / self.max_weight)
+        parts = self._zeckendorf_tree(w)
         result = None
         for p in parts:
             weight_hv = self._weight_vector(p, self.max_weight)
@@ -123,18 +143,23 @@ class VSAAttention:
         # Multi-head: each head binds its weighted aggregation with a role
         head_outputs = []
         for h in range(self.n_heads):
-            agg = None
-            for wv in weighted_vals:
-                if wv is None:
+            contribs, ws = [], []
+            for wv, w in zip(weighted_vals, weights):
+                if wv is None or w == 0:
                     continue
                 if self.n_heads > 1:
                     tagged = _hybrid_bind(wv, self.head_roles[h])
                 else:
                     tagged = wv
-                agg = tagged if agg is None else agg + tagged
+                contribs.append(tagged)
+                ws.append(float(w))
 
-            if agg is None:
+            if not contribs:
                 continue
+            if self.use_signed_weights:
+                agg = spiral_bundle(contribs, ws)
+            else:
+                agg = sum(contribs)
             an = np.linalg.norm(agg)
             if an > 1e-10:
                 head_outputs.append(agg / an)

@@ -312,3 +312,82 @@ class TemporalZeckendorf:
         else:
             slow = theta_base * max(0.0, 1.0 - (distance - slow_window) / max(slow_window, 1))
         return (max(fast, 0.0), max(slow, 0.0))
+
+
+def signed_phi_digits(x: float, K: int = 40) -> tuple[dict, float]:
+    """Жадный φ-разбор x с цифрами {-1,0,1} по виткам j ∈ [-K, K].
+
+    Симметричная φ-система: x = Σ digits[j]·φ^{-j} (по всем виткам).
+    Для |x| ≤ φ² разбор идёт напрямую от витка 0 (жадный, ошибка ≤ φ^{1-K}).
+    Для |x| > φ² масштабируем: x = y·φ^M, y ∈ [-φ², φ²], цифры сдвигаются
+    на -M витков. Возвращает (dict {виток: цифра}, остаток).
+
+    Закрывает лакуну Zeckendorf-иерархии FCF: знак — отрицательные веса,
+    антизнание, структурный ноль (компенсация +/- витков).
+    """
+    PHI = FibonacciUtils.golden_ratio()
+    phi2 = PHI * PHI
+    if x == 0.0:
+        return {}, 0.0
+    M = 0
+    if abs(x) > phi2:
+        M = int(np.floor(np.log(abs(x)) / np.log(PHI))) - 1
+    y = x / (PHI ** M)
+    rem = float(y)
+    digits = {}
+    for i in range(K):
+        v = rem * PHI ** i
+        a = int(np.floor(v + 0.5))  # round half away from zero (не banker's)
+        if a > 1:
+            a = 1
+        elif a < -1:
+            a = -1
+        j = i - M
+        if abs(j) <= K:
+            digits[j] = a
+        rem -= a * PHI ** (-i)
+    return digits, rem * (PHI ** M)
+
+
+def signed_phi_sum(digits: dict) -> float:
+    """Декодирование φ-разбора: Σ digits[j]·φ^{-j}."""
+    PHI = FibonacciUtils.golden_ratio()
+    return float(sum(a * PHI ** (-j) for j, a in digits.items()))
+
+
+def spiral_bundle(vecs, weights, eps: float = 1e-12):
+    """Знаковый VSA-bundle: accum = Σ a_i·r_i / Σ max(a_i, 0).
+
+    - антизнание (a_i < 0) не разбавляет знаменатель (Σmax, не Σ|a|)
+    - при ортонормированных витках и ядре a_0 > 0: ||accum|| ≤ 1
+    - с антизнанием норма растёт до √(1+R), R = Σ|a⁻|/Σmax
+    - при отсутствии положительных весов (Σmax ≈ 0) возвращает нулевой
+      вектор: «нет знания» структурно, без порогов
+    """
+    V = np.asarray(vecs, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    if V.ndim == 1:
+        V = V[None, :]
+    denom = float(np.maximum(w, 0.0).sum())
+    if denom <= eps:
+        return np.zeros(V.shape[1], dtype=np.float64)
+    weighted = (w[:, None] * V).sum(axis=0)
+    return weighted / denom
+
+
+def phi_decay(d: int) -> float:
+    """φ-затухание по индексу максимального числа Фибоначчи ≤ d.
+
+    phi_decay(d) = φ^{1-idx(F)}, где F — крупнейшее Fib-число ≤ d:
+    d=1 → idx(F₂)=2 → φ^{-1}≈0.618; d=2 → idx(F₃)=3 → φ^{-2}≈0.382; ...
+    Строго убывает по ступенькам Fib-иерархии — структурный аналог
+    экспоненциального затухания exp(-d/τ) с τ = 1/ln φ ≈ 2.078
+    (константа выведена из λ_d, не из эмпирического подбора).
+    """
+    if d <= 0:
+        return 1.0
+    PHI = FibonacciUtils.golden_ratio()
+    i = 2
+    while FibonacciUtils.get(i) <= d:
+        i += 1
+    return float(PHI ** (1 - (i - 1)))

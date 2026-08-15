@@ -1,8 +1,10 @@
-"""Spiral-математика как spec для интеграции в FCF.
+"""Spiral-математика — интеграция в FCF.
 
-Наработки из WideBind (test_zero_spiral: M1-M13) переведены на numpy/VSA-язык FCF.
-Цель: проверить примитивы ДО интеграции в fibonacci_utils.py / vsa_attention.py:
+Примитивы интегрированы в eva/symbolic/fibonacci_utils.py:
+  signed_phi_digits, signed_phi_sum, spiral_bundle, phi_decay
+и в eva/symbolic/vsa_attention.py (VSAAttention use_signed_weights=True).
 
+Проверяем:
   1. signed_phi_digits — жадный φ-разбор с цифрами {-1,0,1} (антизнание),
      ошибка усечения <= φ^{1-K} (закрывает лакуну «отрицательных весов»
      в Zeckendorf-иерархии FCF)
@@ -10,12 +12,11 @@
      ||accum|| <= 1 при ортонормированных витках и ядре (M11a),
      рост до sqrt(1+R) при антизнании (M11b)
   3. phi_decay — аналог экспоненциального затухания exp(-d/tau) через φ-витки
-     (FCF уже делает это в TemporalZeckendorf.theta; phi_decay даёт ту же
-     асимптотику с гарантированной границей сжатия M5)
+     (согласован с TemporalZeckendorf.theta, граница сжатия M5)
   4. telescopic_zero — телескоп нуля: знакопеременная сумма -> ровно 0
      (замена пороговых «нет перехода» структурным балансом)
-  5. signed_attention — знаковое внимание: отрицательный косинус -> подавление,
-     а не отбрасывание (расширение _quantize_weight / _scale_bundle)
+  5. signed_attention — знаковое внимание в VSAAttention: отрицательный косинус
+     -> подавление, а не отбрасывание
 """
 
 import math
@@ -27,72 +28,17 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from eva.symbolic.fibonacci_utils import (  # noqa: E402
+    signed_phi_digits, signed_phi_sum, spiral_bundle, phi_decay,
+    FibonacciUtils, ZeckendorfQuantizer, TemporalZeckendorf,
+)
+
 PHI = (1.0 + math.sqrt(5.0)) / 2.0
 EPS = 1e-12
 
 
-# ── примитивы (прототипы, spec для интеграции) ──────────────────
-
-def signed_phi_digits(x, K=40):
-    """Жадный φ-разбор x с цифрами {-1,0,1} по виткам j ∈ [-K, K].
-
-    Симметричная φ-система: x = Σ digits[j]·φ^{-j} (сумма по всем виткам).
-    Для |x| ≤ φ² разбор идёт напрямую от витка 0 (WideBind M8).
-    Для |x| > φ² масштабируем: x = y·φ^M, y ∈ [-φ², φ²], и сдвигаем
-    цифры на -M витков. Возвращает dict {виток: цифра}.
-    """
-    phi2 = PHI * PHI
-    if x == 0.0:
-        return {}, 0.0
-    M = 0
-    if abs(x) > phi2:
-        M = int(math.floor(math.log(abs(x), PHI))) - 1
-    y = x / (PHI ** M)
-    rem = float(y)
-    digits = {}
-    for i in range(K):
-        v = rem * PHI ** i
-        a = int(math.floor(v + 0.5))  # round half away from zero (не banker's)
-        if a > 1:
-            a = 1
-        elif a < -1:
-            a = -1
-        j = i - M
-        if abs(j) <= K:
-            digits[j] = a
-        rem -= a * PHI ** (-i)
-    return digits, rem * (PHI ** M)
-
-
 def phi_partial_sum(digits):
-    return sum(a * PHI ** (-j) for j, a in digits.items())
-
-
-def spiral_bundle(vecs, weights, eps=1e-12):
-    """Знаковый bundle: accum = Σ a_i·r_i / Σ max(a_i, 0)."""
-    V = np.asarray(vecs, dtype=np.float64)
-    w = np.asarray(weights, dtype=np.float64)
-    if V.ndim == 1:
-        V = V[None, :]
-    weighted = (w[:, None] * V).sum(axis=0)
-    denom = np.maximum(w, 0.0).sum() + eps
-    return weighted / denom
-
-
-def phi_decay(d):
-    """φ-затухание по индексу максимального числа Фибоначчи ≤ d.
-
-    φ^{1-idx(F)}, где F — крупнейшее число Фибоначчи ≤ d:
-    d=1 → idx(F2)=2 → φ^{-1}≈0.618; d=2 → idx(F3)=3 → φ^{-2}≈0.382; ...
-    Строго убывает по ступенькам Fib-иерархии (аналог exp(-d/τ) с τ=1/ln φ).
-    """
-    from eva.symbolic.fibonacci_utils import FibonacciUtils
-    if d <= 0:
-        return 1.0
-    i = 2
-    while FibonacciUtils.get(i) <= d:
-        i += 1
-    return PHI ** (1 - (i - 1))
+    return signed_phi_sum(digits)
 
 
 def telescopic_zero(N=50):
@@ -308,6 +254,72 @@ class TestSignedAttention:
         b = _hybrid_bind(v, wv)
         nb = _hybrid_bind(-v, wv)
         assert abs(float(np.dot(b, nb)) + 1.0) < 1e-6, "знак не сохранился в bind"
+
+
+# ── 5b. интегрированное знаковое внимание (VSAAttention) ────────
+
+class TestSignedAttentionIntegrated:
+    def test_negative_key_suppresses(self):
+        """Отрицательный косинус -> отрицательный вес -> подавление."""
+        from eva.symbolic.vsa_attention import VSAAttention
+        rng = np.random.RandomState(11)
+        dim = 64
+        q = rng.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        k_anti = -q.copy()  # sim = -1
+        v = rng.randn(dim).astype(np.float32)
+        v /= np.linalg.norm(v)
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                            use_bind_weighting=False, use_signed_weights=True)
+        out = attn.forward(q, [q, k_anti], [q, v])
+        # подавление вклада v через отрицательный вес: out отклонился от v
+        assert float(np.dot(out, v)) < 0.0
+
+    def test_signed_disabled_matches_old(self):
+        """use_signed_weights=False — старое поведение (отбрасывание)."""
+        from eva.symbolic.vsa_attention import VSAAttention
+        rng = np.random.RandomState(12)
+        dim = 64
+        q = rng.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        k_anti = -q.copy()
+        v = rng.randn(dim).astype(np.float32)
+        v /= np.linalg.norm(v)
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                            use_bind_weighting=False, use_signed_weights=False)
+        out = attn.forward(q, [q, k_anti], [q, v])
+        # негативный вклад отброшен: out = q (вклад v не входит)
+        assert np.allclose(out, q, atol=0.01)
+
+    def test_signed_identity_single_key(self):
+        """Один ключ с sim=1: знаковый путь даёт единичную норму."""
+        from eva.symbolic.vsa_attention import VSAAttention
+        rng = np.random.RandomState(13)
+        dim = 64
+        q = rng.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                            use_bind_weighting=True, use_signed_weights=True)
+        out = attn.forward(q, [q.copy()], [q.copy()])
+        assert abs(float(np.linalg.norm(out)) - 1.0) < 1e-5
+
+    def test_signed_zero_weight_no_contribution(self):
+        """Ортогональный ключ (sim≈0) -> вес 0 -> без вклада (как раньше)."""
+        from eva.symbolic.vsa_attention import VSAAttention
+        rng = np.random.RandomState(14)
+        dim = 64
+        q = rng.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        k_orth = rng.randn(dim).astype(np.float32)
+        k_orth -= np.dot(k_orth, q) * q
+        k_orth /= np.linalg.norm(k_orth)
+        v = rng.randn(dim).astype(np.float32)
+        v /= np.linalg.norm(v)
+        attn = VSAAttention(dim=dim, n_heads=1, use_fib_pos=False,
+                            use_bind_weighting=False, use_signed_weights=True)
+        out_orth = attn.forward(q, [k_orth], [v])
+        out_empty = attn.forward(q, [], [])
+        assert np.allclose(out_orth, out_empty, atol=0.01)
 
 
 # ── 6. совместимость с существующим FCF ──────────────────────────

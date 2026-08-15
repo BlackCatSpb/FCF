@@ -1,1054 +1,264 @@
-"""Full training (146K BPE). Process line-by-line. Checkpoints overwrite."""
-
-import os
-# Prevent numpy/BLAS thread contention on single-CPU workloads
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
-os.environ['NUMEXPR_NUM_THREADS'] = '1'
-
-import sys; sys.path.insert(0, os.path.dirname(__file__))
-import time, json, os, shutil, argparse, glob, random, re, zlib, math
+"""Полное обучение: STDP + CollocationMatrix на full_corpus_ru_clean.txt.
+С сохранением каждые 10K, онлайн-прогресс, тестовая генерация.
+"""
+import sys, os, time, json, argparse, pickle
+sys.stdout.reconfigure(encoding='utf-8')
 import numpy as np
-import sentencepiece as spm
-from sklearn.decomposition import PCA
-
-def _quiet(func, *args, **kwargs):
-    try:
-        return func(*args, **kwargs)
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except Exception as e:
-        print(f"[WARN] {func.__name__} failed: {e}", file=sys.stderr)
-        return None
-
-def _load_morph(path, sp_path):
-    """Load or build MorphVocab (builds from corpus if no cached file)."""
-    from eva.symbolic.morph_vocab import MorphVocab
-    if os.path.exists(path):
-        return MorphVocab.load(path, sp_model_path=sp_path)
-    print("  MorphVocab not cached — building from corpus...")
-    mv = MorphVocab.build(sp_model_path=sp_path)
-    mv.save(path)
-    return mv
+from eva.symbolic.fcf_config import FCFConfig, EnvironmentResolver
 from eva.symbolic.concept_space import ConceptSpace
 from eva.symbolic.syntax_lattice import SyntaxLattice
 from eva.symbolic.crystal_generator import CrystalGenerator
-from eva.symbolic.parameter_optimizer import ParameterOptimizer, PlateauDetector
-from eva.symbolic.fcf_config import FCFConfig
+import sentencepiece as spm
 
-# ── Config ──────────────────────────────────────────────────────
-CFG = FCFConfig()
-os.makedirs(CFG.data_dir, exist_ok=True)
-os.makedirs(CFG.vis_dir, exist_ok=True)
+CORPUS = r'C:\Users\black\OneDrive\Desktop\FCF\real_data\full_corpus_ru_clean.txt'
+CHECKPOINT_DIR = r'C:\Users\black\OneDrive\Desktop\FCF\checkpoints'
+LOG_FILE = r'C:\Users\black\OneDrive\Desktop\FCF\train.log'
+STATE_FILE = os.path.join(CHECKPOINT_DIR, 'state.pkl')
+META_FILE = os.path.join(CHECKPOINT_DIR, 'meta.json')
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# Redirect stdout to UTF-8 log file (terminal cp1251 can't print ▁)
-LOG_FILE = CFG.log_path
-class TeeOut:
-    def __init__(self):
-        self._log_fh = open(LOG_FILE, 'a', encoding='utf-8')
-    def write(self, s):
-        self._log_fh.write(s)
-        self._log_fh.flush()
-        try:
-            sys.__stdout__.write(s)
-        except UnicodeEncodeError:
-            sys.__stdout__.write(s.encode('ascii', errors='replace').decode('ascii'))
-        sys.__stdout__.flush()
-    def flush(self):
-        self._log_fh.flush()
-        sys.__stdout__.flush()
-    def __del__(self):
-        self.close()
-    def close(self):
-        if self._log_fh is not None:
-            self._log_fh.close()
-            self._log_fh = None
+# ── Число строк в корпусе (кэшируем) ──
+CORPUS_LINES_FILE = os.path.join(CHECKPOINT_DIR, 'corpus_lines.txt')
+if os.path.exists(CORPUS_LINES_FILE):
+    TOTAL_LINES = int(open(CORPUS_LINES_FILE).read().strip())
+else:
+    TOTAL_LINES = sum(1 for _ in open(CORPUS, 'r', encoding='utf-8'))
+    with open(CORPUS_LINES_FILE, 'w') as cf:
+        cf.write(str(TOTAL_LINES))
 
-old_stdout = sys.stdout
-sys.stdout = TeeOut()
-
-sp = spm.SentencePieceProcessor(model_file=CFG.bpe_model_path)
-V = sp.vocab_size()
-
-# ── e5 seeding helper ───────────────────────────────────────────
-
-_E5_MODEL = None
-
-def _load_e5(device='cpu'):
-    global _E5_MODEL
-    if _E5_MODEL is not None:
-        return _E5_MODEL
-    from sentence_transformers import SentenceTransformer
-    print(f"  Loading multilingual-e5-base on {device}...", end=' ', flush=True)
-    t0 = time.time()
-    _E5_MODEL = SentenceTransformer('intfloat/multilingual-e5-base', device=device)
-    print(f"{time.time()-t0:.1f}s")
-    return _E5_MODEL
-
-# ── Helpers ─────────────────────────────────────────────────────
-
-def load_checkpoint_state():
-    global RESUME_CLUSTER_POTENTIAL
-    if os.path.exists(CFG.ckpt_state_path):
-        try:
-            with open(CFG.ckpt_state_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            cp = data.get('cluster_potential')
-            if cp is not None:
-                RESUME_CLUSTER_POTENTIAL = cp
-            return data.get('line'), data.get('epoch', 1), data.get('global_step', 0)
-        except (json.JSONDecodeError, Exception) as e:
-            print(f"[WARN] Corrupted checkpoint state ({e}), starting fresh",
-                  file=sys.stderr)
-            return None, None, 0
-    return None, None, 0
-
-# ── Parse args ──────────────────────────────────────────────────
-
+# ── Параметры ──
 parser = argparse.ArgumentParser()
-parser.add_argument('--epochs', '-e', type=int, default=1, help='number of epochs (default: 1). Auto-resume wraps corpus for epoch 2+')
-parser.add_argument('--resume', '-r', nargs='?', const='', default='',
-                    help='resume from checkpoint. Default: auto from checkpoint_state.json. With Nk: load numbered (e.g. 6k)')
-parser.add_argument('--fast', '-f', action='store_true', help='fast mode: higher lr + negative sampling, always fresh')
-parser.add_argument('--fresh', action='store_true', help='force fresh start even if checkpoint exists')
-parser.add_argument('--max-lines', type=int, default=0, help='limit training to N lines (for testing)')
-parser.add_argument('--learned-fields', action='store_true', help='use learnable fields (HDC projection) instead of octree')
-parser.add_argument('--field-bits', type=int, default=512, help='number of learned field bits (default: 512)')
-parser.add_argument('--no-harmonize', action='store_true', help='disable morphological harmonizer (fallback to STDP-only)')
-parser.add_argument('--no-morpheme-field', action='store_true', help='disable morpheme field (GPU < 2GB fallback)')
-parser.add_argument('--no-hebbian-field', action='store_true', help='disable Hebbian entity field (VSA field bindings off)')
-parser.add_argument('--seed-e5', action='store_true', help='seed rare concepts with multilingual-e5-base instead of random')
-parser.add_argument('--e5-device', default='cpu', help='device for e5 model (cpu/cuda)')
-parser.add_argument('--e5-morph-bundle', action='store_true', help='VSA bundle of morpheme e5 vecs (requires --seed-e5)')
-parser.add_argument('--morph-bpe', default=None, help='path to morph-aware SentencePiece .model (replaces default BPE)')
+parser.add_argument('--fresh', action='store_true', help='Fresh start (clear checkpoints)')
+parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+parser.add_argument('--vocab-size', type=int, default=0)
+parser.add_argument('--field-bits', type=int, default=512)
+parser.add_argument('--learned-fields', action='store_true')
+parser.add_argument('--batch-size', type=int, default=100)
+parser.add_argument('--neg-samples', type=int, default=3)
+parser.add_argument('--context-window', type=int, default=4)
+parser.add_argument('--base-lr', type=float, default=0.001)
+parser.add_argument('--fluctuation-amp', type=float, default=0.003)
+parser.add_argument('--pmi-gate', type=float, default=0.0)
+parser.add_argument('--gen-every', type=int, default=10000,
+                    help='Generate test text every N lines (0 = disable)')
+parser.add_argument('--gen-max-words', type=int, default=100,
+                    help='Max tokens for test generation')
+parser.add_argument('--qwen-seed', type=str, default='',
+                    help='Path to .npy with Qwen-seeded concept vectors')
 args = parser.parse_args()
 
-RESUME = args.resume
-FAST = args.fast
-FRESH = args.fresh or FAST
-MAX_LINES = args.max_lines
-USE_LEARNED_FIELDS = args.learned_fields
-N_FIELD_BITS = args.field_bits
-NO_HARMONIZE = args.no_harmonize
-NO_MORPHEME_FIELD = args.no_morpheme_field
-NO_HEBBIAN_FIELD = args.no_hebbian_field
-RESUME_CLUSTER_POTENTIAL = None
-SEED_E5 = args.seed_e5
-E5_DEVICE = args.e5_device
-E5_MORPH_BUNDLE = args.e5_morph_bundle
-MORPH_BPE_PATH = args.morph_bpe
-
-# Override BPE model path if --morph-bpe specified
-if MORPH_BPE_PATH:
-    CFG.bpe_model_path = MORPH_BPE_PATH
-    print(f"  Using morph-aware BPE: {MORPH_BPE_PATH}")
-    # Reload SentencePiece with new model
-    sp = spm.SentencePieceProcessor(model_file=MORPH_BPE_PATH)
-    V = sp.vocab_size()
-
-print(f"vocab_size = {V}")
-
-if FRESH:
-    RESUME = None
-    ckpt = CFG.ckpt_state_path
-    if os.path.exists(ckpt):
-        os.remove(ckpt)
-
-if FAST:
-    print("FAST mode: base_lr=0.15, neg_samples=3, decay_every=250, eval_every=1000")
-
-resume_global_step = 0
-if RESUME is not None:
-    if RESUME == '':
-        rl, r_epoch, r_global_step = load_checkpoint_state()
-        if rl is None:
-            print("No checkpoint found — starting fresh.")
-            RESUME = None
-        else:
-            resume_line = rl
-            resume_epoch = r_epoch
-            resume_global_step = r_global_step
-            ckpt_k = (resume_line // 5000) * 5
-            resume_tag = f"{ckpt_k}k"
-            print(f"\nAuto-resuming from line {resume_line} (checkpoint_state.json) — loading {resume_tag}")
-            cs_path = CFG.cs_path.replace('.json', f'_{resume_tag}.json')
-            lat_path = CFG.lattice_path.replace('.json', f'_{resume_tag}.json')
-            lat_ok = os.path.exists(lat_path) or os.path.exists(lat_path.replace('.json', '.lattice.npz'))
-            if not os.path.exists(cs_path) or not lat_ok:
-                # Try .tmp files (from interrupted async save) and rename them
-                tmp_cs = cs_path + '.tmp'
-                tmp_lat = lat_path + '.tmp'
-                tmp_lat_npz = lat_path.replace('.json', '.lattice.npz') + '.tmp'
-                if os.path.exists(tmp_cs) and (os.path.exists(tmp_lat) or os.path.exists(tmp_lat_npz)):
-                    print(f"  Found .tmp checkpoint — recovering {resume_tag}")
-                    os.replace(tmp_cs, cs_path) if os.path.exists(tmp_cs) else None
-                    if os.path.exists(tmp_lat):
-                        os.replace(tmp_lat, lat_path)
-                    if os.path.exists(tmp_lat_npz):
-                        os.replace(tmp_lat_npz, lat_path.replace('.json', '.lattice.npz'))
-                if not os.path.exists(cs_path) or not (os.path.exists(lat_path) or os.path.exists(lat_path.replace('.json', '.lattice.npz'))):
-                    print(f"Checkpoint {resume_tag} not found: {cs_path} / {lat_path}")
-                    cs_path = CFG.cs_path
-                    lat_path = CFG.lattice_path
-                    if not os.path.exists(cs_path) or not os.path.exists(lat_path.replace('.json', '.lattice.npz')):
-                        print(f"Base checkpoint also not found. Giving up.")
-                        sys.exit(1)
-                    resume_tag = 'base'
-                    print(f"  (fallback to base paths)")
-    else:
-        resume_tag = RESUME
-        r = RESUME.lower().rstrip('k')
-        try: resume_line = int(r) * 1000
-        except ValueError:
-            print(f"Invalid resume value: {RESUME}")
-            sys.exit(1)
-        resume_epoch = 1
-        print(f"Resuming from '{RESUME}' (line {resume_line})")
-        cs_path = CFG.cs_path.replace('.json', f'_{RESUME}.json')
-        lat_path = CFG.lattice_path.replace('.json', f'_{RESUME}.json')
-        if not os.path.exists(cs_path) or not (os.path.exists(lat_path) or os.path.exists(lat_path.replace('.json', '.lattice.npz'))):
-            print(f"Checkpoint not found: {cs_path} / {lat_path}")
-            sys.exit(1)
-
-if RESUME is not None:
-    cs = _quiet(ConceptSpace.load, cs_path)
-    if cs is None:
-        print(f"Failed to load ConceptSpace from {cs_path}")
-        sys.exit(1)
-    lattice = SyntaxLattice()
-    load_ng = not FAST
-    if _quiet(lattice.load, lat_path, load_ngrams=load_ng) is None:
-        print(f"Failed to load SyntaxLattice from {lat_path}")
-        sys.exit(1)
-    ng_info = f" ({[len(v) for v in lattice.ngrams.values()]} prefixes)" if load_ng else " (ngrams skipped)"
-    print(f"  Loaded {len(cs.concept_vectors)} vectors, {len(lattice.concept_freq)} concepts{ng_info}")
-    if NO_MORPHEME_FIELD and hasattr(cs, 'harmonizer'):
-        cs.harmonizer.word_morphs.clear()
-        cs.harmonizer.morphemes.clear()
-        print("  Morpheme field disabled (--no-morpheme-field)")
-    if NO_HEBBIAN_FIELD and hasattr(cs, 'entity_field'):
-        del cs.entity_field
-        print("  Hebbian field disabled (--no-hebbian-field)")
-
-    if not any(lattice.ngrams.values()):
-        print("  Rebuilding lattice n-grams from corpus...")
+if args.fresh and os.path.exists(CHECKPOINT_DIR):
+    for f_name in os.listdir(CHECKPOINT_DIR):
+        f_path = os.path.join(CHECKPOINT_DIR, f_name)
         try:
-            lattice.build(CFG.corpus_path, sp, max_n=CFG.max_n,
-                          min_count=CFG.min_ngram_count,
-                          ppmi_threshold=CFG.ppmi_prune_threshold)
-        except Exception as e:
-            print(f"FATAL: lattice.build failed: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    mv = _load_morph(CFG.morph_vocab_path, CFG.bpe_model_path)
-    path_overrides = mv.get_path_overrides()
-    if not hasattr(cs, 'H') or cs.H is None:
-        fields_label = "learned" if USE_LEARNED_FIELDS else "octree"
-        print(f"  Rebuilding {fields_label} fields from loaded lattice...")
-        try:
-            if USE_LEARNED_FIELDS:
-                use_harm = sp if not (NO_HARMONIZE or NO_MORPHEME_FIELD) else None
-                cs.build_learned_fields(n_field_bits=N_FIELD_BITS, sp=use_harm)
-            else:
-                cs.build_zeckendorf_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
-                                       gamma=CFG.octree_gamma, path_overrides=path_overrides)
-            if SEED_E5:
-                e5 = _load_e5(E5_DEVICE)
-                n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3,
-                                        e5_model=e5, sp=sp, morph_bundle=E5_MORPH_BUNDLE)
-            else:
-                n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3)
-            if n_rare['reinit']:
-                print(f"  Item-memory: {n_rare['reinit']} rare concepts ({n_rare['e5']} e5, method={n_rare['method']})")
-        except Exception as e:
-            print(f"FATAL: build_{fields_label}_fields failed: {e}", file=sys.stderr)
-            sys.exit(1)
-
-else:
-    print(f"\nInitializing {V} concepts @ {CFG.dim}D...")
-    cs = ConceptSpace(vocab_size=V, dim=CFG.dim)
-    try:
-        cs.init_concepts()
-    except Exception as e:
-        print(f"FATAL: init_concepts failed: {e}", file=sys.stderr)
-        sys.exit(1)
-    cs.init_homeostasis()
-    if NO_HEBBIAN_FIELD and hasattr(cs, 'entity_field'):
-        del cs.entity_field
-        print("  Hebbian field disabled (--no-hebbian-field)")
-
-    mv = _load_morph(CFG.morph_vocab_path, CFG.bpe_model_path)
-    path_overrides = mv.get_path_overrides()
-
-    print("Building SyntaxLattice...")
-    lattice = SyntaxLattice()
-    try:
-        lattice.build(CFG.corpus_path, sp, max_n=CFG.max_n)
-    except Exception as e:
-        print(f"FATAL: lattice.build failed: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    fields_label = "learned" if USE_LEARNED_FIELDS else "octree"
-    print(f"Building {fields_label} fields...")
-    try:
-        if USE_LEARNED_FIELDS:
-            use_harm = sp if not (NO_HARMONIZE or NO_MORPHEME_FIELD) else None
-            cs.build_learned_fields(n_field_bits=N_FIELD_BITS, sp=use_harm)
-        else:
-            cs.build_zeckendorf_fields(lattice, n_anchors=CFG.n_anchors, min_lcp=CFG.octree_min_lcp,
-                                   gamma=CFG.octree_gamma, path_overrides=path_overrides)
-        if SEED_E5:
-            e5 = _load_e5(E5_DEVICE)
-            n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3,
-                                    e5_model=e5, sp=sp, morph_bundle=E5_MORPH_BUNDLE)
-        else:
-            n_rare = cs.reinit_rare(lattice.concept_freq, threshold=3)
-        if n_rare['reinit']:
-            print(f"  Item-memory: {n_rare['reinit']} rare concepts ({n_rare['e5']} e5, method={n_rare['method']})")
-    except Exception as e:
-        print(f"FATAL: build_{fields_label}_fields failed: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # ── Diagnostics ────────────────────────────────────────────────
-    # (functions defined unconditionally below; baseline run once)
-
-def mean_cosine_sim(cs, sample=2000):
-    all_cids = list(cs.concept_vectors.keys())
-    if not all_cids:
-        return 0.0, 0.0
-    rng_state = np.random.RandomState(42)
-    cids = rng_state.choice(all_cids, size=min(sample, len(all_cids)), replace=False).tolist()
-    vecs_list = [cs.concept_vectors.get(c) for c in cids]
-    vecs_list = [v for v in vecs_list if v is not None]
-    vecs = np.array(vecs_list, dtype=np.float32)
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    norms[norms < 1e-10] = 1.0
-    vecs /= norms
-    n = len(vecs)
-    n_pairs = min(5000, n * (n - 1) // 2)
-    rng = np.random.RandomState(42)
-    sims = np.empty(n_pairs, dtype=np.float32)
-    for k in range(n_pairs):
-        i = rng.randint(n); j = rng.randint(n)
-        while j == i: j = rng.randint(n)
-        sims[k] = float(vecs[i] @ vecs[j])
-    return float(np.mean(sims)), float(np.std(sims))
-
-def check_consistency(cs, sample=500):
-    all_cids = list(cs.concept_vectors.keys())
-    if not all_cids:
-        return 0, 0
-    rng_state = np.random.RandomState(42)
-    cids = rng_state.choice(all_cids, size=min(sample, len(all_cids)), replace=False).tolist()
-    ok = 0
-    for cid in cids:
-        v_stored = cs.concept_vectors.get(cid)
-        v_code = cs.fractal.compute_vector(cid)
-        if v_stored is not None and v_code is not None and abs(float(np.dot(v_stored, v_code)) - 1.0) < 1e-6:
-            ok += 1
-    return ok, len(cids)
-
-# ── Harmonizer config wiring (Phase 6.2) ─────────────────────────
-if hasattr(cs, 'harmonizer') and cs.harmonizer.word_morphs:
-    cs.harmonizer.harm_lr = CFG.harm_lr
-    cs.harmonizer.morph_lr = CFG.morph_lr
-    cs.harmonizer.n_iter = CFG.n_harm_iterations
-    cs._morph_conf_threshold = CFG.morph_confidence_threshold
-    cs._harm_slow_start_epochs = CFG.harm_slow_start_epochs
-
-# ── Baseline ────────────────────────────────────────────────────
-
-# ── Metric pairs (from config) ──────────────────────────────────
-CFG.build_metric_pairs(morph_vocab=mv, lattice=lattice, sp=sp)
-
-if RESUME is None:
-    mean_sim, std_sim = mean_cosine_sim(cs)
-    ok, total = check_consistency(cs)
-    print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total}")
-
-# ── Parameter Optimizer (auto-tuning with config-driven rules) ──
-
-opt = ParameterOptimizer(CFG)
-if FAST:
-    opt.p['full_lr'].set(CFG.fast_lr)
-    opt.p['neg_samples'].set(CFG.fast_neg_samples)
-
-# Restore optimizer state from checkpoint (metric buffers + adapted params)
-if RESUME is not None:
-    opt_path = CFG.cs_path.replace('.json', f'_{resume_tag}.opt.json')
-    if not os.path.exists(opt_path):
-        opt_path = CFG.cs_path.replace('.json', '.opt.json')
-    if not os.path.exists(opt_path):
-        # TN-34: search with data_dir prefix (matches CheckpointManager naming)
-        opt_path = os.path.join(CFG.data_dir, f'concept_space_{resume_tag}.opt.json')
-    if not os.path.exists(opt_path):
-        # Broad fallback: any .opt.json in data_dir
-        opt_files = sorted(glob.glob(os.path.join(CFG.data_dir, '*.opt.json')))
-        if opt_files:
-            opt_path = opt_files[-1]
-    if os.path.exists(opt_path):
-        with open(opt_path, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
-        opt.load_state(saved)
-        print(f"Loaded optimizer state")
-
-def get_lr(line_idx):
-    if line_idx < CFG.lr_warmup_lines:
-        return opt.p['full_lr'].current * (line_idx + 1) / CFG.lr_warmup_lines
-    # Cosine annealing with warm restarts
-    T_0 = max(CFG.lr_cosine_T0, 1)
-    T_mult = CFG.lr_cosine_mult
-    # Find which restart period we're in
-    t = line_idx - CFG.lr_warmup_lines
-    cur_T = T_0
-    while t >= cur_T:
-        t -= cur_T
-        cur_T = int(cur_T * T_mult)
-    cos_pct = min(t / max(cur_T, 1), 1.0)
-    return opt.p['full_lr'].current * max(0.5 * (1.0 + math.cos(math.pi * cos_pct)), 0.05)
-
-
-# ── Train/val split ──────────────────────────────────────────────
-
-with open(CFG.corpus_path, 'r', encoding='utf-8') as f:
-    all_lines = [l.strip() for l in f if l.strip()]
-
-# Shuffle before split so val set isn't biased toward longest lines
-rng = random.Random(42)
-rng.shuffle(all_lines)
-n_val = max(1, int(len(all_lines) * CFG.val_pct))
-val_lines = all_lines[:n_val]
-train_lines = all_lines[n_val:]
-
-# ── Curriculum: sort train lines by BPE length (short → easy first) ──
-train_lens = [len(sp.encode(l)) for l in train_lines]
-train_pairs = sorted(zip(train_lens, train_lines), key=lambda x: x[0])
-train_lens = [p[0] for p in train_pairs]
-train_lines = [p[1] for p in train_pairs]
-
-# Self-paced learning: re-rank by concept_error at each checkpoint
-def _rescore_lines(lines, gen, batch_size=256):
-    """Score lines by mean concept error (batched for GPU efficiency)."""
-    if not hasattr(gen, 'concept_error') or not gen.concept_error:
-        return lines
-    scores = []
-    for i in range(0, len(lines), batch_size):
-        batch = lines[i:i + batch_size]
-        batch_scores = []
-        for line in batch:
-            ids = gen._encode_input(line)
-            if not ids:
-                batch_scores.append(0.0)
-            else:
-                mean_err = sum(gen.concept_error.get(cid, 0.5) for cid in ids) / len(ids)
-                batch_scores.append(mean_err)
-        scores.extend(batch_scores)
-        if len(lines) > 1000 and (i + batch_size) % 5000 == 0:
-            print(f"  Rescore: {i + batch_size}/{len(lines)} ({100*(i+batch_size)//len(lines)}%)")
-    return [l for _, l in sorted(zip(scores, lines))]
-
-
-from collections import OrderedDict
-from eva.symbolic.checkpoint_manager import CheckpointManager
-
-class TrainingPipeline:
-    """Encapsulates the main training loop with batch scheduling, checkpoints, and reporting."""
-    def __init__(self, gen, sp, cs, lattice, opt, cfg, start_line=0):
-        self.gen = gen
-        self.sp = sp
-        self.cs = cs
-        self.lattice = lattice
-        self.opt = opt
-        self.cfg = cfg
-        self.ppl_history = []
-        self.vppl_history = []
-        self.last_fluct_lines = 0
-        self.global_step = 0
-        self.total_pairs_since_last_decay = 0
-        self.last_stat_time = 0.0
-        self.last_cos_time = 0.0
-        self.last_cos_sim = (0.0, 0.0)
-        self.ngram_last_total = 0
-        # TN-4: Early Stopping
-        self.best_score = float('inf')
-        self.best_ckpt_name = None
-        self.patience_counter = 0
-        self.patience = 5
-        # Collapse-aware inhibition: base strength, scales up with cos_mean
-        self._base_inh_strength = 0.05
-        self._current_inh_strength = 0.05
-        # TN-12: Switched Evaluation cycle counter
-        self._eval_count = 0
-        # AM-7: Async Checkpoint Manager
-        ckpt_keep = getattr(cfg, 'cleanup_keep', 5)
-        self.ckpt_mgr = CheckpointManager(
-            data_dir=os.path.dirname(cfg.cs_path),
-            cleanup_keep=ckpt_keep)
-        # TN-32: preserve curriculum progress after rescore
-        self._rescore_cp = None
-        # V18: Soft plateau detector (replaces hard _full_stuck_counter ×2 logic)
-        self._plateau_detector = PlateauDetector()
-        # If resuming mid-epoch (start_line > 0), prevent rescore until next epoch
-        self._rescore_line = None if start_line == 0 else -1
-
-    def _checkpoint(self, epoch, idx, elapsed, epoch_lines, destab_scale, t_start,
-                    epoch_train=None, start_line=None, global_step=0):
-        gen = self.gen; cs = self.cs; lattice = self.lattice; opt = self.opt
-        rate = idx / max(elapsed, 0.1)
-        pct = 100 * idx / epoch_lines
-        print(f"\n[{pct:5.1f}%] {idx:7d}L | {rate:4.0f} L/s")
-        mean_sim, std_sim = mean_cosine_sim(cs)
-        ok, total_c = check_consistency(cs)
-        ng_total = sum(len(v) for v in lattice.ngrams.values())
-        ng_new = ng_total - self.ngram_last_total
-        self.ngram_last_total = ng_total
-        print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total_c} ngrams={ng_total}(+{ng_new})")
-        # Collapse-aware inhibition: scale inh_strength when cos_mean rises
-        if mean_sim > 0.08:
-            scale = 1.0 + (mean_sim - 0.08) * 50  # 1.0 at 0.08, 1.5 at 0.09, etc.
-            opt.p['inh_strength'].current = min(opt.p['inh_strength'].max,
-                opt.p['inh_strength'].default * scale)
-            print(f"  COLLAPSE_GUARD cos={mean_sim:.4f} > 0.08 → inh_strength={opt.p['inh_strength'].current:.3f}")
-        elif mean_sim < 0.04:
-            opt.p['inh_strength'].current = opt.p['inh_strength'].default
-        ckpt_k = idx // 1000
-        ckpt_name = f"{ckpt_k}k"
-        # AM-7: Fully async checkpoint save (background thread + atomic state)
-        ckpt_state = {
-            '_path': self.cfg.ckpt_state_path,
-            'line': idx, 'epoch': epoch,
-            'global_step': global_step, 'timestamp': time.time(),
-        }
-        # P2.2: persist cluster potential for minesweeper
-        if hasattr(gen, '_cluster_potential') and gen._cluster_potential is not None:
-            ckpt_state['cluster_potential'] = gen._cluster_potential.tolist()
-        self.ckpt_mgr.save(ckpt_name, cs, lattice, opt, ckpt_state=ckpt_state)
-        n_upd = cs._update_count
-        avg_delta = (cs._total_shift / max(n_upd, 1)) * 1e3
-        cs._total_shift = 0.0; cs._update_count = 0
-        n_code_out, max_code_abs = cs.check_code_range(bound=self.cfg.code_bound)
-        vec_ok, vec_total, vec_max_dev = cs.validate_vector_norms()
-        if n_code_out > 0 or vec_max_dev > self.cfg.vec_dev_warn:
-            print(f"  CODE_DRIFT n_out={n_code_out} max|code|={max_code_abs:.1f} vec_dev={vec_max_dev:.6f}")
-        # Semantic bootstrap: use lattice PPMI connections to pull related tokens together
-        boot_n = self.gen._trainer._semantic_bootstrap(cs, lattice, base_lr=self.cfg.bootstrap_lr)
-        if boot_n > 0:
-            print(f"  Semantic bootstrap: {boot_n} tokens updated")
-
-        # ── Phase 3.2/3.3: Harmonizer full pass + slow-start ──
-        if hasattr(cs, 'harmonizer') and cs.harmonizer.word_morphs:
-            harm = cs.harmonizer
-            harm_n_ckpt = getattr(cs, '_harm_n_checkpoints', 0)
-            slow_start_epochs = getattr(cs, '_harm_slow_start_epochs', 5)
-            if harm_n_ckpt < slow_start_epochs:
-                scale = 0.1 + 0.9 * (harm_n_ckpt / max(slow_start_epochs - 1, 1))
-            else:
-                scale = 1.0
-            effective_harm_lr = harm.harm_lr * scale
-            saved_lr = harm.harm_lr
-            harm.harm_lr = effective_harm_lr
-            cs._harm_n_checkpoints = harm_n_ckpt + 1
-
-            # Phase 5.5: Save preharm checkpoint before first harmonize pass
-            if harm_n_ckpt == 0:
-                data_dir = os.path.dirname(self.cfg.cs_path)
-                preharm_path = os.path.join(data_dir, f'concept_space_{ckpt_name}_preharm.json')
-                cs.save(preharm_path)
-                print(f"  Preharm checkpoint saved: {preharm_path}")
-
-            # Full pass: harmonize all dirty words
-            dirty_words = list(harm.word_dirty)
-            if dirty_words:
-                n_ok = 0
-                n_delta = 0.0
-                for cid in dirty_words:
-                    v = cs.concept_vectors.get(cid)
-                    if v is not None:
-                        new_v, delta = harm.harmonize(cid, v)
-                        if new_v is not None:
-                            cs._apply_vector_update(cid, new_v)
-                            n_ok += 1
-                            n_delta += delta
-                harm.clear_dirty()
-                avg_d = n_delta / max(n_ok, 1)
-                print(f"  Harmonizer: {n_ok}/{len(dirty_words)} words harmonized "
-                      f"(avg δ={avg_d:.5f}, lr={effective_harm_lr:.4f})")
-                # Phase 6.3: harmonisation convergence metric
-                cs._harm_convergence = n_ok / max(1, len(harm.word_morphs))
-            harm.harm_lr = saved_lr
-
-            # Phase 6.3: EntityField + morph_drift
-            if hasattr(cs, 'entity_field'):
-                ef = cs.entity_field
-                # P2.4: decay entity vectors to prevent unbounded growth
-                ef.decay(factor=0.999)
-                n_ef = len(ef.entities)
-                char_count = sum(1 for k in ef.entities if k[0] == 'c')
-                sent_count = sum(1 for k in ef.entities if k[0] == 's')
-                print(f"  EntityField: {n_ef} entities ({char_count} chars, {sent_count} sents)")
-
-            if harm_n_ckpt > 0:
-                # morph_drift: sample words, compare composed vs actual
-                drift_cids = list(harm.word_morphs.keys())[:200]
-                drifts = []
-                for cid in drift_cids:
-                    v = cs.concept_vectors.get(cid)
-                    if v is None:
-                        continue
-                    parts = []
-                    for mid, role in harm.word_morphs[cid]:
-                        mv = harm.morphemes.get(mid)
-                        if mv is not None:
-                            parts.append((role, mv))
-                    if parts:
-                        composed = harm.compose_word(parts)
-                        if composed is not None:
-                            drifts.append(float(1.0 - abs(np.dot(composed, v))))
-                if drifts:
-                    morph_drift = sum(drifts) / len(drifts)
-                    print(f"  Morph drift: {morph_drift:.4f} (mean 1-|cos|) over {len(drifts)} words")
-        seed = self.cfg.test_seeds[zlib.crc32(str(idx).encode()) % len(self.cfg.test_seeds)]
-        if gen.sp is not None:
-            result = gen.generate(seed_word=seed, max_words=self.cfg.gen_max_words)
-            txt = result.text.replace('\n', ' ').strip()
-            print(f"  gen({seed}): {txt}")
-        if idx % (CHECKPOINT_EVERY * 5) == 0:
-            _quiet(save_3d_vis, cs, self.sp, ckpt_name)
-        self.eval_vppl = getattr(self, 'eval_vppl', None)
-        self.eval_acc1 = getattr(self, 'eval_acc1', None)
-        self.eval_vacc1 = getattr(self, 'eval_vacc1', None)
-        if idx > 0 and idx % self.cfg.eval_every_fast == 0:
-            self._eval_count += 1
-            is_full = (self._eval_count * self.cfg.eval_every_fast) % self.cfg.eval_every_full == 0
-            max_lines = self.cfg.eval_full_lines if is_full else self.cfg.eval_fast_lines
-            eval_result = _quiet(gen.evaluate, self.cfg.val_corpus_path, max_lines=max_lines)
-            if eval_result is not None:
-                self.eval_vppl = eval_result.get('vec_perplexity')
-                if is_full:
-                    ppl = eval_result.get('perplexity')
-                    self.eval_acc1 = eval_result.get('accuracy_top1')
-                    self.eval_vacc1 = eval_result.get('vec_accuracy_top1')
-                    self.ppl_history.append((idx, ppl))
-                    self.vppl_history.append((idx, self.eval_vppl))
-                    ppl_trend = ''
-                    if len(self.ppl_history) >= 2:
-                        d = ppl - self.ppl_history[-2][1]
-                        ppl_trend = f" {'+' if d > 0 else ''}{d:.0f}"
-                    print(f"  PPL={ppl:.0f}{ppl_trend} acc@1={self.eval_acc1:.3f} vPPL={self.eval_vppl:.0f} vacc@1={self.eval_vacc1:.3f}")
-                    # TN-4: Early Stopping + Best Checkpoint
-                    score = self.eval_vppl + (1.0 - self.eval_vacc1 if self.eval_vacc1 is not None else 0) * 50
-                    if score < self.best_score:
-                        self.best_score = score
-                        self.best_ckpt_name = ckpt_name
-                        self.patience_counter = 0
-                    else:
-                        self.patience_counter += 1
-                else:
-                    self.vppl_history.append((idx, self.eval_vppl))
-                    print(f"  vPPL={self.eval_vppl:.0f} (fast)")
-        opt.step(mean_cos=mean_sim, std_cos=std_sim, delta=avg_delta, ng_new=ng_new,
-                 vec_ppl=self.eval_vppl, acc1=self.eval_acc1, vacc1=self.eval_vacc1)
-        # T-B1: Self-paced learning rescore (once per epoch)
-        if self._rescore_line is None and epoch_train is not None and start_line is not None:
-            remaining = idx - start_line + 1
-            if remaining > 0 and remaining < len(epoch_train):
-                self._rescore_cp = _curriculum_p(idx + 1)
-                self._rescore_line = idx  # TN-41: save LR schedule position
-                epoch_train = _rescore_lines(epoch_train[idx + 1:], gen)
-                idx = 0; start_line = 0
-                self.last_fluct_lines = 0
-        if self.patience_counter >= self.patience or opt._full_stuck_counter >= 5:
-            print(f"  Early stopping: patience={self.patience_counter}/{self.patience}, "
-                  f"stuck={opt._full_stuck_counter}")
-            self.ckpt_mgr.wait()
-            import sys; sys.exit(0)
-        return idx, start_line, epoch_train
-
-# Continuous curriculum: ramp max_len, context_window, neg_samples over first fraction
-CURICULUM_FRACTION = 0.20
-CURICULUM_MIN_LEN = 16
-TOTAL_LINES_GLOBAL = len(train_lines)
-
-def _curriculum_p(idx):
-    return min(idx / max(TOTAL_LINES_GLOBAL * CURICULUM_FRACTION, 1), 1.0)
-
-def _curriculum_max_len(idx, max_total=10**9):
-    p = _curriculum_p(idx)
-    return int(CURICULUM_MIN_LEN + (max_total - CURICULUM_MIN_LEN) * p)
-
-def _effective_cp(idx, pipeline):
-    cp = _curriculum_p(max(idx, 0))
-    if pipeline._rescore_cp is not None:
-        if cp >= pipeline._rescore_cp:
-            pipeline._rescore_cp = None
-        else:
-            cp = pipeline._rescore_cp
-    return cp
-
-if MAX_LINES > 0:
-    train_lines = train_lines[:MAX_LINES]
-    print(f"  Limited to {len(train_lines)} lines (--max-lines={MAX_LINES})")
-
-print(f"  {len(train_lines)} train, {len(val_lines)} val")
-print(f"  Shortest: {train_lens[0]} BPE tokens, Longest: {train_lens[-1]} BPE tokens")
-print(f"  Median: {train_lens[len(train_lens)//2]} BPE tokens")
-with open(CFG.val_corpus_path, 'w', encoding='utf-8') as f:
-    for l in val_lines:
-        f.write(l + '\n')
-
-# ── STDP Training (line by line) ────────────────────────────────
-
-LIVE_REFRESH = 1.0  # seconds between live status updates
-COS_REFRESH = 5.0   # seconds between cos/pair recomputation
-
-print("STDP training...")
-gen = CrystalGenerator(cs, sp, lattice)
-gen.train_lr = opt.p['full_lr'].current
-if RESUME_CLUSTER_POTENTIAL is not None:
-    import torch
-    dev = gen._torch_device if gen._torch_device is not None else torch.device('cpu')
-    gen._cluster_potential = torch.tensor(RESUME_CLUSTER_POTENTIAL, device=dev, dtype=torch.float32)
-t_start = time.time()
-
-total_lines = len(train_lines)
-CHECKPOINT_EVERY = CFG.checkpoint_every
-EVAL_EVERY_F = CFG.eval_every_fast if FAST else CFG.eval_every_slow
-FLUCTUATE_EVERY = CFG.fluctuate_every
-n_trained = 0
-ngram_last_total = 0
-ppl_history = []
-vppl_history = []
-last_stat_time = 0.0
-last_cos_time = 0.0
-last_cos_sim = (0.0, 0.0)
-global_step = resume_global_step if RESUME is not None else 0
-last_decay_pairs = 0
-total_pairs_since_last_decay = 0
-
-def live_status(text):
-    """Write one-line status to terminal only — \r updates in place."""
-    try:
-        sys.__stdout__.write('\r' + text)
-    except UnicodeEncodeError:
-        safe = text.encode('cp1251', errors='replace').decode('cp1251')
-        sys.__stdout__.write('\r' + safe)
-    sys.__stdout__.flush()
-
-def save_3d_vis(cs, sp, checkpoint_name):
-    vis_dir = CFG.vis_dir
-
-    cids = sorted(cs.concept_vectors.keys())
-    if len(cids) == 0:
-        return
-
-    # Build matrix 32K×384
-    X = np.array([cs.concept_vectors[c] for c in cids], dtype=np.float32)
-    X_mean = X.mean(axis=0, keepdims=True)
-    Xc = X - X_mean
-
-    # Randomized SVD for speed
-    pca = PCA(n_components=3, random_state=0)
-    proj = pca.fit_transform(Xc)  # N×3
-
-    # Rescale to fill [-1, 1] cube
-    scale = np.max(np.abs(proj))
-    if scale > 0:
-        proj = proj / scale
-
-    # Build JSON
-    codes = cs.fractal.codes
-    tokens = []
-    for i, cid in enumerate(cids):
-        tok = sp.IdToPiece(cid) if cid < sp.vocab_size() else f'[ID{cid}]'
-        f = float(np.linalg.norm(codes.get(cid, np.zeros(384))))
-        tokens.append({
-            't': tok, 'x': float(proj[i, 0]), 'y': float(proj[i, 1]), 'z': float(proj[i, 2]),
-            'f': round(f, 1), 'id': int(cid)
-        })
-
-    json_path = os.path.join(vis_dir, f'points_{checkpoint_name}.json')
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(tokens, f, ensure_ascii=False)
-
-    # Latest copy for viewer.html
-    latest_path = os.path.join(vis_dir, 'points_latest.json')
-    if json_path != latest_path:
-        shutil.copy2(json_path, latest_path)
-
-    # Write HTML if not exists
-    html_path = os.path.join(vis_dir, 'viewer.html')
-    if not os.path.exists(html_path):
-        _write_viewer_html(html_path)
-
-    return json_path
-
-def _write_viewer_html(path):
-    # Template lives in real_data/viewer_template.html
-    with open(os.path.join(CFG.data_dir, 'viewer_template.html'), 'r', encoding='utf-8') as f:
-        TEMPLATE = f.read()
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(TEMPLATE)
-
-def _final_save(cs, lattice, opt, epoch, total_lines, global_step=0):
-    """Save all training state. Each operation protected individually."""
-    for _op_name, _op_fn, _op_args in [
-        ('cs.save', cs.save, (CFG.cs_path,)),
-        ('lattice.save', lattice.save, (CFG.lattice_path,)),
-    ]:
-        try:
-            _op_fn(*_op_args)
-        except Exception as e:
-            print(f"[WARN] {_op_name} failed: {e}", file=sys.stderr)
-    try:
-        state = opt.save_state()
-        with open(os.path.join(CFG.data_dir, 'concept_space_final.opt.json'), 'w', encoding='utf-8') as _of:
-            json.dump(state, _of)
-    except Exception as e:
-        print(f"[WARN] opt.save_state failed: {e}", file=sys.stderr)
-    try:
-        ckpt = {'epoch': epoch, 'line': total_lines, 'global_step': global_step, 'timestamp': time.time()}
-        with open(CFG.ckpt_state_path + '.tmp', 'w', encoding='utf-8') as f:
-            json.dump(ckpt, f)
-        os.replace(CFG.ckpt_state_path + '.tmp', CFG.ckpt_state_path)
-    except Exception as e:
-        print(f"[WARN] ckpt_state save failed: {e}", file=sys.stderr)
-    for f in glob.glob(os.path.join(CFG.data_dir, 'points_*.html')):
-        try:
-            if os.path.isfile(f):
-                os.remove(f)
-        except:
+            if os.path.isfile(f_path):
+                os.remove(f_path)
+        except Exception:
             pass
 
-# Determine starting line and epoch
-start_line = resume_line if RESUME is not None else 0
-total_epochs = args.epochs
-current_epoch = resume_epoch if RESUME is not None else 1
+_log_fh = open(LOG_FILE, 'a' if args.resume else 'w', encoding='utf-8')
+def log(msg=''):
+    print(msg)
+    _log_fh.write(str(msg) + '\n')
+    _log_fh.flush()
 
-if RESUME is not None:
-    print(f"Resuming epoch {current_epoch} at line {start_line}")
+TEST_SEEDS = ['на', 'человек', 'большой', 'ходить', 'сегодня',
+              'мир', 'время', 'жизнь', 'новый', 'говорить']
 
-_ckpt_epoch = current_epoch
-idx = start_line
-# AM-15/T-B2: Activate TrainingPipeline
-pipeline = TrainingPipeline(gen, sp, cs, lattice, opt, CFG, start_line=start_line)
-pipeline.ngram_last_total = sum(len(v) for v in lattice.ngrams.values())
+cfg = FCFConfig()
+env = EnvironmentResolver()
+sp = spm.SentencePieceProcessor(model_file=env.bpe_model_path)
+
+resume_lines = 0
+resume_pairs = 0
+
+if args.resume and os.path.exists(STATE_FILE) and os.path.exists(META_FILE):
+    log(f'Resuming from {STATE_FILE}...')
+    with open(META_FILE, 'r') as mf:
+        meta = json.load(mf)
+    resume_lines = meta.get('lines', 0)
+    resume_pairs = meta.get('pairs', 0)
+    log(f'  previous progress: {resume_lines:,} lines, {resume_pairs:,} pairs')
+    with open(STATE_FILE, 'rb') as sf:
+        state = pickle.load(sf)
+    cs = state['cs']
+    lattice = state['lattice']
+    gen = CrystalGenerator(cs, sp, lattice)
+    gen._use_colloc = True
+    gen.concept_error = state.get('concept_error', gen.concept_error)
+    gen.hormones = state.get('hormones', gen.hormones)
+    log('  model state restored.')
+else:
+    V = args.vocab_size if args.vocab_size else sp.vocab_size()
+    log(f'Init ConceptSpace (vocab={V})...')
+    cs = ConceptSpace(vocab_size=V, dim=256)
+    cs.init_concepts()
+    cs.init_homeostasis()
+    if args.qwen_seed and os.path.exists(args.qwen_seed):
+        log(f'Seeding from Qwen: {args.qwen_seed}')
+        n = cs.seed_from_qwen(args.qwen_seed)
+        log(f'  {n} vectors loaded')
+    else:
+        cs.seed_alphabet_basis(sp, seed_multi_char=True)
+    cs.build_collocation_matrix()
+    cs.build_multi_level_encoder()
+
+    log('Init lattice + generator...')
+    lattice = SyntaxLattice()
+    lattice.concept_freq = {i: max(10 - i, 1) for i in range(V)}
+    for n in range(2, 5):
+        lattice.ngrams[n] = {}
+    gen = CrystalGenerator(cs, sp, lattice)
+    gen._use_colloc = True
+
+V = cs.vocab_size
+log(f'Config:')
+log(f'  corpus={CORPUS} ({TOTAL_LINES:,} lines)')
+log(f'  vocab={V}, batch={args.batch_size}, lr={args.base_lr}')
+log(f'  neg_samples={args.neg_samples}, context_window={args.context_window}')
+log(f'  field_bits={args.field_bits}, learned_fields={args.learned_fields}')
+log(f'  pmi_gate={args.pmi_gate}, fluctuation={args.fluctuation_amp}')
+log(f'  gen_every={args.gen_every}, gen_max_words={args.gen_max_words}')
+log(f'  qwen_seed={"yes" if args.qwen_seed else "no"}')
+if resume_lines:
+    log(f'  resuming from line {resume_lines:,}')
+log()
+
+# ── Сохранение чекпоинта ──
+def save_checkpoint(total_lines, total_pairs):
+    state = {
+        'cs': cs,
+        'lattice': lattice,
+        'concept_error': gen.concept_error,
+        'hormones': gen.hormones,
+    }
+    with open(STATE_FILE, 'wb') as sf:
+        pickle.dump(state, sf, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(META_FILE, 'w') as mf:
+        json.dump({'lines': total_lines, 'pairs': total_pairs}, mf)
+
+# ── Тестовая генерация ──
+def run_test_generation(elapsed):
+    n_seeds = min(3, len(TEST_SEEDS))
+    seeds = list(np.random.RandomState(hash(f'{total_lines}_{time.time()}') % 2**31).choice(TEST_SEEDS, n_seeds, replace=False))
+    for sw in seeds:
+        try:
+            res = gen.generate(seed_word=sw, max_words=args.gen_max_words, use_colloc=True)
+            txt = res.text if res and res.text else '(empty)'
+            log(f'  [{sw}] {txt[:200]}')
+        except Exception as e:
+            log(f'  [{sw}] ERROR: {e}')
+
+# ── Основной цикл ──
+t0 = time.time()
+last_status_time = t0
+total_lines = resume_lines
+total_pairs = resume_pairs
+batch_times = []
+lines_to_skip = resume_lines
+gen_var_counter = 0
+
 try:
-    for epoch in range(current_epoch, total_epochs + 1):
-        _ckpt_epoch = epoch
-        pipeline.total_pairs_since_last_decay = 0
-        if epoch > current_epoch:
-            print(f"\n{'='*60}")
-            print(f"EPOCH {epoch} / {total_epochs}")
-            print(f"{'='*60}")
-            # Reset start_line for new epoch
-            start_line = 0
-            pipeline._rescore_line = None  # allow rescore once per epoch
-            # Re-read corpus with fresh decay
-            destab_pct = 0.0  # fresh destab for new epoch
-            # Update learned fields (Hebbian adaptation of W_proj)
-            if hasattr(cs, 'fractal') and cs.fractal.W_proj is not None:
-                cs.update_learned_fields(batches_seen=global_step)
-            # Adaptive per-concept L1 (maintain target density)
-            if hasattr(cs.fractal, 'adjust_l1_lambdas') and epoch % 2 == 0:
-                cs.fractal.adjust_l1_lambdas()
-            # Dynamic capacity: grow if codes are dense, prune if sparse
-            if hasattr(cs.fractal, 'auto_adjust_capacity') and epoch % 3 == 0:
-                cs.fractal.auto_adjust_capacity()
+    with open(CORPUS, 'r', encoding='utf-8') as f:
+        batch = []
 
-        # Continuous curriculum: max_len ramps from CURICULUM_MIN_LEN → unlimited
-        epoch_train = train_lines
-        epoch_lines = total_lines
-
-        bs_curve = lambda i: int(CFG.batch_size_start + (CFG.batch_size_end - CFG.batch_size_start) * _curriculum_p(i))
-        BATCH_SIZE = bs_curve(idx)
-        _batch_mult = 1.0  # TN-46: plateau doubling multiplier (not overwritten by bs_curve)
-        batch_buffer = []
-        batch_lr = None
-        batch_destab = 0.0
-
-        idx = start_line
-        while idx < len(epoch_train):
-            line = epoch_train[idx]
-            global_step += 1
-            if not line:
-                idx += 1
-                continue
-
-            # TN-32: effective curriculum (preserved across rescore)
-            _eff_cp = _effective_cp(idx, pipeline)
-            max_len = int(CURICULUM_MIN_LEN + (10**9 - CURICULUM_MIN_LEN) * _eff_cp)
-            if len(sp.encode(line)) > max_len:
-                idx += 1
-                continue
-
-            # LR warmup (TN-41: continue schedule after rescore via offset)
-            _lr_offset = pipeline._rescore_line if pipeline._rescore_line is not None else 0
-            gen.train_lr = get_lr(idx + _lr_offset)
-
-            destab_pct = min(global_step / max(round(opt.p['destab_decay_lines'].current), 1), 1.0)
-            destab_from = max(CFG.destab_scale_start, CFG.destab_scale_end)
-            destab_to = min(CFG.destab_scale_start, CFG.destab_scale_end)
-            destab_scale = destab_from + (destab_to - destab_from) * destab_pct
-
-            batch_buffer.append(line)
-            batch_lr = gen.train_lr
-            batch_destab = destab_scale
-            BATCH_SIZE = int((CFG.batch_size_start + (CFG.batch_size_end - CFG.batch_size_start) * _eff_cp) * _batch_mult)
-
-            if len(batch_buffer) < BATCH_SIZE and idx < start_line + len(epoch_train) - 1:
-                # Check if periodic tasks are due — if so, flush early
-                is_fluct_due = (idx + 1 - pipeline.last_fluct_lines) >= FLUCTUATE_EVERY
-                is_decay_due = total_pairs_since_last_decay >= CFG.decay_every_pairs
-                if not is_fluct_due and not is_decay_due:
+        if lines_to_skip > 0:
+            skipped = 0
+            for line in f:
+                if len(line.strip()) < 10:
                     continue
+                skipped += 1
+                if skipped >= lines_to_skip:
+                    break
+            log(f'Skipped {skipped} valid lines, resuming at byte offset {f.tell()}')
 
-            # Flush batch
-            _bt = time.time()
-            cp = _eff_cp
-            cw_target = int(round(opt.p['context_window'].current))
-            ns_target = int(round(opt.p['neg_samples'].current))
-            pg_target = opt.p['pmi_gate_min'].current
-            cw_ramp = max(1, int(round(cw_target * cp)))
-            ns_ramp = int(round(ns_target * cp))
-            pg_ramp = pg_target * cp
-            n_pairs = gen.train_batch(batch_buffer, pmi_strength=opt.p['pmi_strength'].current,
-                pmi_gate_min=pg_ramp,
-                base_lr=batch_lr,
-                neg_samples=ns_ramp,
-                context_window=cw_ramp,
-                inh_strength=opt.p['inh_strength'].current,
-                inh_threshold=opt.p['inh_threshold'].current,
-                neg_lr_ratio=CFG.neg_lr_ratio, field_gate=opt.p['field_gate_threshold'].current,
-                use_torch=CFG.use_torch, destab_scale=batch_destab,
-                gradient_noise_scale=opt.p['gradient_noise_scale'].current,
-                momentum_mu=opt.p['momentum_mu'].current)
-            total_pairs_since_last_decay += n_pairs
-            _batch_ms = (time.time() - _bt) * 1000
-            _n = len(batch_buffer)
-            if 'batch_log' not in locals() or batch_log is None:
-                csv_path = os.path.join(CFG.data_dir, '_batch_timing.csv')
-                batch_log = open(csv_path, 'a', encoding='utf-8')
-                if os.path.getsize(csv_path) == 0:
-                    batch_log.write('idx,lines,batch_ms,speed_lps\n')
-            batch_log.write(f'{idx},{_n},{_batch_ms:.0f},{_n/max(_batch_ms,1)*1000:.0f}\n')
-            batch_log.flush()
-            n_trained += len(batch_buffer)
-            batch_buffer = []
-            now = time.time()
-            elapsed = now - t_start
+        for line_no, line in enumerate(f):
+            stripped = line.strip()
+            if len(stripped) < 10:
+                continue
+            batch.append(stripped)
 
-            # ---- Periodic tasks (line-based) ----
-            # TN-49: decay warmup ramp from 0.998 to target over decay_warmup_lines (with rescore offset)
-            _decay_pct = min((idx + _lr_offset) / max(CFG.decay_warmup_lines, 1), 1.0)
-            _decay_target = opt.p['decay_rate'].current
-            _decay_warmup = 0.998 + (_decay_target - 0.998) * _decay_pct
+            if len(batch) >= args.batch_size:
+                tb = time.time()
+                field_gate = 0.2 if args.learned_fields else 0.0
+                n = gen.train_batch(batch,
+                    base_lr=args.base_lr, use_torch=None,
+                    pmi_gate_min=args.pmi_gate,
+                    neg_samples=args.neg_samples,
+                    context_window=args.context_window,
+                    field_gate=field_gate,
+                    fluctuation_amp=args.fluctuation_amp)
+                batch_times.append(time.time() - tb)
+                total_pairs += n
+                total_lines += len(batch)
+                batch = []
 
-            if idx > 0 and idx - pipeline.last_fluct_lines >= FLUCTUATE_EVERY:
-                cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
-                                     decay=_decay_warmup,
-                                     repel_strength=opt.p['repel_strength'].current,
-                                     generator=gen,
-                                     current_cos=last_cos_sim[0] if last_cos_sim else None)
-                pipeline.last_fluct_lines = idx
+                elapsed = time.time() - t0
+                lines_this_run = total_lines - resume_lines
+                remaining = max(TOTAL_LINES - total_lines, 0)
+                rate = lines_this_run / max(elapsed, 0.001)
+                avg_b = np.mean(batch_times[-100:]) if batch_times else 0
+                l2 = cs.colloc._total_cid[2]
+                l3 = cs.colloc._total[3]
+                eta = (elapsed / max(lines_this_run, 1)) * remaining if lines_this_run > 0 else 0
 
-            if idx > 0 and total_pairs_since_last_decay >= CFG.decay_every_pairs:
-                lattice.decay_all(rare_concept_protect=True, rare_threshold=3)
-                lattice.decay_connections()
-                cs.decay_usage(decay=0.98, rare_protect=True)
-                total_pairs_since_last_decay = 0
+                # Онлайн-прогресс: каждые 10 строк
+                if total_lines % 10 < args.batch_size:
+                    sys.stdout.write(f'\r[{elapsed/60:.1f}min] '
+                        f'{total_lines:,}/{TOTAL_LINES:,} '
+                        f'{rate:.0f}l/s '
+                        f'pairs={total_pairs:,} '
+                        f'colloc_l2={l2:,} '
+                        f'l3={l3} '
+                        f'batch={avg_b:.2f}s '
+                        f'ETA={eta/3600:.0f}h      ')
+                    sys.stdout.flush()
 
-            # ---- Live status (every ~1 second on terminal) ----
-            if now - last_stat_time >= LIVE_REFRESH:
-                rate = idx / max(elapsed, 0.1)
-                pct = 100 * idx / epoch_lines
-                if rate >= 0.1:
-                    eta = (epoch_lines - idx) / rate
-                    eta_h, eta_m = int(eta // 3600), int((eta % 3600) // 60)
-                    eta_s = f"ETA {eta_h}h{eta_m:02d}m"
-                else:
-                    eta_s = "ETA ---"
+                # Полный лог + чекпоинт + генерация: каждые 10K строк
+                if total_lines % args.gen_every < args.batch_size and total_lines > resume_lines and total_lines > 0:
+                    print()
+                    log(f'[{elapsed/60:.1f}min] '
+                        f'lines={total_lines:,}/{TOTAL_LINES:,} '
+                        f'pairs={total_pairs:,} '
+                        f'colloc_l2={l2:,} l3={l3} '
+                        f'rate={rate:.0f}l/s '
+                        f'batch={avg_b:.2f}s '
+                        f'ETA={eta/3600:.0f}h')
+                    log('Saving checkpoint...')
+                    save_checkpoint(total_lines, total_pairs)
+                    log(f'Checkpoint saved ({os.path.getsize(STATE_FILE)/1024**2:.0f} MB).')
+                    log(f'Test generation (max_words={args.gen_max_words}):')
+                    run_test_generation(elapsed)
 
-                if now - last_cos_time >= COS_REFRESH:
-                    last_cos_sim = mean_cosine_sim(cs)
-                    last_cos_time = now
-
-                mean_sim, std_sim = last_cos_sim
-                live_status(f"[{pct:4.1f}%] {idx:6d}L | {rate:4.0f} L/s | {eta_s} | "
-                            f"{elapsed/60:.0f}min cos={mean_sim:.4f}±{std_sim:.4f}")
-                try:
-                    with open(CFG.status_path + '.tmp', 'w', encoding='utf-8') as _sf:
-                        json.dump({'line': idx, 'total': epoch_lines, 'pct': pct,
-                                   'rate': rate, 'eta_s': eta_s, 'elapsed_min': elapsed/60,
-                                   'cos_mean': mean_sim, 'cos_std': std_sim}, _sf)
-                    os.replace(CFG.status_path + '.tmp', CFG.status_path)
-                except Exception:
-                    pass
-                last_stat_time = now
-
-            # ---- Line-based checkpoint + full report (AM-15/T-B2: via pipeline) ----
-            if idx > 0 and idx % CHECKPOINT_EVERY == 0:
-                pipeline.global_step = global_step
-                result = pipeline._checkpoint(epoch, idx, elapsed, epoch_lines, destab_scale, t_start, epoch_train, start_line, global_step)
-                if result is not None:
-                    idx, start_line, epoch_train = result
-                gen.train_lr = pipeline.opt.p['full_lr'].current
-                if pipeline.opt._full_stuck_counter >= 5 and pipeline.last_fluct_lines != idx:
-                    print(f"  FULL_STUCK — forcing fluctuate")
-                    cs.fluctuate_fractal(fluctuation_amp=opt.p['fluctuation_amp'].current,
-                                         decay=_decay_warmup,
-                                         repel_strength=opt.p['repel_strength'].current,
-                                         generator=gen,
-                                         current_cos=last_cos_sim[0] if last_cos_sim else None)
-                    pipeline.last_fluct_lines = idx
-                # P1.4: EMA-based batch plateau (replaces hard ×2/×0.95)
-                plateau_loss = pipeline.eval_vppl if pipeline.eval_vppl is not None else mean_sim * 1000
-                plateau_df = pipeline._plateau_detector.update(plateau_loss, idx)
-                if pipeline.opt._full_stuck_counter >= 5:
-                    _batch_mult = max(1.0, min(4.0, _batch_mult * 0.85))
-                else:
-                    _batch_mult = max(1.0, min(4.0, _batch_mult * (0.95 + 0.1 * (1.0 - plateau_df))))
-                BATCH_SIZE = int(bs_curve(idx) * _batch_mult)
-                print()
-            idx += 1
+        if batch:
+            tb = time.time()
+            field_gate = 0.2 if args.learned_fields else 0.0
+            n = gen.train_batch(batch,
+                base_lr=args.base_lr, use_torch=None,
+                pmi_gate_min=args.pmi_gate,
+                neg_samples=args.neg_samples,
+                context_window=args.context_window,
+                field_gate=field_gate,
+                fluctuation_amp=args.fluctuation_amp)
+            batch_times.append(time.time() - tb)
+            total_pairs += n
+            total_lines += len(batch)
 
 except KeyboardInterrupt:
-    print("\n\n[EVA] Training interrupted — saving checkpoint...")
-    try:
-        _final_save(cs, lattice, opt, _ckpt_epoch, idx, global_step)
-    except BaseException:
-        pass
-    print("[EVA] Checkpoint saved. Exiting.")
-    sys.exit(0)
-finally:
-    try:
-        if 'batch_log' in locals() and batch_log is not None:
-            batch_log.close()
-    except Exception:
-        pass
-    if hasattr(sys.stdout, 'close'):
-        sys.stdout.close()
-    sys.stdout = old_stdout
+    print()
+    log('\nKeyboardInterrupt — saving checkpoint...')
+    if total_lines > resume_lines:
+        save_checkpoint(total_lines, total_pairs)
+        log(f'Checkpoint saved at {total_lines:,} lines.')
+    log('Interrupted.')
 
-# Final save
-_final_save(cs, lattice, opt, _ckpt_epoch, idx, global_step)
+elapsed = time.time() - t0
+log(f'\nDone. {total_lines:,}/{TOTAL_LINES:,} lines, {total_pairs:,} pairs')
+log(f'Elapsed: {elapsed/60:.1f} min')
+log(f'Colloc L2: {cs.colloc._total_cid[2]:,}')
+log(f'Colloc L3: {cs.colloc._total[3]:,}')
 
-# ── Final diagnostics ───────────────────────────────────────────
-
-print("--- Final ---")
-mean_sim, std_sim = mean_cosine_sim(cs)
-ok, total = check_consistency(cs)
-print(f"  cos={mean_sim:.4f}±{std_sim:.4f} con={ok}/{total}")
-
-print("--- Generation ---")
-for seed in CFG.test_seeds:
-    result = gen.generate(seed_word=seed, max_words=CFG.gen_max_words)
-    txt = result.text
-    print(f"  [{seed}] {txt}  ({result.score:.2f})")
-
-t_total = time.time() - t_start
-print(f"  {n_trained} lines in {t_total:.0f}s ({n_trained/t_total:.0f} L/s)")
-print("Done.")
-
-
+if total_lines >= TOTAL_LINES:
+    save_checkpoint(total_lines, total_pairs)
+    log('Final checkpoint saved.')
+log('Done.')

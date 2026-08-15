@@ -2892,10 +2892,10 @@ class TestGeneralizedFibonacci:
                 assert s2 != s3 or True  # может совпадать случайно
 
     def test_subspace_ratios_from_config_default(self):
-        """FCFConfig с defaults даёт l_c/l_a/l_m пропорциональные φ²:φ:1."""
+        """FCFConfig с defaults (use_fib_generalized=True, d=2) даёт φ²:φ:1."""
         from eva.symbolic.fcf_config import FCFConfig
         cfg = FCFConfig()
-        assert not cfg.use_fib_generalized
+        assert cfg.use_fib_generalized
         assert cfg.fib_dimension == 2
         total = cfg.l_c + cfg.l_a + cfg.l_m
         assert total == cfg.latent_dim, f"{total} ≠ {cfg.latent_dim}"

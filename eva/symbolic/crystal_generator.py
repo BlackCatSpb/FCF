@@ -578,7 +578,8 @@ class CrystalGenerator:
     # ── Generation ─────────────────────────────────────────────
 
     def generate(self, seed_word=None, seed_cid=None, target_text=None,
-                 query_words=None, max_words=None, beam_width=3):
+                 query_words=None, max_words=None, beam_width=3,
+                 use_colloc=True):
         """Generate a token sequence via beam search over concept IDs.
 
         Args:
@@ -586,12 +587,16 @@ class CrystalGenerator:
             seed_cid: starting concept ID (overrides seed_word)
             target_text: target for supervised training
             query_words: list of words from the query
+            use_colloc: if True, use CollocationMatrix (lambda_d+PMI) as primary signal.
 
         Returns:
             dict with response text, concept path, score, etc.
         """
         # Encode target if provided
         target_ids = self._encode_input(target_text) if target_text else []
+
+        # Store use_colloc for _branch()
+        self._use_colloc = use_colloc
 
         # Determine seed CID
         if seed_cid is None:
@@ -635,7 +640,8 @@ class CrystalGenerator:
                 prev_cid = seq[-1]
                 expected_cid = target_ids[wn] if wn < len(target_ids) else None
 
-                candidates = self._branch(seq, wn, h_temp, expected_cid, centroid)
+                candidates = self._branch(seq, wn, h_temp, expected_cid, centroid,
+                                           use_colloc=getattr(self, '_use_colloc', True))
                 if not candidates:
                     self.hormones.update(confidence=0.0, is_match=False,
                         novelty=0.0, surprise=0.5, expected_cid=expected_cid)
@@ -668,6 +674,18 @@ class CrystalGenerator:
                     self.hormones.update(confidence=conf, is_match=is_match,
                         novelty=novelty, surprise=surprise,
                         expected_cid=expected_cid, gen_cid=cid)
+
+                    # Гормональное → CollocationMatrix: поощрение/наказание
+                    if (hasattr(self.cs, 'colloc') and self.cs.colloc is not None
+                            and len(seq) >= 1):
+                        if seq[-1] is not None and cid is not None:
+                            self.cs.colloc.hormonal_learn(
+                                2, seq[-1], cid,
+                                is_match=is_match,
+                                surprise=surprise,
+                                expected=expected_cid,
+                                novelty=novelty,
+                            )
 
                     new_beam.append((new_seq, new_score, next_branch_id))
                     next_branch_id += 1
@@ -797,7 +815,10 @@ class CrystalGenerator:
 
     # ── Branch ─────────────────────────────────────────────────
 
-    def _branch(self, seq: List[int], word_num: int, theta_temp: float = 0.3, target_cid: Optional[int] = None, centroid: Optional[np.ndarray] = None) -> List[Tuple[int, float]]:
+    def _branch(self, seq: List[int], word_num: int, theta_temp: float = 0.3,
+                target_cid: Optional[int] = None,
+                centroid: Optional[np.ndarray] = None,
+                use_colloc: bool = True) -> List[Tuple[int, float]]:
         """Generate diverse branching candidates via RRF over multiple signals."""
         if not seq:
             return []
@@ -868,6 +889,11 @@ class CrystalGenerator:
                 rrf += _fc.rrf_hdc * hdc_candidates[cid] / (K + 1)
             if cid in vector_sim:
                 rrf += _fc.rrf_vector * vector_sim[cid] / (K + 1)
+            # CollocationMatrix score (STDP-safe — ключи по cid)
+            if use_colloc and hasattr(self.cs, 'colloc') and self.cs.colloc is not None:
+                colloc_score = self.cs.colloc(2, prev_cid, cid)
+                if colloc_score > 0.0:
+                    rrf += _fc.rrf_colloc_alpha * colloc_score
             # Beam score: насколько переход prev_cid→cid лежит на известном луче
             if manifold is not None and manifold.n_beams() >= _FCF.beam_rrf_min_beams:
                 v_c = self.cs.concept_vector(cid)
@@ -1029,7 +1055,10 @@ class CrystalGenerator:
             return 0.1
 
         if distance == 1:
-            prefix_counter = self.lattice.ngrams[2].get((prev_cid,))
+            ngrams2 = self.lattice.ngrams.get(2)
+            if ngrams2 is None:
+                return 0.1
+            prefix_counter = ngrams2.get((prev_cid,))
             if not prefix_counter:
                 return 0.1
             count_pair = prefix_counter.get(next_cid, 0)

@@ -103,7 +103,7 @@ class DimensionCoordinator:
     vec_dim: int = 768
     latent_dim: int = 2048
     fib_dimension: int = 2
-    use_fib_generalized: bool = False
+    use_fib_generalized: bool = True
 
     def __post_init__(self):
         if self.vec_dim % 8 != 0:
@@ -114,7 +114,7 @@ class DimensionCoordinator:
 
     @classmethod
     def from_vocab(cls, vocab_size, vram_limit_mb=2048, latent_ratio=2.67,
-                   fib_dimension=2, use_fib_generalized=False):
+                   fib_dimension=2, use_fib_generalized=True):
         r = AdaptiveDimensionResolver(vocab_size, vram_limit_mb, latent_ratio)
         return cls(vec_dim=r.vec_dim, latent_dim=r.latent_dim,
                    fib_dimension=fib_dimension, use_fib_generalized=use_fib_generalized)

@@ -34,3 +34,9 @@ real_data/wiki_download/
 checkpoints/
 *.npy
 eva/real_data/
+
+# Local tooling & dev scratch
+.opencode/
+
+# Large derived artifacts (75MB, rebuilt from corpus)
+real_data/morph_vocab.json

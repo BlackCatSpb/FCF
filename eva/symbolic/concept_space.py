@@ -26,6 +26,8 @@ from typing import Dict, List, Optional
 from eva.symbolic.dimension_coordinator import DimensionCoordinator
 from eva.symbolic.adaptive_controller import AdaptiveArchitectureController
 from eva.symbolic.fcf_config import FCFConfig
+from eva.symbolic.multi_level_encoder import MultiLevelEncoder
+from eva.symbolic.branch_network import CollocationMatrix
 
 # ── FFT-HRR VSA primitives ─────────────────────────────────────
 # Circular convolution (bind) and circular correlation (unbind)
@@ -1627,6 +1629,12 @@ class ConceptSpace:
         # ── EntityField: recursive semantic field (char↔word↔sent↔para) ──
         self.entity_field = EntityField(dim=self.dims.latent_dim, word_store=self.concept_vectors, dim_coord=self.dims)
 
+        # ── MultiLevelEncoder: Symbol→Word→Sentence→Cluster ──
+        self.ml_encoder: Optional[MultiLevelEncoder] = None
+
+        # ── CollocationMatrix: λ_d + PMI матрица языка ──
+        self.colloc: Optional[CollocationMatrix] = None
+
         # ---- Initialization ----
 
     def init_concepts(self):
@@ -1639,6 +1647,150 @@ class ConceptSpace:
                 v = self.rng.randn(self.dim).astype(np.float32)
                 v /= max(np.linalg.norm(v), 1e-10)
                 self.concept_vectors[cid] = v
+
+    def seed_alphabet_basis(self, sp_model, seed_multi_char=True) -> int:
+        """Override concept vectors with deterministic λ_d trajectory states.
+
+        Читает BPE-модель (sp_model) и перезаписывает concept vectors
+        λ_d-траекториями через MultiLevelEncoder (одинаковые shift'ы,
+        одинаковый λ).  Это унифицирует пространство concept vectors
+        с char→word ML encoder — NN-маппинг слово→концепт даёт
+        осмысленный косинус.
+
+        Без seed_multi_char=False — только одиночные буквы (AlphabetBasis
+        напрямую, без λ_d-прогона, совместимость со старым кодом).
+
+        Возвращает число перезаписанных концептов.
+        """
+        from eva.symbolic.alphabet_basis import get_basis
+        basis = get_basis(self.dim)
+
+        if not seed_multi_char:
+            # Legacy mode: single-char only, raw AlphabetBasis
+            count = 0
+            for cid in range(self.vocab_size):
+                token = sp_model.id_to_piece(cid)
+                raw = token.lstrip('\u2581')
+                if len(raw) == 1 and raw in basis:
+                    self.concept_vectors[cid] = basis[raw].copy()
+                    count += 1
+            return count
+
+        # ── λ_d unification mode ──
+        from eva.symbolic.multi_level_encoder import MultiLevelEncoder
+        from eva.symbolic.fibonacci_utils import FibonacciUtils
+        _cfg = FCFConfig()
+        lam = FibonacciUtils.get_lambda(_cfg.fib_dimension)
+        enc = MultiLevelEncoder(dim=self.dim, lam=lam)
+
+        count = 0
+        for cid in range(self.vocab_size):
+            token = sp_model.id_to_piece(cid)
+            raw = token.lstrip('\u2581')
+            if len(raw) == 0:
+                continue
+            enc.reset()
+            has_chars = False
+            for ch in raw:
+                if ch in basis:
+                    enc.step(basis[ch], start_level=1)
+                    has_chars = True
+            if not has_chars:
+                continue
+            emits = enc.step(np.zeros(self.dim, dtype=np.float32),
+                             break_level=1, start_level=1)
+            for e in emits:
+                if e.level == 1:
+                    self.concept_vectors[cid] = e.vector.copy()
+                    count += 1
+                    break
+
+        return count
+
+    def seed_from_qwen(self, npy_path: str) -> int:
+        """Load Qwen-seeded concept vectors from .npy (PCA 2560→256).
+        
+        Заменяет concept vectors для найденных cid на векторы,
+        полученные из Qwen3 RuAdapt embed_tokens + PCA reduction.
+        Токены без Qwen-маппинга остаются как есть (λ_d или fractal init).
+        
+        Args:
+            npy_path: путь к .npy с dict {cid: vector_256}
+            
+        Returns:
+            число перезаписанных концептов
+        """
+        data = np.load(npy_path, allow_pickle=True).item()
+        count = 0
+        for cid, vec in data.items():
+            cid = int(cid)
+            if cid >= self.vocab_size:
+                continue
+            n = np.linalg.norm(vec)
+            if n > 1e-10:
+                self.concept_vectors[cid] = (vec / n).astype(np.float32)
+                count += 1
+        return count
+
+    # ── MultiLevelEncoder ──
+
+    def build_multi_level_encoder(self, lam: float | None = None):
+        """Создать 4-level λ_d-кодировщик Symbol→Word→Sentence→Cluster."""
+        if lam is None:
+            from eva.symbolic.fibonacci_utils import FibonacciUtils
+            cfg = FCFConfig()
+            lam = FibonacciUtils.get_lambda(cfg.fib_dimension)
+        self.ml_encoder = MultiLevelEncoder(dim=self.dim, lam=lam)
+        return self.ml_encoder
+
+    def build_collocation_matrix(self, lam: float | None = None):
+        """Создать λ_d + PMI матрицу языка (4 уровня)."""
+        if lam is None:
+            from eva.symbolic.fibonacci_utils import FibonacciUtils
+            cfg = FCFConfig()
+            lam = FibonacciUtils.get_lambda(cfg.fib_dimension)
+        self.colloc = CollocationMatrix(dim=self.dim, lam=lam, concept_store=self.concept_vectors)
+        return self.colloc
+
+    def multi_level_step(self, token: str | int, sp_model=None) -> list:
+        """Продвинуть токен через ML-encoder, используя AlphabetBasis для букв.
+
+        Args:
+            token: символ (str) или CID (int).
+            sp_model: sentencepiece-модель для CID→str.
+
+        Returns:
+            list[LevelEmit] — испускания уровней.
+        """
+        if self.ml_encoder is None:
+            self.build_multi_level_encoder()
+
+        # Получить вектор токена
+        if isinstance(token, str):
+            ch = token
+        elif sp_model is not None:
+            ch = sp_model.id_to_piece(token).lstrip('\u2581')
+        else:
+            ch = ''
+
+        from eva.symbolic.alphabet_basis import get_basis
+        basis = get_basis(self.dim)
+        if len(ch) == 1 and ch in basis:
+            vec = basis[ch]
+        elif isinstance(token, int) and token in self.concept_vectors:
+            vec = self.concept_vectors[token]
+        else:
+            vec = self.concept_vectors.get(0, basis._base)
+
+        # Разделители
+        bl = 0
+        if isinstance(token, str):
+            if token == ' ':
+                bl = 1
+            elif token in '.!?':
+                bl = 2
+
+        return self.ml_encoder.step(vec, break_level=bl)
 
     def _sync_from_fractal(self):
         """Sync concept_vectors from fractal latent codes."""

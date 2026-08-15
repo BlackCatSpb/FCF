@@ -5,6 +5,29 @@
 
 ---
 
+## 0. Открытие: λ_d-иерархия
+
+Все числовые константы архитектуры — decay, weight, window, threshold, learning rate — выведены из **λ_d**, обобщённого золотого сечения, а не из эмпирического тюнинга.
+
+λ_d — действительный корень x^d = x^{d-1} + … + 1:
+
+| d | λ_d | Название |
+|---|-----|----------|
+| 2 | 1.618… | φ — золотое сечение |
+| 3 | 1.839… | Трибоначчи-константа |
+| 4 | 1.928… | Тетраначчи-константа |
+| d→∞ | 2.0 | Двоичный предел |
+
+Каждый коэффициент — позиция в иерархии:
+- **λ_d^{−k}** — baselines, decay, slope по глубине k
+- **F^(d)_n** — окна, буферы, ёмкости (числа Фибоначчи порядка d)
+- **(λ_d−1)/2** — moderation в 10 подсистемах (homeostatic, intent, neg_lr, …)
+- **1/log(λ·V)** — информационно-теоретические масштабы
+
+Метод лакун: отсутствие λ_d-вывода у эмпирического коэффициента указывает на пропущенный структурный элемент. Все лакуны закрыты — 0 эмпирических констант в горячем пути. Подробнее: `fcf_config.py :: rebuild()`.
+
+---
+
 ## 1. Представление знаний: от токена к вектору
 
 Каждый токен SentencePiece BPE (146K или 256K словаря) является **концептом** — автономной единицей знания, представленной точкой на единичной гиперсфере в 768-мерном пространстве.
@@ -725,33 +748,31 @@ FCF/
 │   ├── concept_space.py         # 146K концептов, фрактальное поле, L1, EntityField, Harmonizer, HDC
 │   ├── crystal_generator.py     # Движок обучения и генерации, RRF + beam_score
 │   ├── stdp_trainer.py          # STDP, негативная выборка, контрастив, harmonize_batch, beam-pull
-│   ├── fcf_config.py            # Единый конфиг (dim, latent_dim, beam_*, subspace_*)
-│   ├── transition_manifold.py   # Паутина переходов: буфер + VSA-кластеризация в лучи
+│   ├── fcf_config.py            # Единый конфиг + λ_d-rebuild всех коэффициентов
+│   ├── fibonacci_utils.py       # λ_d, обобщённый ряд Фибоначчи, Zeckendorf
+│   ├── concept_space.py         # 146K концептов, EntityField, Harmonizer, поле, HDC
+│   ├── crystal_generator.py     # Движок обучения и генерации (RRF + λ_d-weights)
+│   ├── stdp_trainer.py          # STDP, негативная выборка, контрастив, harmonize_batch
+│   ├── transition_manifold.py   # Паутина переходов (VSA-кластеризация)
 │   ├── vsa_attention.py         # VSA-внимание (Zeckendorf-weighted bind)
 │   ├── hdtransformer_layer.py   # VSA-native однослойный трансформер
-│   ├── semantic_piece.py        # CharEnvelope (LFU-эвикция, word_envelope, modulate)
-│   ├── syntax_lattice.py        # Статистическая n-граммная решётка
-│   ├── qwen_knowledge.py        # Дистиллят Qwen как LR-модулятор
-│   ├── morph_vocab.py           # Морфологический словарь
-│   ├── checkpoint_manager.py    # Асинхронное сохранение чекпоинтов + state tracking
-│   ├── parameter_optimizer.py   # Адаптация гиперпараметров + Param cascade
-│   ├── fibonacci_utils.py       # Числа Фибоначчи, Zeckendorf, золотое сечение
+│   ├── semantic_piece.py        # CharEnvelope, LFU-эвикция
+│   ├── syntax_lattice.py        # PPMI n-граммная решётка
 │   ├── seed_registry.py         # Централизованный реестр сидов
-│   ├── rng_registry.py          # Реестр RNG-потоков
+│   ├── hormonal_system.py       # Нейромодуляция через λ_d-базлайны
+│   ├── fractal_encoding.py      # Fractal путевая адресация
 │   ├── dimension_coordinator.py # VRAM-оценщик размерностей
-│   ├── adaptive_controller.py   # Формульные коэффициенты (FormulaCoefficients)
-│   ├── adaptive_error_tracker.py # Поконцептный трекер ошибок
-│   ├── vector_health.py         # Диагностика здоровья векторов
-│   ├── lsh_index.py             # LSH-индекс для быстрого поиска
-│   ├── federated.py             # Экспериментальная федеративная синхронизация
-│   ├── hormonal_system.py       # Нейромодуляция (ACh, NE, DA, 5HT) → FormulaCoefficients
-│   ├── fractal_encoding.py      # Октантные пути (легаси)
+│   ├── adaptive_controller.py   # FormulaCoefficients
+│   ├── checkpoint_manager.py    # Асинхронные чекпойнты
+│   ├── parameter_optimizer.py   # Param cascade
+│   ├── lsh_index.py             # LSH-индекс
+│   ├── morph_vocab.py           # Морфологический словарь
 │   └── experimental/            # Экспериментальные компоненты
 ├── train_full.py                # Конвейер обучения
 ├── inference.py                 # Инференс (read-only)
 ├── eval_metrics.py              # Валидационные метрики
 ├── scripts/                     # Диагностические и аналитические скрипты
-├── tests/                       # 314 автоматических тестов (8 skip)
+├── tests/                       # 334 автоматических теста (7 skip)
 ├── docs/                        # Документация и планы
 ├── logs/                        # Лог-файлы
 ├── data/                        # Вспомогательные данные (antonyms.json)

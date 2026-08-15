@@ -313,6 +313,59 @@ class STDPTrainer:
             if hasattr(cs.fractal, 'hdc_memory') and cs.fractal.W_proj is not None:
                 _update_hdc_ngrams(cs, ids, max_n=3)
 
+        # ── CollocationMatrix: λ_d + PMI переходы ──
+        if not hasattr(cs, 'colloc') or cs.colloc is None:
+            cs.build_collocation_matrix()
+        from eva.symbolic.alphabet_basis import get_basis as _get_basis
+        _cbasis = _get_basis(cs.dim)
+        # Level 2: BPE token→token (STDP-safe — ключи по cid)
+        for ids in all_ids:
+            valid_ids = [c for c in ids if cs.concept_vector(c) is not None]
+            for i in range(len(valid_ids) - 1):
+                cs.colloc.observe(2, valid_ids[i], valid_ids[i + 1])
+
+        # ── Char→ML encoder: предложение→предложение (Level 3) ──
+        # Level 2 (слово→слово) — через BPE encode (без NN lookup, 256K vocab)
+        if not hasattr(cs, 'ml_encoder') or cs.ml_encoder is None:
+            cs.build_multi_level_encoder()
+        for text in inputs:
+            if len(text.strip()) < 2:
+                continue
+            cs.ml_encoder.reset()
+            prev_cid = None
+            prev_sent_vec = None
+            word_start = 0
+            t = text.lower()
+            for pos, ch in enumerate(t):
+                if ch not in _cbasis:
+                    continue
+                is_space = (ch == ' ')
+                is_end = ch in '.!?'
+
+                if is_space or is_end:
+                    raw_word = t[word_start:pos].strip()
+                    if raw_word:
+                        word_ids = gen._encode_input(raw_word)
+                        if word_ids:
+                            cur_cid = word_ids[0]
+                            if prev_cid is not None:
+                                cs.colloc.observe(2, prev_cid, cur_cid)
+                            prev_cid = cur_cid
+                    word_start = pos + 1
+
+                # ML encoder: char trajectory → sentence emits
+                if ch == ' ':
+                    # Пробел — конец слова (force-emit level 1, аккумулирует в level 2)
+                    emits = cs.ml_encoder.step(_cbasis[ch], break_level=1, start_level=1)
+                else:
+                    emits = cs.ml_encoder.step(_cbasis[ch], break_level=2 if is_end else 0, start_level=1)
+
+                for e in emits:
+                    if e.level == 2:  # предложение → Level 3
+                        if prev_sent_vec is not None:
+                            cs.colloc.observe(3, prev_sent_vec, e.vector)
+                        prev_sent_vec = e.vector
+
         # _torch_dirty is NOT set here — would force full tensor rebuild every batch
         # (_build_torch_tensors iterates all 146K codes, O(V·D) CPU + 636MB PCIe xfer)
         # Only _invalidate_torch() (after fluctuate) should set it.

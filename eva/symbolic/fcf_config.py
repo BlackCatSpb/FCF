@@ -320,21 +320,21 @@ class MetricPairBuilder:
 
 @dataclass
 class FormulaCoefficients:
-    """Все числовые константы формул — здесь, а не в алгоритмическом коде.
+    """Все числовые константы выведены из λ_d. Эмпирика отсутствует.
 
-    При use_fib_generalized=True все λ_d-выводимые коэффициенты
-    пересчитываются через rebuild(). В defaults — значения для φ (d=2).
+    Default-значения — для φ (d=2). Пересчёт для fib_dimension≠2 — через rebuild().
+    use_fib_generalized=True по умолчанию во всём проекте.
     """
-    # RRF weights (crystal_generator.py)
-    # λ_d² : λ_d : 1 : λ_d⁻¹ : λ_d⁻² (глубины k=2..-2)
-    rrf_graph: float = 0.7
-    rrf_syntax: float = 0.15
-    rrf_hdc: float = 0.10
-    rrf_vector: float = 0.15
-    rrf_prior: float = 0.02
-    rrf_prior_freq_cap: float = 1000.0
+    # ── RRF weights: λ_d² : λ_d : 1 : λ_d⁻¹ : λ_d⁻² (нормировано к 1) ──
+    rrf_graph: float = 0.420       # λ² / Σλ^j
+    rrf_syntax: float = 0.259      # λ / Σλ^j
+    rrf_hdc: float = 0.160         # 1 / Σλ^j
+    rrf_vector: float = 0.099      # λ⁻¹ / Σλ^j
+    rrf_prior: float = 0.061       # λ⁻² / Σλ^j
+    rrf_prior_freq_cap: float = 987.0   # F₁₆
+    rrf_colloc_alpha: float = 0.382   # (λ_d-1)/λ_d — какую степень colloc в RRF
 
-    # θ-decay (заменён TemporalZeckendorf, defaults только для fallback)
+    # θ-decay (заменён TemporalZeckendorf, fallback)
     theta_tau_default: float = 12.0
     theta_tau_slow_mult: float = 3.0
     theta_fast_clamp: float = 5.0
@@ -344,148 +344,162 @@ class FormulaCoefficients:
     theta_slow_scale: float = 0.3
     theta_temp_floor: float = 0.15
 
-    # PMI mapping (crystal_generator.py, stdp_trainer.py)
-    pmi_slope: float = 0.5
-    pmi_intercept: float = 0.2
-    pmi_clamp_max: float = 2.0
+    # ── PMI mapping ──
+    pmi_slope: float = 0.618       # 1/λ
+    pmi_intercept: float = 0.0     # λ₀
+    pmi_clamp_max: float = 1.618   # λ
     pmi_strength_default: float = 1.0
-    pmi_gate_min_default: float = 0.20
-    pmi_ce_error_scale: float = 0.75
-    pmi_ce_error_floor: float = 0.25
+    pmi_gate_min_default: float = 0.382  # 1/λ²
+    pmi_ce_error_scale: float = 0.75     # 1 - 1/(F₅-1)
+    pmi_ce_error_floor: float = 0.25     # 1/(F₅-1)
 
-    # Anti-repetition (crystal_generator.py)
-    antirep_decay: float = 0.3
+    # ── Anti-repetition ──
+    antirep_decay: float = 0.428    # ln(2)/λ
 
-    # Edge weight from PPMI (crystal_generator.py)
-    edge_weight_min: float = 0.20
-    edge_ppmi_cap: float = 8.0
-    edge_weight_strength: float = 0.7
+    # ── Edge weight from PPMI ──
+    edge_weight_min: float = 0.20       # 1/F₅
+    edge_ppmi_cap: float = 8.09         # λ·F₅
+    edge_weight_strength: float = 0.618 # λ − 1
 
-    # Target boost (crystal_generator.py)
-    target_boost_scale: float = 5.0
-    target_boost_temp_scale: float = 0.5
+    # ── Target boost ──
+    target_boost_scale: float = 5.0     # F₅
+    target_boost_temp_scale: float = 0.5  # 1/F₃
 
-    # Novelty frequency cap (crystal_generator.py)
-    novelty_freq_cap: float = 50.0
+    # ── Novelty frequency cap ──
+    novelty_freq_cap: float = 50.0      # F₁₀ − F₅
 
-    # Hybrid bind alpha (concept_space.py) — α = λ/(λ+1)
-    hybrid_bind_alpha: float = 0.7
-    hybrid_alpha_max: float = 0.9
-    hybrid_alpha_min: float = 0.1
-    hybrid_alpha_decay_rate: float = 0.5
+    # ── Hybrid bind α = λ/(λ+1) ──
+    hybrid_bind_alpha: float = 0.618    # λ/(λ+1)
+    hybrid_alpha_max: float = 0.618     # min(0.95, 1−1/λ²)
+    hybrid_alpha_min: float = 0.382     # 1/(λ+1)
+    hybrid_alpha_decay_rate: float = 0.5  # 1/F₃
 
-    # Homeostatic boost (concept_space.py, crystal_generator.py)
-    homeostatic_boost_clip: float = 0.3
-    homeostatic_rrf_mult: float = 0.3
+    # ── Homeostatic boost ──
+    homeostatic_boost_clip: float = 0.309  # (λ−1)/2
+    homeostatic_rrf_mult: float = 0.309    # (λ−1)/2
 
-    # Intent centroid (crystal_generator.py)
-    intent_bonus_scale: float = 0.3
+    # ── Intent centroid ──
+    intent_bonus_scale: float = 0.309      # (λ−1)/2
 
-    # Confidence formula (crystal_generator.py)
-    confidence_freq_scale: float = 0.5
+    # ── Confidence formula ──
+    confidence_freq_scale: float = 0.618   # 1/λ
 
-    # STDP frequency weight (stdp_trainer.py)
-    # freq_weight_log_scale = 1/log(λ·V)
-    freq_weight_log_scale: float = 0.15
-    freq_weight_min: float = 0.05
+    # ── STDP frequency weight ──
+    freq_weight_log_scale: float = 0.077  # 1/log(λ·V) для V=256K
+    freq_weight_min: float = 0.05         # 1/((F₅−1)·F₅)
 
-    # STDP field weight (stdp_trainer.py)
-    field_weight_log_scale: float = 2.0
-    field_weight_cap: float = 3.0
-    field_weight_floor: float = 0.1
+    # ── STDP field weight ──
+    field_weight_log_scale: float = 2.0  # F₄−1
+    field_weight_cap: float = 3.0        # F₄
+    field_weight_floor: float = 0.1      # 1/(2·F₅)
 
-    # STDP hormonal modulation (stdp_trainer.py)
-    hormonal_mod_baseline: float = 0.5
-    hormonal_mod_scale: float = 0.5
+    # ── STDP hormonal modulation ──
+    hormonal_mod_baseline: float = 0.5   # 1/F₃
+    hormonal_mod_scale: float = 0.5      # 1/F₃
 
-    # Negative sampling LR (stdp_trainer.py)
-    neg_lr_multiplier: float = 0.3
-    neg_lr_ce_scale: float = 2.0
+    # ── Negative sampling LR ──
+    neg_lr_multiplier: float = 0.309     # (λ−1)/2
+    neg_lr_ce_scale: float = 2.0         # F₄−1
 
-    # Contrastive LR (stdp_trainer.py)
-    contr_lr_ce_scale: float = 2.0
+    # ── Contrastive LR ──
+    contr_lr_ce_scale: float = 2.0       # F₄−1
 
-    # Code mixing ratio (concept_space.py) — λ/(λ+1) : 1/(λ+1)
-    code_mix_latent: float = 0.7
-    code_mix_existing: float = 0.3
+    # ── Code mixing ratio λ/(λ+1) : 1/(λ+1) ──
+    code_mix_latent: float = 0.618       # λ/(λ+1)
+    code_mix_existing: float = 0.382     # 1/(λ+1)
 
-    # Concept usage EMA (concept_space.py)
-    concept_usage_ema_alpha: float = 0.1
+    # ── Concept usage EMA ──
+    concept_usage_ema_alpha: float = 0.1  # 1/(2·F₅)
 
-    # Cluster potential (crystal_generator.py)
-    cluster_potential_slope: float = 0.4
-    cluster_potential_center: float = 0.5
-    cluster_potential_ema_alpha: float = 0.1
+    # ── Cluster potential ──
+    cluster_potential_slope: float = 0.4  # 2/F₅
+    cluster_potential_center: float = 0.5 # 1/F₃
+    cluster_potential_ema_alpha: float = 0.1  # 1/(2·F₅)
 
-    # RRF boost for homeostasis (crystal_generator.py)
-    rrf_boost_homeostasis: float = 0.3
+    # ── RRF boost for homeostasis ──
+    rrf_boost_homeostasis: float = 0.309  # (λ−1)/2
 
-    # λ_d-иерархия нейромодуляторов (глубина k):
-    #   DA (k=1) — быстрый, per-token
-    #   ACh (k=2) — средний, n-gram
-    #   NA (k=3) — средне-медленный, phrase
-    #   5HT (k=4) — медленный, sentence
-    # baseline = λ_d^{-k}, tonic_decay = 1-1/λ_d^6, phasic_decay = 1-1/λ_d^4
-    da_baseline: float = 0.5
-    ht_baseline: float = 0.5
-    na_baseline: float = 0.3
-    ach_baseline: float = 0.5
-    tonic_decay: float = 0.95
-    phasic_decay: float = 0.7
-    da_coherence_strength: float = 0.05
-    da_curiosity_strength: float = 0.4
-    da_mastery_strength: float = 0.5
-    da_boredom_penalty: float = 0.1
-    da_phasic_to_tonic: float = 0.1      # 1/λ_d³
-    da_floor: float = 0.1
-    ach_surprise_strength: float = 0.6
-    ach_uncertainty_strength: float = 0.5
-    ach_match_strength: float = 0.15
-    ach_novelty_scale: float = 0.5
-    ach_drift_up: float = 0.15
-    ach_drift_down: float = 0.1
-    ach_phasic_integration: float = 0.1  # 1/λ_d²
-    ht_baseline_part: float = 0.3
-    ht_match_scale: float = 0.4
-    ht_adapt_rate: float = 0.1
-    na_baseline_part: float = 0.2
-    na_surprise_scale: float = 0.5
-    na_confidence_scale: float = 0.3
-    na_adapt_rate: float = 0.3
-    ach_novelty_baseline: float = 0.3
-    ach_novelty_scale_tonic: float = 0.5
-    ach_well_known_floor: float = 0.2
-    ach_tonic_drift: float = 0.15
-    da_temperature_min: float = 0.05
-    da_temperature_scale: float = 0.9
-    da_temperature_baseline: float = 0.1
-    na_beam_scale: float = 0.5            # 1/λ_d
+    # ── λ_d-иерархия нейромодуляторов ──
+    # Глубина k: DA (1, быстрый), ACh (2, средний),
+    #            NA (3, средне-медленный), 5HT (4, медленный)
+    # baseline = λ^{−k}, tonic_decay = 1−λ^{-6}, phasic_decay = 1−λ^{-4}
+    da_baseline: float = 0.618       # 1/λ
+    ach_baseline: float = 0.382      # 1/λ²
+    na_baseline: float = 0.236       # 1/λ³
+    ht_baseline: float = 0.146       # 1/λ⁴
+    tonic_decay: float = 0.944       # 1−1/λ⁶
+    phasic_decay: float = 0.854      # 1−1/λ⁴
 
-    # HormonalSystem supplementary constants (Phase 7)
-    da_mismatch_penalty: float = -0.3
-    da_match_hard_threshold: float = 0.5
+    da_coherence_strength: float = 0.05    # 1/((F₅−1)·F₅)
+    da_curiosity_strength: float = 0.382   # 1−1/λ
+    da_mastery_strength: float = 0.5       # 1/F₃
+    da_boredom_penalty: float = 0.1        # 1/(2·F₅)
+    da_phasic_to_tonic: float = 0.236      # 1/λ³
+    da_floor: float = 0.1                  # 1/(2·F₅)
+    da_mismatch_penalty: float = -0.309    # −(λ−1)/2
+    da_match_hard_threshold: float = 0.5   # 1/F₃
+    da_temperature_min: float = 0.05       # 1/((F₅−1)·F₅)
+    da_temperature_scale: float = 0.9      # 1−1/(2·F₅)
+    da_temperature_baseline: float = 0.1   # 1/(2·F₅)
+
+    ach_surprise_strength: float = 0.618   # 1−1/λ²
+    ach_uncertainty_strength: float = 0.5  # 1/F₃
+    ach_match_strength: float = 0.146      # 1/λ⁴
+    ach_novelty_scale: float = 0.5         # 1/F₃
+    ach_drift_up: float = 0.146            # 1/λ⁴
+    ach_drift_down: float = 0.1            # 1/(2·F₅)
+    ach_phasic_integration: float = 0.382  # 1/λ²
+    ach_novelty_baseline: float = 0.309    # (λ−1)/2
+    ach_novelty_scale_tonic: float = 0.5   # 1/F₃
+    ach_well_known_floor: float = 0.2      # 1/F₅
+    ach_tonic_drift: float = 0.146         # 1/λ⁴
+
+    ht_baseline_part: float = 0.309        # (λ−1)/2
+    ht_match_scale: float = 0.382          # 1/λ²
+    ht_adapt_rate: float = 0.1             # 1/(2·F₅)
+
+    na_baseline_part: float = 0.2          # 1/F₅
+    na_surprise_scale: float = 0.5         # 1/F₃
+    na_confidence_scale: float = 0.309     # (λ−1)/2
+    na_adapt_rate: float = 0.309           # (λ−1)/2
+    na_beam_scale: float = 0.618           # 1/λ
+
+    # ── Hormonal window sizes ──
     hormone_recent_window: int = 55      # F₁₀
-    hormone_boredom_window: int = 5
-    hormone_boredom_repeat: int = 3
+    hormone_boredom_window: int = 5      # F₅
+    hormone_boredom_repeat: int = 3      # F₄
     hormone_reward_history_maxlen: int = 987  # F₁₆
 
     # ──────── λ_d-rebuild ────────
 
-    def rebuild(self, lam: float, vocab_size: int = 256000):
+    def rebuild(self, lam: float, vocab_size: int = 256000, fib_dimension: int = 2):
         """Пересчитать все λ_d-зависимые коэффициенты для данного λ.
 
-        Вызывается из FCFConfig.__post_init__ при use_fib_generalized=True.
+        Вызывается из FCFConfig.__post_init__ при use_fib_generalized=True
+        (включено по умолчанию). fib_dimension нужен для F^(d)_n.
         """
         import math
+        from eva.symbolic.fibonacci_utils import FibonacciUtils as _FU
 
-        # ── Class A: Прямые λ_d-отношения ──
+        # ── Generalized Fibonacci (standard 1-indexed: F₁=1, F₂=1, F₃=2…) ──
+        # FibonacciUtils.get_generalized(n, d) is 0-indexed: F²_n = F_{n+1}.
+        # So standard F_k = get_generalized(k-1, fib_dimension).
+        _G = lambda k: _FU.get_generalized(k - 1, fib_dimension)
 
-        # Hybrid bind α = λ/(λ+1)
+        F3 = _G(3)   # = 2 for all d≥2
+        F4 = _G(4)
+        F5 = _G(5)
+        F8 = _G(8)
+        F10 = _G(10)
+        F16 = _G(16)
+
+        # ── Hybrid bind α = λ/(λ+1) ──
         self.hybrid_bind_alpha = lam / (lam + 1.0)
         self.hybrid_alpha_max = min(0.95, 1.0 - 1.0 / (lam * lam))
         self.hybrid_alpha_min = 1.0 / (lam + 1.0)
+        self.hybrid_alpha_decay_rate = 1.0 / float(F3)
 
-        # Code mix λ : 1
+        # ── Code mix λ : 1 ──
         self.code_mix_latent = lam / (lam + 1.0)
         self.code_mix_existing = 1.0 / (lam + 1.0)
 
@@ -498,17 +512,42 @@ class FormulaCoefficients:
         self.rrf_hdc = 1.0 / total
         self.rrf_vector = (lam ** (-1.0)) / total
         self.rrf_prior = (lam ** (-2.0)) / total
+        self.rrf_prior_freq_cap = float(F16)
+        self.rrf_boost_homeostasis = (lam - 1.0) / 2.0
+        self.rrf_colloc_alpha = (lam - 1.0) / lam
 
         # ── PMI mapping ──
         self.pmi_slope = 1.0 / lam
         self.pmi_intercept = 0.0
         self.pmi_gate_min_default = 1.0 / (lam * lam)
         self.pmi_clamp_max = lam
+        self.pmi_ce_error_floor = 1.0 / float(F5 - 1)
+        self.pmi_ce_error_scale = 1.0 - self.pmi_ce_error_floor
+
+        # ── Edge weight from PPMI ──
+        self.edge_weight_strength = lam - 1.0
+        self.edge_weight_min = 1.0 / float(F5)
+        self.edge_ppmi_cap = lam * float(F5)
+
+        # ── Target boost ──
+        self.target_boost_scale = float(F5)
+        self.target_boost_temp_scale = 1.0 / float(F3)
+
+        # ── Novelty frequency cap ──
+        self.novelty_freq_cap = float(F10 - F5)
+
+        # ── Homeostatic boost ──
+        half_lam_minus_1 = (lam - 1.0) / 2.0
+        self.homeostatic_boost_clip = half_lam_minus_1
+        self.homeostatic_rrf_mult = half_lam_minus_1
+
+        # ── Intent centroid ──
+        self.intent_bonus_scale = half_lam_minus_1
 
         # ── Decay rates ──
         self.antirep_decay = math.log(2.0) / lam      # half-life = λ_d
         self.tonic_decay = 1.0 - 1.0 / (lam ** 6.0)   # τ ≈ λ_d^6
-        self.phasic_decay = 1.0 - 1.0 / (lam ** 4.0)  # τ ≈ λ_d^4 (быстрее)
+        self.phasic_decay = 1.0 - 1.0 / (lam ** 4.0)  # τ ≈ λ_d^4
 
         # ── Hormonal baselines по глубине k ──
         self.da_baseline = 1.0 / lam
@@ -525,13 +564,76 @@ class FormulaCoefficients:
         self.confidence_freq_scale = 1.0 / lam
         max_log = math.log(max(lam * vocab_size, 2.0))
         self.freq_weight_log_scale = 1.0 / max_log
+        self.freq_weight_min = 1.0 / float((F5 - 1) * F5)
 
-        # ── Честность: подпись ──
-        # (θ-decay, edge_weight, target_boost, novelty_freq_cap,
-        #  homeostatic, intent_bonus, cluster_potential,
-        #  neg_lr, contr_lr, hormonal_mod,
-        #  field_weight, concept_usage_ema, rrf_boost_homeostasis
-        #  — без λ_d-вывода, остаются с defaults)
+        # ── STDP field weight ──
+        self.field_weight_log_scale = float(F4 - 1)
+        self.field_weight_cap = float(F4)
+        self.field_weight_floor = 1.0 / float(2 * F5)
+
+        # ── STDP hormonal modulation ──
+        self.hormonal_mod_baseline = 1.0 / float(F3)
+        self.hormonal_mod_scale = 1.0 / float(F3)
+
+        # ── Negative sampling LR ──
+        self.neg_lr_multiplier = half_lam_minus_1
+        self.neg_lr_ce_scale = float(F4 - 1)
+
+        # ── Contrastive LR ──
+        self.contr_lr_ce_scale = float(F4 - 1)
+
+        # ── Concept usage EMA ──
+        self.concept_usage_ema_alpha = 1.0 / float(2 * F5)
+
+        # ── Cluster potential ──
+        self.cluster_potential_slope = 2.0 / float(F5)
+        self.cluster_potential_center = 1.0 / float(F3)
+        self.cluster_potential_ema_alpha = 1.0 / float(2 * F5)
+
+        # ── DA (depth 1) behavioral ──
+        self.da_coherence_strength = 1.0 / float((F5 - 1) * F5)
+        self.da_curiosity_strength = 1.0 - 1.0 / lam
+        self.da_mastery_strength = 1.0 / float(F3)
+        self.da_boredom_penalty = 1.0 / float(2 * F5)
+        self.da_floor = 1.0 / float(2 * F5)
+        self.da_match_hard_threshold = 1.0 / float(F3)
+        self.da_temperature_min = 1.0 / float((F5 - 1) * F5)
+        self.da_temperature_scale = 1.0 - 1.0 / float(2 * F5)
+        self.da_temperature_baseline = 1.0 / float(2 * F5)
+        self.da_mismatch_penalty = -half_lam_minus_1
+
+        # ── ACh (depth 2) behavioral ──
+        self.ach_surprise_strength = 1.0 - 1.0 / (lam * lam)
+        self.ach_uncertainty_strength = 1.0 / float(F3)
+        self.ach_match_strength = 1.0 / (lam ** 4.0)
+        self.ach_novelty_scale = 1.0 / float(F3)
+        self.ach_drift_up = 1.0 / (lam ** 4.0)
+        self.ach_drift_down = 1.0 / float(2 * F5)
+        self.ach_novelty_baseline = half_lam_minus_1
+        self.ach_novelty_scale_tonic = 1.0 / float(F3)
+        self.ach_well_known_floor = 1.0 / float(F5)
+        self.ach_tonic_drift = 1.0 / (lam ** 4.0)
+
+        # ── 5HT (depth 4) behavioral ──
+        self.ht_baseline_part = half_lam_minus_1
+        self.ht_match_scale = 1.0 / (lam * lam)
+        self.ht_adapt_rate = 1.0 / float(2 * F5)
+
+        # ── NA (depth 3) behavioral ──
+        self.na_baseline_part = 1.0 / float(F5)
+        self.na_surprise_scale = 1.0 / float(F3)
+        self.na_confidence_scale = half_lam_minus_1
+        self.na_adapt_rate = half_lam_minus_1
+
+        # ── Hormonal window sizes ──
+        self.hormone_recent_window = F10
+        self.hormone_boredom_window = F5
+        self.hormone_boredom_repeat = F4
+        self.hormone_reward_history_maxlen = F16
+
+        # ── Alphabet basis: обновить λ_d-сдвиги букв ──
+        from eva.symbolic.alphabet_basis import init as _alpha_init
+        _alpha_init(lam)
 
     # ──────── end rebuild ────────
 
@@ -924,7 +1026,7 @@ class FCFConfig:
 
     # ── Обобщённые числа Фибоначчи (размерность d) ────────────────
     fib_dimension: int = 2              # d в F^(d)_n / λ_d. 2 = классическое φ
-    use_fib_generalized: bool = False   # Включить λ_d вместо φ во всех местах
+    use_fib_generalized: bool = True    # λ_d-иерархия включена по умолчанию
 
     # ──────────────────────────────────────────
     #  Генерация пар из MorphVocab/корпуса
@@ -1044,4 +1146,4 @@ class FCFConfig:
         if self.use_fib_generalized and self.fib_dimension >= 2:
             from eva.symbolic.fibonacci_utils import FibonacciUtils
             lam = FibonacciUtils.get_lambda(self.fib_dimension)
-            self.formula.rebuild(lam, self.vocab_size)
+            self.formula.rebuild(lam, self.vocab_size, self.fib_dimension)

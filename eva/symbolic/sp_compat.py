@@ -19,6 +19,7 @@ WideBind-токенизатор — ByteLevel BPE: токены хранятся
 from __future__ import annotations
 
 import os
+import json
 
 
 def _bpe_like(tok, idx: int) -> str:
@@ -131,9 +132,15 @@ def load_piece_model(path) -> SPCompatTokenizer:
 
     *.model            -> sentencepiece (возвращает SP-процессор)
     *tokenizer.json*   -> HF ByteLevel BPE (оборачивает в SPCompatTokenizer)
+    *morpheme*/.json с format=morpheme-v1 -> MorphemeTokenizer (символы→морфемы→слова)
     """
     base = os.path.basename(str(path)).lower()
     if 'tokenizer.json' in base or base.endswith('.json'):
+        with open(str(path), encoding='utf-8') as f:
+            data = json.load(f)
+        if data.get('format') == 'morpheme-v1':
+            from eva.symbolic.morpheme_tokenizer import MorphemeTokenizer
+            return MorphemeTokenizer(data)
         from tokenizers import Tokenizer
         tok = Tokenizer.from_file(str(path))
         return SPCompatTokenizer(tok)

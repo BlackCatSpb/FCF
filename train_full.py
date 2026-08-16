@@ -17,19 +17,14 @@ STATE_FILE = os.path.join(CHECKPOINT_DIR, 'state.pkl')
 META_FILE = os.path.join(CHECKPOINT_DIR, 'meta.json')
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# ── Число строк в корпусе (кэшируем) ──
-CORPUS_LINES_FILE = os.path.join(CHECKPOINT_DIR, 'corpus_lines.txt')
-if os.path.exists(CORPUS_LINES_FILE):
-    TOTAL_LINES = int(open(CORPUS_LINES_FILE).read().strip())
-else:
-    TOTAL_LINES = sum(1 for _ in open(CORPUS, 'r', encoding='utf-8'))
-    with open(CORPUS_LINES_FILE, 'w') as cf:
-        cf.write(str(TOTAL_LINES))
-
 # ── Параметры ──
 parser = argparse.ArgumentParser()
 parser.add_argument('--fresh', action='store_true', help='Fresh start (clear checkpoints)')
 parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+parser.add_argument('--corpus', type=str, default=CORPUS,
+                    help='Path to corpus file (default: full_corpus_ru_clean.txt)')
+parser.add_argument('--max-lines', type=int, default=0,
+                    help='Stop after N valid lines (0 = whole corpus)')
 parser.add_argument('--vocab-size', type=int, default=0)
 parser.add_argument('--field-bits', type=int, default=512)
 parser.add_argument('--learned-fields', action='store_true')
@@ -46,6 +41,19 @@ parser.add_argument('--gen-max-words', type=int, default=100,
 parser.add_argument('--qwen-seed', type=str, default='',
                     help='Path to .npy with Qwen-seeded concept vectors')
 args = parser.parse_args()
+if args.corpus != CORPUS:
+    CORPUS = args.corpus
+
+# ── Число строк в корпусе (кэшируем) ──
+CORPUS_LINES_FILE = os.path.join(CHECKPOINT_DIR, 'corpus_lines.txt')
+if os.path.exists(CORPUS_LINES_FILE):
+    TOTAL_LINES = int(open(CORPUS_LINES_FILE).read().strip())
+else:
+    TOTAL_LINES = sum(1 for _ in open(CORPUS, 'r', encoding='utf-8'))
+    with open(CORPUS_LINES_FILE, 'w') as cf:
+        cf.write(str(TOTAL_LINES))
+if args.max_lines > 0:
+    TOTAL_LINES = min(TOTAL_LINES, args.max_lines)
 
 if args.fresh and os.path.exists(CHECKPOINT_DIR):
     for f_name in os.listdir(CHECKPOINT_DIR):
@@ -100,6 +108,8 @@ else:
         log(f'  {n} vectors loaded')
     else:
         cs.seed_alphabet_basis(sp, seed_multi_char=True)
+    if args.learned_fields:
+        cs.build_learned_fields(n_field_bits=args.field_bits, sp=None)
     cs.build_collocation_matrix()
     cs.build_multi_level_encoder()
 
@@ -170,7 +180,7 @@ try:
                 skipped += 1
                 if skipped >= lines_to_skip:
                     break
-            log(f'Skipped {skipped} valid lines, resuming at byte offset {f.tell()}')
+            log(f'Skipped {skipped} valid lines, resuming from line {resume_lines}')
 
         for line_no, line in enumerate(f):
             stripped = line.strip()
@@ -192,6 +202,10 @@ try:
                 total_pairs += n
                 total_lines += len(batch)
                 batch = []
+
+                if args.max_lines > 0 and total_lines >= TOTAL_LINES:
+                    log(f'Reached --max-lines {TOTAL_LINES:,}, stopping.')
+                    break
 
                 elapsed = time.time() - t0
                 lines_this_run = total_lines - resume_lines

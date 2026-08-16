@@ -41,3 +41,5 @@ eva/real_data/
 # Large derived artifacts (75MB, rebuilt from corpus)
 real_data/morph_vocab.json
 real_data/tokenizer.json
+real_data/corpus_*.txt
+

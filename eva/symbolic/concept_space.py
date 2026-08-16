@@ -303,6 +303,19 @@ class FractalField:
         self._sector_index: Dict[int, Dict[tuple, list]] = {}  # depth → {prefix → [cids]}
         self._sector_depths: list = self.arch.sector_depths
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for k, v in list(state.items()):
+            if type(v).__name__ in ('lock', '_thread.lock'):
+                state[k] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        for k, v in list(self.__dict__.items()):
+            if v is None and k.endswith('_lock'):
+                self.__dict__[k] = threading.Lock()
+
     def _apply_l1(self, code: np.ndarray, ce: float = 0.0, cid: Optional[int] = None) -> np.ndarray:
         """Soft-threshold z_c subspace: high CE → weak L1 (allows densification).
 
@@ -1113,6 +1126,19 @@ class EntityField:
         self._entity_batch_counter = 0
         self._max_entities = _c.entity_field_max_entities  # 50K × 2048 × fp32 ≈ 400MB cap
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for k, v in list(state.items()):
+            if type(v).__name__ in ('lock', '_thread.lock'):
+                state[k] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        for k, v in list(self.__dict__.items()):
+            if v is None and k.endswith('_lock'):
+                self.__dict__[k] = threading.Lock()
+
     # ── Key helpers ──────────────────────────────────────────
     @staticmethod
     def key_char(cp):    return ('c', cp)
@@ -1636,6 +1662,25 @@ class ConceptSpace:
         self.colloc: Optional[CollocationMatrix] = None
 
         # ---- Initialization ----
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Generator re-binds the hook on construction; don't pickle it
+        # (bound method would drag the whole generator into the checkpoint)
+        if '_after_update_hook' in state:
+            state['_after_update_hook'] = None
+        for k, v in list(state.items()):
+            if type(v).__name__ in ('lock', '_thread.lock'):
+                state[k] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if '_after_update_hook' not in self.__dict__:
+            self._after_update_hook = None
+        for k, v in list(self.__dict__.items()):
+            if v is None and k.endswith('_lock'):
+                self.__dict__[k] = threading.Lock()
 
     def init_concepts(self):
         """Initialize all concept vectors (0..vocab_size-1) via fractal field."""

@@ -92,6 +92,29 @@ class SyntaxLattice:
         self._prefix_total = {}  # prefix_tuple -> int (total count)
         self._skip2_total = {}   # prev_cid -> int (total count)
 
+    def __getstate__(self):
+        """Lambda-based defaultdict factories are not picklable — flatten."""
+        state = self.__dict__.copy()
+        for _k in ('update', 'decay_all'):
+            # Generator-wrapped instance attributes (local closures) are not
+            # picklable; class methods restore on load, generator re-wraps them.
+            if _k in state:
+                del state[_k]
+        if isinstance(state.get('connections'), dict):
+            state['connections'] = dict(state['connections'])
+        if isinstance(state.get('ngrams'), dict):
+            state['ngrams'] = {n: dict(d) for n, d in state['ngrams'].items()}
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if isinstance(self.connections, dict):
+            self.connections = defaultdict(
+                lambda: {'count': 0, 'types': Counter()}, self.connections)
+        if isinstance(self.ngrams, dict):
+            self.ngrams = {n: defaultdict(float, d) if isinstance(d, dict) else d
+                           for n, d in self.ngrams.items()}
+
     def build(self, corpus_path, sp, max_n=4, min_count=2,
               ppmi_threshold=None, ami_alpha=None):
         """Build n-gram model from corpus via SentencePiece.
